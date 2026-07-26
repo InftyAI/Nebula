@@ -1,0 +1,23 @@
+# Renders the checked-in, git-tracked provider price catalogs
+# (pkg/provider/catalog/data/*.csv) into a ConfigMap the manager mounts at
+# /etc/nebula/catalog. The CSVs remain the source of truth in-repo (reviewed via
+# PR); this ConfigMap is how they reach the running controller, and ops can
+# `kubectl edit configmap nebula-catalog` to adjust prices live without a
+# rebuild (the manager re-reads on restart).
+#
+# This component sets NO namespace/namePrefix of its own: it is included by
+# config/default, which applies the shared `nebula-` prefix and `nebula-system`
+# namespace. That also lets kustomize rewrite the Deployment's `catalog` volume
+# reference to the generated `nebula-catalog` name automatically.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+- name: catalog
+  files:
+  - modal.csv=../../pkg/provider/catalog/data/modal.csv
+
+generatorOptions:
+  # Stable name (no content-hash suffix) so `kubectl edit` and the volume
+  # reference stay valid across price updates.
+  disableNameSuffixHash: true

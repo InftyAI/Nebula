@@ -1,0 +1,22 @@
+# Narrow the Pod mutating webhook so it only ever intercepts Pods that opt into
+# Nebula, and never Pods in system namespaces. This is critical: the webhook is
+# failurePolicy=Fail and on the Pod-CREATE critical path, so an over-broad scope
+# would make every Pod creation in the cluster depend on the Nebula webhook being
+# healthy. controller-gen markers cannot express selectors, so this patch layers
+# them onto the generated MutatingWebhookConfiguration.
+- op: add
+  path: /webhooks/0/objectSelector
+  value:
+    matchLabels:
+      nebula.inftyai.com/enabled: "true"
+- op: add
+  path: /webhooks/0/namespaceSelector
+  value:
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values:
+          - kube-system
+          - kube-node-lease
+          - kube-public
+          - nebula-system

@@ -1,0 +1,222 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: nodepools.nebula.inftyai.com
+spec:
+  group: nebula.inftyai.com
+  names:
+    kind: NodePool
+    listKind: NodePoolList
+    plural: nodepools
+    shortNames:
+    - np
+    singular: nodepool
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.strategy
+      name: Strategy
+      type: string
+    - jsonPath: .spec.providers[*].name
+      name: Providers
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodePool is the placement policy for GPU workloads across NeoClouds.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: "NodePoolSpec is the placement policy for a set of workloads.
+              It is the\nlong-lived, user-facing object: editing it changes behaviour
+              for every Pod\nthat selects the pool, without touching any workload.\n\nPlacement
+              resolves along two orthogonal axes, and the ORDER between them is\nfixed:
+              capacity type first, provider second.\n\n\tFOR each capacityType in
+              CapacityTypes (in listed order):   // outer: hard tier\n\t    candidates
+              = Providers x {this capacityType}, available now, minus blocklist\n\t
+              \   IF candidates non-empty:\n\t        pick one via Strategy (LowestPrice
+              | Ordered | Weighted) // inner: rank providers\n\t        DONE\n\t    //
+              else fall through to the next capacity tier\n\nSo CapacityTypes is a
+              hard preference: every provider's Spot is tried before\nANY provider's
+              OnDemand. This is deliberate — \"spot everywhere before any\non-demand\"
+              is the least surprising behaviour, even if a different provider's\non-demand
+              were momentarily cheaper. Strategy only ranks providers *within*\nthe
+              active capacity tier; it never crosses tiers.\n\nThe Weighted strategy
+              requires a weight on every provider ref. This is a\nstatic property
+              of the spec, so it is enforced at admission by the CEL rule\nbelow rather
+              than surfaced as a status condition after the fact."
+            properties:
+              capacityTypes:
+                default:
+                - Reserved
+                - OnDemand
+                - Spot
+                description: |-
+                  CapacityTypes is the OUTER axis: the purchase models to try, in fallback
+                  order. e.g. [Spot, OnDemand] means "use spot on any provider first; only
+                  when spot is exhausted everywhere, drop to on-demand". A single-element
+                  list pins the pool to that type. This replaces a spot on/off flag and
+                  extends to Reserved without new fields.
+                items:
+                  description: |-
+                    CapacityType is the purchase model (the outer axis). Each provider maps it to
+                    its own concept — e.g. RunPod Spot -> interruptible/podRentInterruptable.
+                  enum:
+                  - Spot
+                  - OnDemand
+                  - Reserved
+                  type: string
+                minItems: 1
+                type: array
+              failover:
+                description: |-
+                  Failover controls how a provider that fails at provision time (e.g.
+                  RunPod reports no capacity) is temporarily excluded and re-tried.
+                properties:
+                  blocklistTTL:
+                    default: 10m
+                    description: |-
+                      BlocklistTTL is how long a failed placement is excluded before the
+                      provider becomes a candidate for it again.
+                    type: string
+                type: object
+              providers:
+                description: |-
+                  Providers is the ordered set of NeoClouds this pool is allowed to use.
+                  A Pod bound to this pool can only ever be placed on a provider in this
+                  list. Order is significant only for the Ordered strategy (it is the
+                  inner, provider-ranking axis).
+                items:
+                  description: ProviderRef names a provider and, for the Weighted
+                    strategy, its share.
+                  properties:
+                    name:
+                      description: |-
+                        Name is the provider identifier, matching the ProviderLabel value on that
+                        provider's virtual node (e.g. "runpod", "modal", "kubernetes").
+                      type: string
+                    weight:
+                      description: |-
+                        Weight is the relative share of new placements for the Weighted strategy.
+                        Ignored by other strategies.
+                      format: int32
+                      minimum: 1
+                      type: integer
+                  required:
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+              strategy:
+                default: Ordered
+                description: |-
+                  Strategy is the INNER axis: how to rank providers within the active
+                  capacity tier. It never overrides the capacity tier ordering.
+                enum:
+                - LowestPrice
+                - Ordered
+                - Weighted
+                type: string
+            required:
+            - providers
+            type: object
+            x-kubernetes-validations:
+            - message: strategy Weighted requires a weight on every provider
+              rule: self.strategy != 'Weighted' || self.providers.all(p, has(p.weight))
+          status:
+            description: NodePoolStatus surfaces the current placement picture for
+              observability.
+            properties:
+              conditions:
+                description: Conditions follows the standard Kubernetes condition
+                  convention.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              placed:
+                additionalProperties:
+                  format: int32
+                  type: integer
+                description: Placed counts running instances per provider, for at-a-glance
+                  balance.
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

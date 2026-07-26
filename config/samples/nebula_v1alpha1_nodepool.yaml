@@ -1,0 +1,21 @@
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: nebula
+  name: nodepool-sample
+spec:
+  # The NeoClouds this pool may place onto. Order matters only for the Ordered
+  # strategy (the inner, provider-ranking axis).
+  providers:
+  - name: modal
+  # - name: runpod
+  # Outer axis: try spot on every provider first, fall back to on-demand.
+  capacityTypes:
+  - Reserved
+  - OnDemand
+  - Spot
+  # Inner axis: within the active capacity tier.
+  strategy: Ordered
+  failover:
+    blocklistTTL: 10m

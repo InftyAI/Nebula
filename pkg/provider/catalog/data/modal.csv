@@ -1,0 +1,30 @@
+# Modal price/availability catalog — community-maintained.
+#
+# Modal exposes NO pricing API (SDK and gRPC surface neither a rate card nor
+# per-accelerator prices), so these are list prices transcribed from
+# https://modal.com/pricing by hand. Treat them as a starting point, not a
+# billing source, and refresh via `make update-catalog` (see hack/refresh.go).
+# Modal is OnDemand-only: it has no user-facing spot/preemptible tier.
+#
+# This file is the SINGLE source of truth for Modal's accelerators: the
+# accelerator column defines both the supported set + price (for the optimizer)
+# and, since Modal names its GPUs identically to Nebula's canonical names, the
+# accelerator vocabulary MapAccelerator resolves against. No accelerator table
+# lives in Go anymore. (If a future provider's identifiers diverge from the
+# canonical names, add a provider_id column here rather than a Go map.)
+#
+# Columns:
+#   accelerator    canonical Nebula accelerator type
+#   capacity_type  Spot | OnDemand | Reserved
+#   price_per_hour approximate on-demand USD/GPU-hour
+#   available      whether Modal currently offers it (a live probe may override)
+#   updated        YYYY-MM-DD the row was last verified
+accelerator,capacity_type,price_per_hour,available,updated
+T4,OnDemand,0.59,true,2026-07-25
+L4,OnDemand,0.80,true,2026-07-25
+A10G,OnDemand,1.10,true,2026-07-25
+L40S,OnDemand,1.95,true,2026-07-25
+A100-40GB,OnDemand,2.10,true,2026-07-25
+A100-80GB,OnDemand,2.50,true,2026-07-25
+H100,OnDemand,3.95,true,2026-07-25
+H200,OnDemand,4.55,true,2026-07-25

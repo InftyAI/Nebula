@@ -17,6 +17,10 @@ Dockerfile.cross
 
 !vendor/**/zz_generated.*
 
+# local environment / credentials — never commit real tokens
+.env
+.env.local
+
 # editor and IDE paraphernalia
 .idea
 .vscode
@@ -31,3 +35,6 @@ __pycache__
 *.pyc
 .pytest_cache
 *.tgz
+
+.devcontainer
+bin

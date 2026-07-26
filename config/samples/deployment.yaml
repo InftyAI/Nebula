@@ -1,0 +1,74 @@
+# A minimal GPU workload that opts into Nebula placement.
+#
+# A workload opts in with just THREE fields on the POD TEMPLATE — everything else
+# Nebula adds for you (the webhook and placement controller act on Pods, so the
+# opt-in lives on spec.template, NOT on the Deployment's own metadata):
+#   1. label  nebula.inftyai.com/enabled: "true"   -> opt in (webhook acts only on this)
+#   2. label  nebula.inftyai.com/nodepool: <name>  -> which NodePool to place against
+#   3. label  nebula.inftyai.com/accelerator-type: <type>  -> requested GPU type
+#      (count rides on the standard nvidia.com/gpu resource below)
+#
+# On CREATE, the mutating webhook injects the provider-selection scheduling gate
+# and a toleration for the virtual-node taint on each Pod. The Pod sits
+# SchedulingGated until the placement controller picks a provider from the pool,
+# stamps the provider nodeSelector, and removes the gate — then the Pod binds to
+# that provider's virtual node and the VK provisions the real instance.
+#
+# A Deployment (rather than a bare Pod) means its ReplicaSet recreates a Pod that
+# fails or is torn down, so the workload — and its backing GPU instance — is
+# self-healing rather than a one-shot that lingers Failed.
+#
+# Prereqs: the NodePool below must exist (kubectl apply -k config/samples applies
+# both), and its providers must be registered (their credential Secrets present).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-workload-sample
+  namespace: default
+  labels:
+    app.kubernetes.io/managed-by: nebula
+spec:
+  replicas: 8
+  selector:
+    matchLabels:
+      app: gpu-workload-sample
+  template:
+    metadata:
+      labels:
+        app: gpu-workload-sample
+        # --- opt in (must be on the Pod template) ---
+        nebula.inftyai.com/enabled: "true"
+        # Place against this pool (see nebula_v1alpha1_nodepool.yaml).
+        nebula.inftyai.com/nodepool: nodepool-sample
+        # Requested accelerator TYPE. Matched case-insensitively against the
+        # provider catalog (e.g. Modal offers T4/L4/A10G/A100-40GB/A100-80GB/
+        # H100/H200). The COUNT is the nvidia.com/gpu resource below — omit it
+        # for a single GPU.
+        nebula.inftyai.com/accelerator-type: l4
+    spec:
+      # Do NOT set nodeName or a provider nodeSelector yourself — the placement
+      # controller fills the nodeSelector in when it ungates the Pod. Setting
+      # nodeName would bypass placement entirely (the webhook skips bound Pods).
+      containers:
+      - name: workload
+        # A CUDA base image so nvidia-smi and the GPU userspace are present — a
+        # plain image (e.g. busybox) has no nvidia-smi. Any CUDA/GPU image works;
+        # this one is small and only needs the driver from the host.
+        image: nvidia/cuda:12.4.1-base-ubuntu22.04
+        # Print the GPUs the sandbox sees at startup, then idle.
+        #
+        # NOTE: `kubectl logs` and `kubectl exec` do NOT work against a Nebula
+        # virtual node — it does not serve the kubelet API (see pkg/vnode
+        # handler.go: GetContainerLogs/RunInContainer return NotFound). So to see
+        # this output, read it on the PROVIDER side (the Modal dashboard or
+        # `modal app logs`), not via kubectl.
+        command: ["sh", "-c", "nvidia-smi --query-gpu=index,name,memory.total --format=csv || echo 'no nvidia-smi'; sleep 3600"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            # GPU count. Standard extended resource, so the scheduler's fit check
+            # and provisioning read the same number. 8 => 8x the accelerator-type
+            # above.
+            nvidia.com/gpu: "1"

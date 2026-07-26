@@ -1,0 +1,138 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: nodeclaims.nebula.inftyai.com
+spec:
+  group: nebula.inftyai.com
+  names:
+    kind: NodeClaim
+    listKind: NodeClaimList
+    plural: nodeclaims
+    shortNames:
+    - nc
+    singular: nodeclaim
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.provider
+      name: Provider
+      type: string
+    - jsonPath: .status.instanceID
+      name: Instance
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodeClaim represents one external GPU instance and its lifecycle.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              NodeClaimSpec is the durable identity of one external instance: who it serves,
+              which provider it lives on, and which policy produced it. It is created and
+              owned by the controller (not users), one per placed Pod. The workload shape
+              (image, resources, GPU type/count, spot) is NOT duplicated here — that lives
+              on the Pod, which the provider controller reads directly. NodeClaim is a
+              ledger, not a spec: its reason to exist is to survive the Node so teardown can
+              reclaim the external instance and never leak a paid GPU.
+            properties:
+              capacityType:
+                description: |-
+                  CapacityType is the purchase tier the placement optimizer selected
+                  (Spot/OnDemand/Reserved). It is stored durably here because it is the one
+                  provisioning input that cannot be read off the Pod, and Provision needs it
+                  to re-issue the request after a controller restart. Immutable, like
+                  Provider. Empty means "let the provider use its default" (e.g. Modal is
+                  OnDemand-only and ignores it).
+                enum:
+                - Spot
+                - OnDemand
+                - Reserved
+                type: string
+              podRef:
+                description: |-
+                  PodRef links this claim to the Pod it serves. UID pins the exact Pod so a
+                  recreated Pod of the same name gets a fresh claim rather than adopting the
+                  old instance.
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                  uid:
+                    description: |-
+                      UID pins the exact Pod object; a recreated Pod of the same name gets a new
+                      NodeClaim rather than silently adopting the old instance.
+                    type: string
+                required:
+                - name
+                - namespace
+                - uid
+                type: object
+              poolRef:
+                description: PoolRef is the NodePool whose policy produced this claim,
+                  for reporting.
+                type: string
+              provider:
+                description: |-
+                  Provider is the chosen NeoCloud. Immutable: a NodeClaim never migrates.
+                  Recovery from preemption is delete-and-recreate. Held durably so teardown
+                  knows which provider API to call even after status is lost.
+                type: string
+            required:
+            - podRef
+            - provider
+            type: object
+          status:
+            description: |-
+              NodeClaimStatus is the durable record reconciled against the provider by the
+              poll loop.
+            properties:
+              endpoint:
+                description: Endpoint is the reachable address (e.g. SSH host:port)
+                  once ready.
+                type: string
+              instanceID:
+                description: |-
+                  InstanceID is the provider's identifier for the external instance (e.g. a
+                  RunPod pod id). This is the field that must not be lost: the terminate
+                  finalizer uses it to reclaim the instance.
+                type: string
+              nodeName:
+                description: NodeName is the virtual Node created for this instance,
+                  once it exists.
+                type: string
+              phase:
+                description: Phase is the coarse lifecycle state.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

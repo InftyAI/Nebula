@@ -1,0 +1,12 @@
+resources:
+- manifests.yaml
+- service.yaml
+
+# Narrow the generated Pod webhook to opt-in Pods outside system namespaces.
+patches:
+- path: selector_patch.yaml
+  target:
+    kind: MutatingWebhookConfiguration
+
+configurations:
+- kustomizeconfig.yaml

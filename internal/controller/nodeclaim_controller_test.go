@@ -1,0 +1,473 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
+)
+
+// fakeProvider is a minimal provider.Provider. On the happy path the NodeClaim
+// controller never touches a provider (VK owns provisioning), but the teardown
+// backstop calls List/Terminate on the deletion path, so this records those.
+type fakeProvider struct {
+	name string
+
+	list         []provider.Instance // what List returns
+	listErr      error               // if set, List fails
+	terminated   []string            // instance ids passed to Terminate, in order
+	terminateErr error               // if set, Terminate fails
+	gpus         []string            // accelerators MapAccelerator offers; nil = offer any
+}
+
+func (f *fakeProvider) Name() string                        { return f.name }
+func (f *fakeProvider) Capabilities() provider.Capabilities { return provider.Capabilities{} }
+func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (string, error) {
+	return "", nil
+}
+func (f *fakeProvider) Terminate(_ context.Context, id string) error {
+	f.terminated = append(f.terminated, id)
+	return f.terminateErr
+}
+func (f *fakeProvider) Get(context.Context, string) (*provider.Instance, error) { return nil, nil }
+func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
+	return f.list, f.listErr
+}
+func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
+func (f *fakeProvider) MapAccelerator(c string) (string, bool) {
+	if f.gpus == nil {
+		return c, true // offer any accelerator
+	}
+	for _, g := range f.gpus {
+		if g == c {
+			return c, true
+		}
+	}
+	return "", false
+}
+func (f *fakeProvider) ClassifyProvisionError(error) provider.BlockScope {
+	return provider.BlockScope{}
+}
+
+// resolver returns a Providers func that resolves only the given provider.
+func resolver(provs ...*fakeProvider) func(string) (provider.Provider, bool) {
+	return func(name string) (provider.Provider, bool) {
+		for _, p := range provs {
+			if p.name == name {
+				return p, true
+			}
+		}
+		return nil, false
+	}
+}
+
+// testScheme builds a scheme with core + Nebula types registered.
+func testScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
+	}
+	if err := nebulav1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add nebula scheme: %v", err)
+	}
+	return s
+}
+
+// newClaimReconciler wires a NodeClaimReconciler over a fake client seeded with
+// objs. Any fakeProviders passed are registered as the reconciler's resolver so
+// the teardown backstop can reach them.
+func newClaimReconciler(t *testing.T, objs []client.Object, provs ...*fakeProvider) (*NodeClaimReconciler, client.Client) {
+	t.Helper()
+	s := testScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&nebulav1alpha1.NodeClaim{}).
+		Build()
+	r := &NodeClaimReconciler{Client: c, Scheme: s}
+	if len(provs) > 0 {
+		r.Providers = resolver(provs...)
+	}
+	return r, c
+}
+
+func newPod(name, ns, uid string, phase corev1.PodPhase) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(uid)},
+		Spec: corev1.PodSpec{
+			NodeName:   "nebula-fake",
+			Containers: []corev1.Container{{Name: "main", Image: "img"}},
+		},
+		Status: corev1.PodStatus{Phase: phase, PodIP: "1.2.3.4"},
+	}
+}
+
+// newClaim builds a steady-state claim: it already carries the terminate
+// finalizer, since the normal reconcile adds that before doing anything else.
+// Use newClaimNoFinalizer to exercise the finalizer-addition path itself.
+func newClaim(name, podName, podNS, podUID, prov string) *nebulav1alpha1.NodeClaim {
+	nc := newClaimNoFinalizer(name, podName, podNS, podUID, prov)
+	nc.Finalizers = []string{nebulav1alpha1.TerminateInstanceFinalizer}
+	return nc
+}
+
+func newClaimNoFinalizer(name, podName, podNS, podUID, prov string) *nebulav1alpha1.NodeClaim {
+	return &nebulav1alpha1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: nebulav1alpha1.NodeClaimSpec{
+			PodRef:   nebulav1alpha1.PodReference{Namespace: podNS, Name: podName, UID: podUID},
+			Provider: prov,
+		},
+	}
+}
+
+func reconcileClaim(t *testing.T, r *NodeClaimReconciler, name string) reconcile.Result {
+	t.Helper()
+	res, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: name},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	return res
+}
+
+func getClaim(t *testing.T, c client.Client, name string) *nebulav1alpha1.NodeClaim {
+	t.Helper()
+	var nc nebulav1alpha1.NodeClaim
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name}, &nc); err != nil {
+		t.Fatalf("get claim %s: %v", name, err)
+	}
+	return &nc
+}
+
+func TestReconcile_AddsFinalizerBeforePlacing(t *testing.T) {
+	// A claim with no finalizer: the first reconcile must add the terminate
+	// finalizer (and do nothing else) so teardown is guaranteed from the start.
+	pod := newPod("p1", "default", "uid-1", corev1.PodRunning)
+	claim := newClaimNoFinalizer("c1", "p1", "default", "uid-1", "fake")
+	r, c := newClaimReconciler(t, []client.Object{pod, claim})
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if !hasFinalizer(got) {
+		t.Fatal("expected terminate finalizer to be added on first reconcile")
+	}
+	// Phase must NOT yet be Bound: the finalizer-add reconcile returns early.
+	if got.Status.Phase == nebulav1alpha1.NodeClaimBound {
+		t.Fatal("must not mark Bound in the same reconcile that adds the finalizer")
+	}
+}
+
+func TestReconcile_MarksBoundWhenPodPresent(t *testing.T) {
+	// With the finalizer already present and the served Pod alive, the claim is
+	// marked Bound (the durable guard) and nothing is torn down.
+	pod := newPod("p1", "default", "uid-1", corev1.PodRunning)
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	r, c := newClaimReconciler(t, []client.Object{pod, claim})
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimBound {
+		t.Fatalf("expected phase Bound, got %q", got.Status.Phase)
+	}
+	if !got.DeletionTimestamp.IsZero() {
+		t.Fatal("must not delete a claim whose Pod is present")
+	}
+}
+
+func TestReconcile_PendingPodDoesNotMarkBound(t *testing.T) {
+	// A served Pod that exists but is still provisioning (PodPending) must NOT
+	// flip the claim to Bound — Bound is the teardown guard, earned only once the
+	// instance is actually running. The instance id is still captured early.
+	pod := newPod("p1", "default", "uid-1", corev1.PodPending)
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	prov := &fakeProvider{
+		name: "fake",
+		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
+	}
+	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase == nebulav1alpha1.NodeClaimBound {
+		t.Fatal("must not mark Bound while the Pod is still provisioning")
+	}
+	if got.Status.Phase != nebulav1alpha1.NodeClaimProvisioning {
+		t.Fatalf("expected phase Provisioning, got %q", got.Status.Phase)
+	}
+	if got.Status.InstanceID != "inst-1" {
+		t.Fatalf("expected instance id captured early, got %q", got.Status.InstanceID)
+	}
+}
+
+func TestReconcile_RecordsInstanceIDOnBound(t *testing.T) {
+	// When the served Pod is running, the claim is marked Bound AND its
+	// status.InstanceID is captured (resolved by claim name via List) so the
+	// teardown backstop can reclaim the instance even if VK forgets the id.
+	pod := newPod("p1", "default", "uid-1", corev1.PodRunning)
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	prov := &fakeProvider{
+		name: "fake",
+		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
+	}
+	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimBound {
+		t.Fatalf("expected phase Bound, got %q", got.Status.Phase)
+	}
+	if got.Status.InstanceID != "inst-1" {
+		t.Fatalf("expected status.InstanceID recorded as inst-1, got %q", got.Status.InstanceID)
+	}
+}
+
+func TestReconcile_TerminalPodMarksTerminated(t *testing.T) {
+	// A served Pod that has reached a terminal phase (VK reports the external
+	// instance gone) must move the claim to Terminated rather than wedge it at
+	// Bound. The claim is NOT deleted — its Pod still exists (restartPolicy:
+	// Never leaves it around), and the instance is already gone.
+	pod := newPod("p1", "default", "uid-1", corev1.PodFailed)
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Status.Phase = nebulav1alpha1.NodeClaimBound
+	prov := &fakeProvider{name: "fake"} // instance already gone from List
+	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimTerminated {
+		t.Fatalf("expected phase Terminated, got %q", got.Status.Phase)
+	}
+	if !got.DeletionTimestamp.IsZero() {
+		t.Fatal("must not delete a Terminated claim whose Pod still exists")
+	}
+}
+
+func TestReconcile_BoundClaimWithGonePodSelfDeletes(t *testing.T) {
+	// A claim we previously observed Bound, whose Pod has since vanished, is a
+	// real teardown: the claim self-deletes (a finalizer keeps it around for the
+	// backstop rather than dropping it immediately).
+	claim := newClaim("c1", "gone", "default", "uid-1", "fake")
+	claim.Status.Phase = nebulav1alpha1.NodeClaimBound
+	prov := &fakeProvider{name: "fake"}
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.DeletionTimestamp.IsZero() {
+		t.Fatal("expected a Bound claim with a gone Pod to be deleted")
+	}
+}
+
+func TestReconcile_NeverObservedPodWaitsForGrace(t *testing.T) {
+	// A claim that never reached Bound and whose Pod is absent is treated as
+	// possible cache lag within the grace window: requeue, do NOT delete.
+	claim := newClaim("c1", "pending", "default", "uid-1", "fake")
+	claim.CreationTimestamp = metav1.NewTime(time.Now())
+	r, c := newClaimReconciler(t, []client.Object{claim})
+
+	res := reconcileClaim(t, r, "c1")
+
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("expected a requeue within the grace period, got %+v", res)
+	}
+	got := getClaim(t, c, "c1")
+	if !got.DeletionTimestamp.IsZero() {
+		t.Fatal("must not delete a never-observed claim inside the grace window (cache-lag guard)")
+	}
+}
+
+func TestReconcile_NeverObservedPodDeletedAfterGrace(t *testing.T) {
+	// Same claim, but the grace window has elapsed and the Pod never appeared:
+	// nothing was ever provisioned, so the orphaned claim is deleted.
+	claim := newClaim("c1", "pending", "default", "uid-1", "fake")
+	claim.CreationTimestamp = metav1.NewTime(time.Now().Add(-2 * placementGracePeriod))
+	prov := &fakeProvider{name: "fake"}
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.DeletionTimestamp.IsZero() {
+		t.Fatal("expected an orphaned claim to be deleted after the grace period")
+	}
+}
+
+func TestReconcileDelete_TerminatesInstanceByClaimName(t *testing.T) {
+	// The backstop: on the deletion path, the instance is found by its
+	// Pod-derived claim name via List and terminated before the finalizer drops.
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	deleteClaim(t, claim) // set deletionTimestamp; finalizer keeps it alive
+	prov := &fakeProvider{
+		name: "fake",
+		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
+	}
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	if len(prov.terminated) != 1 || prov.terminated[0] != "inst-1" {
+		t.Fatalf("expected Terminate(inst-1), got %v", prov.terminated)
+	}
+	if claimExists(t, c, "c1") {
+		t.Fatal("expected finalizer released and claim gone after teardown")
+	}
+}
+
+func TestReconcileDelete_UsesRecordedInstanceID(t *testing.T) {
+	// When status.InstanceID is set (VK wrote it), the backstop terminates it
+	// directly without needing a List lookup.
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Status.InstanceID = "inst-recorded"
+	deleteClaim(t, claim)
+	prov := &fakeProvider{name: "fake"} // List would return nothing
+	r, _ := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	if len(prov.terminated) != 1 || prov.terminated[0] != "inst-recorded" {
+		t.Fatalf("expected Terminate(inst-recorded) from recorded id, got %v", prov.terminated)
+	}
+}
+
+func TestReconcileDelete_NoInstanceIsIdempotentNoOp(t *testing.T) {
+	// The happy path: VK's DeletePod already terminated, so List finds nothing.
+	// Terminate is called with "" (idempotent no-op) and the finalizer releases.
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	deleteClaim(t, claim)
+	prov := &fakeProvider{name: "fake"} // empty list
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	if len(prov.terminated) != 1 || prov.terminated[0] != "" {
+		t.Fatalf("expected a no-op Terminate(\"\"), got %v", prov.terminated)
+	}
+	if claimExists(t, c, "c1") {
+		t.Fatal("expected claim gone after a no-op teardown")
+	}
+}
+
+func TestReconcileDelete_UnknownProviderReleasesFinalizer(t *testing.T) {
+	// If no adapter is registered for the claim's provider, we must not wedge
+	// deletion forever — the finalizer is released so the claim can be removed.
+	claim := newClaim("c1", "p1", "default", "uid-1", "ghost")
+	deleteClaim(t, claim)
+	prov := &fakeProvider{name: "fake"} // does not match "ghost"
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	if len(prov.terminated) != 0 {
+		t.Fatalf("must not call Terminate on an unresolved provider, got %v", prov.terminated)
+	}
+	if claimExists(t, c, "c1") {
+		t.Fatal("expected finalizer released so the claim is not stuck")
+	}
+}
+
+func TestReconcileDelete_ListErrorRetries(t *testing.T) {
+	// A transient List error must NOT release the finalizer — teardown retries
+	// so the instance is never abandoned.
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	deleteClaim(t, claim)
+	prov := &fakeProvider{name: "fake", listErr: errListFailed}
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	_, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "c1"},
+	})
+	if err == nil {
+		t.Fatal("expected an error so reconcile retries on a List failure")
+	}
+	if !claimExists(t, c, "c1") {
+		t.Fatal("must not release the finalizer while teardown is unresolved")
+	}
+}
+
+func TestClaimsForPod_MapsByPodRef(t *testing.T) {
+	pod := newPod("p1", "default", "uid-1", corev1.PodRunning)
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	other := newClaim("c2", "other", "default", "uid-2", "fake")
+	r, _ := newClaimReconciler(t, []client.Object{pod, claim, other})
+
+	reqs := r.claimsForPod(context.Background(), pod)
+	if len(reqs) != 1 || reqs[0].Name != "c1" {
+		t.Fatalf("expected only c1 enqueued for pod p1, got %+v", reqs)
+	}
+}
+
+var errListFailed = errTest("list failed")
+
+type errTest string
+
+func (e errTest) Error() string { return string(e) }
+
+func hasFinalizer(nc *nebulav1alpha1.NodeClaim) bool {
+	for _, f := range nc.Finalizers {
+		if f == nebulav1alpha1.TerminateInstanceFinalizer {
+			return true
+		}
+	}
+	return false
+}
+
+// deleteClaim stamps a deletionTimestamp on an in-memory claim so it can be
+// seeded into the fake client already on the deletion path. (The fake client
+// only accepts a deletionTimestamp on objects that carry a finalizer.)
+func deleteClaim(t *testing.T, nc *nebulav1alpha1.NodeClaim) {
+	t.Helper()
+	now := metav1.Now()
+	nc.DeletionTimestamp = &now
+}
+
+// claimExists reports whether the named claim is still present.
+func claimExists(t *testing.T, c client.Client, name string) bool {
+	t.Helper()
+	var nc nebulav1alpha1.NodeClaim
+	err := c.Get(context.Background(), types.NamespacedName{Name: name}, &nc)
+	if err == nil {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	t.Fatalf("get claim %s: %v", name, err)
+	return false
+}
