@@ -81,6 +81,10 @@ verify-catalog: kustomize ## Verify the price catalog CSVs parse and the catalog
 fmt: ## Run go fmt against code.
 	go fmt ./...
 
+.PHONY: format
+format: golangci-lint ## Format code with the configured formatters (gofmt, goimports).
+	$(GOLANGCI_LINT) fmt
+
 .PHONY: vet
 vet: ## Run go vet against code.
 	go vet ./...

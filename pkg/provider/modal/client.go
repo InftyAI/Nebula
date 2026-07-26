@@ -24,6 +24,7 @@ import (
 	"time"
 
 	modal "github.com/modal-labs/modal-client/go"
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
@@ -93,6 +94,11 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	}
 	image := c.mc.Images.FromRegistry(spec.Image, nil)
 
+	probe, err := modalProbe(spec.ReadinessProbe)
+	if err != nil {
+		return "", fmt.Errorf("modal: readiness probe: %w", err)
+	}
+
 	sb, err := c.mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 		Command:        spec.Command,
 		Env:            spec.Env,
@@ -102,11 +108,40 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		EncryptedPorts: spec.Ports,
 		Timeout:        spec.Timeout,
 		Tags:           spec.Tags,
+		ReadinessProbe: probe,
 	})
 	if err != nil {
 		return "", err
 	}
 	return sb.SandboxID, nil
+}
+
+// modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only
+// TCP and Exec probes, so an HTTPGet probe degrades to a TCP probe on its port
+// (readiness ≈ the port accepting connections). Returns (nil, nil) when p is nil
+// or names no supported handler, so a probe-less (or unsupported) workload simply
+// gets no Modal probe. PeriodSeconds maps to the probe interval; zero leaves the
+// SDK default (a zero interval is rejected by the SDK constructors).
+func modalProbe(p *corev1.Probe) (*modal.Probe, error) {
+	if p == nil {
+		return nil, nil
+	}
+	// PeriodSeconds maps to the probe interval; zero leaves the SDK default (the
+	// SDK constructors reject a zero interval).
+	var interval time.Duration
+	if p.PeriodSeconds > 0 {
+		interval = time.Duration(p.PeriodSeconds) * time.Second
+	}
+	switch {
+	case p.Exec != nil && len(p.Exec.Command) > 0:
+		return modal.NewExecProbe(p.Exec.Command, &modal.ExecProbeParams{Interval: interval})
+	case p.TCPSocket != nil:
+		return modal.NewTCPProbe(p.TCPSocket.Port.IntValue(), &modal.TCPProbeParams{Interval: interval})
+	case p.HTTPGet != nil:
+		return modal.NewTCPProbe(p.HTTPGet.Port.IntValue(), &modal.TCPProbeParams{Interval: interval})
+	default:
+		return nil, nil
+	}
 }
 
 // TerminateSandbox implements Client. Idempotent: a sandbox that no longer
@@ -166,30 +201,34 @@ func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 // status (from Poll), tags (from GetTags), and a best-effort endpoint (from
 // Tunnels). Tag/tunnel/poll errors are tolerated so a single flaky sandbox
 // doesn't fail the whole List — the poll loop will re-observe next tick.
+//
+// observe is a POINT-IN-TIME read and never blocks: it reports the status as
+// currently known and returns immediately. It deliberately does not call
+// WaitUntilReady (the only Modal readiness signal), because that blocks until the
+// probe first passes and would stall the List for as long as a sandbox takes to
+// come up.
 func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) Sandbox {
 	out := Sandbox{ID: sb.SandboxID}
 
-	// Status. Poll (== sandboxWait(0)) reports whether the sandbox PROCESS HAS
-	// EXITED: a non-nil exit code means it is gone (terminated), nil means it is
-	// still live. We treat "still live" as running. This does fold the brief
-	// startup window (queued, image pull, GPU attach, container boot) into
-	// "running" rather than "pending", because the SDK at this version exposes no
-	// lightweight readiness readback: WaitUntilReady only resolves against a
-	// readiness probe configured at create time (which we do not set) and requires
-	// a live task-command-router connection, so it can never report ready here.
-	// Poll is the only reliable signal, and reporting a starting sandbox as running
-	// a few seconds early is far better than the alternative — never reporting it
-	// ready at all, which wedges the Pod at Pending and the NodeClaim at Provisioning.
+	// Tags carry Nebula identity (ClaimTagKey), recovered by toInstance.
+	if tags, err := sb.GetTags(ctx, &modal.SandboxGetTagsParams{}); err == nil {
+		out.Tags = tags
+	}
+
+	// Status. Poll (== sandboxWait(0)) is the only cheap point-in-time signal: it
+	// reports whether the sandbox PROCESS HAS EXITED — a non-nil exit code means it
+	// is gone (terminated), nil means it is still live. Poll cannot tell "still
+	// scheduling" (queued, image pull, GPU attach, container boot) apart from
+	// "running and serving" — both read as nil — and Modal exposes no cheap
+	// readiness readback (WaitUntilReady blocks, so we do not call it here). So a
+	// live sandbox is reported "running" as soon as its process exists, folding the
+	// brief startup window into running rather than blocking to confirm readiness.
 	if code, err := sb.Poll(ctx, &modal.SandboxPollParams{}); err == nil {
 		if code != nil {
 			out.Status = "terminated"
 		} else {
 			out.Status = "running"
 		}
-	}
-
-	if tags, err := sb.GetTags(ctx, &modal.SandboxGetTagsParams{}); err == nil {
-		out.Tags = tags
 	}
 
 	// Endpoint is only meaningful once running; look it up best-effort.

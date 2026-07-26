@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -304,27 +305,85 @@ func TestOfferings(t *testing.T) {
 }
 
 func TestToState(t *testing.T) {
-	// The status→state mapping is load-bearing: "pending" must map to
-	// InstancePending, not InstanceRunning. A still-starting sandbox is reported
-	// pending by observe (via the readiness probe), and mapping it to Running here
-	// would resurface the "Pod Ready while the instance is still coming up" bug.
+	// The status→state mapping is load-bearing. observe emits only "running"/
+	// "ready" (live), "terminated" (exited), or "" (Poll errored); everything else,
+	// including the empty string, must map to Pending so the poll loop keeps
+	// watching rather than declaring a premature terminal state.
 	cases := map[string]provider.InstanceState{
 		"running":    provider.InstanceRunning,
 		"ready":      provider.InstanceRunning,
 		"pending":    provider.InstancePending,
-		"starting":   provider.InstancePending,
-		"queued":     provider.InstancePending,
-		"":           provider.InstancePending,
+		"":           provider.InstancePending, // Poll errored, status left unset
 		"terminated": provider.InstanceTerminated,
-		"stopped":    provider.InstanceTerminated,
-		"completed":  provider.InstanceTerminated,
-		"error":      provider.InstanceFailed,
-		"failed":     provider.InstanceFailed,
 		"weird-new":  provider.InstancePending, // unknown => keep watching, not terminal
 	}
 	for in, want := range cases {
 		if got := toState(in); got != want {
 			t.Fatalf("toState(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestProvision_ReadinessProbeCarriedThrough(t *testing.T) {
+	f := &fakeClient{createID: "sb-1"}
+	p := newTestProvider(f)
+
+	pod := gpuPod("claim-a", "H100", 1)
+	probe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(8000)},
+		},
+	}
+	pod.Spec.Containers[0].ReadinessProbe = probe
+
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	// The probe is carried onto the spec so the Client can configure Modal's own
+	// readiness probe; Modal enforces it internally (Nebula does not read it back).
+	if f.lastSpec.ReadinessProbe != probe {
+		t.Fatalf("ReadinessProbe not carried onto the spec: got %v", f.lastSpec.ReadinessProbe)
+	}
+}
+
+func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
+	f := &fakeClient{createID: "sb-1"}
+	p := newTestProvider(f)
+
+	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if f.lastSpec.ReadinessProbe != nil {
+		t.Fatalf("ReadinessProbe should be nil when the Pod declares none, got %v", f.lastSpec.ReadinessProbe)
+	}
+}
+
+func TestModalProbe(t *testing.T) {
+	// nil Pod probe => no Modal probe (probe-less workload).
+	if got, err := modalProbe(nil); err != nil || got != nil {
+		t.Fatalf("modalProbe(nil) = (%v, %v), want (nil, nil)", got, err)
+	}
+
+	// A probe with no supported handler also degrades to no Modal probe rather
+	// than an error, so it never wedges provisioning.
+	empty := &corev1.Probe{}
+	if got, err := modalProbe(empty); err != nil || got != nil {
+		t.Fatalf("modalProbe(empty) = (%v, %v), want (nil, nil)", got, err)
+	}
+
+	// Supported handlers each produce a Modal probe. HTTPGet degrades to TCP.
+	supported := []*corev1.Probe{
+		{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(8000)}}},
+		{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}},
+		{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromInt(80)}}, PeriodSeconds: 5},
+	}
+	for i, pr := range supported {
+		got, err := modalProbe(pr)
+		if err != nil {
+			t.Fatalf("case %d: modalProbe error: %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("case %d: expected a Modal probe, got nil", i)
 		}
 	}
 }

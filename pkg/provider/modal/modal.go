@@ -108,6 +108,13 @@ type SandboxSpec struct {
 	Timeout time.Duration
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// ReadinessProbe, when non-nil, is the Pod's first-container readinessProbe
+	// carried through so the Client can configure Modal's own readiness probe at
+	// create time. Modal enforces the probe internally (it gates its own traffic
+	// routing on it); Nebula does not read the result back — observe reports status
+	// from the cheap point-in-time Poll signal and never blocks on WaitUntilReady.
+	// We only ever pass a user-supplied probe; the adapter never fabricates one.
+	ReadinessProbe *corev1.Probe
 }
 
 // Sandbox is the adapter-level view of a Modal sandbox as observed.
@@ -261,14 +268,15 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 	}
 
 	spec := SandboxSpec{
-		Image:     c.Image,
-		Command:   append(append([]string{}, c.Command...), c.Args...),
-		Env:       env,
-		CPU:       cpuCores(&c),
-		MemoryMiB: memoryMiB(&c),
-		Ports:     containerPorts(&c),
-		Timeout:   sandboxTimeout(pod),
-		Tags:      map[string]string{ClaimTagKey: req.ClaimName},
+		Image:          c.Image,
+		Command:        append(append([]string{}, c.Command...), c.Args...),
+		Env:            env,
+		CPU:            cpuCores(&c),
+		MemoryMiB:      memoryMiB(&c),
+		Ports:          containerPorts(&c),
+		Timeout:        sandboxTimeout(pod),
+		Tags:           map[string]string{ClaimTagKey: req.ClaimName},
+		ReadinessProbe: c.ReadinessProbe,
 	}
 
 	// Accelerator type comes from the AcceleratorTypeLabel; count from the
@@ -361,19 +369,19 @@ func (p *Provider) toInstance(sb Sandbox) provider.Instance {
 	}
 }
 
-// toState maps Modal's status strings to the provider-agnostic lifecycle state.
-// Unknown statuses map to Pending so the poll loop keeps watching rather than
-// declaring a premature terminal state.
+// toState maps the status strings observe produces to the provider-agnostic
+// lifecycle state. observe derives status from Poll (+ the readiness probe), so
+// it only ever emits four values: "running"/"ready" (live), "pending" (live but
+// the readiness probe has not passed yet), and "terminated" (process exited).
+// Anything else — including the empty string observe leaves when Poll itself
+// errors — maps to Pending, so the poll loop keeps watching rather than declaring
+// a premature terminal state.
 func toState(modalStatus string) provider.InstanceState {
 	switch strings.ToLower(modalStatus) {
 	case "running", "ready":
 		return provider.InstanceRunning
-	case "terminated", "stopped", "completed":
+	case "terminated":
 		return provider.InstanceTerminated
-	case "error", "failed":
-		return provider.InstanceFailed
-	case "pending", "starting", "queued", "":
-		return provider.InstancePending
 	default:
 		return provider.InstancePending
 	}

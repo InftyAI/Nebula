@@ -10,7 +10,7 @@ spec:
   providers:
   - name: modal
   # - name: runpod
-  # Outer axis: try spot on every provider first, fall back to on-demand.
+  # Outer axis: try Reserved on every provider first, fall back to on-demand, then spot.
   capacityTypes:
   - Reserved
   - OnDemand
