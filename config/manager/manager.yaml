@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: nebula
+    app.kubernetes.io/managed-by: kustomize
+  name: system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: nebula
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: nebula
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: nebula
+    spec:
+      # TODO(user): Uncomment the following code to configure the nodeAffinity expression
+      # according to the platforms which are supported by your solution.
+      # It is considered best practice to support multiple architectures. You can
+      # build your manager image using the makefile target docker-buildx.
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #         - matchExpressions:
+      #           - key: kubernetes.io/arch
+      #             operator: In
+      #             values:
+      #               - amd64
+      #               - arm64
+      #               - ppc64le
+      #               - s390x
+      #           - key: kubernetes.io/os
+      #             operator: In
+      #             values:
+      #               - linux
+      securityContext:
+        # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
+        # This ensures that deployments meet the highest security requirements for Kubernetes.
+        # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - command:
+        - /manager
+        args:
+          - --leader-elect
+          - --health-probe-bind-address=:8081
+        image: controller:latest
+        name: manager
+        env:
+          # Point the price catalog at the mounted ConfigMap so prices can be
+          # edited live (kubectl edit configmap nebula-catalog) without a
+          # rebuild. If unset/absent, the manager falls back to the CSVs
+          # embedded in the binary.
+          - name: NEBULA_CATALOG_DIR
+            value: /etc/nebula/catalog
+        envFrom:
+          # Provider credentials live in a per-provider Secret, one secretRef per
+          # provider — NOT a single shared secret. This matches the "creds-absent →
+          # skip that provider, not fatal" model (see registerProviders): each
+          # secretRef is independently optional=true, so configuring Modal but not
+          # RunPod just skips RunPod. It also isolates rotation and RBAC per
+          # provider. Providers namespace their env vars (MODAL_TOKEN_ID,
+          # RUNPOD_API_KEY, ...), so the merged environment never collides.
+          #
+          # The Modal SDK reads MODAL_TOKEN_ID / MODAL_TOKEN_SECRET from the environment.
+          - secretRef:
+              name: nebula-modal-credentials
+              optional: true
+          # Add one secretRef per provider as adapters land, e.g.:
+          # - secretRef:
+          #     name: nebula-runpod-credentials
+          #     optional: true
+        ports: []
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # TODO(user): Configure the resources accordingly based on the project requirements.
+        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        volumeMounts:
+          - name: catalog
+            mountPath: /etc/nebula/catalog
+            readOnly: true
+      volumes:
+        - name: catalog
+          configMap:
+            # Unprefixed on purpose: config/default's namePrefix rewrites this
+            # reference to the generated "nebula-catalog" ConfigMap. optional so
+            # the manager still starts (embedded-CSV fallback) if it's absent.
+            name: catalog
+            optional: true
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10

@@ -1,0 +1,14 @@
+# e2e overlay: the production config/default plus the fake-provider env var, so
+# the e2e suite can drive the full placement flow with no cloud credentials.
+# Built by `make deploy-e2e`; never used by production `make deploy`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../default
+
+patches:
+- path: enable_fake_provider_patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager

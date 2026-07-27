@@ -1,0 +1,490 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/InftyAI/Nebula/test/utils"
+)
+
+// namespace where the project is deployed in
+const namespace = "nebula-system"
+
+// serviceAccountName created for the project
+const serviceAccountName = "nebula-controller-manager"
+
+// metricsServiceName is the name of the metrics service of the project
+const metricsServiceName = "nebula-controller-manager-metrics-service"
+
+// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
+const metricsRoleBindingName = "nebula-metrics-binding"
+
+// Fake-provider placement-flow fixtures. fakeProviderName must match
+// fake.ProviderName; fakeVirtualNode is vnode.NodeName(fakeProviderName)
+// ("nebula-<provider>"). Kept as literals here so the e2e package stays free of
+// production imports.
+const (
+	fakeProviderName = "fake"
+	fakeVirtualNode  = "nebula-fake"
+	fakePoolName     = "e2e-fake-pool"
+	fakeWorkloadPod  = "e2e-fake-workload"
+	// fakeWorkloadNS is a dedicated namespace for the placement-flow workload. It
+	// must NOT be the manager namespace: the mutating webhook's namespaceSelector
+	// excludes nebula-system (see config/webhook/selector_patch.yaml), so a Pod
+	// there would never get the scheduling gate and placement would never run.
+	fakeWorkloadNS = "nebula-e2e-workload"
+)
+
+var _ = Describe("Manager", Ordered, func() {
+	var controllerPodName string
+
+	// Before running the tests, set up the environment by creating the namespace,
+	// enforce the restricted security policy to the namespace, installing CRDs,
+	// and deploying the controller.
+	BeforeAll(func() {
+		By("creating manager namespace")
+		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+
+		By("labeling the namespace to enforce the restricted security policy")
+		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+			"pod-security.kubernetes.io/enforce=restricted")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+
+		By("installing CRDs")
+		cmd = exec.Command("make", "install")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+
+		// The manager mounts webhook-server-cert as a REQUIRED volume, so the
+		// self-signed cert Secret must exist before the pod starts, or it wedges
+		// in ContainerCreating (Pending) forever. Nebula does not use cert-manager
+		// (see config/default/kustomization.yaml); hack/gen-webhook-cert.sh is the
+		// source of truth, matching the ordering hack/deploy.sh uses in prod.
+		By("provisioning the webhook serving certificate Secret")
+		cmd = exec.Command("hack/gen-webhook-cert.sh", "secret")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to provision the webhook serving cert Secret")
+
+		// Deploy via the e2e overlay, which bakes NEBULA_ENABLE_FAKE_PROVIDER=true
+		// into the manager env so the in-memory fake provider registers at first
+		// boot. This drives the placement→NodeClaim→virtual-node flow without cloud
+		// credentials (no real provider registers in a Kind cluster). Baking it in
+		// (vs. a post-deploy `kubectl set env`) means the manager boots ONCE — no
+		// second rollout, so no leader-election re-acquire window where the metrics
+		// endpoint serves before the first reconcile. The fake ships in the binary
+		// but only registers on this env var, so production `make deploy` never has it.
+		By("deploying the controller-manager (e2e overlay: fake provider enabled)")
+		cmd = exec.Command("make", "deploy-e2e", fmt.Sprintf("IMG=%s", projectImage))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		// caBundle injection is server-side (only the API server reads it) and
+		// requires the MutatingWebhookConfiguration created by the deploy, so it
+		// runs after the deploy. The manager pod is untouched — no restart needed.
+		By("injecting the webhook CA bundle")
+		cmd = exec.Command("hack/gen-webhook-cert.sh", "cabundle")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to inject the webhook CA bundle")
+	})
+
+	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
+	// and deleting the namespace.
+	AfterAll(func() {
+		By("cleaning up the curl pod for metrics")
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		_, _ = utils.Run(cmd)
+
+		By("cleaning up the fake-provider workload, pool, and namespace")
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", fakeWorkloadPod,
+			"-n", fakeWorkloadNS, "--ignore-not-found=true"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakePoolName, "--ignore-not-found=true"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", fakeWorkloadNS, "--ignore-not-found=true"))
+
+		By("undeploying the controller-manager")
+		cmd = exec.Command("make", "undeploy")
+		_, _ = utils.Run(cmd)
+
+		By("uninstalling CRDs")
+		cmd = exec.Command("make", "uninstall")
+		_, _ = utils.Run(cmd)
+
+		By("removing manager namespace")
+		cmd = exec.Command("kubectl", "delete", "ns", namespace)
+		_, _ = utils.Run(cmd)
+	})
+
+	// After each test, check for failures and collect logs, events,
+	// and pod descriptions for debugging.
+	AfterEach(func() {
+		specReport := CurrentSpecReport()
+		if specReport.Failed() {
+			By("Fetching controller manager pod logs")
+			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
+			controllerLogs, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
+			}
+
+			By("Fetching Kubernetes events")
+			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
+			eventsOutput, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
+			}
+
+			By("Fetching curl-metrics logs")
+			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
+			metricsOutput, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
+			}
+
+			By("Fetching controller manager pod description")
+			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
+			podDescription, err := utils.Run(cmd)
+			if err == nil {
+				fmt.Println("Pod description:\n", podDescription)
+			} else {
+				fmt.Println("Failed to describe controller pod")
+			}
+		}
+	})
+
+	SetDefaultEventuallyTimeout(2 * time.Minute)
+	SetDefaultEventuallyPollingInterval(time.Second)
+
+	Context("Manager", func() {
+		It("should run successfully", func() {
+			By("validating that the controller-manager pod is running as expected")
+			verifyControllerUp := func(g Gomega) {
+				// Get the name of the controller-manager pod
+				cmd := exec.Command("kubectl", "get",
+					"pods", "-l", "control-plane=controller-manager",
+					"-o", "go-template={{ range .items }}"+
+						"{{ if not .metadata.deletionTimestamp }}"+
+						"{{ .metadata.name }}"+
+						"{{ \"\\n\" }}{{ end }}{{ end }}",
+					"-n", namespace,
+				)
+
+				podOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
+				podNames := utils.GetNonEmptyLines(podOutput)
+				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
+				controllerPodName = podNames[0]
+				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+
+				// Validate the pod's status
+				cmd = exec.Command("kubectl", "get",
+					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
+					"-n", namespace,
+				)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
+			}
+			Eventually(verifyControllerUp).Should(Succeed())
+		})
+
+		It("should ensure the metrics endpoint is serving metrics", func() {
+			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
+			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+				"--clusterrole=nebula-metrics-reader",
+				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
+			)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+
+			By("validating that the metrics service is available")
+			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
+
+			By("getting the service account token")
+			token, err := serviceAccountToken()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(token).NotTo(BeEmpty())
+
+			By("waiting for the metrics endpoint to be ready")
+			verifyMetricsEndpointReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "endpoints", metricsServiceName, "-n", namespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("8443"), "Metrics endpoint is not ready")
+			}
+			Eventually(verifyMetricsEndpointReady).Should(Succeed())
+
+			By("verifying that the controller manager is serving the metrics server")
+			verifyMetricsServerStarted := func(g Gomega) {
+				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("controller-runtime.metrics\tServing metrics server"),
+					"Metrics server not yet started")
+			}
+			Eventually(verifyMetricsServerStarted).Should(Succeed())
+
+			By("creating the curl-metrics pod to access the metrics endpoint")
+			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
+				"--namespace", namespace,
+				"--image=curlimages/curl:latest",
+				"--overrides",
+				fmt.Sprintf(`{
+					"spec": {
+						"containers": [{
+							"name": "curl",
+							"image": "curlimages/curl:latest",
+							"command": ["/bin/sh", "-c"],
+							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
+							"securityContext": {
+								"readOnlyRootFilesystem": true,
+								"allowPrivilegeEscalation": false,
+								"capabilities": {
+									"drop": ["ALL"]
+								},
+								"runAsNonRoot": true,
+								"runAsUser": 1000,
+								"seccompProfile": {
+									"type": "RuntimeDefault"
+								}
+							}
+						}],
+						"serviceAccountName": "%s"
+					}
+				}`, token, metricsServiceName, namespace, serviceAccountName))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
+
+			By("waiting for the curl-metrics pod to complete.")
+			verifyCurlUp := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
+					"-o", "jsonpath={.status.phase}",
+					"-n", namespace)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
+			}
+			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
+
+			By("getting the metrics by checking curl-metrics logs")
+			metricsOutput := getMetricsOutput()
+			Expect(metricsOutput).To(ContainSubstring(
+				"controller_runtime_reconcile_total",
+			))
+		})
+
+		It("should have the self-signed webhook serving cert Secret", func() {
+			// Nebula does not use cert-manager; hack/gen-webhook-cert.sh creates this
+			// self-signed Secret in the e2e BeforeAll (and hack/deploy.sh in prod).
+			By("validating that the webhook serving cert Secret exists")
+			verifyCertSecret := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			Eventually(verifyCertSecret).Should(Succeed())
+		})
+
+		It("should have CA injection for mutating webhooks", func() {
+			By("checking CA injection for mutating webhooks")
+			verifyCAInjection := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get",
+					"mutatingwebhookconfigurations.admissionregistration.k8s.io",
+					"nebula-mutating-webhook-configuration",
+					"-o", "go-template={{ range .webhooks }}{{ .clientConfig.caBundle }}{{ end }}")
+				mwhOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(len(mwhOutput)).To(BeNumerically(">", 10))
+			}
+			Eventually(verifyCAInjection).Should(Succeed())
+		})
+
+		It("should place an opted-in Pod onto the fake provider's virtual node", func() {
+			// This exercises the whole control-plane loop against the in-memory fake
+			// provider: webhook gate → placement picks the pool's provider → NodeClaim
+			// ledger → the fake's virtual node provisions → the Pod binds and runs.
+
+			By("waiting for the fake provider's virtual node to register")
+			verifyNode := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", fakeVirtualNode)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "fake virtual node not registered")
+			}
+			Eventually(verifyNode).Should(Succeed())
+
+			By("creating the workload namespace (webhook-eligible, restricted policy)")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", fakeWorkloadNS))
+			cmd := exec.Command("kubectl", "label", "--overwrite", "ns", fakeWorkloadNS,
+				"pod-security.kubernetes.io/enforce=restricted")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to label the workload namespace")
+
+			By("creating a NodePool that allows the fake provider")
+			manifest := fmt.Sprintf(`apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  name: %s
+spec:
+  providers:
+  - name: %s
+  capacityTypes:
+  - OnDemand
+  strategy: Ordered
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    nebula.inftyai.com/enabled: "true"
+    nebula.inftyai.com/nodepool: %s
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: main
+    image: registry.k8s.io/pause:3.10
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+`, fakePoolName, fakeProviderName, fakeWorkloadPod, fakeWorkloadNS, fakePoolName)
+			manifestFile := filepath.Join("/tmp", "nebula-fake-workload.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), 0o644)).To(Succeed())
+			cmd = exec.Command("kubectl", "apply", "-f", manifestFile)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply the NodePool + Pod")
+
+			By("verifying the placement controller creates a NodeClaim for the Pod")
+			verifyClaim := func(g Gomega) {
+				// util.ClaimName(namespace, name) == "<namespace>-<name>".
+				claim := fmt.Sprintf("%s-%s", fakeWorkloadNS, fakeWorkloadPod)
+				cmd := exec.Command("kubectl", "get", "nodeclaim", claim,
+					"-o", "jsonpath={.spec.provider}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "NodeClaim not created")
+				g.Expect(out).To(Equal(fakeProviderName), "NodeClaim names the wrong provider")
+			}
+			Eventually(verifyClaim).Should(Succeed())
+
+			By("verifying the Pod is ungated and bound to the fake virtual node")
+			verifyBound := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", fakeWorkloadPod, "-n", fakeWorkloadNS,
+					"-o", "jsonpath={.spec.nodeName}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal(fakeVirtualNode), "Pod not bound to the fake virtual node")
+			}
+			Eventually(verifyBound).Should(Succeed())
+
+			By("cleaning up the fake workload")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile, "--ignore-not-found=true"))
+		})
+
+		// +kubebuilder:scaffold:e2e-webhooks-checks
+
+		// TODO: Customize the e2e test suite with scenarios specific to your project.
+		// Consider applying sample/CR(s) and check their status and/or verifying
+		// the reconciliation by using the metrics, i.e.:
+		// metricsOutput := getMetricsOutput()
+		// Expect(metricsOutput).To(ContainSubstring(
+		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
+		//    strings.ToLower(<Kind>),
+		// ))
+	})
+})
+
+// serviceAccountToken returns a token for the specified service account in the given namespace.
+// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
+// and parsing the resulting token from the API response.
+func serviceAccountToken() (string, error) {
+	const tokenRequestRawString = `{
+		"apiVersion": "authentication.k8s.io/v1",
+		"kind": "TokenRequest"
+	}`
+
+	// Temporary file to store the token request
+	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
+	tokenRequestFile := filepath.Join("/tmp", secretName)
+	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+	if err != nil {
+		return "", err
+	}
+
+	var out string
+	verifyTokenCreation := func(g Gomega) {
+		// Execute kubectl command to create the token
+		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
+			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
+			namespace,
+			serviceAccountName,
+		), "-f", tokenRequestFile)
+
+		output, err := cmd.CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred())
+
+		// Parse the JSON output to extract the token
+		var token tokenRequest
+		err = json.Unmarshal(output, &token)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		out = token.Status.Token
+	}
+	Eventually(verifyTokenCreation).Should(Succeed())
+
+	return out, err
+}
+
+// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
+func getMetricsOutput() string {
+	By("getting the curl-metrics logs")
+	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
+	metricsOutput, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
+	Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
+	return metricsOutput
+}
+
+// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
+// containing only the token field that we need to extract.
+type tokenRequest struct {
+	Status struct {
+		Token string `json:"token"`
+	} `json:"status"`
+}

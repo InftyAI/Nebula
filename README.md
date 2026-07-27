@@ -1,3 +1,3 @@
-# template-repo
+# Nebula
 
-A template repo.
+The control plane for GPUaaS.

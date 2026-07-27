@@ -1,0 +1,268 @@
+/*
+Copyright 2026 The InftyAI Team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/util"
+)
+
+// poolFor resolves the NodePool a Pod is placed against. The Pod names its pool
+// via PoolLabel. Returns (nil, nil) when the label is absent or the named pool
+// does not exist, so the caller leaves the Pod gated rather than guessing.
+func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (*nebulav1alpha1.NodePool, error) {
+	name := pod.Labels[nebulav1alpha1.PoolLabel]
+	if name == "" {
+		return nil, nil
+	}
+	var pool nebulav1alpha1.NodePool
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, &pool); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &pool, nil
+}
+
+// selectPlacement implements the v1 "first matching provider" policy: walk the
+// pool's providers in listed order and pick the first whose adapter offers the
+// Pod's requested GPU type. The capacity tier is the pool's first preference
+// (the outer axis); provider quirks (e.g. Modal being OnDemand-only) are handled
+// at Provision time, not here. Returns ok=false when nothing matches.
+//
+// This is the seam the richer optimizer replaces later (price ranking, capacity
+// fallback, blocklist); the caller's flow does not depend on how the choice is
+// made, only that a (provider, capacityType) comes back.
+func (r *PodPlacementReconciler) selectPlacement(pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool) {
+	// Only the accelerator type is needed for matching; the count is a provisioning
+	// detail the adapter reads. A malformed request is treated as "no accelerator"
+	// so placement stays a no-op rather than erroring the reconcile — provisioning
+	// would surface the real error.
+	accel, _, _ := util.AcceleratorRequest(pod)
+
+	for _, ref := range pool.Spec.Providers {
+		prov, ok := r.provider(ref.Name)
+		if !ok {
+			continue // unregistered; NodePool status surfaces this separately
+		}
+		// A CPU-only Pod (no accelerator) matches any provider; an accelerator Pod
+		// only matches a provider whose catalog maps that accelerator.
+		if accel != "" {
+			if _, offered := prov.MapAccelerator(accel); !offered {
+				continue
+			}
+		}
+		return placement{
+			provider:     ref.Name,
+			capacityType: preferredCapacityType(pool),
+		}, true
+	}
+	return placement{}, false
+}
+
+// preferredCapacityType is the pool's first-choice tier (the outer axis's head).
+// v1 does not do cross-tier fallback here; empty means "provider default".
+func preferredCapacityType(pool *nebulav1alpha1.NodePool) nebulav1alpha1.CapacityType {
+	if len(pool.Spec.CapacityTypes) == 0 {
+		return ""
+	}
+	return pool.Spec.CapacityTypes[0]
+}
+
+// ensureClaim creates the NodeClaim for this placement if it does not already
+// exist. The claim is the durable teardown ledger (see NodeClaimReconciler): it
+// pins the Pod by UID, records the chosen provider and capacity tier, and labels
+// itself with the pool for status roll-up.
+//
+// It returns ready=true only when a claim pinned to THIS Pod's UID exists, so the
+// caller may ungate. Two cases return ready=false with no error, telling the
+// caller to requeue rather than ungate:
+//   - A pre-existing claim of the same name still pins a PRIOR Pod incarnation
+//     (same namespace/name, different UID). This happens when a Pod is recreated
+//     faster than the backstop reaps the old Pod's claim. Ungating now would bind
+//     the new Pod against a ledger that names the wrong instance, so we wait: the
+//     NodeClaim controller sees the old Pod is gone (UID mismatch), self-deletes
+//     the stale claim and terminates its instance, after which our Create succeeds
+//     with the correct UID.
+func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, p placement) (ready bool, err error) {
+	claim := &nebulav1alpha1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: util.ClaimName(pod.Namespace, pod.Name),
+			Labels: map[string]string{
+				nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
+				nebulav1alpha1.PoolLabel:      pool.Name,
+				nebulav1alpha1.ProviderLabel:  p.provider,
+			},
+		},
+		Spec: nebulav1alpha1.NodeClaimSpec{
+			PodRef: nebulav1alpha1.PodReference{
+				Namespace: pod.Namespace,
+				Name:      pod.Name,
+				UID:       string(pod.UID),
+			},
+			Provider:     p.provider,
+			CapacityType: p.capacityType,
+			PoolRef:      pool.Name,
+		},
+	}
+	err = r.Create(ctx, claim)
+	if err == nil {
+		return true, nil // freshly created for this Pod
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return false, err
+	}
+
+	// A claim of this name already exists. Confirm it belongs to THIS Pod before
+	// treating the create as a successful no-op; otherwise it is a stale claim for
+	// a prior same-named Pod and we must wait for the backstop to reap it.
+	var existing nebulav1alpha1.NodeClaim
+	if err := r.Get(ctx, client.ObjectKeyFromObject(claim), &existing); err != nil {
+		// A NotFound here means the stale claim was reaped between our Create and
+		// Get; let the caller requeue so the next pass re-creates it cleanly.
+		return false, client.IgnoreNotFound(err)
+	}
+	if existing.Spec.PodRef.UID == string(pod.UID) {
+		return true, nil // our own claim (a retry after a crash before ungate)
+	}
+	return false, nil // stale claim for a prior Pod; wait for the backstop
+}
+
+// place stamps the routing decision onto the Pod and removes the gate, atomically
+// from the Pod's perspective (one Update). After this, the scheduler is free to
+// bind the Pod to the chosen provider's virtual node.
+func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, p placement) error {
+	// Route to the provider's virtual node.
+	if pod.Spec.NodeSelector == nil {
+		pod.Spec.NodeSelector = map[string]string{}
+	}
+	pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] = p.provider
+
+	// Carry the capacity tier the VK handler reads on CreatePod (the one input
+	// that is not otherwise on the Pod). Skip when empty (provider default).
+	if p.capacityType != "" {
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation] = string(p.capacityType)
+	}
+
+	// Remove our gate, releasing the Pod to the scheduler. Preserve any other
+	// gates a different controller may hold.
+	pod.Spec.SchedulingGates = removeGate(pod.Spec.SchedulingGates, nebulav1alpha1.ProviderSelectionGate)
+
+	return r.Update(ctx, pod)
+}
+
+// removeGate returns gates with the named gate removed, preserving order.
+func removeGate(gates []corev1.PodSchedulingGate, name string) []corev1.PodSchedulingGate {
+	out := gates[:0]
+	for _, g := range gates {
+		if g.Name != name {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// reapTerminalPod deletes a terminated, Nebula-owned, controller-managed Pod so
+// its owner recreates it cleanly instead of leaving a Failed tombstone. It
+// returns reaped=true when it issued (or already sees) a delete for this Pod, so
+// the caller stops processing it as a placement candidate.
+//
+// The delete is what actually stamps the Pod's deletionTimestamp — that field is
+// server-managed and cannot be written directly, so a real Delete call is the
+// only way to remove the object. It is scoped narrowly to avoid touching Pods
+// that are not ours to reap:
+//   - EnabledLabel: only Pods that opted into Nebula (never a plain workload).
+//   - terminal phase: only Failed/Succeeded (a live Pod is never touched).
+//   - controller-owned: only Pods a ReplicaSet/Job will recreate; a bare Pod is
+//     left as an inspectable record.
+//
+// Delete is UID-pinned so a Pod already replaced by a same-name recreate is not
+// clobbered, and a NotFound (already gone) is treated as success.
+func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev1.Pod) (bool, error) {
+	if pod.Labels[nebulav1alpha1.EnabledLabel] != "true" {
+		return false, nil
+	}
+	if !pod.DeletionTimestamp.IsZero() {
+		return true, nil // already being deleted; nothing more to place
+	}
+	if !isTerminal(pod.Status.Phase) {
+		return false, nil
+	}
+	if !isControllerOwned(pod) {
+		return false, nil // bare Pod: leave it as a record
+	}
+
+	preconditions := metav1.Preconditions{UID: &pod.UID}
+	if err := r.Delete(ctx, pod, &client.DeleteOptions{Preconditions: &preconditions}); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return true, nil
+}
+
+// isControllerOwned reports whether the Pod has a controlling owner (e.g. a
+// ReplicaSet or Job) that will recreate it after deletion.
+func isControllerOwned(pod *corev1.Pod) bool {
+	return metav1.GetControllerOf(pod) != nil
+}
+
+// SetupWithManager wires the controller. It watches Pods; NodePool edits are not
+// watched because a Pod already gated will re-reconcile on the periodic resync,
+// and a newly-created Pod always triggers its own event.
+func (r *PodPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Pod{}).
+		Watches(&nebulav1alpha1.NodePool{}, handler.EnqueueRequestsFromMapFunc(r.podsForPool)).
+		Named("pod-placement").
+		Complete(r)
+}
+
+// podsForPool re-enqueues gated Pods that name a pool when that pool changes, so
+// a pool edit (e.g. adding a provider that can now serve a stuck Pod) promptly
+// retries placement instead of waiting for the resync.
+func (r *PodPlacementReconciler) podsForPool(ctx context.Context, obj client.Object) []reconcile.Request {
+	pool, ok := obj.(*nebulav1alpha1.NodePool)
+	if !ok {
+		return nil
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.MatchingLabels{nebulav1alpha1.PoolLabel: pool.Name}); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range pods.Items {
+		if needsPlacement(&pods.Items[i]) {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: client.ObjectKeyFromObject(&pods.Items[i]),
+			})
+		}
+	}
+	return reqs
+}
