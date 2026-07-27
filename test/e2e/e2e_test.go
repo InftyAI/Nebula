@@ -359,9 +359,18 @@ metadata:
     nebula.inftyai.com/enabled: "true"
     nebula.inftyai.com/nodepool: %s
 spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
   containers:
   - name: main
     image: registry.k8s.io/pause:3.10
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
 `, fakePoolName, fakeProviderName, fakeWorkloadPod, namespace, fakePoolName)
 			manifestFile := filepath.Join("/tmp", "nebula-fake-workload.yaml")
 			Expect(os.WriteFile(manifestFile, []byte(manifest), 0o644)).To(Succeed())
