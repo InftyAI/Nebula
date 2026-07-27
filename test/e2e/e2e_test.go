@@ -51,6 +51,11 @@ const (
 	fakeVirtualNode  = "nebula-fake"
 	fakePoolName     = "e2e-fake-pool"
 	fakeWorkloadPod  = "e2e-fake-workload"
+	// fakeWorkloadNS is a dedicated namespace for the placement-flow workload. It
+	// must NOT be the manager namespace: the mutating webhook's namespaceSelector
+	// excludes nebula-system (see config/webhook/selector_patch.yaml), so a Pod
+	// there would never get the scheduling gate and placement would never run.
+	fakeWorkloadNS = "nebula-e2e-workload"
 )
 
 var _ = Describe("Manager", Ordered, func() {
@@ -115,10 +120,11 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
-		By("cleaning up the fake-provider workload and pool")
+		By("cleaning up the fake-provider workload, pool, and namespace")
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", fakeWorkloadPod,
-			"-n", namespace, "--ignore-not-found=true"))
+			"-n", fakeWorkloadNS, "--ignore-not-found=true"))
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakePoolName, "--ignore-not-found=true"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", fakeWorkloadNS, "--ignore-not-found=true"))
 
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
@@ -338,6 +344,13 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 			Eventually(verifyNode).Should(Succeed())
 
+			By("creating the workload namespace (webhook-eligible, restricted policy)")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", fakeWorkloadNS))
+			cmd := exec.Command("kubectl", "label", "--overwrite", "ns", fakeWorkloadNS,
+				"pod-security.kubernetes.io/enforce=restricted")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to label the workload namespace")
+
 			By("creating a NodePool that allows the fake provider")
 			manifest := fmt.Sprintf(`apiVersion: nebula.inftyai.com/v1alpha1
 kind: NodePool
@@ -371,17 +384,17 @@ spec:
       capabilities:
         drop:
         - ALL
-`, fakePoolName, fakeProviderName, fakeWorkloadPod, namespace, fakePoolName)
+`, fakePoolName, fakeProviderName, fakeWorkloadPod, fakeWorkloadNS, fakePoolName)
 			manifestFile := filepath.Join("/tmp", "nebula-fake-workload.yaml")
 			Expect(os.WriteFile(manifestFile, []byte(manifest), 0o644)).To(Succeed())
-			cmd := exec.Command("kubectl", "apply", "-f", manifestFile)
-			_, err := utils.Run(cmd)
+			cmd = exec.Command("kubectl", "apply", "-f", manifestFile)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply the NodePool + Pod")
 
 			By("verifying the placement controller creates a NodeClaim for the Pod")
 			verifyClaim := func(g Gomega) {
 				// util.ClaimName(namespace, name) == "<namespace>-<name>".
-				claim := fmt.Sprintf("%s-%s", namespace, fakeWorkloadPod)
+				claim := fmt.Sprintf("%s-%s", fakeWorkloadNS, fakeWorkloadPod)
 				cmd := exec.Command("kubectl", "get", "nodeclaim", claim,
 					"-o", "jsonpath={.spec.provider}")
 				out, err := utils.Run(cmd)
@@ -392,7 +405,7 @@ spec:
 
 			By("verifying the Pod is ungated and bound to the fake virtual node")
 			verifyBound := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", fakeWorkloadPod, "-n", namespace,
+				cmd := exec.Command("kubectl", "get", "pod", fakeWorkloadPod, "-n", fakeWorkloadNS,
 					"-o", "jsonpath={.spec.nodeName}")
 				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
