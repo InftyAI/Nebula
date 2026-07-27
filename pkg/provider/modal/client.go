@@ -25,6 +25,7 @@ import (
 
 	modal "github.com/modal-labs/modal-client/go"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
@@ -122,6 +123,12 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 // or names no supported handler, so a probe-less (or unsupported) workload simply
 // gets no Modal probe. PeriodSeconds maps to the probe interval; zero leaves the
 // SDK default (a zero interval is rejected by the SDK constructors).
+//
+// A TCP/HTTPGet probe with a NAMED port (e.g. port: http) is treated as
+// unsupported: resolving the name to a number needs the container's ports list,
+// which this helper does not have, and passing the intstr's 0 fallback would
+// create an invalid Modal TCP probe on port 0. So a named port omits the probe
+// rather than emitting a bogus one.
 func modalProbe(p *corev1.Probe) (*modal.Probe, error) {
 	if p == nil {
 		return nil, nil
@@ -136,12 +143,32 @@ func modalProbe(p *corev1.Probe) (*modal.Probe, error) {
 	case p.Exec != nil && len(p.Exec.Command) > 0:
 		return modal.NewExecProbe(p.Exec.Command, &modal.ExecProbeParams{Interval: interval})
 	case p.TCPSocket != nil:
-		return modal.NewTCPProbe(p.TCPSocket.Port.IntValue(), &modal.TCPProbeParams{Interval: interval})
+		if port, ok := numericPort(p.TCPSocket.Port); ok {
+			return modal.NewTCPProbe(port, &modal.TCPProbeParams{Interval: interval})
+		}
+		return nil, nil // named port: unsupported here (see doc)
 	case p.HTTPGet != nil:
-		return modal.NewTCPProbe(p.HTTPGet.Port.IntValue(), &modal.TCPProbeParams{Interval: interval})
+		if port, ok := numericPort(p.HTTPGet.Port); ok {
+			return modal.NewTCPProbe(port, &modal.TCPProbeParams{Interval: interval})
+		}
+		return nil, nil // named port: unsupported here (see doc)
 	default:
 		return nil, nil
 	}
+}
+
+// numericPort returns an intstr port as an int when it is numeric (>0), reporting
+// ok=false for a named port or a non-positive value. IntValue() yields 0 for a
+// named port, which is not a usable Modal probe target, so callers must skip the
+// probe rather than emit port 0.
+func numericPort(p intstr.IntOrString) (int, bool) {
+	if p.Type != intstr.Int {
+		return 0, false
+	}
+	if v := p.IntValue(); v > 0 {
+		return v, true
+	}
+	return 0, false
 }
 
 // TerminateSandbox implements Client. Idempotent: a sandbox that no longer
@@ -176,8 +203,13 @@ func (c *sdkClient) GetSandbox(ctx context.Context, id string) (*Sandbox, error)
 	return &out, nil
 }
 
-// ListSandboxes implements Client. Filters server-side by the Nebula claim tag
-// key so only Nebula-owned sandboxes are returned.
+// ListSandboxes implements Client. It scopes the list server-side to Nebula's
+// own Modal App (AppID), which is what isolates Nebula-owned sandboxes: every
+// sandbox Nebula creates lives under this one App, so sandboxes in other Apps
+// are never returned. It does NOT filter by the claim tag — the SDK's Tags
+// filter matches exact key=value pairs, but ClaimTagKey carries a distinct
+// value (the claim name) per sandbox, so there is no "has this key with any
+// value" filter to select all Nebula sandboxes by. App scoping already does it.
 func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 	app, err := c.app(ctx)
 	if err != nil {

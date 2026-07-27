@@ -118,12 +118,18 @@ func hasGate(pod *corev1.Pod, name string) bool {
 }
 
 // hasProviderToleration reports whether the Pod already tolerates the
-// provider-node taint. An existing toleration counts if it would match the
-// NoSchedule taint on key nebula.inftyai.com/provider — either a key-only
-// Exists toleration or the user's own equivalent — so we never add a duplicate.
+// provider-node taint for ANY provider value. Only a key-only Exists toleration
+// qualifies: the provider — and thus the taint value — is not chosen at
+// admission, so an Operator=Equal toleration matches just one specific value and
+// would leave the Pod unable to bind if placement later routes it to a different
+// provider's node. Treating such an Equal toleration as sufficient would suppress
+// the required Exists toleration, so we require Exists here.
 func hasProviderToleration(pod *corev1.Pod) bool {
 	for _, t := range pod.Spec.Tolerations {
 		if t.Key != nebulav1alpha1.ProviderLabel {
+			continue
+		}
+		if t.Operator != corev1.TolerationOpExists {
 			continue
 		}
 		if t.Effect != "" && t.Effect != corev1.TaintEffectNoSchedule {

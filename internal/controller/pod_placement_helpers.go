@@ -112,7 +112,7 @@ func preferredCapacityType(pool *nebulav1alpha1.NodePool) nebulav1alpha1.Capacit
 func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, p placement) (ready bool, err error) {
 	claim := &nebulav1alpha1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: claimNameForPod(pod),
+			Name: util.ClaimName(pod.Namespace, pod.Name),
 			Labels: map[string]string{
 				nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
 				nebulav1alpha1.PoolLabel:      pool.Name,

@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +28,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 // staleClaimRequeue is how long placement waits before re-checking when a
@@ -125,7 +125,7 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// against the wrong ledger; wait for the NodeClaim backstop to reap it,
 		// then a requeue re-creates the claim with this Pod's UID.
 		log.Info("waiting for a stale NodeClaim to be reclaimed before placing",
-			"pod", pod.Name, "claim", claimNameForPod(&pod))
+			"pod", pod.Name, "claim", util.ClaimName(pod.Namespace, pod.Name))
 		return ctrl.Result{RequeueAfter: staleClaimRequeue}, nil
 	}
 
@@ -175,10 +175,4 @@ func (r *PodPlacementReconciler) provider(name string) (provider.Provider, bool)
 		return r.Providers(name)
 	}
 	return provider.Get(name)
-}
-
-// claimName is the fixed, Pod-derived NodeClaim name, so placement is idempotent
-// across retries: one Pod always maps to one claim of this name.
-func claimNameForPod(pod *corev1.Pod) string {
-	return fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
 }

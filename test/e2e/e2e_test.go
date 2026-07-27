@@ -65,10 +65,28 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		// The manager mounts webhook-server-cert as a REQUIRED volume, so the
+		// self-signed cert Secret must exist before the pod starts, or it wedges
+		// in ContainerCreating (Pending) forever. Nebula does not use cert-manager
+		// (see config/default/kustomization.yaml); hack/gen-webhook-cert.sh is the
+		// source of truth, matching the ordering hack/deploy.sh uses in prod.
+		By("provisioning the webhook serving certificate Secret")
+		cmd = exec.Command("hack/gen-webhook-cert.sh", "secret")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to provision the webhook serving cert Secret")
+
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		// caBundle injection is server-side (only the API server reads it) and
+		// requires the MutatingWebhookConfiguration created by `make deploy`, so it
+		// runs after the deploy. The manager pod is untouched — no restart needed.
+		By("injecting the webhook CA bundle")
+		cmd = exec.Command("hack/gen-webhook-cert.sh", "cabundle")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to inject the webhook CA bundle")
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,

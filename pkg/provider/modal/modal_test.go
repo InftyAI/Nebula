@@ -396,4 +396,16 @@ func TestModalProbe(t *testing.T) {
 			t.Fatalf("case %d: expected a Modal probe, got nil", i)
 		}
 	}
+
+	// A NAMED port cannot be resolved here (needs the container's ports list), so
+	// TCP/HTTPGet with a named port omits the probe rather than emitting port 0.
+	named := []*corev1.Probe{
+		{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("http")}}},
+		{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromString("http")}}},
+	}
+	for i, pr := range named {
+		if got, err := modalProbe(pr); err != nil || got != nil {
+			t.Fatalf("named-port case %d: modalProbe = (%v, %v), want (nil, nil)", i, got, err)
+		}
+	}
 }
