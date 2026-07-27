@@ -299,14 +299,16 @@ var _ = Describe("Manager", Ordered, func() {
 			))
 		})
 
-		It("should provisioned cert-manager", func() {
-			By("validating that cert-manager has the certificate Secret")
-			verifyCertManager := func(g Gomega) {
+		It("should have the self-signed webhook serving cert Secret", func() {
+			// Nebula does not use cert-manager; hack/gen-webhook-cert.sh creates this
+			// self-signed Secret in the e2e BeforeAll (and hack/deploy.sh in prod).
+			By("validating that the webhook serving cert Secret exists")
+			verifyCertSecret := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
 				_, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 			}
-			Eventually(verifyCertManager).Should(Succeed())
+			Eventually(verifyCertSecret).Should(Succeed())
 		})
 
 		It("should have CA injection for mutating webhooks", func() {

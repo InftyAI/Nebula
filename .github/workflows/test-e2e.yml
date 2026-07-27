@@ -27,6 +27,11 @@ jobs:
         run: kind version
 
       - name: Running Test e2e
+        # Nebula does not use cert-manager: the webhook serving cert is a
+        # self-signed Secret from hack/gen-webhook-cert.sh (see the e2e BeforeAll),
+        # so skip the suite's cert-manager install/uninstall entirely.
+        env:
+          CERT_MANAGER_INSTALL_SKIP: "true"
         run: |
           go mod tidy
           make test-e2e
