@@ -42,12 +42,14 @@ func warnError(err error) {
 
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
-	dir, _ := GetProjectDir()
-	cmd.Dir = dir
-
-	if err := os.Chdir(cmd.Dir); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %q\n", err)
+	// Isolate the working directory to the command via cmd.Dir rather than
+	// os.Chdir: os.Chdir mutates the process-wide cwd, which is not goroutine-safe
+	// and would corrupt parallel commands (and anything else relying on cwd).
+	dir, err := GetProjectDir()
+	if err != nil {
+		return "", fmt.Errorf("get project dir: %w", err)
 	}
+	cmd.Dir = dir
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	command := strings.Join(cmd.Args, " ")
@@ -214,7 +216,7 @@ func UncommentCode(filename, target, prefix string) error {
 
 	idx := strings.Index(strContent, target)
 	if idx < 0 {
-		return fmt.Errorf("unable to find the code %q to be uncomment", target)
+		return fmt.Errorf("unable to find the code %q to uncomment", target)
 	}
 
 	out := new(bytes.Buffer)
