@@ -42,7 +42,7 @@ import (
 // only the fallback: a provider may override the cadence via
 // Capabilities.PollInterval (e.g. a spot-heavy backend polls faster to notice
 // reclaims sooner; an OnDemand-only one can poll lazily).
-const defaultPollInterval = 30 * time.Second
+const defaultPollInterval = 15 * time.Second
 
 // Handler bridges one provider into the virtual kubelet: it implements the VK
 // PodLifecycleHandler (+ PodNotifier) so the pod controller's CreatePod

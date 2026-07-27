@@ -136,7 +136,7 @@ type Capabilities struct {
 	// provider: a spot-heavy backend where preemption is common and costly wants a
 	// short interval to notice reclaims quickly, while an OnDemand-only backend
 	// that never preempts can poll lazily. Zero means "use the vnode default"
-	// (30s). The happy-path transitions (provision start, teardown) do not wait on
+	// (15s). The happy-path transitions (provision start, teardown) do not wait on
 	// this — they are pushed synchronously by CreatePod/DeletePod — so this only
 	// bounds detection latency for events no provider pushes.
 	PollInterval time.Duration
