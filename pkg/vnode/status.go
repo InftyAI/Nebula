@@ -56,7 +56,7 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 	case provider.InstanceRunning:
 		setPhase(pod, corev1.PodRunning, reasonRunning, "external instance is running", now)
 		setReady(pod, corev1.ConditionTrue, now)
-		setContainerStatuses(pod, corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}}, true, now)
+		setContainerStatuses(pod, corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}}, true)
 		if endpoint != "" {
 			pod.Status.PodIP = endpoint
 		}
@@ -65,13 +65,17 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 		setReady(pod, corev1.ConditionFalse, now)
 		setContainerStatuses(pod, corev1.ContainerState{
 			Waiting: &corev1.ContainerStateWaiting{Reason: reasonProvisioning, Message: "external instance is starting"},
-		}, false, now)
+		}, false)
 	case provider.InstanceFailed:
 		setPhase(pod, corev1.PodFailed, reasonFailed, "external instance entered a failed state", now)
 		setReady(pod, corev1.ConditionFalse, now)
 		setContainerStatuses(pod, corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{Reason: reasonFailed, Message: "external instance entered a failed state", FinishedAt: now},
-		}, false, now)
+			Terminated: &corev1.ContainerStateTerminated{
+				Reason:     reasonFailed,
+				Message:    "external instance entered a failed state",
+				FinishedAt: now,
+			},
+		}, false)
 	case provider.InstanceTerminated:
 		// The instance is simply gone — absent from the provider's List, whether
 		// torn down by us, deleted out-of-band, or reclaimed. We cannot tell WHY
@@ -80,8 +84,12 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 		setPhase(pod, corev1.PodFailed, reasonTerminated, "external instance is gone", now)
 		setReady(pod, corev1.ConditionFalse, now)
 		setContainerStatuses(pod, corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{Reason: reasonTerminated, Message: "external instance is gone", FinishedAt: now},
-		}, false, now)
+			Terminated: &corev1.ContainerStateTerminated{
+				Reason:     reasonTerminated,
+				Message:    "external instance is gone",
+				FinishedAt: now,
+			},
+		}, false)
 	}
 }
 
@@ -93,7 +101,7 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 // True. There is one real workload behind the whole Pod, so every container
 // mirrors the same state. The container's Image is echoed back (required field);
 // RestartCount stays 0 (the provider owns restarts, not the kubelet).
-func setContainerStatuses(pod *corev1.Pod, state corev1.ContainerState, ready bool, now metav1.Time) {
+func setContainerStatuses(pod *corev1.Pod, state corev1.ContainerState, ready bool) {
 	statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
 	for i := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[i]

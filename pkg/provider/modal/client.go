@@ -187,7 +187,8 @@ func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []Sandbox
+	// seq is an iterator with no length, so out is grown as sandboxes arrive.
+	out := make([]Sandbox, 0) //nolint:prealloc // unknown length: iterator, not a slice
 	for sb, err := range seq {
 		if err != nil {
 			return nil, err
@@ -225,14 +226,14 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) Sandbox {
 	// brief startup window into running rather than blocking to confirm readiness.
 	if code, err := sb.Poll(ctx, &modal.SandboxPollParams{}); err == nil {
 		if code != nil {
-			out.Status = "terminated"
+			out.Status = statusTerminated
 		} else {
-			out.Status = "running"
+			out.Status = statusRunning
 		}
 	}
 
 	// Endpoint is only meaningful once running; look it up best-effort.
-	if out.Status == "running" {
+	if out.Status == statusRunning {
 		tctx, cancel := context.WithTimeout(ctx, c.endpointTimeout)
 		if tunnels, err := sb.Tunnels(tctx, c.endpointTimeout, &modal.SandboxTunnelsParams{}); err == nil {
 			for _, t := range tunnels {

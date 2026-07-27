@@ -200,7 +200,8 @@ func TestProvision_DefaultsTimeoutWhenNoDeadline(t *testing.T) {
 
 	// No activeDeadlineSeconds: the adapter must still set a non-zero timeout, else
 	// Modal applies its 5-minute default and the workload dies almost immediately.
-	if _, err := p.Provision(context.Background(), gpuPod("claim-dt", "H100", 1), provider.ProvisionRequest{ClaimName: "claim-dt"}); err != nil {
+	req := provider.ProvisionRequest{ClaimName: "claim-dt"}
+	if _, err := p.Provision(context.Background(), gpuPod("claim-dt", "H100", 1), req); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.Timeout != defaultSandboxTimeout {
@@ -226,11 +227,16 @@ func TestProvision_CPUOnly(t *testing.T) {
 
 func TestProvision_Idempotent(t *testing.T) {
 	f := &fakeClient{
-		sandboxes: []Sandbox{{ID: "sb-existing", Tags: map[string]string{ClaimTagKey: "claim-a"}, Status: "running"}},
+		sandboxes: []Sandbox{{
+			ID:     "sb-existing",
+			Tags:   map[string]string{ClaimTagKey: "claim-a"},
+			Status: "running",
+		}},
 	}
 	p := newTestProvider(f)
 
-	id, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), provider.ProvisionRequest{ClaimName: "claim-a"})
+	req := provider.ProvisionRequest{ClaimName: "claim-a"}
+	id, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req)
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -245,7 +251,8 @@ func TestProvision_Idempotent(t *testing.T) {
 func TestProvision_UnsupportedAccelerator(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
-	_, err := p.Provision(context.Background(), gpuPod("claim-x", "TPU-v4", 1), provider.ProvisionRequest{ClaimName: "claim-x"})
+	req := provider.ProvisionRequest{ClaimName: "claim-x"}
+	_, err := p.Provision(context.Background(), gpuPod("claim-x", "TPU-v4", 1), req)
 	if err == nil {
 		t.Fatal("expected error for unsupported accelerator")
 	}
@@ -253,18 +260,20 @@ func TestProvision_UnsupportedAccelerator(t *testing.T) {
 
 func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
+	denyAll := provider.BlockScope{DenyAll: true}
+	onDemand := provider.BlockScope{CapacityType: nebulav1alpha1.CapacityOnDemand}
 	tests := []struct {
 		name string
 		err  error
 		want provider.BlockScope
 	}{
-		{"auth sentinel", provider.ErrAuth, provider.BlockScope{DenyAll: true}},
-		{"quota sentinel", provider.ErrQuota, provider.BlockScope{DenyAll: true}},
-		{"capacity sentinel", provider.ErrNoCapacity, provider.BlockScope{CapacityType: nebulav1alpha1.CapacityOnDemand}},
-		{"wrapped capacity", fmt.Errorf("provision: %w", provider.ErrNoCapacity), provider.BlockScope{CapacityType: nebulav1alpha1.CapacityOnDemand}},
-		{"string unauthorized", fmt.Errorf("401 unauthorized"), provider.BlockScope{DenyAll: true}},
-		{"string no capacity", fmt.Errorf("no capacity available in region"), provider.BlockScope{CapacityType: nebulav1alpha1.CapacityOnDemand}},
-		{"unknown", fmt.Errorf("weird transient blip"), provider.BlockScope{DenyAll: true}},
+		{"auth sentinel", provider.ErrAuth, denyAll},
+		{"quota sentinel", provider.ErrQuota, denyAll},
+		{"capacity sentinel", provider.ErrNoCapacity, onDemand},
+		{"wrapped capacity", fmt.Errorf("provision: %w", provider.ErrNoCapacity), onDemand},
+		{"string unauthorized", fmt.Errorf("401 unauthorized"), denyAll},
+		{"string no capacity", fmt.Errorf("no capacity available in region"), onDemand},
+		{"unknown", fmt.Errorf("weird transient blip"), denyAll},
 		{"nil", nil, provider.BlockScope{}},
 	}
 	for _, tt := range tests {
@@ -350,7 +359,8 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 	f := &fakeClient{createID: "sb-1"}
 	p := newTestProvider(f)
 
-	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+	req := provider.ProvisionRequest{ClaimName: "claim-a"}
+	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.ReadinessProbe != nil {

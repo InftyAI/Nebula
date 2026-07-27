@@ -36,6 +36,15 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # Test helpers intentionally take name/namespace params for readable call
+      # sites even when the current tests all pass the same value; unparam's
+      # "always receives X" is noise there (and removing the param hurts clarity).
+      # goconst likewise flags repeated fixture strings ("inst-1", …) that read
+      # fine inline — extracting a const per fixture adds indirection, not clarity.
+      - linters:
+          - goconst
+          - unparam
+        path: _test\.go
     paths:
       - third_party$
       - builtin$

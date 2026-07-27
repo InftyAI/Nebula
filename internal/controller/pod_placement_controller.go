@@ -155,13 +155,13 @@ func needsPlacement(pod *corev1.Pod) bool {
 	if pod.Spec.NodeName != "" {
 		return false
 	}
-	return hasGateNamed(pod, nebulav1alpha1.ProviderSelectionGate)
+	return hasGateNamed(pod)
 }
 
-// hasGateNamed reports whether the Pod carries the named scheduling gate.
-func hasGateNamed(pod *corev1.Pod, name string) bool {
+// hasGateNamed reports whether the Pod carries the provider-selection scheduling gate.
+func hasGateNamed(pod *corev1.Pod) bool {
 	for _, g := range pod.Spec.SchedulingGates {
-		if g.Name == name {
+		if g.Name == nebulav1alpha1.ProviderSelectionGate {
 			return true
 		}
 	}

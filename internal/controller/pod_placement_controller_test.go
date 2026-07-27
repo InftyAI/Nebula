@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // newPlacementReconciler wires a PodPlacementReconciler over a fake client.
@@ -73,7 +74,7 @@ func gatedPod(name, ns, uid, pool, gpu string) *corev1.Pod {
 }
 
 func poolWith(name string, capTypes []nebulav1alpha1.CapacityType, providers ...string) *nebulav1alpha1.NodePool {
-	var refs []nebulav1alpha1.ProviderRef
+	refs := make([]nebulav1alpha1.ProviderRef, 0, len(providers))
 	for _, p := range providers {
 		refs = append(refs, nebulav1alpha1.ProviderRef{Name: p})
 	}
@@ -106,19 +107,19 @@ func getPod(t *testing.T, c client.Client, ns, name string) *corev1.Pod {
 
 func TestPlacement_UngatesAndRoutesAndCreatesClaim(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
-	prov := &fakeProvider{name: "modal", gpus: []string{"H100"}}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
 
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
 	// Gate removed.
-	if hasGateNamed(got, nebulav1alpha1.ProviderSelectionGate) {
+	if hasGateNamed(got) {
 		t.Fatal("expected the provider-selection gate to be removed")
 	}
 	// Routed to the chosen provider.
-	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "modal" {
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected nodeSelector provider=modal, got %v", got.Spec.NodeSelector)
 	}
 	// Capacity tier stamped for the VK handler.
@@ -130,7 +131,7 @@ func TestPlacement_UngatesAndRoutesAndCreatesClaim(t *testing.T) {
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err != nil {
 		t.Fatalf("expected NodeClaim default-p1: %v", err)
 	}
-	if nc.Spec.Provider != "modal" || nc.Spec.PodRef.UID != "uid-1" || nc.Spec.PoolRef != "pool-a" {
+	if nc.Spec.Provider != provider.ProviderModal || nc.Spec.PodRef.UID != "uid-1" || nc.Spec.PoolRef != "pool-a" {
 		t.Fatalf("unexpected claim spec: %+v", nc.Spec)
 	}
 }
@@ -139,15 +140,15 @@ func TestPlacement_FirstMatchingProviderWins(t *testing.T) {
 	// runpod is listed first but does not offer H100; modal does. First MATCHING
 	// provider wins, so modal is chosen.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "runpod", "modal")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "runpod", provider.ProviderModal)
 	runpod := &fakeProvider{name: "runpod", gpus: []string{"A100"}}
-	modal := &fakeProvider{name: "modal", gpus: []string{"H100"}}
+	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, runpod, modal)
 
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
-	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "modal" {
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected modal (first matching), got %v", got.Spec.NodeSelector)
 	}
 }
@@ -155,9 +156,9 @@ func TestPlacement_FirstMatchingProviderWins(t *testing.T) {
 func TestPlacement_OrderedPrefersEarlierProvider(t *testing.T) {
 	// Both offer H100; the first in the list wins.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "runpod", "modal")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "runpod", provider.ProviderModal)
 	runpod := &fakeProvider{name: "runpod", gpus: []string{"H100"}}
-	modal := &fakeProvider{name: "modal", gpus: []string{"H100"}}
+	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, runpod, modal)
 
 	reconcilePod(t, r, "default", "p1")
@@ -177,7 +178,7 @@ func TestPlacement_NoMatchingProviderLeavesPodGated(t *testing.T) {
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
-	if !hasGateNamed(got, nebulav1alpha1.ProviderSelectionGate) {
+	if !hasGateNamed(got) {
 		t.Fatal("expected the Pod to stay gated when no provider matches")
 	}
 	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "" {
@@ -188,14 +189,14 @@ func TestPlacement_NoMatchingProviderLeavesPodGated(t *testing.T) {
 func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
 	// No GPU annotation => any provider matches; even one offering nothing.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
-	modal := &fakeProvider{name: "modal", gpus: []string{}} // offers no GPUs
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{}} // offers no GPUs
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, modal)
 
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
-	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "modal" {
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected a CPU-only Pod to place on modal, got %v", got.Spec.NodeSelector)
 	}
 }
@@ -203,14 +204,14 @@ func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
 func TestPlacement_SkipsPodWithoutOptInLabel(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pod.Labels[nebulav1alpha1.EnabledLabel] = "false"
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
-	modal := &fakeProvider{name: "modal"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	modal := &fakeProvider{name: provider.ProviderModal}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, modal)
 
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
-	if !hasGateNamed(got, nebulav1alpha1.ProviderSelectionGate) {
+	if !hasGateNamed(got) {
 		t.Fatal("expected a non-opted-in Pod to be left untouched")
 	}
 }
@@ -218,8 +219,8 @@ func TestPlacement_SkipsPodWithoutOptInLabel(t *testing.T) {
 func TestPlacement_SkipsAlreadyScheduledPod(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pod.Spec.NodeName = "some-node"
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
-	modal := &fakeProvider{name: "modal"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	modal := &fakeProvider{name: provider.ProviderModal}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, modal)
 
 	reconcilePod(t, r, "default", "p1")
@@ -234,13 +235,13 @@ func TestPlacement_SkipsAlreadyScheduledPod(t *testing.T) {
 
 func TestPlacement_MissingPoolLeavesPodGated(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "ghost-pool", "H100")
-	modal := &fakeProvider{name: "modal"}
+	modal := &fakeProvider{name: provider.ProviderModal}
 	r, c := newPlacementReconciler(t, []client.Object{pod}, modal) // no pool seeded
 
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
-	if !hasGateNamed(got, nebulav1alpha1.ProviderSelectionGate) {
+	if !hasGateNamed(got) {
 		t.Fatal("expected the Pod to stay gated when its pool is missing")
 	}
 }
@@ -250,16 +251,16 @@ func TestPlacement_StaleClaimForPriorPodBlocksUngate(t *testing.T) {
 	// (different UID). Placement must NOT ungate against the wrong ledger: it
 	// leaves the Pod gated and requeues until the backstop reaps the stale claim.
 	pod := gatedPod("p1", "default", "uid-new", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
 	stale := &nebulav1alpha1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-p1"},
 		Spec: nebulav1alpha1.NodeClaimSpec{
 			PodRef:   nebulav1alpha1.PodReference{Namespace: "default", Name: "p1", UID: "uid-old"},
-			Provider: "modal",
+			Provider: provider.ProviderModal,
 			PoolRef:  "pool-a",
 		},
 	}
-	prov := &fakeProvider{name: "modal", gpus: []string{"H100"}}
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool, stale}, prov)
 
 	res, err := r.Reconcile(context.Background(), reconcile.Request{
@@ -273,7 +274,7 @@ func TestPlacement_StaleClaimForPriorPodBlocksUngate(t *testing.T) {
 	}
 
 	got := getPod(t, c, "default", "p1")
-	if !hasGateNamed(got, nebulav1alpha1.ProviderSelectionGate) {
+	if !hasGateNamed(got) {
 		t.Fatal("expected the Pod to stay gated against a stale claim")
 	}
 	// The stale claim must be left untouched (the backstop, not placement, owns it).
@@ -290,25 +291,25 @@ func TestPlacement_AdoptsOwnClaimOnRetry(t *testing.T) {
 	// A claim of this name already exists AND pins this Pod's UID: a genuine retry
 	// after a crash between create and ungate. Placement adopts it and ungates.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
 	mine := &nebulav1alpha1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-p1"},
 		Spec: nebulav1alpha1.NodeClaimSpec{
 			PodRef:   nebulav1alpha1.PodReference{Namespace: "default", Name: "p1", UID: "uid-1"},
-			Provider: "modal",
+			Provider: provider.ProviderModal,
 			PoolRef:  "pool-a",
 		},
 	}
-	prov := &fakeProvider{name: "modal", gpus: []string{"H100"}}
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool, mine}, prov)
 
 	reconcilePod(t, r, "default", "p1")
 
 	got := getPod(t, c, "default", "p1")
-	if hasGateNamed(got, nebulav1alpha1.ProviderSelectionGate) {
+	if hasGateNamed(got) {
 		t.Fatal("expected the Pod placed when the existing claim is its own")
 	}
-	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "modal" {
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected routing to modal, got %v", got.Spec.NodeSelector)
 	}
 }
@@ -317,8 +318,8 @@ func TestPlacement_IdempotentOnRetry(t *testing.T) {
 	// A second reconcile after a successful placement must not error (claim
 	// AlreadyExists is success) and must leave the Pod placed.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "modal")
-	prov := &fakeProvider{name: "modal", gpus: []string{"H100"}}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
 
 	reconcilePod(t, r, "default", "p1")
@@ -331,7 +332,7 @@ func TestPlacement_IdempotentOnRetry(t *testing.T) {
 	reconcilePod(t, r, "default", "p1") // must not error on AlreadyExists
 
 	final := getPod(t, c, "default", "p1")
-	if hasGateNamed(final, nebulav1alpha1.ProviderSelectionGate) {
+	if hasGateNamed(final) {
 		t.Fatal("expected the Pod placed again on retry")
 	}
 }

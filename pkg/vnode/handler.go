@@ -316,7 +316,9 @@ func ptrNow(t metav1.Time) *metav1.Time { return &t }
 // These satisfy the nodeutil.Provider interface required by nodeutil.NewNode and
 // return a NotFound so the VK core reports them cleanly rather than panicking.
 
-func (h *Handler) GetContainerLogs(context.Context, string, string, string, vkapi.ContainerLogOpts) (io.ReadCloser, error) {
+func (h *Handler) GetContainerLogs(
+	context.Context, string, string, string, vkapi.ContainerLogOpts,
+) (io.ReadCloser, error) {
 	return nil, errdefs.NotFound("container logs are not supported by the Nebula virtual node")
 }
 

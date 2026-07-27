@@ -132,9 +132,10 @@ func (r *Runner) Start(ctx context.Context) error {
 	// A NaiveNodeProvider marks the node Ready and answers pings; our Handler
 	// owns only pod lifecycle, not node health.
 	np := vknode.NewNaiveNodeProvider()
+	leases := r.client.CoordinationV1().Leases(corev1.NamespaceNodeLease)
 	nc, err := vknode.NewNodeController(
 		np, nodeSpec, r.client.CoreV1().Nodes(),
-		vknode.WithNodeEnableLeaseV1(r.client.CoordinationV1().Leases(corev1.NamespaceNodeLease), vknode.DefaultLeaseDuration),
+		vknode.WithNodeEnableLeaseV1(leases, vknode.DefaultLeaseDuration),
 	)
 	if err != nil {
 		return fmt.Errorf("build node controller for %q: %w", r.nodeName, err)
@@ -157,7 +158,10 @@ func (r *Runner) Start(ctx context.Context) error {
 // run starts the pod and node controllers in the required order (pods ready
 // before the node advertises Ready) and blocks until ctx is cancelled or a
 // controller exits.
-func (r *Runner) run(ctx context.Context, pc *vknode.PodController, nc *vknode.NodeController, nodeSpec *corev1.Node, np *vknode.NaiveNodeProviderV2) error {
+func (r *Runner) run(
+	ctx context.Context, pc *vknode.PodController, nc *vknode.NodeController,
+	nodeSpec *corev1.Node, np *vknode.NaiveNodeProviderV2,
+) error {
 	go pc.Run(ctx, 1) //nolint:errcheck
 
 	select {

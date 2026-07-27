@@ -369,18 +369,25 @@ func (p *Provider) toInstance(sb Sandbox) provider.Instance {
 	}
 }
 
+// Sandbox status strings observe produces (and toState consumes). observe
+// derives status from Poll, so it only ever emits statusRunning (live) or
+// statusTerminated (process exited); an unset status ("") means Poll errored.
+const (
+	statusRunning    = "running"
+	statusTerminated = "terminated"
+)
+
 // toState maps the status strings observe produces to the provider-agnostic
-// lifecycle state. observe derives status from Poll (+ the readiness probe), so
-// it only ever emits four values: "running"/"ready" (live), "pending" (live but
-// the readiness probe has not passed yet), and "terminated" (process exited).
-// Anything else — including the empty string observe leaves when Poll itself
-// errors — maps to Pending, so the poll loop keeps watching rather than declaring
-// a premature terminal state.
+// lifecycle state. observe emits only statusRunning (live) or statusTerminated
+// (process exited); "ready" is also accepted as a live synonym. Anything else —
+// including the empty string observe leaves when Poll itself errors — maps to
+// Pending, so the poll loop keeps watching rather than declaring a premature
+// terminal state.
 func toState(modalStatus string) provider.InstanceState {
 	switch strings.ToLower(modalStatus) {
-	case "running", "ready":
+	case statusRunning, "ready":
 		return provider.InstanceRunning
-	case "terminated":
+	case statusTerminated:
 		return provider.InstanceTerminated
 	default:
 		return provider.InstancePending

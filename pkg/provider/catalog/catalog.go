@@ -140,7 +140,7 @@ func parseCSV(r io.Reader) ([]provider.Offering, error) {
 		return nil, err
 	}
 
-	var offerings []provider.Offering
+	offerings := make([]provider.Offering, 0, len(records))
 	for i, rec := range records {
 		if i == 0 {
 			continue // header
