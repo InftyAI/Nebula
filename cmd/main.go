@@ -46,6 +46,7 @@ import (
 	"github.com/InftyAI/Nebula/internal/controller"
 	webhookv1 "github.com/InftyAI/Nebula/internal/webhook/v1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
@@ -322,6 +323,16 @@ func registerProviders(ctx context.Context) {
 	if p, err := modal.NewSDKClient(ctx, os.Getenv("MODAL_APP_NAME")); err != nil {
 		setupLog.Info("skipping Modal provider registration", "reason", err.Error())
 	} else {
+		provider.Register(p)
+		setupLog.Info("registered provider", "provider", p.Name())
+	}
+
+	// The fake provider is an in-memory backend used only by the e2e suite to
+	// exercise the full control-plane loop without cloud credentials. It ships in
+	// the binary but registers ONLY when explicitly enabled, so it can never place
+	// real workloads in production.
+	if os.Getenv("NEBULA_ENABLE_FAKE_PROVIDER") == "true" {
+		p := fake.New()
 		provider.Register(p)
 		setupLog.Info("registered provider", "provider", p.Name())
 	}

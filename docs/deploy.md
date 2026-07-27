@@ -134,8 +134,6 @@ cert-manager, and drop the `gen-webhook-cert.sh` calls from `hack/deploy.sh`.
 |---|---|---|---|
 | `MODAL_TOKEN_ID` | Modal | yes | From `modal token new` |
 | `MODAL_TOKEN_SECRET` | Modal | yes | From `modal token new` |
-| `MODAL_ENVIRONMENT` | Modal | no | Modal workspace environment |
-| `MODAL_APP_NAME` | Modal | no | Modal App for all sandboxes (default `nebula`) |
 
 Non-secret config, passed as `make` variables:
 
@@ -156,7 +154,7 @@ When a new provider adapter lands, wire its credentials in two places:
 
    ```bash
    PROVIDER_SECRETS=(
-     "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|MODAL_ENVIRONMENT MODAL_APP_NAME"
+     "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET"
      "nebula-runpod-credentials|RUNPOD_API_KEY|"
    )
    ```

@@ -60,7 +60,8 @@ fi
 # SDKs read them by these exact names). To add a provider, append a row —
 # nothing else in this script needs to change.
 PROVIDER_SECRETS=(
-  "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|MODAL_ENVIRONMENT MODAL_APP_NAME"
+  # Only secrets belong here.
+  "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|"
   # "nebula-runpod-credentials|RUNPOD_API_KEY|"
 )
 

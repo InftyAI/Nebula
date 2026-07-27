@@ -42,6 +42,17 @@ const metricsServiceName = "nebula-controller-manager-metrics-service"
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "nebula-metrics-binding"
 
+// Fake-provider placement-flow fixtures. fakeProviderName must match
+// fake.ProviderName; fakeVirtualNode is vnode.NodeName(fakeProviderName)
+// ("nebula-<provider>"). Kept as literals here so the e2e package stays free of
+// production imports.
+const (
+	fakeProviderName = "fake"
+	fakeVirtualNode  = "nebula-fake"
+	fakePoolName     = "e2e-fake-pool"
+	fakeWorkloadPod  = "e2e-fake-workload"
+)
+
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
@@ -80,6 +91,17 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
+		// Enable the in-memory fake provider so the placement→NodeClaim→virtual-node
+		// flow can be exercised end-to-end without cloud credentials (no real
+		// provider registers in a Kind cluster). It is gated on this env var and
+		// never registers in production. Set it AFTER deploy and wait for the
+		// rollout so the manager restarts with the fake registered.
+		By("enabling the fake provider on the controller-manager")
+		cmd = exec.Command("kubectl", "set", "env", "deployment/nebula-controller-manager",
+			"-n", namespace, "NEBULA_ENABLE_FAKE_PROVIDER=true")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to enable the fake provider")
+
 		// caBundle injection is server-side (only the API server reads it) and
 		// requires the MutatingWebhookConfiguration created by `make deploy`, so it
 		// runs after the deploy. The manager pod is untouched — no restart needed.
@@ -87,6 +109,12 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("hack/gen-webhook-cert.sh", "cabundle")
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to inject the webhook CA bundle")
+
+		By("waiting for the controller-manager rollout to finish")
+		cmd = exec.Command("kubectl", "rollout", "status",
+			"deployment/nebula-controller-manager", "-n", namespace, "--timeout=120s")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "controller-manager rollout did not complete")
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
@@ -95,6 +123,11 @@ var _ = Describe("Manager", Ordered, func() {
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
+
+		By("cleaning up the fake-provider workload and pool")
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", fakeWorkloadPod,
+			"-n", namespace, "--ignore-not-found=true"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakePoolName, "--ignore-not-found=true"))
 
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
@@ -297,6 +330,76 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(len(mwhOutput)).To(BeNumerically(">", 10))
 			}
 			Eventually(verifyCAInjection).Should(Succeed())
+		})
+
+		It("should place an opted-in Pod onto the fake provider's virtual node", func() {
+			// This exercises the whole control-plane loop against the in-memory fake
+			// provider: webhook gate → placement picks the pool's provider → NodeClaim
+			// ledger → the fake's virtual node provisions → the Pod binds and runs.
+
+			By("waiting for the fake provider's virtual node to register")
+			verifyNode := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", fakeVirtualNode)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "fake virtual node not registered")
+			}
+			Eventually(verifyNode).Should(Succeed())
+
+			By("creating a NodePool that allows the fake provider")
+			manifest := fmt.Sprintf(`apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  name: %s
+spec:
+  providers:
+  - name: %s
+  capacityTypes:
+  - OnDemand
+  strategy: Ordered
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    nebula.inftyai.com/enabled: "true"
+    nebula.inftyai.com/nodepool: %s
+spec:
+  containers:
+  - name: main
+    image: registry.k8s.io/pause:3.10
+`, fakePoolName, fakeProviderName, fakeWorkloadPod, namespace, fakePoolName)
+			manifestFile := filepath.Join("/tmp", "nebula-fake-workload.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), 0o644)).To(Succeed())
+			cmd := exec.Command("kubectl", "apply", "-f", manifestFile)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply the NodePool + Pod")
+
+			By("verifying the placement controller creates a NodeClaim for the Pod")
+			verifyClaim := func(g Gomega) {
+				// util.ClaimName(namespace, name) == "<namespace>-<name>".
+				claim := fmt.Sprintf("%s-%s", namespace, fakeWorkloadPod)
+				cmd := exec.Command("kubectl", "get", "nodeclaim", claim,
+					"-o", "jsonpath={.spec.provider}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "NodeClaim not created")
+				g.Expect(out).To(Equal(fakeProviderName), "NodeClaim names the wrong provider")
+			}
+			Eventually(verifyClaim).Should(Succeed())
+
+			By("verifying the Pod is ungated and bound to the fake virtual node")
+			verifyBound := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", fakeWorkloadPod, "-n", namespace,
+					"-o", "jsonpath={.spec.nodeName}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal(fakeVirtualNode), "Pod not bound to the fake virtual node")
+			}
+			Eventually(verifyBound).Should(Succeed())
+
+			By("cleaning up the fake workload")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile, "--ignore-not-found=true"))
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks

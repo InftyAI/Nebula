@@ -81,8 +81,7 @@ spec:
           # provider. Providers namespace their env vars (MODAL_TOKEN_ID,
           # RUNPOD_API_KEY, ...), so the merged environment never collides.
           #
-          # The Modal SDK reads MODAL_TOKEN_ID / MODAL_TOKEN_SECRET (and optionally
-          # MODAL_ENVIRONMENT / MODAL_APP_NAME) from the environment.
+          # The Modal SDK reads MODAL_TOKEN_ID / MODAL_TOKEN_SECRET from the environment.
           - secretRef:
               name: nebula-modal-credentials
               optional: true
