@@ -1,0 +1,12 @@
+# e2e-only: enable the in-memory fake provider so the placement→NodeClaim→
+# virtual-node flow can be exercised without cloud credentials. This overlay is
+# built ONLY by `make deploy-e2e` (see the e2e suite); production `make deploy`
+# uses config/default, which never sets this env, so the fake never registers in
+# a real cluster. Baked in at deploy time (not `kubectl set env`) so the manager
+# boots once with the fake already registered — no extra rollout, and thus no
+# leader-election re-acquire window where metrics serve before the first reconcile.
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NEBULA_ENABLE_FAKE_PROVIDER
+    value: "true"

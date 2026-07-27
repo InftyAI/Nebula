@@ -86,35 +86,26 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to provision the webhook serving cert Secret")
 
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		// Deploy via the e2e overlay, which bakes NEBULA_ENABLE_FAKE_PROVIDER=true
+		// into the manager env so the in-memory fake provider registers at first
+		// boot. This drives the placement→NodeClaim→virtual-node flow without cloud
+		// credentials (no real provider registers in a Kind cluster). Baking it in
+		// (vs. a post-deploy `kubectl set env`) means the manager boots ONCE — no
+		// second rollout, so no leader-election re-acquire window where the metrics
+		// endpoint serves before the first reconcile. The fake ships in the binary
+		// but only registers on this env var, so production `make deploy` never has it.
+		By("deploying the controller-manager (e2e overlay: fake provider enabled)")
+		cmd = exec.Command("make", "deploy-e2e", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
-		// Enable the in-memory fake provider so the placement→NodeClaim→virtual-node
-		// flow can be exercised end-to-end without cloud credentials (no real
-		// provider registers in a Kind cluster). It is gated on this env var and
-		// never registers in production. Set it AFTER deploy and wait for the
-		// rollout so the manager restarts with the fake registered.
-		By("enabling the fake provider on the controller-manager")
-		cmd = exec.Command("kubectl", "set", "env", "deployment/nebula-controller-manager",
-			"-n", namespace, "NEBULA_ENABLE_FAKE_PROVIDER=true")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to enable the fake provider")
-
 		// caBundle injection is server-side (only the API server reads it) and
-		// requires the MutatingWebhookConfiguration created by `make deploy`, so it
+		// requires the MutatingWebhookConfiguration created by the deploy, so it
 		// runs after the deploy. The manager pod is untouched — no restart needed.
 		By("injecting the webhook CA bundle")
 		cmd = exec.Command("hack/gen-webhook-cert.sh", "cabundle")
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to inject the webhook CA bundle")
-
-		By("waiting for the controller-manager rollout to finish")
-		cmd = exec.Command("kubectl", "rollout", "status",
-			"deployment/nebula-controller-manager", "-n", namespace, "--timeout=120s")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "controller-manager rollout did not complete")
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
