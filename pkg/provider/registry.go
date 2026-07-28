@@ -12,14 +12,16 @@ import (
 // ProviderLabel value on each provider's virtual node. Keeping them as consts in
 // one place stops those three call sites from drifting apart on a typo.
 //
-// Hyperscalers (aws/gcp/azure) are a planned near-term expansion and will be
-// added here when their adapters land; nothing else about the registry changes.
+// AWS is the first hyperscaler (region-aware) backend; GCP/Azure are a planned
+// near-term expansion and will be added here when their adapters land, with
+// nothing else about the registry changing.
 const (
 	ProviderRunPod     = "runpod"
 	ProviderModal      = "modal"
 	ProviderCoreWeave  = "coreweave"
 	ProviderLambda     = "lambda"
 	ProviderKubernetes = "kubernetes"
+	ProviderAWS        = "aws"
 )
 
 // registry is the process-wide map of registered provider backends, keyed by

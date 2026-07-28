@@ -27,6 +27,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
@@ -57,6 +58,20 @@ type PodPlacementReconciler struct {
 	// Providers resolves a provider name to its backend; defaults to the
 	// process-wide registry. Overridable in tests.
 	Providers func(name string) (provider.Provider, bool)
+
+	// Blocklist is the shared failover blocklist the VK handlers write to on a
+	// Provision failure; selectPlacement reads it to skip a candidate that just
+	// failed. May be nil (no candidate is ever considered blocked), keeping tests
+	// and blocklist-less wiring simple.
+	Blocklist Blocklister
+}
+
+// Blocklister is the read side of pkg/failover.Blocklist the placement controller
+// depends on: it asks whether a candidate placement is currently excluded. The
+// concrete type is injected from main; this narrow interface keeps the controller
+// decoupled and a nil value a no-op.
+type Blocklister interface {
+	Blocked(c failover.Candidate) bool
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
@@ -130,10 +145,11 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Stamp the routing decision and release the Pod to the scheduler.
-	if err := r.place(ctx, &pod, placement); err != nil {
+	if err := r.place(ctx, &pod, pool, placement); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("placed Pod", "pod", pod.Name, "provider", placement.provider, "capacityType", placement.capacityType)
+	log.Info("placed Pod", "pod", pod.Name, "provider", placement.provider,
+		"capacityType", placement.capacityType, "region", placement.region)
 	return ctrl.Result{}, nil
 }
 
@@ -141,6 +157,10 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 type placement struct {
 	provider     string
 	capacityType nebulav1alpha1.CapacityType
+	// region is the provider region to provision in (provider's own vocabulary).
+	// Empty means the provider's configured default region; region-simple
+	// providers leave it empty.
+	region string
 }
 
 // needsPlacement reports whether the Pod is an opted-in workload still held by

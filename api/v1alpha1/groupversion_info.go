@@ -82,6 +82,24 @@ const (
 	// default" (e.g. Modal is OnDemand-only and ignores it).
 	CapacityTypeAnnotation = "nebula.inftyai.com/capacity-type"
 
+	// RegionAnnotation carries the optimizer-chosen provider region. Like
+	// CapacityTypeAnnotation it is a provisioning input absent from the Pod's own
+	// spec, so the placement controller writes it when it ungates the Pod and the
+	// virtual kubelet reads it back on CreatePod into ProvisionRequest.Region.
+	// Empty/absent means "the provider's configured default region" — region-simple
+	// providers (Modal, RunPod) ignore it.
+	RegionAnnotation = "nebula.inftyai.com/region"
+
+	// BlocklistTTLAnnotation carries the pool's FailoverPolicy.BlocklistTTL down to
+	// the virtual kubelet. Like the two annotations above it is a provisioning-time
+	// input the Pod cannot otherwise express: the TTL is a NodePool policy, but the
+	// VK handler (which provisions per-Pod and never sees the pool) needs it to know
+	// how long to blocklist a placement that just failed. The placement controller
+	// stamps it when it ungates the Pod; the handler reads it on a Provision failure
+	// to bound the block it records. Absent/unparseable means the handler's built-in
+	// default TTL.
+	BlocklistTTLAnnotation = "nebula.inftyai.com/blocklist-ttl"
+
 	// TerminateInstanceFinalizer is held by every NodeClaim to guarantee teardown.
 	// The virtual kubelet owns the happy path (DeletePod → provider.Terminate,
 	// keyed on the Pod-derived claim name), but its teardown is edge-triggered and

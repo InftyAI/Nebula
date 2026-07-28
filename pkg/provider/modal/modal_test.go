@@ -278,7 +278,7 @@ func TestClassifyProvisionError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := p.ClassifyProvisionError(tt.err)
+			got := p.ClassifyProvisionError(tt.err, "")
 			if got != tt.want {
 				t.Fatalf("got %+v, want %+v", got, tt.want)
 			}

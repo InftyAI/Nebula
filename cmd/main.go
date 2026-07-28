@@ -45,7 +45,9 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/internal/controller"
 	webhookv1 "github.com/InftyAI/Nebula/internal/webhook/v1"
+	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
 	"github.com/InftyAI/Nebula/pkg/vnode"
@@ -219,6 +221,13 @@ func main() {
 	// startup already sees its provider.
 	registerProviders(context.Background())
 
+	// One shared failover blocklist, written by the virtual kubelet handlers on a
+	// Provision failure and read by the placement controller to skip a candidate
+	// that just failed (zone → region → tier). It is in-memory, process-wide state
+	// (empty on restart, self-refilling), so a single instance is threaded into
+	// both sides rather than persisted.
+	blocklist := failover.New()
+
 	if err := (&controller.NodePoolReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -234,8 +243,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.PodPlacementReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Blocklist: blocklist,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PodPlacement")
 		os.Exit(1)
@@ -246,7 +256,7 @@ func main() {
 	// provider.Terminate on DeletePod, so an ungated Pod bound to a provider's
 	// virtual node materializes an external instance. Each Runner is a
 	// manager.Runnable, so it shares the manager's lifecycle and leader election.
-	if err := setupVirtualNodes(mgr); err != nil {
+	if err := setupVirtualNodes(mgr, blocklist); err != nil {
 		setupLog.Error(err, "unable to set up virtual nodes")
 		os.Exit(1)
 	}
@@ -295,7 +305,7 @@ func main() {
 // provider. The Runner needs a typed clientset (the virtual kubelet's node/pod
 // controllers use client-go directly, not the controller-runtime client), built
 // from the same rest.Config the manager uses.
-func setupVirtualNodes(mgr ctrl.Manager) error {
+func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister) error {
 	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		return err
@@ -305,7 +315,7 @@ func setupVirtualNodes(mgr ctrl.Manager) error {
 		if !ok {
 			continue
 		}
-		if err := mgr.Add(vnode.NewRunner(prov, clientset)); err != nil {
+		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist)); err != nil {
 			return err
 		}
 		setupLog.Info("registered virtual node", "provider", name, "node", vnode.NodeName(name))
@@ -322,6 +332,21 @@ func setupVirtualNodes(mgr ctrl.Manager) error {
 func registerProviders(ctx context.Context) {
 	if p, err := modal.NewSDKClient(ctx, os.Getenv("MODAL_APP_NAME")); err != nil {
 		setupLog.Info("skipping Modal provider registration", "reason", err.Error())
+	} else {
+		provider.Register(p)
+		setupLog.Info("registered provider", "provider", p.Name())
+	}
+
+	// AWS. Region is the only NON-SECRET config, read from AWS_REGION (empty => the
+	// SDK resolves its default from shared config / IMDS). The adapter is otherwise
+	// self-configuring: it resolves the GPU AMI and default-VPC subnets itself, so
+	// no launch template or pre-created infra is needed. Credentials are secrets and
+	// are NEVER read here: the SDK client uses the default credential chain (IRSA /
+	// instance-role / AWS_ACCESS_KEY_ID delivered via a Secret), so nothing
+	// sensitive touches a flag or this call. When AWS is not configured (no
+	// resolvable region, no GPU AMI in the region), registration is a non-fatal skip.
+	if p, err := awsprovider.NewSDKClient(ctx, os.Getenv("AWS_REGION")); err != nil {
+		setupLog.Info("skipping AWS provider registration", "reason", err.Error())
 	} else {
 		provider.Register(p)
 		setupLog.Info("registered provider", "provider", p.Name())

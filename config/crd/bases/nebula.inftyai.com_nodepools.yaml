@@ -55,18 +55,23 @@ spec:
               resolves along two orthogonal axes, and the ORDER between them is\nfixed:
               capacity type first, provider second.\n\n\tFOR each capacityType in
               CapacityTypes (in listed order):   // outer: hard tier\n\t    candidates
-              = Providers x {this capacityType}, available now, minus blocklist\n\t
+              = Providers x (each provider's Regions) x {this capacityType},\n\t                 available
+              now, minus blocklist                // region nests per provider\n\t
               \   IF candidates non-empty:\n\t        pick one via Strategy (LowestPrice
-              | Ordered | Weighted) // inner: rank providers\n\t        DONE\n\t    //
-              else fall through to the next capacity tier\n\nSo CapacityTypes is a
-              hard preference: every provider's Spot is tried before\nANY provider's
-              OnDemand. This is deliberate — \"spot everywhere before any\non-demand\"
-              is the least surprising behaviour, even if a different provider's\non-demand
-              were momentarily cheaper. Strategy only ranks providers *within*\nthe
-              active capacity tier; it never crosses tiers.\n\nThe Weighted strategy
-              requires a weight on every provider ref. This is a\nstatic property
-              of the spec, so it is enforced at admission by the CEL rule\nbelow rather
-              than surfaced as a status condition after the fact."
+              | Ordered | Weighted) // inner: rank candidates\n\t        DONE\n\t
+              \   // else fall through to the next capacity tier\n\nRegion is a per-provider
+              axis (see ProviderSpec.Regions), nested under each\nprovider because
+              a region name only means something to one provider. It\nwidens the candidate
+              key to {provider, region, accelerator, capacityType}\nwithout changing
+              the tier-first ordering above.\n\nSo CapacityTypes is a hard preference:
+              every provider's Spot is tried before\nANY provider's OnDemand. This
+              is deliberate — \"spot everywhere before any\non-demand\" is the least
+              surprising behaviour, even if a different provider's\non-demand were
+              momentarily cheaper. Strategy only ranks providers *within*\nthe active
+              capacity tier; it never crosses tiers.\n\nThe Weighted strategy requires
+              a weight on every provider ref. This is a\nstatic property of the spec,
+              so it is enforced at admission by the CEL rule\nbelow rather than surfaced
+              as a status condition after the fact."
             properties:
               capacityTypes:
                 default:
@@ -109,14 +114,41 @@ spec:
                   list. Order is significant only for the Ordered strategy (it is the
                   inner, provider-ranking axis).
                 items:
-                  description: ProviderRef names a provider and, for the Weighted
-                    strategy, its share.
+                  description: |-
+                    ProviderSpec is one provider's entry in a pool: which provider, and the
+                    per-provider placement policy (Weighted share, allowed regions). It is not a
+                    mere reference — it carries config — so it is a Spec, not a Ref.
                   properties:
                     name:
                       description: |-
                         Name is the provider identifier, matching the ProviderLabel value on that
                         provider's virtual node (e.g. "runpod", "modal", "kubernetes").
                       type: string
+                    regions:
+                      description: |-
+                        Regions constrains this provider to a subset of its regions, in the
+                        provider's OWN vocabulary (e.g. ["us-east-1","eu-west-2"] for AWS). Region
+                        is provider-namespaced — there is no cross-provider region vocabulary — so
+                        it lives here per provider, not on the pool. Two cases:
+                          - omitted/empty => the provider's configured default region (the region
+                            its client resolved from env/config/instance metadata at startup). This
+                            is the no-surprise default for region-simple providers (Modal, RunPod),
+                            which have a single region and ignore this field.
+                          - explicit list => exactly those regions.
+                        AWS is the exception: it is region-aware with no meaningful single default,
+                        so a `- name: aws` entry MUST list at least one region. That is enforced at
+                        admission by the CEL rule on NodePoolSpec (a per-provider requirement, so it
+                        belongs on the spec where all provider entries are visible, not as a blanket
+                        MinItems that would burden region-simple providers). An "all regions"
+                        wildcard is intentionally NOT supported yet: it only makes sense once the
+                        price-ranking optimizer can expand it against the provider's catalog and
+                        choose among the results, so it is reserved for then. At most 8 regions;
+                        maxLength bounds each entry.
+                      items:
+                        maxLength: 32
+                        type: string
+                      maxItems: 8
+                      type: array
                     weight:
                       description: |-
                         Weight is the relative share of new placements for the Weighted strategy.
@@ -145,6 +177,9 @@ spec:
             x-kubernetes-validations:
             - message: strategy Weighted requires a weight on every provider
               rule: self.strategy != 'Weighted' || self.providers.all(p, has(p.weight))
+            - message: provider aws requires at least one region
+              rule: self.providers.all(p, p.name != 'aws' || (has(p.regions) && size(p.regions)
+                > 0))
           status:
             description: NodePoolStatus surfaces the current placement picture for
               observability.

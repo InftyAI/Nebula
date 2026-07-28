@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -49,15 +50,33 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 	return &pool, nil
 }
 
-// selectPlacement implements the v1 "first matching provider" policy: walk the
-// pool's providers in listed order and pick the first whose adapter offers the
-// Pod's requested GPU type. The capacity tier is the pool's first preference
-// (the outer axis); provider quirks (e.g. Modal being OnDemand-only) are handled
-// at Provision time, not here. Returns ok=false when nothing matches.
+// selectPlacement resolves the pool's policy along the two orthogonal axes, in the
+// fixed order the NodePoolSpec doc mandates: capacity tier is the OUTER axis and
+// region (nested per provider) is the INNER one. It walks
 //
-// This is the seam the richer optimizer replaces later (price ranking, capacity
-// fallback, blocklist); the caller's flow does not depend on how the choice is
-// made, only that a (provider, capacityType) comes back.
+//	FOR each capacityType in CapacityTypes (listed order):   // outer: hard tier
+//	    FOR each provider (listed order = Ordered strategy):
+//	        FOR each of that provider's regions:              // inner
+//	            skip if the candidate is blocklisted; else place here
+//
+// so every provider's Spot is tried (in every one of its regions) before ANY
+// provider's OnDemand — "capacity is the outer axis". Skipping blocklisted
+// candidates is what turns a single provision failure into failover: a region-
+// scoped block (a Spot limit in us-east-1) advances to the next region, then the
+// next tier, without hot-looping against the placement that just failed. The
+// adapter already handled the finer zone axis (sweeping a region's AZs) before the
+// failure ever reached the blocklist, so this loop only walks regions, not zones.
+//
+// Returns ok=false when every (tier, provider, region) candidate is either
+// unservable (provider unregistered or does not offer the accelerator) or blocked;
+// the caller then leaves the Pod gated for a later retry (a pool edit, a provider
+// registering, or a block expiring). Provider quirks (e.g. Modal being
+// OnDemand-only) are still handled at Provision time, not here.
+//
+// Strategy (LowestPrice/Weighted price-ranking) is a later swap-in for the inner
+// ordering; today the inner walk is listed order (Ordered), which the caller's
+// flow does not depend on — only that a (provider, capacityType, region) comes
+// back.
 func (r *PodPlacementReconciler) selectPlacement(pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool) {
 	// Only the accelerator type is needed for matching; the count is a provisioning
 	// detail the adapter reads. A malformed request is treated as "no accelerator"
@@ -65,33 +84,71 @@ func (r *PodPlacementReconciler) selectPlacement(pod *corev1.Pod, pool *nebulav1
 	// would surface the real error.
 	accel, _, _ := util.AcceleratorRequest(pod)
 
-	for _, ref := range pool.Spec.Providers {
-		prov, ok := r.provider(ref.Name)
-		if !ok {
-			continue // unregistered; NodePool status surfaces this separately
-		}
-		// A CPU-only Pod (no accelerator) matches any provider; an accelerator Pod
-		// only matches a provider whose catalog maps that accelerator.
-		if accel != "" {
-			if _, offered := prov.MapAccelerator(accel); !offered {
-				continue
+	for _, tier := range capacityTiers(pool) { // outer: capacity
+		for _, ref := range pool.Spec.Providers { // provider (Ordered = listed order)
+			prov, ok := r.provider(ref.Name)
+			if !ok {
+				continue // unregistered; NodePool status surfaces this separately
+			}
+			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
+			// Pod only matches a provider whose catalog maps that accelerator.
+			if accel != "" {
+				if _, offered := prov.MapAccelerator(accel); !offered {
+					continue
+				}
+			}
+			for _, region := range regionsFor(ref) { // inner: region
+				if r.blocked(ref.Name, accel, tier, region) {
+					continue // failed recently; try the next region, then the next tier
+				}
+				return placement{
+					provider:     ref.Name,
+					capacityType: tier,
+					region:       region,
+				}, true
 			}
 		}
-		return placement{
-			provider:     ref.Name,
-			capacityType: preferredCapacityType(pool),
-		}, true
 	}
 	return placement{}, false
 }
 
-// preferredCapacityType is the pool's first-choice tier (the outer axis's head).
-// v1 does not do cross-tier fallback here; empty means "provider default".
-func preferredCapacityType(pool *nebulav1alpha1.NodePool) nebulav1alpha1.CapacityType {
+// capacityTiers is the outer axis to walk: the pool's CapacityTypes in fallback
+// order. An empty list means "the provider default tier" — a single unnamed
+// candidate ("") so the walk still runs once. (Admission defaults the field, so
+// this only guards a hand-built pool.)
+func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType {
 	if len(pool.Spec.CapacityTypes) == 0 {
-		return ""
+		return []nebulav1alpha1.CapacityType{""}
 	}
-	return pool.Spec.CapacityTypes[0]
+	return pool.Spec.CapacityTypes
+}
+
+// regionsFor is the inner axis for one provider ref: the regions to try, in listed
+// order. An empty/omitted list means "the provider's configured default region",
+// represented as a single empty-string candidate so the walk runs once for
+// region-simple providers (Modal, RunPod). AWS is required by admission to list at
+// least one region (the CEL rule on NodePoolSpec). An "all regions" wildcard is not
+// supported yet (see ProviderSpec.Regions), so there is nothing to expand here.
+func regionsFor(ref nebulav1alpha1.ProviderSpec) []string {
+	if len(ref.Regions) == 0 {
+		return []string{""} // omitted => provider default region (region-simple providers)
+	}
+	return ref.Regions
+}
+
+// blocked reports whether the (provider, accelerator, tier, region) candidate is
+// currently excluded by the failover blocklist. It is nil-safe: with no blocklist
+// wired (tests, or a blocklist-less build) nothing is ever blocked.
+func (r *PodPlacementReconciler) blocked(provName, accel string, tier nebulav1alpha1.CapacityType, region string) bool {
+	if r.Blocklist == nil {
+		return false
+	}
+	return r.Blocklist.Blocked(failover.Candidate{
+		Provider:        provName,
+		AcceleratorType: accel,
+		CapacityType:    tier,
+		Region:          region,
+	})
 }
 
 // ensureClaim creates the NodeClaim for this placement if it does not already
@@ -127,6 +184,7 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 			},
 			Provider:     p.provider,
 			CapacityType: p.capacityType,
+			Region:       p.region,
 			PoolRef:      pool.Name,
 		},
 	}
@@ -156,20 +214,26 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 // place stamps the routing decision onto the Pod and removes the gate, atomically
 // from the Pod's perspective (one Update). After this, the scheduler is free to
 // bind the Pod to the chosen provider's virtual node.
-func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, p placement) error {
+func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, p placement) error {
 	// Route to the provider's virtual node.
 	if pod.Spec.NodeSelector == nil {
 		pod.Spec.NodeSelector = map[string]string{}
 	}
 	pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] = p.provider
 
-	// Carry the capacity tier the VK handler reads on CreatePod (the one input
-	// that is not otherwise on the Pod). Skip when empty (provider default).
+	// Carry the capacity tier and region the VK handler reads on CreatePod (inputs
+	// that are not otherwise on the Pod). Skip each when empty (provider default).
 	if p.capacityType != "" {
-		if pod.Annotations == nil {
-			pod.Annotations = map[string]string{}
-		}
-		pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation] = string(p.capacityType)
+		setAnnotation(pod, nebulav1alpha1.CapacityTypeAnnotation, string(p.capacityType))
+	}
+	if p.region != "" {
+		setAnnotation(pod, nebulav1alpha1.RegionAnnotation, p.region)
+	}
+	// Carry the pool's blocklist TTL so the VK handler (which never sees the pool)
+	// knows how long to exclude a placement that fails. Only stamp an explicit
+	// policy value; an unset policy leaves the handler on its own default.
+	if pool.Spec.Failover != nil && pool.Spec.Failover.BlocklistTTL.Duration > 0 {
+		setAnnotation(pod, nebulav1alpha1.BlocklistTTLAnnotation, pool.Spec.Failover.BlocklistTTL.Duration.String())
 	}
 
 	// Remove our gate, releasing the Pod to the scheduler. Preserve any other
@@ -177,6 +241,14 @@ func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, p p
 	pod.Spec.SchedulingGates = removeGate(pod.Spec.SchedulingGates, nebulav1alpha1.ProviderSelectionGate)
 
 	return r.Update(ctx, pod)
+}
+
+// setAnnotation sets one annotation on the Pod, allocating the map on first use.
+func setAnnotation(pod *corev1.Pod, key, value string) {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[key] = value
 }
 
 // removeGate returns gates with the named gate removed, preserving order.

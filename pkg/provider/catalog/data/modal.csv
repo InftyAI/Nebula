@@ -10,21 +10,29 @@
 # accelerator column defines both the supported set + price (for the optimizer)
 # and, since Modal names its GPUs identically to Nebula's canonical names, the
 # accelerator vocabulary MapAccelerator resolves against. No accelerator table
-# lives in Go anymore. (If a future provider's identifiers diverge from the
-# canonical names, add a provider_id column here rather than a Go map.)
+# lives in Go anymore.
 #
-# Columns:
-#   accelerator    canonical Nebula accelerator type
-#   capacity_type  Spot | OnDemand | Reserved
-#   price_per_hour approximate on-demand USD/GPU-hour
-#   available      whether Modal currently offers it (a live probe may override)
-#   updated        YYYY-MM-DD the row was last verified
-accelerator,capacity_type,price_per_hour,available,updated
-T4,OnDemand,0.59,true,2026-07-25
-L4,OnDemand,0.80,true,2026-07-25
-A10G,OnDemand,1.10,true,2026-07-25
-L40S,OnDemand,1.95,true,2026-07-25
-A100-40GB,OnDemand,2.10,true,2026-07-25
-A100-80GB,OnDemand,2.50,true,2026-07-25
-H100,OnDemand,3.95,true,2026-07-25
-H200,OnDemand,4.55,true,2026-07-25
+# Columns (shared header across all provider CSVs; unused cells left blank):
+#   accelerator_type  canonical Nebula accelerator type
+#   accelerator_id    BLANK — Modal names its GPUs exactly like the canonical types,
+#                     so the mapping is identity and MapAccelerator falls back to
+#                     accelerator_type. A provider whose ids diverge (AWS instance
+#                     types) fills it in.
+#   gpu_count         BLANK — Modal takes the accelerator count as a runtime
+#                     parameter (off the Pod's nvidia.com/gpu resource), so it is
+#                     not a catalog lookup dimension. AWS, where the count is baked
+#                     into the instance type, fills it in.
+#   capacity_type     Spot | OnDemand | Reserved
+#   price_per_hour    approximate on-demand USD/GPU-hour
+#   available         whether Modal currently offers it (a live probe may override)
+#   region            BLANK — Modal is region-simple
+#   updated           YYYY-MM-DD the row was last verified
+accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
+T4,,,OnDemand,0.59,true,,2026-07-25
+L4,,,OnDemand,0.80,true,,2026-07-25
+A10G,,,OnDemand,1.10,true,,2026-07-25
+L40S,,,OnDemand,1.95,true,,2026-07-25
+A100-40GB,,,OnDemand,2.10,true,,2026-07-25
+A100-80GB,,,OnDemand,2.50,true,,2026-07-25
+H100,,,OnDemand,3.95,true,,2026-07-25
+H200,,,OnDemand,4.55,true,,2026-07-25

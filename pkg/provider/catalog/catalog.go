@@ -119,48 +119,98 @@ func (c *Catalog) Offerings(providerName string) []provider.Offering {
 	return out
 }
 
+// Required and optional CSV column names. Parsing is header-driven (by name, not
+// position) so a provider can add the optional columns — or reorder — without a
+// parser change, and NeoCloud CSVs stay in the original minimal form.
+const (
+	colAccelerator   = "accelerator_type" // required: canonical Nebula accelerator type
+	colAcceleratorID = "accelerator_id"   // optional: provider's own accelerator id (e.g. AWS instance type)
+	colCapacityType  = "capacity_type"    // required: Spot | OnDemand | Reserved
+	colPrice         = "price_per_hour"   // required: approximate USD/GPU-hour
+	colAvailable     = "available"        // required: whether the provider offers it
+	colGPUCount      = "gpu_count"        // optional: accelerators the id provides (AWS: baked into instance type)
+	colRegion        = "region"           // optional: provider region this row prices
+	colUpdated       = "updated"          // optional: documentation only, ignored
+)
+
 // parseCSV reads offering rows. Lines beginning with '#' are comments; the first
-// non-comment line is the header. Column order is fixed:
-// accelerator,capacity_type,price_per_hour,available,updated. The trailing
-// updated column is documentation only and ignored here.
-//
-// There is deliberately no provider_id column yet: every provider we currently
-// support (Modal) names its accelerators identically to Nebula's canonical
-// names, so MapAccelerator is pure identity. When a provider whose identifiers
-// diverge lands (e.g. RunPod's "NVIDIA H100 80GB HBM3"), add a provider_id
-// column here and have MapAccelerator return it — no per-provider Go table.
+// non-comment line is the header, and columns are resolved BY NAME from it, so
+// order does not matter and optional columns may be absent. Required columns:
+// accelerator_type, capacity_type, price_per_hour, available. Optional columns:
+// accelerator_id (a provider's own accelerator id, e.g. AWS "p5.48xlarge", for a
+// provider whose MapAccelerator override translates canonical names — for Modal,
+// whose mapping is identity, it is simply left blank), gpu_count (how many
+// accelerators the id provides, a lookup dimension only where the count is baked
+// into the offering — AWS instance types — and blank/0 for providers that take
+// the count as a runtime parameter, like Modal), region (the provider region a
+// row prices, for region-aware providers), and updated (documentation only).
 func parseCSV(r io.Reader) ([]provider.Offering, error) {
 	cr := csv.NewReader(r)
 	cr.Comment = '#'
-	cr.FieldsPerRecord = -1 // tolerate a trailing "updated" column we ignore
+	cr.FieldsPerRecord = -1 // rows may carry a different column count than legacy fixed-order
 	cr.TrimLeadingSpace = true
 
 	records, err := cr.ReadAll()
 	if err != nil {
 		return nil, err
 	}
+	if len(records) == 0 {
+		return nil, nil
+	}
 
-	offerings := make([]provider.Offering, 0, len(records))
+	// Map header names to column indices.
+	idx := make(map[string]int, len(records[0]))
+	for i, h := range records[0] {
+		idx[strings.TrimSpace(h)] = i
+	}
+	for _, req := range []string{colAccelerator, colCapacityType, colPrice, colAvailable} {
+		if _, ok := idx[req]; !ok {
+			return nil, fmt.Errorf("missing required column %q in header", req)
+		}
+	}
+
+	// field returns the named column's value for a row, or "" if the column is
+	// absent (optional) or the row is short.
+	field := func(rec []string, name string) string {
+		i, ok := idx[name]
+		if !ok || i >= len(rec) {
+			return ""
+		}
+		return strings.TrimSpace(rec[i])
+	}
+
+	offerings := make([]provider.Offering, 0, len(records)-1)
 	for i, rec := range records {
 		if i == 0 {
 			continue // header
 		}
-		if len(rec) < 4 {
-			return nil, fmt.Errorf("row %d: expected >=4 columns, got %d", i, len(rec))
-		}
-		price, err := strconv.ParseFloat(strings.TrimSpace(rec[2]), 64)
+		price, err := strconv.ParseFloat(field(rec, colPrice), 64)
 		if err != nil {
-			return nil, fmt.Errorf("row %d: price_per_hour %q: %w", i, rec[2], err)
+			return nil, fmt.Errorf("row %d: price_per_hour %q: %w", i, field(rec, colPrice), err)
 		}
-		available, err := strconv.ParseBool(strings.TrimSpace(rec[3]))
+		available, err := strconv.ParseBool(field(rec, colAvailable))
 		if err != nil {
-			return nil, fmt.Errorf("row %d: available %q: %w", i, rec[3], err)
+			return nil, fmt.Errorf("row %d: available %q: %w", i, field(rec, colAvailable), err)
+		}
+		// gpu_count is optional; blank => 0 (not a lookup dimension for this
+		// provider, e.g. Modal, which takes the count as a runtime parameter). A
+		// present-but-unparseable value is an error, not a silent 0.
+		var gpuCount int32
+		if v := field(rec, colGPUCount); v != "" {
+			n, err := strconv.ParseInt(v, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("row %d: gpu_count %q: %w", i, v, err)
+			}
+			gpuCount = int32(n)
 		}
 		offerings = append(offerings, provider.Offering{
-			AcceleratorType: strings.TrimSpace(rec[0]),
-			CapacityType:    nebulav1alpha1.CapacityType(strings.TrimSpace(rec[1])),
+			AcceleratorType: field(rec, colAccelerator),
+			CapacityType:    nebulav1alpha1.CapacityType(field(rec, colCapacityType)),
 			PricePerHour:    price,
 			Available:       available,
+			Region:          field(rec, colRegion),
+			AcceleratorID:   field(rec, colAcceleratorID),
+			GPUCount:        gpuCount,
 		})
 	}
 	return offerings, nil

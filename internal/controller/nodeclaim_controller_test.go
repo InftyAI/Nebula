@@ -73,7 +73,7 @@ func (f *fakeProvider) MapAccelerator(c string) (string, bool) {
 	}
 	return "", false
 }
-func (f *fakeProvider) ClassifyProvisionError(error) provider.BlockScope {
+func (f *fakeProvider) ClassifyProvisionError(error, string) provider.BlockScope {
 	return provider.BlockScope{}
 }
 

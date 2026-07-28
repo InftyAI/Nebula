@@ -1,0 +1,35 @@
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: nebula
+  name: aws
+spec:
+  # Place onto AWS EC2. The provider name must match the ProviderLabel value on
+  # the AWS virtual node ("aws"); the adapter registers whenever the manager has a
+  # resolvable region (AWS_REGION or the SDK default chain) and credentials (IRSA /
+  # instance role / keys) — it self-configures the GPU AMI and subnets, so no other
+  # setup is needed. Otherwise the pool reports Ready=False/UnknownProvider.
+  providers:
+  - name: aws
+    # regions is per-provider and in AWS's OWN vocabulary. Unlike region-simple
+    # providers (Modal), AWS is region-aware with no meaningful default, so at
+    # least one region is REQUIRED here (enforced at admission). List more to
+    # widen the candidate set; prices are similar across regions, so which types
+    # are actually offered is resolved by the live probe.
+    regions:
+    - us-east-1
+    # - us-west-2
+  # Outer axis: prefer cheap interruptible Spot, fall back to OnDemand when Spot
+  # capacity is exhausted. (EC2 has a real Spot tier with a ~2-minute notice; a
+  # Spot no-capacity failure blocks only Spot in that region, so OnDemand is still
+  # tried.) Reserved is omitted — EC2 Reserved is a billing construct, not a
+  # distinct provisioning path here.
+  capacityTypes:
+  - Spot
+  - OnDemand
+  # Inner axis: within the active capacity tier. A single-provider pool makes this
+  # a no-op, but LowestPrice is the natural choice once more AWS regions are listed.
+  strategy: LowestPrice
+  failover:
+    blocklistTTL: 10m

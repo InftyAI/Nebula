@@ -62,6 +62,14 @@ fi
 PROVIDER_SECRETS=(
   # Only secrets belong here.
   "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|"
+  # AWS: creds are the only secret. The access key + secret are required together
+  # (a lone key is a misconfig), so a blank pair skips the Secret — the SDK then
+  # relies on IRSA / instance role, which is the preferred path. AWS_SESSION_TOKEN
+  # is OPTIONAL: it is REQUIRED for temporary STS/SSO creds (ASIA... keys) and
+  # unused for long-lived IAM user keys (AKIA...), so it is only added to the
+  # Secret when set. The region is NON-SECRET and lives on the manager Deployment,
+  # not in this Secret; the adapter self-configures the rest (GPU AMI + subnets).
+  "nebula-aws-credentials|AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN"
   # "nebula-runpod-credentials|RUNPOD_API_KEY|"
 )
 

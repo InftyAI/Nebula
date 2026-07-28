@@ -51,6 +51,12 @@ const (
 //	Pending    -> PodPending, Ready=False (starting)
 //	Failed     -> PodFailed
 //	Terminated -> PodFailed (instance gone: torn down or reclaimed out-of-band)
+//
+// Running already means "reachable": a provider only reports InstanceRunning once
+// the instance has passed its readiness bar (for AWS, the 2/2 EC2 status checks —
+// see toState), so reaching Running is the point at which the Pod is both Running
+// and Ready. Ready is the condition Kubernetes counts toward a Deployment's ready
+// replicas.
 func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, now metav1.Time) {
 	switch state {
 	case provider.InstanceRunning:

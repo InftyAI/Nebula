@@ -31,6 +31,16 @@ type NodeClaimSpec struct {
 	// +optional
 	CapacityType CapacityType `json:"capacityType,omitempty"`
 
+	// Region is the provider region the placement optimizer selected, in the
+	// provider's own vocabulary (e.g. AWS "us-east-1"). Stored durably alongside
+	// Provider/CapacityType because it is a provisioning input that cannot be read
+	// off the Pod, and Provision needs it to re-issue the request in the same
+	// region after a controller restart. Immutable, like Provider. Empty means
+	// "the provider's configured default region" — region-simple providers (Modal,
+	// RunPod) leave it empty.
+	// +optional
+	Region string `json:"region,omitempty"`
+
 	// PoolRef is the NodePool whose policy produced this claim, for reporting.
 	// +optional
 	PoolRef string `json:"poolRef,omitempty"`

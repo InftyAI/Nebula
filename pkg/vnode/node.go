@@ -72,17 +72,21 @@ func NodeName(providerName string) string {
 // 0.33 line this project pins. Nebula does not serve the kubelet API (logs/exec
 // are unsupported — see handler.go), so none of that surface is needed.
 type Runner struct {
-	prov     provider.Provider
-	client   kubernetes.Interface
-	nodeName string
+	prov      provider.Provider
+	client    kubernetes.Interface
+	blocklist Blocklister
+	nodeName  string
 }
 
-// NewRunner builds the virtual-node runner for one provider.
-func NewRunner(prov provider.Provider, client kubernetes.Interface) *Runner {
+// NewRunner builds the virtual-node runner for one provider. blocklist is the
+// shared failover blocklist the handler records Provision failures on (may be
+// nil).
+func NewRunner(prov provider.Provider, client kubernetes.Interface, blocklist Blocklister) *Runner {
 	return &Runner{
-		prov:     prov,
-		client:   client,
-		nodeName: NodeName(prov.Name()),
+		prov:      prov,
+		client:    client,
+		blocklist: blocklist,
+		nodeName:  NodeName(prov.Name()),
 	}
 }
 
@@ -93,7 +97,7 @@ var _ manager.Runnable = (*Runner)(nil)
 func (r *Runner) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithValues("virtualNode", r.nodeName, "provider", r.prov.Name())
 
-	handler := NewHandler(r.prov)
+	handler := NewHandler(r.prov, r.blocklist)
 	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
 
 	// Pod informer scoped to this node only (spec.nodeName == nodeName), so the
