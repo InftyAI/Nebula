@@ -12,11 +12,17 @@ import (
 // fixed: capacity type first, provider second.
 //
 //	FOR each capacityType in CapacityTypes (in listed order):   // outer: hard tier
-//	    candidates = Providers x {this capacityType}, available now, minus blocklist
+//	    candidates = Providers x (each provider's Regions) x {this capacityType},
+//	                 available now, minus blocklist                // region nests per provider
 //	    IF candidates non-empty:
-//	        pick one via Strategy (LowestPrice | Ordered | Weighted) // inner: rank providers
+//	        pick one via Strategy (LowestPrice | Ordered | Weighted) // inner: rank candidates
 //	        DONE
 //	    // else fall through to the next capacity tier
+//
+// Region is a per-provider axis (see ProviderSpec.Regions), nested under each
+// provider because a region name only means something to one provider. It
+// widens the candidate key to {provider, region, accelerator, capacityType}
+// without changing the tier-first ordering above.
 //
 // So CapacityTypes is a hard preference: every provider's Spot is tried before
 // ANY provider's OnDemand. This is deliberate — "spot everywhere before any
@@ -28,13 +34,14 @@ import (
 // static property of the spec, so it is enforced at admission by the CEL rule
 // below rather than surfaced as a status condition after the fact.
 // +kubebuilder:validation:XValidation:rule="self.strategy != 'Weighted' || self.providers.all(p, has(p.weight))",message="strategy Weighted requires a weight on every provider"
+// +kubebuilder:validation:XValidation:rule="self.providers.all(p, p.name != 'aws' || (has(p.regions) && size(p.regions) > 0))",message="provider aws requires at least one region"
 type NodePoolSpec struct {
 	// Providers is the ordered set of NeoClouds this pool is allowed to use.
 	// A Pod bound to this pool can only ever be placed on a provider in this
 	// list. Order is significant only for the Ordered strategy (it is the
 	// inner, provider-ranking axis).
 	// +kubebuilder:validation:MinItems=1
-	Providers []ProviderRef `json:"providers"`
+	Providers []ProviderSpec `json:"providers"`
 
 	// CapacityTypes is the OUTER axis: the purchase models to try, in fallback
 	// order. e.g. [Spot, OnDemand] means "use spot on any provider first; only
@@ -57,8 +64,10 @@ type NodePoolSpec struct {
 	Failover *FailoverPolicy `json:"failover,omitempty"`
 }
 
-// ProviderRef names a provider and, for the Weighted strategy, its share.
-type ProviderRef struct {
+// ProviderSpec is one provider's entry in a pool: which provider, and the
+// per-provider placement policy (Weighted share, allowed regions). It is not a
+// mere reference — it carries config — so it is a Spec, not a Ref.
+type ProviderSpec struct {
 	// Name is the provider identifier, matching the ProviderLabel value on that
 	// provider's virtual node (e.g. "runpod", "modal", "kubernetes").
 	Name string `json:"name"`
@@ -68,6 +77,29 @@ type ProviderRef struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Weight *int32 `json:"weight,omitempty"`
+
+	// Regions constrains this provider to a subset of its regions, in the
+	// provider's OWN vocabulary (e.g. ["us-east-1","eu-west-2"] for AWS). Region
+	// is provider-namespaced — there is no cross-provider region vocabulary — so
+	// it lives here per provider, not on the pool. Two cases:
+	//   - omitted/empty => the provider's configured default region (the region
+	//     its client resolved from env/config/instance metadata at startup). This
+	//     is the no-surprise default for region-simple providers (Modal, RunPod),
+	//     which have a single region and ignore this field.
+	//   - explicit list => exactly those regions.
+	// AWS is the exception: it is region-aware with no meaningful single default,
+	// so a `- name: aws` entry MUST list at least one region. That is enforced at
+	// admission by the CEL rule on NodePoolSpec (a per-provider requirement, so it
+	// belongs on the spec where all provider entries are visible, not as a blanket
+	// MinItems that would burden region-simple providers). An "all regions"
+	// wildcard is intentionally NOT supported yet: it only makes sense once the
+	// price-ranking optimizer can expand it against the provider's catalog and
+	// choose among the results, so it is reserved for then. At most 8 regions;
+	// maxLength bounds each entry.
+	// +optional
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=32
+	Regions []string `json:"regions,omitempty"`
 }
 
 // PlacementStrategy ranks providers WITHIN a capacity tier (the inner axis).

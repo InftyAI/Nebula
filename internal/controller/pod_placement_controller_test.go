@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,8 +30,35 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
+
+// fakeBlocklist is a test Blocklister that reports a fixed set of candidates as
+// blocked. A candidate is blocked when it matches an entry on every NON-empty
+// field (empty fields are wildcards), mirroring the real blocklist's coverage.
+type fakeBlocklist struct {
+	blocked []failover.Candidate
+}
+
+func (b *fakeBlocklist) Blocked(c failover.Candidate) bool {
+	for _, e := range b.blocked {
+		if e.Provider != "" && e.Provider != c.Provider {
+			continue
+		}
+		if e.AcceleratorType != "" && e.AcceleratorType != c.AcceleratorType {
+			continue
+		}
+		if e.CapacityType != "" && e.CapacityType != c.CapacityType {
+			continue
+		}
+		if e.Region != "" && e.Region != c.Region {
+			continue
+		}
+		return true
+	}
+	return false
+}
 
 // newPlacementReconciler wires a PodPlacementReconciler over a fake client.
 func newPlacementReconciler(t *testing.T, objs []client.Object, provs ...*fakeProvider) (*PodPlacementReconciler, client.Client) {
@@ -74,14 +102,26 @@ func gatedPod(name, ns, uid, pool, gpu string) *corev1.Pod {
 }
 
 func poolWith(name string, capTypes []nebulav1alpha1.CapacityType, providers ...string) *nebulav1alpha1.NodePool {
-	refs := make([]nebulav1alpha1.ProviderRef, 0, len(providers))
+	refs := make([]nebulav1alpha1.ProviderSpec, 0, len(providers))
 	for _, p := range providers {
-		refs = append(refs, nebulav1alpha1.ProviderRef{Name: p})
+		refs = append(refs, nebulav1alpha1.ProviderSpec{Name: p})
 	}
 	return &nebulav1alpha1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: nebulav1alpha1.NodePoolSpec{
 			Providers:     refs,
+			CapacityTypes: capTypes,
+		},
+	}
+}
+
+// poolWithRegions builds a single-provider pool whose provider ref lists the given
+// regions, with the given capacity-type fallback order.
+func poolWithRegions(name string, capTypes []nebulav1alpha1.CapacityType, providerName string, regions ...string) *nebulav1alpha1.NodePool {
+	return &nebulav1alpha1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: nebulav1alpha1.NodePoolSpec{
+			Providers:     []nebulav1alpha1.ProviderSpec{{Name: providerName, Regions: regions}},
 			CapacityTypes: capTypes,
 		},
 	}
@@ -334,6 +374,97 @@ func TestPlacement_IdempotentOnRetry(t *testing.T) {
 	final := getPod(t, c, "default", "p1")
 	if hasGateNamed(final) {
 		t.Fatal("expected the Pod placed again on retry")
+	}
+}
+
+func TestPlacement_FailsOverToNextRegionWhenBlocked(t *testing.T) {
+	// The pool lists two regions on one provider. us-east-1 is blocklisted, so the
+	// inner region walk advances to us-west-2 within the SAME capacity tier.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, "us-east-1", "us-west-2")
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
+		{Provider: provider.ProviderModal, AcceleratorType: "H100", CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"},
+	}}
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if got.Annotations[nebulav1alpha1.RegionAnnotation] != "us-west-2" {
+		t.Fatalf("expected failover to us-west-2, got region %q", got.Annotations[nebulav1alpha1.RegionAnnotation])
+	}
+}
+
+func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
+	// Two providers, tiers [Spot, OnDemand]. Spot is blocked on BOTH providers but
+	// OnDemand is free. Capacity is the OUTER axis, so the walk must exhaust every
+	// provider's Spot before dropping any provider to OnDemand — landing on the
+	// first provider's OnDemand, not the second provider's (still-Spot) offer.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand},
+		"runpod", provider.ProviderModal)
+	runpod := &fakeProvider{name: "runpod", gpus: []string{"H100"}}
+	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, runpod, modal)
+	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
+		// Both providers' Spot is exhausted (wildcard provider, Spot only).
+		{CapacityType: nebulav1alpha1.CapacitySpot},
+	}}
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if got.Annotations[nebulav1alpha1.CapacityTypeAnnotation] != "OnDemand" {
+		t.Fatalf("expected the walk to drop to OnDemand, got %q", got.Annotations[nebulav1alpha1.CapacityTypeAnnotation])
+	}
+	// ...and to the FIRST provider (runpod), since OnDemand is walked provider-first.
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "runpod" {
+		t.Fatalf("expected first provider runpod at the OnDemand tier, got %v", got.Spec.NodeSelector)
+	}
+}
+
+func TestPlacement_AllCandidatesBlockedLeavesPodGated(t *testing.T) {
+	// Every (tier, provider, region) candidate is blocked (DenyAll on the provider).
+	// Placement has nowhere to go, so it leaves the Pod gated for a later retry
+	// (when a block expires) rather than placing onto a failing candidate.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
+		{Provider: provider.ProviderModal}, // whole-provider block (auth/quota)
+	}}
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when every candidate is blocked")
+	}
+	// No claim should have been created for an unplaced Pod.
+	var nc nebulav1alpha1.NodeClaim
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err == nil {
+		t.Fatal("expected no claim when placement is blocked everywhere")
+	}
+}
+
+func TestPlacement_StampsBlocklistTTLAnnotation(t *testing.T) {
+	// The pool's FailoverPolicy.BlocklistTTL must reach the Pod so the VK handler
+	// knows how long to blocklist a placement that fails.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	pool.Spec.Failover = &nebulav1alpha1.FailoverPolicy{BlocklistTTL: metav1.Duration{Duration: 7 * time.Minute}}
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if got.Annotations[nebulav1alpha1.BlocklistTTLAnnotation] != "7m0s" {
+		t.Fatalf("expected blocklist-ttl annotation 7m0s, got %q", got.Annotations[nebulav1alpha1.BlocklistTTLAnnotation])
 	}
 }
 

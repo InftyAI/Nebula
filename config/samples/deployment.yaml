@@ -36,15 +36,9 @@ spec:
     metadata:
       labels:
         app: gpu-workload-sample
-        # --- opt in (must be on the Pod template) ---
         nebula.inftyai.com/enabled: "true"
-        # Place against this pool (see nebula_v1alpha1_nodepool.yaml).
-        nebula.inftyai.com/nodepool: nodepool-sample
-        # Requested accelerator TYPE. Matched case-insensitively against the
-        # provider catalog (e.g. Modal offers T4/L4/A10G/A100-40GB/A100-80GB/
-        # H100/H200). The COUNT is the nvidia.com/gpu resource below — omit it
-        # for a single GPU.
-        nebula.inftyai.com/accelerator-type: a100-40gb
+        nebula.inftyai.com/nodepool: aws
+        nebula.inftyai.com/accelerator-type: l4
     spec:
       # Do NOT set nodeName or a provider nodeSelector yourself — the placement
       # controller fills the nodeSelector in when it ungates the Pod. Setting

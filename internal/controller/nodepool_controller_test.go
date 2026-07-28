@@ -58,7 +58,7 @@ func newPoolReconciler(t *testing.T, known []string, objs ...client.Object) (*No
 	return r, c
 }
 
-func newPool(name string, strategy nebulav1alpha1.PlacementStrategy, providers ...nebulav1alpha1.ProviderRef) *nebulav1alpha1.NodePool {
+func newPool(name string, strategy nebulav1alpha1.PlacementStrategy, providers ...nebulav1alpha1.ProviderSpec) *nebulav1alpha1.NodePool {
 	return &nebulav1alpha1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: nebulav1alpha1.NodePoolSpec{
@@ -106,7 +106,7 @@ func poolReadyCond(p *nebulav1alpha1.NodePool) *metav1.Condition {
 
 func TestPool_ValidPoolBecomesReady(t *testing.T) {
 	pool := newPool("gpu", nebulav1alpha1.StrategyOrdered,
-		nebulav1alpha1.ProviderRef{Name: "modal"})
+		nebulav1alpha1.ProviderSpec{Name: "modal"})
 	r, c := newPoolReconciler(t, []string{"modal"}, pool)
 
 	reconcilePool(t, r, "gpu")
@@ -122,8 +122,8 @@ func TestPool_ValidPoolBecomesReady(t *testing.T) {
 
 func TestPool_UnknownProviderNotReady(t *testing.T) {
 	pool := newPool("gpu", nebulav1alpha1.StrategyOrdered,
-		nebulav1alpha1.ProviderRef{Name: "modal"},
-		nebulav1alpha1.ProviderRef{Name: "ghost"})
+		nebulav1alpha1.ProviderSpec{Name: "modal"},
+		nebulav1alpha1.ProviderSpec{Name: "ghost"})
 	r, c := newPoolReconciler(t, []string{"modal"}, pool) // ghost not registered
 
 	reconcilePool(t, r, "gpu")
@@ -139,8 +139,8 @@ func TestPool_UnknownProviderNotReady(t *testing.T) {
 
 func TestPool_PlacedCountsBoundClaims(t *testing.T) {
 	pool := newPool("gpu", nebulav1alpha1.StrategyOrdered,
-		nebulav1alpha1.ProviderRef{Name: "modal"},
-		nebulav1alpha1.ProviderRef{Name: "runpod"})
+		nebulav1alpha1.ProviderSpec{Name: "modal"},
+		nebulav1alpha1.ProviderSpec{Name: "runpod"})
 	// 2 bound on modal, 1 on runpod for this pool; 1 bound for another pool
 	// (ignored); 1 pending on modal for this pool (ignored — not Bound).
 	r, c := newPoolReconciler(t, []string{"modal", "runpod"},
@@ -168,7 +168,7 @@ func TestPool_PlacedCountsBoundClaims(t *testing.T) {
 
 func TestPool_PlacedNilWhenNothingRunning(t *testing.T) {
 	pool := newPool("gpu", nebulav1alpha1.StrategyOrdered,
-		nebulav1alpha1.ProviderRef{Name: "modal"})
+		nebulav1alpha1.ProviderSpec{Name: "modal"})
 	r, c := newPoolReconciler(t, []string{"modal"},
 		pool,
 		poolClaim("pend", "gpu", "modal", nebulav1alpha1.NodeClaimProvisioning),

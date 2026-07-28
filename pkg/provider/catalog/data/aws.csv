@@ -1,0 +1,56 @@
+# AWS EC2 GPU price/availability catalog — community-maintained.
+#
+# Unlike Modal, AWS does not name GPUs by accelerator type, and the GPU count is
+# NOT a free runtime knob: you request an INSTANCE TYPE whose accelerator count is
+# fixed (T4x1 = g4dn.xlarge, T4x8 = g4dn.metal). So the mapping key is
+# (accelerator_type, gpu_count): accelerator_id holds the EC2 instance type that
+# serves that pair, and the AWS adapter selects it by matching BOTH the canonical
+# accelerator and the Pod's requested GPU count.
+#
+# The `region` column is left BLANK here on purpose. This file holds only the
+# durable facts — the (accelerator, count) -> instance-type mapping and a seed
+# on-demand price — one row per {accelerator, count, capacity_type}. Region truth
+# (which types a region actually offers, and live spot prices) is NOT
+# hand-maintained: AWS exposes it at runtime, so the adapter's Offerings(ctx)
+# probes DescribeInstanceTypeOfferings per configured region and stamps/filters
+# these rows. That keeps this file small and stops per-region availability from
+# drifting out of date.
+#
+# On-demand prices are approximate USD per INSTANCE-hour transcribed by hand from
+# https://aws.amazon.com/ec2/pricing/on-demand/ (us-east-1 rates as the seed);
+# treat them as a starting point, not a billing source. Spot prices vary by
+# region and minute and are left to the live probe (the seed spot rows carry a
+# recent us-east-1 typical rate only as a fallback).
+#
+# Columns (shared header across all provider CSVs; unused cells left blank):
+#   accelerator_type  canonical Nebula accelerator type
+#   accelerator_id    EC2 instance type that serves {accelerator_type, gpu_count}
+#   gpu_count         accelerators the instance type provides (the lookup key)
+#   capacity_type     Spot | OnDemand | Reserved
+#   price_per_hour    approximate USD/instance-hour (seed; live probe may override)
+#   available         seed availability (the live probe is authoritative per region)
+#   region            BLANK — stamped per configured region by the live probe
+#   updated           YYYY-MM-DD the row was last verified
+accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
+T4,g4dn.xlarge,1,OnDemand,0.526,true,,2026-07-27
+T4,g4dn.xlarge,1,Spot,0.158,true,,2026-07-27
+T4,g4dn.12xlarge,4,OnDemand,3.912,true,,2026-07-27
+T4,g4dn.12xlarge,4,Spot,1.174,true,,2026-07-27
+T4,g4dn.metal,8,OnDemand,7.824,true,,2026-07-27
+T4,g4dn.metal,8,Spot,2.347,true,,2026-07-27
+A10G,g5.xlarge,1,OnDemand,1.006,true,,2026-07-27
+A10G,g5.xlarge,1,Spot,0.352,true,,2026-07-27
+A10G,g5.12xlarge,4,OnDemand,5.672,true,,2026-07-27
+A10G,g5.12xlarge,4,Spot,1.985,true,,2026-07-27
+A10G,g5.48xlarge,8,OnDemand,16.288,true,,2026-07-27
+A10G,g5.48xlarge,8,Spot,5.700,true,,2026-07-27
+L4,g6.xlarge,1,OnDemand,0.805,true,,2026-07-27
+L4,g6.xlarge,1,Spot,0.282,true,,2026-07-27
+L4,g6.12xlarge,4,OnDemand,4.602,true,,2026-07-27
+L4,g6.12xlarge,4,Spot,1.610,true,,2026-07-27
+L4,g6.48xlarge,8,OnDemand,13.350,true,,2026-07-27
+L4,g6.48xlarge,8,Spot,4.672,true,,2026-07-27
+A100-80GB,p4de.24xlarge,8,OnDemand,40.966,true,,2026-07-27
+A100-80GB,p4de.24xlarge,8,Spot,14.338,true,,2026-07-27
+H100,p5.48xlarge,8,OnDemand,98.320,true,,2026-07-27
+H100,p5.48xlarge,8,Spot,34.412,true,,2026-07-27

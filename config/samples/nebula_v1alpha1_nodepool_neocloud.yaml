@@ -3,7 +3,7 @@ kind: NodePool
 metadata:
   labels:
     app.kubernetes.io/managed-by: nebula
-  name: nodepool-sample
+  name: neocloud
 spec:
   # The NeoClouds this pool may place onto. Order matters only for the Ordered
   # strategy (the inner, provider-ranking axis).

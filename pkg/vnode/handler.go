@@ -29,6 +29,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -44,6 +45,32 @@ import (
 // reclaims sooner; an OnDemand-only one can poll lazily).
 const defaultPollInterval = 15 * time.Second
 
+// defaultBlocklistTTL bounds how long a failed placement is excluded when the Pod
+// carries no BlocklistTTLAnnotation (an out-of-band Pod, or one placed before the
+// annotation existed). It mirrors FailoverPolicy.BlocklistTTL's own default so the
+// behaviour is identical whether or not the pool policy reached the handler.
+const defaultBlocklistTTL = 10 * time.Minute
+
+// Blocklister records a failed placement so the placement controller can fail over
+// to the next candidate instead of hot-looping against a provider that just
+// rejected the request. It is the write half of pkg/failover.Blocklist; the
+// handler depends on this narrow interface (not the concrete type) so it stays
+// testable and a nil blocklist is a no-op.
+type Blocklister interface {
+	Record(prov string, scope provider.BlockScope, ttl time.Duration)
+}
+
+// defaultProvisionTimeout bounds a single Provision call when the provider does
+// not override it (Capabilities.ProvisionTimeout). Provisioning is a network
+// call to the backend (Modal's gRPC CreateSandbox, AWS's RunInstances and its
+// per-zone capacity failover), and none of them are guaranteed to return
+// promptly — a hung call would otherwise pin the pod controller's worker
+// indefinitely. Enforcing it here, at the single call site, keeps every provider
+// bounded by default; a provider that legitimately needs longer (AWS sweeping
+// several zones) raises it via Capabilities. It is deliberately generous: the
+// happy path returns in well under this, so it is a backstop, not a tuning knob.
+const defaultProvisionTimeout = 90 * time.Second
+
 // Handler bridges one provider into the virtual kubelet: it implements the VK
 // PodLifecycleHandler (+ PodNotifier) so the pod controller's CreatePod
 // provisions an external instance through the provider seam and DeletePod
@@ -57,6 +84,12 @@ const defaultPollInterval = 15 * time.Second
 // status-write adopts the existing instance rather than creating a second.
 type Handler struct {
 	prov provider.Provider
+
+	// blocklist records failed placements so the placement controller can fail over
+	// (zone → region → tier). Shared across every provider's handler and the
+	// placement controller. May be nil (a no-op), keeping tests and any
+	// blocklist-less wiring simple.
+	blocklist Blocklister
 
 	mu      sync.Mutex
 	tracked map[string]*trackedPod // key: namespace/name
@@ -79,14 +112,16 @@ type trackedPod struct {
 
 // NewHandler builds a Handler for the given provider backend. The poll cadence
 // comes from the provider's Capabilities.PollInterval, falling back to
-// defaultPollInterval when the provider does not set one.
-func NewHandler(prov provider.Provider) *Handler {
+// defaultPollInterval when the provider does not set one. blocklist is the shared
+// failover blocklist a Provision failure is recorded on; it may be nil (no-op).
+func NewHandler(prov provider.Provider, blocklist Blocklister) *Handler {
 	poll := prov.Capabilities().PollInterval
 	if poll <= 0 {
 		poll = defaultPollInterval
 	}
 	return &Handler{
 		prov:      prov,
+		blocklist: blocklist,
 		tracked:   make(map[string]*trackedPod),
 		nowFn:     metav1.Now,
 		pollEvery: poll,
@@ -120,10 +155,28 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	req := provider.ProvisionRequest{
 		ClaimName:    claim,
 		CapacityType: nebulav1alpha1.CapacityType(pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation]),
+		Region:       pod.Annotations[nebulav1alpha1.RegionAnnotation],
 	}
+
+	// Bound the provision call so a wedged backend cannot pin this worker forever.
+	// The provider may raise the deadline via Capabilities.ProvisionTimeout (AWS
+	// does, to leave room for cross-zone failover); zero means "use the default".
+	timeout := h.prov.Capabilities().ProvisionTimeout
+	if timeout <= 0 {
+		timeout = defaultProvisionTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	id, err := h.prov.Provision(ctx, pod, req)
 	if err != nil {
+		// Record the failure on the shared blocklist so placement fails over to the
+		// next candidate (zone → region → tier) instead of hot-looping here. The
+		// provider classifies its own error into the precise BlockScope (a Spot
+		// no-capacity in one region blocks only that, not OnDemand or other regions;
+		// auth/quota blocks the whole provider); the TTL rides on the Pod from the
+		// pool's FailoverPolicy.
+		h.recordBlock(pod, err)
 		// Surface the failure on the Pod so the placement controller can fail
 		// over, and return the error so the pod controller retries with backoff.
 		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, err.Error())
@@ -230,11 +283,14 @@ func (h *Handler) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 // pollLoop periodically reconciles tracked pods against the provider's live
 // instance list and pushes any status change through the notify callback.
 func (h *Handler) pollLoop(ctx context.Context) {
+	log := logf.FromContext(ctx).WithName("vnode-poll").WithValues("provider", h.prov.Name())
+	log.Info("poll loop started", "interval", h.pollEvery.String())
 	t := time.NewTicker(h.pollEvery)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			log.Info("poll loop stopped")
 			return
 		case <-t.C:
 			h.reconcileOnce(ctx)
@@ -246,9 +302,16 @@ func (h *Handler) pollLoop(ctx context.Context) {
 // from the matching instance (matched by claim name, since a pod maps 1:1 to a
 // claim). A tracked pod whose instance is absent from the list is treated as
 // terminated (preempted / externally torn down), per the provider contract.
+//
+// A List error is logged and skipped (retry next tick) rather than swallowed:
+// a provider whose List fails every tick would otherwise strand every tracked
+// pod in its last status forever with no signal, which is exactly the failure
+// mode this logging exists to surface.
 func (h *Handler) reconcileOnce(ctx context.Context) {
+	log := logf.FromContext(ctx).WithName("vnode-poll").WithValues("provider", h.prov.Name())
 	instances, err := h.prov.List(ctx)
 	if err != nil {
+		log.Error(err, "provider List failed; tracked pod statuses will not advance this tick")
 		return // transient; retry on the next tick
 	}
 	byClaim := make(map[string]provider.Instance, len(instances))
@@ -258,12 +321,15 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 
 	h.mu.Lock()
 	changed := make([]*corev1.Pod, 0)
+	tracked := len(h.tracked)
+	matched := 0
 	for _, tp := range h.tracked {
 		inst, present := byClaim[tp.claimName]
 		before := tp.pod.Status.Phase
 		if !present {
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
 		} else {
+			matched++
 			applyState(tp.pod, inst.State, inst.Endpoint, h.nowFn())
 		}
 		if tp.pod.Status.Phase != before {
@@ -272,6 +338,12 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 	notify := h.notify
 	h.mu.Unlock()
+
+	// At V(1) so a healthy steady state stays quiet, but the counts are there when
+	// pods appear stuck: tracked>0 with matched==0 means List returns instances the
+	// claim names don't line up with (the classic "provisioned but never Running").
+	log.V(1).Info("poll tick",
+		"listed", len(instances), "tracked", tracked, "matched", matched, "changed", len(changed))
 
 	if notify != nil {
 		for _, p := range changed {
@@ -305,6 +377,57 @@ func (h *Handler) emit(pod *corev1.Pod) {
 // the passed Pod (which VK then reports to the API server).
 func (h *Handler) markStatus(pod *corev1.Pod, phase corev1.PodPhase, reason, msg string) {
 	setPhase(pod, phase, reason, msg, h.nowFn())
+}
+
+// recordBlock classifies a Provision failure into a BlockScope (via the provider)
+// and records it on the shared blocklist for the pool's BlocklistTTL, so placement
+// fails over instead of retrying the same failing candidate. It is a no-op when no
+// blocklist is wired or the error yields an empty scope (nothing to block).
+//
+// The provider owns the whole scope: the handler resolves the requested accelerator
+// off the Pod (the error does not carry it) and passes it in, but does NOT assemble
+// or mutate the scope itself — narrowing to the failing accelerator and any
+// region axis is the provider's job (see ClassifyError / the adapters). This keeps
+// scope derivation in one place per provider rather than spread across the handler.
+//
+// Because the provider stamps the accelerator, the block errs NARROW: a truly
+// account/region-wide error (e.g. a per-region Spot limit that spans accelerators)
+// is narrowed to just this accelerator too, since the error text does not
+// distinguish it from an instance-type shortage; the cost is that a sibling
+// accelerator gets one wasted re-probe before it re-records. That is the right
+// trade — over-narrow costs a fast retry, over-broad wrongly excludes serviceable
+// accelerators. DenyAll (auth/quota) ignores the accelerator: it fails for all.
+func (h *Handler) recordBlock(pod *corev1.Pod, err error) {
+	if h.blocklist == nil {
+		return
+	}
+	// The accelerator is a property of the REQUEST, not the error; the provider
+	// cannot see it, so we resolve it off the Pod and hand it over ("" for a
+	// CPU-only Pod, which the provider treats as "not applicable").
+	accel, _, _ := util.AcceleratorRequest(pod)
+	scope := h.prov.ClassifyProvisionError(err, accel)
+	if scope == (provider.BlockScope{}) {
+		// An empty scope means the error is not one we know how to blocklist; do not
+		// install a wildcard block that would exclude everything on the provider.
+		return
+	}
+	h.blocklist.Record(h.prov.Name(), scope, blocklistTTL(pod))
+}
+
+// blocklistTTL reads the pool's FailoverPolicy.BlocklistTTL off the Pod annotation
+// the placement controller stamped, falling back to defaultBlocklistTTL when it is
+// absent or unparseable (an out-of-band Pod, or a non-positive value that could
+// otherwise install a permanent block).
+func blocklistTTL(pod *corev1.Pod) time.Duration {
+	raw := pod.Annotations[nebulav1alpha1.BlocklistTTLAnnotation]
+	if raw == "" {
+		return defaultBlocklistTTL
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultBlocklistTTL
+	}
+	return d
 }
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }

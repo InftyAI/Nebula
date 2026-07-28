@@ -230,8 +230,8 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // matching shared sentinel (e.g. fmt.Errorf("...: %w", provider.ErrNoCapacity));
 // ClassifyError honours those first and falls back to string heuristics for raw
 // API messages, so no Modal-specific matching is duplicated here.
-func (p *Provider) ClassifyProvisionError(err error) provider.BlockScope {
-	return provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand)
+func (p *Provider) ClassifyProvisionError(err error, accelerator string) provider.BlockScope {
+	return provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
 }
 
 // findByClaim returns the sandbox tagged with claimName, or nil if none.

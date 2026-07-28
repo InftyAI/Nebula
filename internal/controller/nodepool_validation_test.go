@@ -30,7 +30,7 @@ import (
 // run CRD x-kubernetes-validations). They require envtest binaries; when those
 // are absent the whole suite is skipped in BeforeSuite.
 var _ = Describe("NodePool spec validation (CEL)", func() {
-	newWeightedPool := func(name string, refs ...nebulav1alpha1.ProviderRef) *nebulav1alpha1.NodePool {
+	newWeightedPool := func(name string, refs ...nebulav1alpha1.ProviderSpec) *nebulav1alpha1.NodePool {
 		return &nebulav1alpha1.NodePool{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: nebulav1alpha1.NodePoolSpec{
@@ -43,8 +43,8 @@ var _ = Describe("NodePool spec validation (CEL)", func() {
 
 	It("rejects a Weighted pool with a provider missing a weight", func() {
 		pool := newWeightedPool("weighted-missing",
-			nebulav1alpha1.ProviderRef{Name: "modal", Weight: weight(3)},
-			nebulav1alpha1.ProviderRef{Name: "runpod"}, // no weight
+			nebulav1alpha1.ProviderSpec{Name: "modal", Weight: weight(3)},
+			nebulav1alpha1.ProviderSpec{Name: "runpod"}, // no weight
 		)
 		err := k8sClient.Create(ctx, pool)
 		Expect(err).To(HaveOccurred())
@@ -53,8 +53,8 @@ var _ = Describe("NodePool spec validation (CEL)", func() {
 
 	It("admits a Weighted pool with a weight on every provider", func() {
 		pool := newWeightedPool("weighted-ok",
-			nebulav1alpha1.ProviderRef{Name: "modal", Weight: weight(3)},
-			nebulav1alpha1.ProviderRef{Name: "runpod", Weight: weight(1)},
+			nebulav1alpha1.ProviderSpec{Name: "modal", Weight: weight(3)},
+			nebulav1alpha1.ProviderSpec{Name: "runpod", Weight: weight(1)},
 		)
 		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
@@ -64,7 +64,7 @@ var _ = Describe("NodePool spec validation (CEL)", func() {
 		pool := &nebulav1alpha1.NodePool{
 			ObjectMeta: metav1.ObjectMeta{Name: "ordered-noweights"},
 			Spec: nebulav1alpha1.NodePoolSpec{
-				Providers: []nebulav1alpha1.ProviderRef{{Name: "modal"}},
+				Providers: []nebulav1alpha1.ProviderSpec{{Name: "modal"}},
 				Strategy:  nebulav1alpha1.StrategyOrdered,
 			},
 		}

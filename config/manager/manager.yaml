@@ -72,6 +72,14 @@ spec:
           # embedded in the binary.
           - name: NEBULA_CATALOG_DIR
             value: /etc/nebula/catalog
+          # AWS NON-SECRET config (never a credential): the region to operate in.
+          # The adapter is otherwise self-configuring — it resolves the GPU AMI and
+          # the default VPC's subnets itself — so no launch template or other infra
+          # config is needed. This is a plain value here, NOT in a Secret. Empty =>
+          # the SDK resolves its default region (shared config / IMDS); with no
+          # resolvable region AWS registration is a non-fatal skip.
+          - name: AWS_REGION
+            value: "us-east-1"
         envFrom:
           # Provider credentials live in a per-provider Secret, one secretRef per
           # provider — NOT a single shared secret. This matches the "creds-absent →
@@ -84,6 +92,14 @@ spec:
           # The Modal SDK reads MODAL_TOKEN_ID / MODAL_TOKEN_SECRET from the environment.
           - secretRef:
               name: nebula-modal-credentials
+              optional: true
+          # AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), read by
+          # the SDK's default chain. optional=true so an absent Secret is fine —
+          # in production this is the norm: prefer IRSA / instance role and skip
+          # this Secret entirely. Non-secret region/launch-template config is set
+          # as plain env above, never here.
+          - secretRef:
+              name: nebula-aws-credentials
               optional: true
           # Add one secretRef per provider as adapters land, e.g.:
           # - secretRef:

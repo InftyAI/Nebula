@@ -96,7 +96,14 @@ type Provider interface {
 	// the failing placement should be blocklisted. This keeps failover precise:
 	// a "no H100 capacity" error blocks only {provider, H100, capacityType},
 	// while an auth/quota error blocks the whole provider. See BlockScope.
-	ClassifyProvisionError(err error) BlockScope
+	//
+	// accelerator is the canonical accelerator the failing request asked for (""
+	// for a CPU-only Pod). The provider needs it because the error alone does not
+	// carry it, and the provider is the single owner of the complete scope: it
+	// stamps the accelerator on a capacity block AND adds any provider-specific
+	// axis it knows (AWS confines the block to its region). No caller assembles a
+	// scope piecemeal after this returns.
+	ClassifyProvisionError(err error, accelerator string) BlockScope
 }
 
 // ProvisionRequest carries only the decisions the placement controller made
@@ -114,6 +121,13 @@ type ProvisionRequest struct {
 	// This is the one workload-independent decision that cannot be expressed on
 	// the Pod, so it must be passed explicitly.
 	CapacityType nebulav1alpha1.CapacityType
+	// Region is the provider region the optimizer chose to provision in, in the
+	// provider's own vocabulary (e.g. AWS "us-east-1"). Like CapacityType it is a
+	// workload-independent decision absent from the Pod. Empty means "use the
+	// provider's configured default region" — region-simple NeoClouds (Modal,
+	// RunPod) ignore it, and a region-aware adapter falls back to the region its
+	// client was built with (see the AWS adapter's NewSDKClient).
+	Region string
 }
 
 // Capabilities declares provider quirks as data, so the control plane filters
@@ -140,6 +154,17 @@ type Capabilities struct {
 	// this — they are pushed synchronously by CreatePod/DeletePod — so this only
 	// bounds detection latency for events no provider pushes.
 	PollInterval time.Duration
+	// ProvisionTimeout bounds a single Provision call end to end. It exists for
+	// region-aware providers that fail over across capacity pools (e.g. AWS tries
+	// each availability zone in turn on a capacity error): the deadline caps how
+	// long that inner failover loop may spend before giving up so the outer
+	// region-level failover can proceed, rather than a slow provider stalling a
+	// Pod indefinitely. It bounds the PROVISIONING attempt (the launch API calls
+	// and any per-zone retries), NOT "the workload became healthy" — that remains
+	// the poll loop's job. Zero means "no adapter-imposed deadline" (the caller's
+	// context still applies); providers with a single capacity pool (Modal) leave
+	// it zero.
+	ProvisionTimeout time.Duration
 }
 
 // Instance is the provider-agnostic view of one external instance, as observed.
@@ -151,6 +176,9 @@ type Instance struct {
 	Endpoint string
 	// CapacityType reflects how the instance was provisioned, when known.
 	CapacityType nebulav1alpha1.CapacityType
+	// Region is where the instance actually lives, in the provider's own
+	// vocabulary. Empty for region-simple providers that do not report one.
+	Region string
 }
 
 // InstanceState is the provider-agnostic lifecycle state, normalized from each
@@ -177,19 +205,75 @@ type Offering struct {
 	CapacityType    nebulav1alpha1.CapacityType
 	PricePerHour    float64
 	Available       bool
+	// Region is the provider region this row prices, in the provider's own
+	// vocabulary (e.g. AWS "us-east-1"). Empty for region-simple providers whose
+	// catalog is not region-partitioned (Modal, RunPod); a region-aware provider
+	// emits one row per {accelerator, capacityType, region}.
+	Region string
+	// AcceleratorID is this provider's own name for what serves the canonical
+	// AcceleratorType — the per-provider half of the mapping the canonical GPU
+	// vocabulary is translated through (e.g. AWS "p5.48xlarge" for H100). It is
+	// the lookup data a diverging provider's MapAccelerator override returns. Left
+	// unset by providers whose mapping is identity (Modal names its GPUs exactly
+	// like the canonical types), which reuse catalog.Base's default MapAccelerator
+	// and so need no per-name id. Mirrors the providerAcceleratorID that
+	// MapAccelerator returns.
+	AcceleratorID string
+	// GPUCount is how many accelerators the AcceleratorID provides. It matters for
+	// providers where the accelerator count is not a free knob but is baked into
+	// the offering: on AWS you do not ask for "N T4s", you pick an instance type
+	// whose GPU count is fixed (T4x1 = g4dn.xlarge, T4x8 = g4dn.metal), so the
+	// mapping key is (AcceleratorType, GPUCount) and the same accelerator appears
+	// once per count. Left 0 by providers that attach an arbitrary count to a
+	// single offering (Modal takes the count as a parameter), for whom it is not a
+	// lookup dimension.
+	GPUCount int32
 }
 
 // BlockScope is the granularity at which a failed placement is excluded, matched
-// to what actually failed (SkyPilot's blocklist-granularity rule). Empty fields
-// act as wildcards in the in-memory blocklist match: a failed H100 request must
-// not disqualify A100 requests on the same provider.
+// to what actually failed (SkyPilot's blocklist-granularity rule). It is a partial
+// MATCH PATTERN, not a value, and AcceleratorType/Region are THREE-STATE pointers
+// so a pattern can distinguish "any value" from "no value":
+//
+//   - nil   => the axis is NOT APPLICABLE to this block: it matches only a
+//     candidate whose corresponding field is also empty. A CPU-only Pod (no
+//     accelerator) and a region-simple provider (no region) both leave the axis
+//     nil, so the block never spuriously widens across it.
+//   - &""   => WILDCARD: matches any value on that axis (a Spot-capacity block that
+//     spans every accelerator, say).
+//   - &"v"  => EXACT: matches only candidates whose field equals "v" (so a failed
+//     H100 request must not disqualify A100 on the same provider).
+//
+// This is why the scope is assembled in two places: the adapter classifies from the
+// error alone (which knows the region — AWS is bound to one — but never the
+// accelerator, a property of the request), and the vnode handler fills the
+// accelerator in from the failing Pod. Neither can produce the full scope, so the
+// unset fields must be distinguishable from a deliberate wildcard — hence pointers.
+// DenyAll is the broadest scope and ignores the pattern fields entirely.
+//
+// This is the opposite sense to a value field like NodePoolSpec's
+// ProviderSpec.Regions, where empty means "the one default region" — because a
+// pattern matches, while a request takes a single default. The blocklist never
+// mixes the two: a NodePool candidate is resolved to fully-concrete values before
+// it is matched against these patterns.
 type BlockScope struct {
-	// AcceleratorType empty => blocks all accelerator types on this provider.
-	AcceleratorType string
+	// AcceleratorType: nil => not applicable (CPU-only Pod, or a DenyAll scope);
+	// &"" => wildcard, matches every accelerator; &"H100" => exactly that one.
+	// A capacity error carries no accelerator (it is classified from the error
+	// alone), so the adapter leaves this nil and the vnode handler fills it in
+	// from the failing Pod's request — narrowing the block to the accelerator that
+	// actually failed.
+	AcceleratorType *string
 	// CapacityType empty => blocks all capacity types.
 	CapacityType nebulav1alpha1.CapacityType
+	// Region: nil => the provider has no region axis (a region-simple provider like
+	// Modal/RunPod, whose candidate carries an empty region too, so nil matches it);
+	// &"us-east-1" => confines the block to that one region, so a "no capacity in
+	// us-east-1" failure does not disqualify the same request in us-west-2. A
+	// region-aware provider (AWS) sets it; a region-simple one leaves it nil.
+	Region *string
 	// DenyAll true => block everything on this provider (e.g. auth/quota errors),
-	// ignoring AcceleratorType/CapacityType. The scope is still this one provider;
-	// it never spans providers.
+	// ignoring AcceleratorType/CapacityType/Region. The scope is still this one
+	// provider; it never spans providers.
 	DenyAll bool
 }

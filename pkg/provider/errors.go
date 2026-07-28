@@ -52,20 +52,41 @@ var (
 // provider; an unrecognized error is treated conservatively as whole-provider so
 // a failure does not hot-loop (the blocklist TTL bounds the blast radius).
 //
+// It is the single place the SHARED part of a scope is derived — category
+// (DenyAll vs capacity-scoped), the capacity tier, and the accelerator — so every
+// adapter's ClassifyProvisionError delegates here and then only decorates with
+// what is provider-specific (AWS adds its region). No scope is assembled anywhere
+// else: the vnode handler resolves the accelerator off the Pod and passes it in,
+// rather than mutating the returned scope.
+//
 // capacityType is the tier the failing request used; it is stamped onto
 // accelerator-scoped scopes so the block is precise (a Spot failure does not
-// block OnDemand). Adapters call this from ClassifyProvisionError after wrapping
-// their own errors, passing the only tier they serve when they are single-tier.
-func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType) BlockScope {
+// block OnDemand). accelerator is the canonical accelerator the request asked for
+// ("" for a CPU-only Pod): on a capacity-scoped block a non-empty accelerator
+// becomes an exact-match pointer (narrowing the block to the type that failed),
+// while "" leaves AcceleratorType nil ("not applicable") so the block does not
+// widen across every accelerator. Auth/quota (DenyAll) ignores both, since bad
+// credentials fail for every accelerator and tier.
+func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelerator string) BlockScope {
 	if err == nil {
 		return BlockScope{}
+	}
+
+	// capacityScope builds an accelerator/tier-scoped block, promoting a non-empty
+	// accelerator to an exact-match pointer and leaving it nil otherwise.
+	capacityScope := func() BlockScope {
+		s := BlockScope{CapacityType: capacityType}
+		if accelerator != "" {
+			s.AcceleratorType = &accelerator
+		}
+		return s
 	}
 
 	switch {
 	case errors.Is(err, ErrAuth), errors.Is(err, ErrQuota):
 		return BlockScope{DenyAll: true}
 	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator):
-		return BlockScope{CapacityType: capacityType}
+		return capacityScope()
 	}
 
 	// Fall back to string heuristics for errors not wrapped with a sentinel.
@@ -76,7 +97,7 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType) BlockSco
 	case containsAny(msg, "quota", "limit exceeded", "rate limit"):
 		return BlockScope{DenyAll: true}
 	case containsAny(msg, "no capacity", "capacity", "unavailable", "out of", "no gpu"):
-		return BlockScope{CapacityType: capacityType}
+		return capacityScope()
 	default:
 		return BlockScope{DenyAll: true}
 	}

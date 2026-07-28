@@ -76,14 +76,21 @@ func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 	return b.Catalog.Offerings(b.ProviderName), nil
 }
 
-// MapAccelerator is the default identity translation: it confirms the canonical
-// accelerator is in this provider's catalog (case-insensitively) and returns the
-// canonical name unchanged. Providers whose identifiers differ from the
-// canonical names override this method. Returns ok=false when the provider does
-// not offer the accelerator.
+// MapAccelerator translates a canonical accelerator type into this provider's
+// own accelerator id using the catalog as the mapping table: it finds the row
+// whose AcceleratorType matches (case-insensitively) and returns that row's
+// AcceleratorID. When AcceleratorID is blank (a provider whose id equals the
+// canonical name) it falls back to the canonical name, so an identity-mapped
+// provider needs no per-name data. Because the mapping lives entirely in the
+// CSV, a provider whose ids diverge (AWS instance types) does NOT need to
+// override this — it just populates the accelerator_id column. Returns ok=false
+// when the provider does not offer the accelerator.
 func (b Base) MapAccelerator(canonical string) (providerAcceleratorID string, ok bool) {
 	for _, o := range b.Catalog.Offerings(b.ProviderName) {
 		if strings.EqualFold(o.AcceleratorType, canonical) {
+			if o.AcceleratorID != "" {
+				return o.AcceleratorID, true
+			}
 			return o.AcceleratorType, true
 		}
 	}

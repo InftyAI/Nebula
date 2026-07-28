@@ -1,3 +1,11 @@
 # More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
 # Ignore build and test binaries.
 bin/
+
+# Secrets must never enter the build context, so they can never be baked into an
+# image layer even if the Dockerfile later switches to a broad `COPY . .`. The
+# manager reads credentials from the environment at runtime (per-provider
+# Secrets), never from a file in the image.
+.env
+.env.*
+!.env.example
