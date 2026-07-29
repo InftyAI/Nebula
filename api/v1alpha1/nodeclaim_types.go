@@ -93,6 +93,16 @@ const (
 	// claim whose Pod later disappears is a real teardown, not cache lag. The claim
 	// does not track finer workload status; the Pod is the source of truth for that.
 	NodeClaimBound NodeClaimPhase = "Bound"
+	// NodeClaimTerminating: the served Pod is being deleted (its DeletionTimestamp
+	// is set) but the external instance may not be reclaimed yet — teardown is in
+	// flight. This is distinct from Terminated, which means the instance is already
+	// GONE: here the Pod object still exists (draining its grace period / VK's
+	// DeletePod running / a finalizer pending), so the phase reflects "going away"
+	// rather than stranding the claim on a stale Provisioning/Bound. It is a
+	// forward transition from ANY prior phase, since a deleting Pod is on its way
+	// out regardless of how far provisioning had progressed. The claim self-deletes
+	// (firing the terminate backstop) once the Pod object is fully gone.
+	NodeClaimTerminating NodeClaimPhase = "Terminating"
 	// NodeClaimTerminated: the external instance is gone. Set when the served Pod
 	// has reached a terminal phase (Failed/Succeeded) — VK reports that when the
 	// provider's instance disappears (torn down, reclaimed, or exited). The claim
