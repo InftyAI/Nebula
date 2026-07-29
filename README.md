@@ -35,6 +35,32 @@ per-cloud glue. The API follows a Karpenter-style split:
 5. **Reclaim.** A NodeClaim tracks the instance and guarantees teardown via a
    finalizer — even if the Pod is force-deleted while the virtual kubelet is down.
 
+## Defining a NodePool
+
+A NodePool declares which providers may serve a workload and how to pick between
+them. Workloads target it by name via the `nebula.inftyai.com/nodepool` label. A
+single pool can span multiple providers, so a workload fails over across clouds:
+
+```yaml
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  name: gpu
+spec:
+  providers:
+  - name: modal            # NeoCloud; region-simple, no regions needed
+  - name: aws              # hyperscaler; region-aware, at least one required
+    regions:
+    - us-east-1
+    - us-west-1
+  capacityTypes:           # prefer cheap Spot, fall back to OnDemand
+  - Spot
+  - OnDemand
+  strategy: Ordered        # try providers in listed order (or LowestPrice)
+  failover:
+    blocklistTTL: 10m      # how long a failed placement is skipped
+```
+
 ## Opting a workload in
 
 Three labels on the **Pod template** (not the Deployment metadata) are all it
@@ -44,7 +70,7 @@ takes; Nebula fills in the rest:
 metadata:
   labels:
     nebula.inftyai.com/enabled: "true"          # opt in
-    nebula.inftyai.com/nodepool: aws            # which NodePool to place against
+    nebula.inftyai.com/nodepool: gpu            # which NodePool to place against
     nebula.inftyai.com/accelerator-type: h100   # GPU type (case-insensitive)
 spec:
   containers:
@@ -66,6 +92,6 @@ placement controller owns those.
 
 ## Getting started
 
-See [docs/deploy.md](docs/deploy.md) to install and [config/samples](config/samples)
-for example NodePools and a runnable workload. Design details live in
-[docs/architecture.md](docs/architecture.md).
+- See [docs/deploy.md](docs/deploy.md) to install
+- See [config/samples](config/samples) for example NodePools and a runnable workload.
+- See [docs/architecture.md](docs/architecture.md) for design details.
