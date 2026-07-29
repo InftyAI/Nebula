@@ -23,14 +23,17 @@ spec:
     - jsonPath: .spec.region
       name: Region
       type: string
-    - jsonPath: .status.instanceID
-      name: Instance
+    - jsonPath: .spec.acceleratorID
+      name: ACCELERATOR_ID
       type: string
     - jsonPath: .spec.capacityType
-      name: CapacityType
+      name: CAPACITY_TYPE
       type: string
     - jsonPath: .status.phase
       name: Phase
+      type: string
+    - jsonPath: .status.instanceID
+      name: Instance
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -67,6 +70,17 @@ spec:
               ledger, not a spec: its reason to exist is to survive the Node so teardown can
               reclaim the external instance and never leak a paid GPU.
             properties:
+              acceleratorID:
+                description: |-
+                  AcceleratorID is the provider's own identifier for what actually serves this
+                  claim (e.g. AWS "p5.48xlarge", RunPod "NVIDIA H100 80GB HBM3"), resolved at
+                  placement time from the Pod's requested accelerator type + count via the
+                  provider's MapAccelerator. Unlike Provider/CapacityType/Region it is NOT a
+                  provisioning input (the provider re-derives it from the Pod) — it is recorded
+                  for reporting, like PoolRef, so `kubectl get nc` shows the concrete SKU behind
+                  each instance without cross-referencing the Pod. Empty for a CPU-only claim,
+                  which requests no accelerator.
+                type: string
               capacityType:
                 description: |-
                   CapacityType is the purchase tier the placement optimizer selected
