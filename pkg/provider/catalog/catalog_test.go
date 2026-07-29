@@ -204,7 +204,7 @@ func TestBaseMapAccelerator_CaseInsensitive(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, ok := base.MapAccelerator(tc.in)
+			got, ok := base.MapAccelerator(tc.in, 1)
 			if ok != tc.wantOK || got != tc.want {
 				t.Fatalf("MapAccelerator(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
 			}

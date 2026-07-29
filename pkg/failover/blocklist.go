@@ -51,14 +51,18 @@ type entry struct {
 	expiresAt time.Time
 }
 
-// Candidate is a placement being considered — the (provider, accelerator, tier,
+// Candidate is a placement being considered — the (provider, acceleratorID, tier,
 // region) tuple the blocklist is queried against. It is the query counterpart to a
 // recorded BlockScope: Blocked reports whether any live entry's scope covers it.
+// AcceleratorID is the provider's RESOLVED id for what would serve the request
+// (the (type, count) mapped through MapAccelerator), not the bare accelerator
+// type, so a block recorded against one instance type/capacity pool matches only
+// candidates that share it.
 type Candidate struct {
-	Provider        string
-	AcceleratorType string
-	CapacityType    nebulav1alpha1.CapacityType
-	Region          string
+	Provider      string
+	AcceleratorID string
+	CapacityType  nebulav1alpha1.CapacityType
+	Region        string
 }
 
 // Blocklist is a concurrency-safe, TTL-bounded set of provider blocks. The zero
@@ -88,6 +92,15 @@ func newWithClock(c clock.Clock) *Blocklist {
 // to key on) — the caller is expected to skip zero scopes, but Record is defensive
 // so a misfire cannot install a permanent or provider-less block. Recording also
 // opportunistically drops expired entries so the slice cannot grow without bound.
+//
+// Records COALESCE: if a live entry with the same provider and an identical scope
+// already exists, its expiry is extended to the later of its current value and
+// now+ttl rather than appending a duplicate. Several Pods failing for the same
+// (provider, accelerator, tier, region) reason therefore produce ONE entry, not one
+// per failure — the slice is bounded by the number of distinct live scopes, not by
+// failure volume. The externally observable behaviour is unchanged: Blocked/
+// BlockedUntil already took the latest covering expiry, and coalescing preserves
+// exactly that latest value.
 func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Duration) {
 	if prov == "" || ttl <= 0 {
 		return
@@ -97,10 +110,22 @@ func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Dura
 
 	now := b.clock.Now()
 	b.gcLocked(now)
+
+	expiresAt := now.Add(ttl)
+	// Coalesce into an existing live entry for the same scope. gcLocked has already
+	// dropped expired entries, so every entry scanned here is still live.
+	for i := range b.entries {
+		if b.entries[i].provider == prov && scopeEqual(b.entries[i].scope, scope) {
+			if expiresAt.After(b.entries[i].expiresAt) {
+				b.entries[i].expiresAt = expiresAt // extend; never shorten a live block
+			}
+			return
+		}
+	}
 	b.entries = append(b.entries, entry{
 		provider:  prov,
 		scope:     scope,
-		expiresAt: now.Add(ttl),
+		expiresAt: expiresAt,
 	})
 }
 
@@ -119,6 +144,33 @@ func (b *Blocklist) Blocked(c Candidate) bool {
 		}
 	}
 	return false
+}
+
+// BlockedUntil reports whether c is currently excluded and, if so, how long until
+// it could become servable — the duration until the LATEST covering entry lapses
+// (c stays blocked while ANY covering entry is live, so it frees only when the
+// last one expires). Placement uses this to requeue a gated Pod exactly when a
+// candidate frees, instead of leaving it idle until the periodic resync. A false
+// result (retryAfter 0) means c is not blocked now.
+func (b *Blocklist) BlockedUntil(c Candidate) (retryAfter time.Duration, blocked bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := b.clock.Now()
+	b.gcLocked(now)
+	var latest time.Time
+	for i := range b.entries {
+		if b.entries[i].provider == c.Provider && scopeCovers(b.entries[i].scope, c) {
+			if b.entries[i].expiresAt.After(latest) {
+				latest = b.entries[i].expiresAt
+			}
+		}
+	}
+	if latest.IsZero() {
+		return 0, false
+	}
+	// gcLocked has dropped every expired entry, so latest is strictly after now.
+	return latest.Sub(now), true
 }
 
 // gcLocked drops entries that have expired as of now. Caller holds b.mu.
@@ -155,7 +207,7 @@ func scopeCovers(scope provider.BlockScope, c Candidate) bool {
 	if scope.DenyAll {
 		return true
 	}
-	if !ptrMatches(scope.AcceleratorType, c.AcceleratorType) {
+	if !ptrMatches(scope.AcceleratorID, c.AcceleratorID) {
 		return false
 	}
 	if scope.CapacityType != "" && scope.CapacityType != c.CapacityType {
@@ -165,6 +217,31 @@ func scopeCovers(scope provider.BlockScope, c Candidate) bool {
 		return false
 	}
 	return true
+}
+
+// scopeEqual reports whether two BlockScopes are the SAME block — identical along
+// every axis. It is used by Record to coalesce a repeated failure into an existing
+// entry. The *string fields are compared by VALUE, not pointer identity: two
+// independent failures for the same region allocate distinct *string pointers, so a
+// pointer-wise "==" on BlockScope would never coalesce them (and pointer fields make
+// "==" unsafe anyway). This is stricter than scopeCovers, which asks "does this block
+// COVER that candidate"; here we need exact equality so distinct scopes stay distinct
+// entries.
+func scopeEqual(a, b provider.BlockScope) bool {
+	return a.DenyAll == b.DenyAll &&
+		a.CapacityType == b.CapacityType &&
+		ptrEqual(a.AcceleratorID, b.AcceleratorID) &&
+		ptrEqual(a.Region, b.Region)
+}
+
+// ptrEqual reports whether two *string are equal by value: both nil, or both non-nil
+// pointing at equal strings. (nil and &"" are DIFFERENT — nil means "axis not
+// applicable" while &"" means "wildcard", a distinction BlockScope depends on.)
+func ptrEqual(x, y *string) bool {
+	if x == nil || y == nil {
+		return x == y // equal only if both nil
+	}
+	return *x == *y
 }
 
 // ptrMatches applies BlockScope's three-state rule to one axis: nil matches only an

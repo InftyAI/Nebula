@@ -126,7 +126,7 @@ func offering(accel, id string, count int32, tier nebulav1alpha1.CapacityType, p
 // catalog whose (accelerator_type, gpu_count) pairs map to EC2 instance types.
 // T4 appears at two counts so the count-aware resolution is exercised.
 func newTestProvider(f *fakeClient) *Provider {
-	return New(f, fakeCatalog{rows: []provider.Offering{
+	return newSingleRegion(f, fakeCatalog{rows: []provider.Offering{
 		offering("H100", "p5.48xlarge", 8, nebulav1alpha1.CapacityOnDemand, 98.32),
 		offering("H100", "p5.48xlarge", 8, nebulav1alpha1.CapacitySpot, 34.41),
 		offering("A100-80GB", "p4de.24xlarge", 8, nebulav1alpha1.CapacityOnDemand, 40.96),
@@ -171,6 +171,8 @@ func TestProvision_MapsAcceleratorToInstanceType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	// The returned id is the raw EC2 id (no region prefix); Terminate/Get re-locate
+	// it by sweeping regions.
 	if id != "i-1" {
 		t.Fatalf("id = %q, want i-1", id)
 	}
@@ -204,6 +206,7 @@ func TestProvision_LowercaseAcceleratorLabel(t *testing.T) {
 	// the canonical catalog row (and thus the right instance type).
 	if _, err := p.Provision(context.Background(), gpuPod("h100", 8), provider.ProvisionRequest{
 		ClaimName: "claim-lc",
+		Region:    testRegion,
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -226,7 +229,7 @@ func TestProvision_CountSelectsInstanceType(t *testing.T) {
 	for _, tc := range cases {
 		f := &fakeClient{runID: "i-t4"}
 		p := newTestProvider(f)
-		req := provider.ProvisionRequest{ClaimName: "claim-t4"}
+		req := provider.ProvisionRequest{ClaimName: "claim-t4", Region: testRegion}
 		if _, err := p.Provision(context.Background(), gpuPod("T4", tc.count), req); err != nil {
 			t.Fatalf("Provision(T4 x%d): %v", tc.count, err)
 		}
@@ -241,7 +244,7 @@ func TestProvision_UnsupportedCountIsError(t *testing.T) {
 	p := newTestProvider(f)
 	// T4 x2 has no instance type (there is no 2-GPU T4 shape): must error rather
 	// than silently picking the x1 or x8 row.
-	req := provider.ProvisionRequest{ClaimName: "claim-t4x2"}
+	req := provider.ProvisionRequest{ClaimName: "claim-t4x2", Region: testRegion}
 	if _, err := p.Provision(context.Background(), gpuPod("T4", 2), req); err == nil {
 		t.Fatal("expected an error for an unsupported (accelerator, count) pair")
 	}
@@ -257,6 +260,7 @@ func TestProvision_SpotSetsMarketOption(t *testing.T) {
 	if _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName:    "claim-spot",
 		CapacityType: nebulav1alpha1.CapacitySpot,
+		Region:       testRegion,
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -265,18 +269,21 @@ func TestProvision_SpotSetsMarketOption(t *testing.T) {
 	}
 }
 
-func TestProvision_EmptyRegionFallsBackToAdapterDefault(t *testing.T) {
+func TestProvision_EmptyRegionIsError(t *testing.T) {
 	f := &fakeClient{runID: "i-def"}
 	p := newTestProvider(f)
 
-	// An empty request Region means "use the adapter's configured default region".
+	// There is NO default region: a request that omits one cannot build a client, so
+	// Provision errors rather than silently guessing. In production every request
+	// carries a region (admission requires each aws pool to list ≥1; placement stamps
+	// it), so this only guards a malformed request.
 	if _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName: "claim-def",
-	}); err != nil {
-		t.Fatalf("Provision: %v", err)
+	}); err == nil {
+		t.Fatal("expected an error for a request with no region")
 	}
-	if f.lastSpec.Region != testRegion {
-		t.Fatalf("Region = %q, want adapter default %q", f.lastSpec.Region, testRegion)
+	if f.runCnt != 0 {
+		t.Fatalf("RunInstance called %d times, want 0 (no client built)", f.runCnt)
 	}
 }
 
@@ -286,7 +293,7 @@ func TestProvision_NoAcceleratorIsError(t *testing.T) {
 
 	// EC2 GPU provisioning is by instance type; a Pod with no accelerator has no
 	// instance type to launch, so it must error rather than silently guessing.
-	req := provider.ProvisionRequest{ClaimName: "claim-cpu"}
+	req := provider.ProvisionRequest{ClaimName: "claim-cpu", Region: testRegion}
 	if _, err := p.Provision(context.Background(), gpuPod("", 0), req); err == nil {
 		t.Fatal("expected an error for a Pod requesting no accelerator")
 	}
@@ -306,10 +313,12 @@ func TestProvision_Idempotent(t *testing.T) {
 	}
 	p := newTestProvider(f)
 
-	id, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{ClaimName: "claim-a"})
+	id, err := p.Provision(context.Background(), gpuPod("H100", 8),
+		provider.ProvisionRequest{ClaimName: "claim-a", Region: testRegion})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	// Raw EC2 id, since idempotent reuse returns the same clean id a fresh launch would.
 	if id != "i-existing" {
 		t.Fatalf("id = %q, want i-existing (idempotent reuse)", id)
 	}
@@ -321,7 +330,7 @@ func TestProvision_Idempotent(t *testing.T) {
 func TestProvision_UnsupportedAccelerator(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
-	req := provider.ProvisionRequest{ClaimName: "claim-x"}
+	req := provider.ProvisionRequest{ClaimName: "claim-x", Region: testRegion}
 	if _, err := p.Provision(context.Background(), gpuPod("TPU-v4", 1), req); err == nil {
 		t.Fatal("expected error for unsupported accelerator")
 	}
@@ -341,6 +350,7 @@ func TestGetAndList_NormalizeInstance(t *testing.T) {
 	}
 	p := newTestProvider(f)
 
+	// Get takes the raw EC2 id Provision/List hand back; it sweeps regions to find it.
 	got, err := p.Get(context.Background(), "i-1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -374,23 +384,32 @@ func TestGetAndList_NormalizeInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
+	// List reports the raw EC2 id; a downstream Terminate re-locates it by sweeping
+	// regions.
 	if len(list) != 1 || list[0].ID != "i-1" {
 		t.Fatalf("List = %+v", list)
 	}
 }
 
-func TestToInstance_RegionFallsBackToAdapterDefault(t *testing.T) {
+func TestToInstance_RegionFromInstance(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
-	// An instance that does not report its own region is stamped with the
-	// adapter's configured region.
-	inst := p.toInstance(EC2Instance{ID: "i-x", State: stateRunning})
-	if inst.Region != testRegion {
-		t.Fatalf("Region = %q, want adapter default %q", inst.Region, testRegion)
+	// The region-pinned client always stamps its region onto observed instances, so
+	// toInstance passes it through verbatim (no default fallback exists anymore).
+	inst := p.toInstance(EC2Instance{ID: "i-x", State: stateRunning, Region: "ap-south-1"})
+	if inst.Region != "ap-south-1" {
+		t.Fatalf("Region = %q, want ap-south-1 (reported by the instance)", inst.Region)
 	}
 }
 
 func TestTerminate_Idempotent(t *testing.T) {
-	f := &fakeClient{}
+	f := &fakeClient{
+		instances: []EC2Instance{{
+			ID:     "i-1",
+			Tags:   map[string]string{ClaimTagKey: "claim-a"},
+			State:  stateRunning,
+			Region: testRegion,
+		}},
+	}
 	p := newTestProvider(f)
 
 	// Empty id: nothing was provisioned; treat as already gone (no client call).
@@ -400,11 +419,28 @@ func TestTerminate_Idempotent(t *testing.T) {
 	if len(f.terminated) != 0 {
 		t.Fatalf("Terminate(\"\") called client, want no-op")
 	}
+	// A raw EC2 id: Terminate sweeps regions, confirms the instance lives in one, and
+	// terminates it there.
 	if err := p.Terminate(context.Background(), "i-1"); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}
 	if len(f.terminated) != 1 || f.terminated[0] != "i-1" {
 		t.Fatalf("terminated = %v, want [i-1]", f.terminated)
+	}
+}
+
+// TestTerminate_LegacyQualifiedID covers the back-compat path: an id persisted in the
+// old "<region>/i-..." form (before the id stopped being region-qualified) still
+// routes straight to that region and terminates the raw id, no sweep needed.
+func TestTerminate_LegacyQualifiedID(t *testing.T) {
+	f := &fakeClient{}
+	p := newTestProvider(f)
+
+	if err := p.Terminate(context.Background(), testRegion+"/i-legacy"); err != nil {
+		t.Fatalf("Terminate(legacy): %v", err)
+	}
+	if len(f.terminated) != 1 || f.terminated[0] != "i-legacy" {
+		t.Fatalf("terminated = %v, want [i-legacy]", f.terminated)
 	}
 }
 
@@ -417,10 +453,10 @@ func TestClassifyProvisionError(t *testing.T) {
 	// caller — the provider owns the whole scope). Auth/quota (DenyAll) ignores both.
 	region, wantAccel := testRegion, accel
 	onDemandRegional := provider.BlockScope{
-		AcceleratorType: &wantAccel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: &region,
+		AcceleratorID: &wantAccel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: &region,
 	}
 	spotRegional := provider.BlockScope{
-		AcceleratorType: &wantAccel, CapacityType: nebulav1alpha1.CapacitySpot, Region: &region,
+		AcceleratorID: &wantAccel, CapacityType: nebulav1alpha1.CapacitySpot, Region: &region,
 	}
 
 	// A Spot capacity failure the Client wraps with both sentinels: no-capacity
@@ -444,7 +480,7 @@ func TestClassifyProvisionError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := p.ClassifyProvisionError(tt.err, accel)
+			got := p.ClassifyProvisionError(tt.err, accel, testRegion)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("got %+v, want %+v", got, tt.want)
 			}

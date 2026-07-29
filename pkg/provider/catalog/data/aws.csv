@@ -50,6 +50,8 @@ L4,g6.12xlarge,4,OnDemand,4.602,true,,2026-07-27
 L4,g6.12xlarge,4,Spot,1.610,true,,2026-07-27
 L4,g6.48xlarge,8,OnDemand,13.350,true,,2026-07-27
 L4,g6.48xlarge,8,Spot,4.672,true,,2026-07-27
+A100-40GB,p4d.24xlarge,8,OnDemand,32.773,true,,2026-07-29
+A100-40GB,p4d.24xlarge,8,Spot,11.470,true,,2026-07-29
 A100-80GB,p4de.24xlarge,8,OnDemand,40.966,true,,2026-07-27
 A100-80GB,p4de.24xlarge,8,Spot,14.338,true,,2026-07-27
 H100,p5.48xlarge,8,OnDemand,98.320,true,,2026-07-27

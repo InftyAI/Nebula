@@ -20,8 +20,14 @@ spec:
     - jsonPath: .spec.provider
       name: Provider
       type: string
+    - jsonPath: .spec.region
+      name: Region
+      type: string
     - jsonPath: .status.instanceID
       name: Instance
+      type: string
+    - jsonPath: .spec.capacityType
+      name: CapacityType
       type: string
     - jsonPath: .status.phase
       name: Phase

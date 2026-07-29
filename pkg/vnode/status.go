@@ -17,6 +17,8 @@ limitations under the License.
 package vnode
 
 import (
+	"net"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -28,9 +30,18 @@ import (
 // is a passive ledger and does not mirror this), so these live here in the
 // vnode, not on the API type.
 const (
-	// reasonProvisioning: a provider Provision call has been issued and the
-	// instance is not yet running.
+	// reasonProvisioning: a provider Provision call has been issued but the
+	// instance does not yet exist — we are still allocating it (e.g. EC2
+	// RunInstances in flight). Set on CreatePod, before the first poll observes
+	// the instance.
 	reasonProvisioning = "Provisioning"
+	// reasonInitializing: the instance EXISTS at the provider but is not yet
+	// reachable — it is booting (EC2 "pending") or running-but-not-yet-passing its
+	// reachability checks (running, <2/2, EC2's own "Initializing" status). It
+	// mirrors that EC2 status-check term. Provisioning is done; the instance is
+	// coming up. Distinct from Provisioning so a Pod stuck here points at a slow
+	// boot / failing status checks, not a stuck allocation.
+	reasonInitializing = "Initializing"
 	// reasonRunning: the provider reports the instance running.
 	reasonRunning = "Running"
 	// reasonProvisionFailed: the provider rejected or failed the Provision call.
@@ -63,14 +74,21 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 		setPhase(pod, corev1.PodRunning, reasonRunning, "external instance is running", now)
 		setReady(pod, corev1.ConditionTrue, now)
 		setContainerStatuses(pod, corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}}, true)
-		if endpoint != "" {
+		// PodIP is validated by the API server as a literal IP, so only populate it
+		// when the endpoint actually is one — an AWS public DNS name (the common
+		// case) would make the whole status UpdateStatus fail with a 422 and strand
+		// the Pod on its prior (Initializing) status forever. The endpoint is always
+		// surfaced on EndpointAnnotation regardless of form (see Handler.applyEndpoint),
+		// so a DNS-only instance still exposes its reachable address; PodIP just stays
+		// empty in that case.
+		if endpoint != "" && net.ParseIP(endpoint) != nil {
 			pod.Status.PodIP = endpoint
 		}
 	case provider.InstancePending:
-		setPhase(pod, corev1.PodPending, reasonProvisioning, "external instance is starting", now)
+		setPhase(pod, corev1.PodPending, reasonInitializing, "external instance is initializing", now)
 		setReady(pod, corev1.ConditionFalse, now)
 		setContainerStatuses(pod, corev1.ContainerState{
-			Waiting: &corev1.ContainerStateWaiting{Reason: reasonProvisioning, Message: "external instance is starting"},
+			Waiting: &corev1.ContainerStateWaiting{Reason: reasonInitializing, Message: "external instance is initializing"},
 		}, false)
 	case provider.InstanceFailed:
 		setPhase(pod, corev1.PodFailed, reasonFailed, "external instance entered a failed state", now)

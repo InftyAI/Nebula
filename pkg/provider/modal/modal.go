@@ -230,7 +230,9 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // matching shared sentinel (e.g. fmt.Errorf("...: %w", provider.ErrNoCapacity));
 // ClassifyError honours those first and falls back to string heuristics for raw
 // API messages, so no Modal-specific matching is duplicated here.
-func (p *Provider) ClassifyProvisionError(err error, accelerator string) provider.BlockScope {
+func (p *Provider) ClassifyProvisionError(err error, accelerator, _ string) provider.BlockScope {
+	// Region is ignored: Modal is region-simple (no region axis), so the block's
+	// Region stays nil — see BlockScope's three-state rule.
 	return provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
 }
 
@@ -286,7 +288,7 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		return SandboxSpec{}, fmt.Errorf("modal: %w", err)
 	}
 	if canonical != "" {
-		modalGPU, ok := p.MapAccelerator(canonical)
+		modalGPU, ok := p.MapAccelerator(canonical, count)
 		if !ok {
 			return SandboxSpec{}, fmt.Errorf("modal: unsupported accelerator %q", canonical)
 		}

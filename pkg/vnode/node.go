@@ -97,7 +97,7 @@ var _ manager.Runnable = (*Runner)(nil)
 func (r *Runner) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithValues("virtualNode", r.nodeName, "provider", r.prov.Name())
 
-	handler := NewHandler(r.prov, r.blocklist)
+	handler := NewHandler(r.prov, r.client, r.blocklist)
 	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
 
 	// Pod informer scoped to this node only (spec.nodeName == nodeName), so the

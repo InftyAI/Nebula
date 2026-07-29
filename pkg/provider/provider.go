@@ -86,24 +86,33 @@ type Provider interface {
 
 	// --- Translation -----------------------------------------------------
 
-	// MapAccelerator translates a canonical Nebula accelerator type ("H100",
-	// "A100-80GB", "TPU-v4") into this provider's identifier (e.g. RunPod's
-	// "NVIDIA H100 80GB HBM3"). Returns ok=false if the provider does not offer
-	// that accelerator.
-	MapAccelerator(canonical string) (providerAcceleratorID string, ok bool)
+	// MapAccelerator translates a canonical Nebula accelerator request (type +
+	// count) into this provider's identifier for what actually serves it (e.g.
+	// RunPod's "NVIDIA H100 80GB HBM3", or AWS's "g6.48xlarge"). Count is part of
+	// the key because on some providers the GPU count is baked into the offering
+	// rather than a free knob: on AWS (L4, 1) and (L4, 8) resolve to DIFFERENT
+	// instance types (g6.xlarge vs g6.48xlarge) — distinct capacity pools — so the
+	// id must distinguish them. Providers that attach an arbitrary count to a single
+	// offering (Modal) ignore count and return the same id for every count. Returns
+	// ok=false if the provider does not offer that (type, count). The returned id is
+	// what failover keys a capacity block on, so two requests that share a capacity
+	// pool must return the same id and two that do not must differ.
+	MapAccelerator(canonical string, count int32) (providerAcceleratorID string, ok bool)
 
 	// ClassifyProvisionError maps a Provision error to the granularity at which
 	// the failing placement should be blocklisted. This keeps failover precise:
-	// a "no H100 capacity" error blocks only {provider, H100, capacityType},
+	// a "no H100 capacity" error blocks only {provider, H100, capacityType, region},
 	// while an auth/quota error blocks the whole provider. See BlockScope.
 	//
-	// accelerator is the canonical accelerator the failing request asked for (""
-	// for a CPU-only Pod). The provider needs it because the error alone does not
-	// carry it, and the provider is the single owner of the complete scope: it
-	// stamps the accelerator on a capacity block AND adds any provider-specific
-	// axis it knows (AWS confines the block to its region). No caller assembles a
-	// scope piecemeal after this returns.
-	ClassifyProvisionError(err error, accelerator string) BlockScope
+	// accelerator and region are the two request facts the error itself does not
+	// carry: the accelerator the failing request asked for ("" for a CPU-only Pod)
+	// and the region it targeted ("" for a region-simple provider, or when the
+	// request did not pin one). The provider is the single owner of the complete
+	// scope — it stamps the accelerator on a capacity block, confines the block to
+	// the region that actually failed (a region-aware provider), and widens
+	// auth/quota to the whole provider. No caller assembles a scope piecemeal after
+	// this returns.
+	ClassifyProvisionError(err error, accelerator, region string) BlockScope
 }
 
 // ProvisionRequest carries only the decisions the placement controller made
@@ -232,7 +241,7 @@ type Offering struct {
 
 // BlockScope is the granularity at which a failed placement is excluded, matched
 // to what actually failed (SkyPilot's blocklist-granularity rule). It is a partial
-// MATCH PATTERN, not a value, and AcceleratorType/Region are THREE-STATE pointers
+// MATCH PATTERN, not a value, and AcceleratorID/Region are THREE-STATE pointers
 // so a pattern can distinguish "any value" from "no value":
 //
 //   - nil   => the axis is NOT APPLICABLE to this block: it matches only a
@@ -257,13 +266,18 @@ type Offering struct {
 // mixes the two: a NodePool candidate is resolved to fully-concrete values before
 // it is matched against these patterns.
 type BlockScope struct {
-	// AcceleratorType: nil => not applicable (CPU-only Pod, or a DenyAll scope);
-	// &"" => wildcard, matches every accelerator; &"H100" => exactly that one.
-	// A capacity error carries no accelerator (it is classified from the error
-	// alone), so the adapter leaves this nil and the vnode handler fills it in
-	// from the failing Pod's request — narrowing the block to the accelerator that
-	// actually failed.
-	AcceleratorType *string
+	// AcceleratorID: nil => not applicable (CPU-only Pod, or a DenyAll scope);
+	// &"" => wildcard, matches every accelerator; &"g6.48xlarge" => exactly that
+	// one. It is the provider's RESOLVED id for what serves the failing request —
+	// the (type, count) mapped through MapAccelerator (an EC2 instance type on AWS,
+	// the canonical GPU name on Modal) — NOT the bare accelerator type. Keying on
+	// the resolved id is what confines a capacity block to the pool that actually
+	// ran out: an L4x8 (g6.48xlarge) Spot shortage must not exclude L4x1
+	// (g6.xlarge), a different instance type and capacity pool, though both are
+	// "L4". A capacity error carries no accelerator (it is classified from the error
+	// alone), so the adapter leaves this nil and the vnode handler fills it in from
+	// the failing Pod's resolved request.
+	AcceleratorID *string
 	// CapacityType empty => blocks all capacity types.
 	CapacityType nebulav1alpha1.CapacityType
 	// Region: nil => the provider has no region axis (a region-simple provider like
@@ -273,7 +287,7 @@ type BlockScope struct {
 	// region-aware provider (AWS) sets it; a region-simple one leaves it nil.
 	Region *string
 	// DenyAll true => block everything on this provider (e.g. auth/quota errors),
-	// ignoring AcceleratorType/CapacityType/Region. The scope is still this one
+	// ignoring AcceleratorID/CapacityType/Region. The scope is still this one
 	// provider; it never spans providers.
 	DenyAll bool
 }

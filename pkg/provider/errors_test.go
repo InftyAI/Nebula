@@ -27,9 +27,9 @@ import (
 func TestClassifyError(t *testing.T) {
 	const tier = nebulav1alpha1.CapacityOnDemand
 	const accel = "H100"
-	// capacityScope is the expected accelerator-scoped block: the accelerator is
+	// capacityScope is the expected accelerator-scoped block: the accelerator id is
 	// promoted to an exact-match pointer.
-	capacityScope := BlockScope{CapacityType: tier, AcceleratorType: ptrStr(accel)}
+	capacityScope := BlockScope{CapacityType: tier, AcceleratorID: ptrStr(accel)}
 	tests := []struct {
 		name string
 		err  error
@@ -64,12 +64,12 @@ func TestClassifyError_TierStamped(t *testing.T) {
 	}
 }
 
-// An empty accelerator (CPU-only Pod) must leave AcceleratorType nil ("not
+// An empty accelerator (CPU-only Pod) must leave AcceleratorID nil ("not
 // applicable"), never a wildcard that would widen the block across every GPU.
 func TestClassifyError_EmptyAcceleratorStaysNil(t *testing.T) {
 	got := ClassifyError(ErrNoCapacity, nebulav1alpha1.CapacityOnDemand, "")
-	if got.AcceleratorType != nil {
-		t.Fatalf("expected nil AcceleratorType for a CPU-only request, got %+v", got.AcceleratorType)
+	if got.AcceleratorID != nil {
+		t.Fatalf("expected nil AcceleratorID for a CPU-only request, got %+v", got.AcceleratorID)
 	}
 	if got.DenyAll || got.CapacityType != nebulav1alpha1.CapacityOnDemand {
 		t.Fatalf("expected an OnDemand capacity scope, got %+v", got)

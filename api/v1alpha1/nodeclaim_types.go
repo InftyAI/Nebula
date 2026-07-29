@@ -59,23 +59,35 @@ type PodReference struct {
 //
 // The NodeClaim is a passive teardown ledger, not a status mirror: it does NOT
 // track finer workload runtime status (CPU/logs/restarts) — the Pod is the
-// source of truth for that (see pkg/vnode/status.go). It tracks only the three
-// coarse states that matter to its own job as a ledger, keyed off the served
-// Pod's phase: Provisioning (instance coming up), Bound (instance running — the
-// guard the teardown backstop trusts), and Terminated (instance gone). Finer
-// states (e.g. Preempted) are deliberately absent: preemption cannot be detected
-// — the provider contract's InstanceState has no Preempted value, and an absent
-// instance only tells us it is gone, not why. Reintroduce a phase only when
-// something actually sets it.
+// source of truth for that (see pkg/vnode/status.go). It tracks only the coarse
+// states that matter to its own job as a ledger, keyed off the served Pod's
+// phase/reason: Provisioning (allocating — instance does not exist yet),
+// Initializing (instance exists and is booting but not yet reachable), Bound
+// (instance running — the guard the teardown backstop trusts), and Terminated
+// (instance gone). Finer states (e.g. Preempted) are deliberately absent:
+// preemption cannot be detected — the provider contract's InstanceState has no
+// Preempted value, and an absent instance only tells us it is gone, not why.
+// Reintroduce a phase only when something actually sets it.
+//
+// Only Bound is a teardown guard: neither Provisioning nor Initializing earns the
+// "trust a later disappearance" trust, because until the instance is confirmed up
+// an absent Pod may be cache lag rather than a real teardown.
 type NodeClaimPhase string
 
 const (
-	// NodeClaimProvisioning: the served Pod has been observed but is not yet
-	// running — the external instance is still being provisioned. The claim does
-	// NOT earn the Bound teardown guard here: a Pod that vanishes while still
+	// NodeClaimProvisioning: the served Pod has been observed but the external
+	// instance does not yet exist — provisioning is still allocating it. The claim
+	// does NOT earn the Bound teardown guard here: a Pod that vanishes while still
 	// provisioning is treated as possible cache lag (grace window), not a real
 	// teardown, because we never confirmed the instance was actually up.
 	NodeClaimProvisioning NodeClaimPhase = "Provisioning"
+	// NodeClaimInitializing: the external instance EXISTS at the provider but is not
+	// yet reachable (e.g. EC2 is "pending", or "running" but its 2/2 status checks
+	// have not passed). The served Pod is Pending with reason Initializing (see
+	// pkg/vnode/status.go). Like Provisioning it does NOT earn the Bound guard — the
+	// instance is not yet confirmed up — but it is surfaced as a distinct phase so
+	// "allocating" and "booting" are distinguishable on the ledger.
+	NodeClaimInitializing NodeClaimPhase = "Initializing"
 	// NodeClaimBound: the served Pod has been observed running (present and not in
 	// a terminal phase). This is the durable guard the backstop trusts — a Bound
 	// claim whose Pod later disappears is a real teardown, not cache lag. The claim
@@ -116,7 +128,9 @@ type NodeClaimStatus struct {
 // +kubebuilder:resource:scope=Cluster,shortName=nc
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.provider`
+// +kubebuilder:printcolumn:name="Region",type=string,JSONPath=`.spec.region`
 // +kubebuilder:printcolumn:name="Instance",type=string,JSONPath=`.status.instanceID`
+// +kubebuilder:printcolumn:name="CapacityType",type=string,JSONPath=`.spec.capacityType`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

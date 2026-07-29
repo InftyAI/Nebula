@@ -53,31 +53,33 @@ var (
 // a failure does not hot-loop (the blocklist TTL bounds the blast radius).
 //
 // It is the single place the SHARED part of a scope is derived — category
-// (DenyAll vs capacity-scoped), the capacity tier, and the accelerator — so every
-// adapter's ClassifyProvisionError delegates here and then only decorates with
-// what is provider-specific (AWS adds its region). No scope is assembled anywhere
-// else: the vnode handler resolves the accelerator off the Pod and passes it in,
-// rather than mutating the returned scope.
+// (DenyAll vs capacity-scoped), the capacity tier, and the accelerator id — so
+// every adapter's ClassifyProvisionError delegates here and then only decorates
+// with what is provider-specific (AWS adds its region). No scope is assembled
+// anywhere else: the vnode handler resolves the accelerator id off the Pod and
+// passes it in, rather than mutating the returned scope.
 //
 // capacityType is the tier the failing request used; it is stamped onto
 // accelerator-scoped scopes so the block is precise (a Spot failure does not
-// block OnDemand). accelerator is the canonical accelerator the request asked for
-// ("" for a CPU-only Pod): on a capacity-scoped block a non-empty accelerator
-// becomes an exact-match pointer (narrowing the block to the type that failed),
-// while "" leaves AcceleratorType nil ("not applicable") so the block does not
-// widen across every accelerator. Auth/quota (DenyAll) ignores both, since bad
-// credentials fail for every accelerator and tier.
-func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelerator string) BlockScope {
+// block OnDemand). acceleratorID is the provider's RESOLVED id for what served the
+// failing request (the (type, count) mapped through MapAccelerator — an EC2
+// instance type on AWS, the canonical name on Modal; "" for a CPU-only Pod): on a
+// capacity-scoped block a non-empty id becomes an exact-match pointer (narrowing
+// the block to the instance type / capacity pool that actually failed), while ""
+// leaves AcceleratorID nil ("not applicable") so the block does not widen across
+// every accelerator. Auth/quota (DenyAll) ignores both, since bad credentials fail
+// for every accelerator and tier.
+func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, acceleratorID string) BlockScope {
 	if err == nil {
 		return BlockScope{}
 	}
 
 	// capacityScope builds an accelerator/tier-scoped block, promoting a non-empty
-	// accelerator to an exact-match pointer and leaving it nil otherwise.
+	// accelerator id to an exact-match pointer and leaving it nil otherwise.
 	capacityScope := func() BlockScope {
 		s := BlockScope{CapacityType: capacityType}
-		if accelerator != "" {
-			s.AcceleratorType = &accelerator
+		if acceleratorID != "" {
+			s.AcceleratorID = &acceleratorID
 		}
 		return s
 	}

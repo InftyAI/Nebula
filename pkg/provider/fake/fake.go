@@ -148,7 +148,8 @@ func (p *Provider) List(_ context.Context) ([]provider.Instance, error) {
 // ClassifyProvisionError never really fails to provision, so any error it is
 // asked to classify is treated as a whole-provider block on OnDemand — the same
 // shared derivation the real adapters use.
-func (p *Provider) ClassifyProvisionError(err error, accelerator string) provider.BlockScope {
+func (p *Provider) ClassifyProvisionError(err error, accelerator, _ string) provider.BlockScope {
+	// Region is ignored: the fake is region-simple, matching the OnDemand NeoClouds.
 	return provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
 }
 

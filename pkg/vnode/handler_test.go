@@ -26,6 +26,9 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -46,11 +49,12 @@ type fakeProvider struct {
 	listErr      error
 	capabilities provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
-	// value (empty scope) means "not blocklistable". classifyAccel records the
-	// accelerator the handler passed in, so a test can assert it resolved it off the
-	// Pod (the provider now owns the whole scope; the handler only supplies this).
-	classifyScope provider.BlockScope
-	classifyAccel string
+	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
+	// record what the handler passed in, so a test can assert it resolved them off the
+	// Pod (the provider now owns the whole scope; the handler only supplies these).
+	classifyScope  provider.BlockScope
+	classifyAccel  string
+	classifyRegion string
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
@@ -77,9 +81,10 @@ func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
 }
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
-func (f *fakeProvider) MapAccelerator(c string) (string, bool)                 { return c, true }
-func (f *fakeProvider) ClassifyProvisionError(_ error, accel string) provider.BlockScope {
+func (f *fakeProvider) MapAccelerator(c string, _ int32) (string, bool)        { return c, true }
+func (f *fakeProvider) ClassifyProvisionError(_ error, accel, region string) provider.BlockScope {
 	f.classifyAccel = accel
+	f.classifyRegion = region
 	return f.classifyScope
 }
 
@@ -108,7 +113,7 @@ func testPod(ns, name string) *corev1.Pod {
 
 func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 	pod.Annotations = map[string]string{nebulav1alpha1.CapacityTypeAnnotation: string(nebulav1alpha1.CapacitySpot)}
 
@@ -136,7 +141,7 @@ func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 
 func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity")}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
@@ -155,13 +160,13 @@ func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	accel, region := "H100", "us-east-1"
 	scope := provider.BlockScope{
-		AcceleratorType: &accel,
-		CapacityType:    nebulav1alpha1.CapacitySpot,
-		Region:          &region,
+		AcceleratorID: &accel,
+		CapacityType:  nebulav1alpha1.CapacitySpot,
+		Region:        &region,
 	}
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, bl)
+	h := NewHandler(fp, nil, bl)
 
 	pod := testPod("default", "p1")
 	pod.Annotations = map[string]string{nebulav1alpha1.BlocklistTTLAnnotation: "3m"}
@@ -195,7 +200,7 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 	// (which would exclude everything on the provider).
 	fp := &fakeProvider{provisionErr: errors.New("weird"), classifyScope: provider.BlockScope{}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, bl)
+	h := NewHandler(fp, nil, bl)
 
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 		t.Fatal("expected CreatePod to return the provision error")
@@ -208,7 +213,7 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, bl)
+	h := NewHandler(fp, nil, bl)
 
 	// No BlocklistTTLAnnotation on the Pod => the handler's built-in default.
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
@@ -221,7 +226,7 @@ func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
 
 func TestDeletePod_TerminatesAndUntracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
@@ -243,7 +248,7 @@ func TestDeletePod_TerminatesAndUntracks(t *testing.T) {
 
 func TestDeletePod_Idempotent(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -257,7 +262,7 @@ func TestDeletePod_Idempotent(t *testing.T) {
 
 func TestReconcileOnce_ReportsRunning(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -287,6 +292,10 @@ func TestReconcileOnce_ReportsRunning(t *testing.T) {
 		t.Fatalf("expected endpoint set as PodIP, got %q", got.Status.PodIP)
 	}
 
+	if got.Annotations[nebulav1alpha1.EndpointAnnotation] != "5.6.7.8" {
+		t.Fatalf("expected endpoint annotation set, got %q", got.Annotations[nebulav1alpha1.EndpointAnnotation])
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	if len(notified) == 0 {
@@ -294,9 +303,135 @@ func TestReconcileOnce_ReportsRunning(t *testing.T) {
 	}
 }
 
+func TestReconcileOnce_DNSEndpointNotWrittenToPodIP(t *testing.T) {
+	// AWS reports a public DNS name as the endpoint. PodIP is validated by the API
+	// server as a literal IP, so a DNS name there fails the whole status write; it
+	// must be left empty. The reachable address is surfaced on the annotation
+	// instead, which accepts any form.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil)
+	pod := testPod("default", "p1")
+	_ = h.CreatePod(context.Background(), pod)
+
+	const dns = "ec2-54-161-33-206.compute-1.amazonaws.com"
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: dns,
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodRunning {
+		t.Fatalf("expected Running, got %q", got.Status.Phase)
+	}
+	if got.Status.PodIP != "" {
+		t.Fatalf("a DNS endpoint must not be written to PodIP, got %q", got.Status.PodIP)
+	}
+	if got.Annotations[nebulav1alpha1.EndpointAnnotation] != dns {
+		t.Fatalf("expected DNS endpoint on the annotation, got %q", got.Annotations[nebulav1alpha1.EndpointAnnotation])
+	}
+}
+
+func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
+	// The endpoint must reach the API-server Pod metadata (VK writes only status),
+	// so the notify wrapper issues a metadata patch. It must fire when the endpoint
+	// first appears and then dedup: a steady Running pod re-emitted every tick must
+	// not re-patch.
+	const dns = "ec2-54-161-33-206.compute-1.amazonaws.com"
+	pod := testPod("default", "p1")
+	client := fake.NewSimpleClientset(pod)
+
+	var patches int
+	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		patches++
+		return false, nil, nil // fall through to the tracker so the object updates
+	})
+
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, client, nil)
+	_ = h.CreatePod(context.Background(), pod)
+	// Register the notify wrapper (this is where persistEndpoint is injected).
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: dns,
+	}}
+
+	// First tick: endpoint appears -> one patch.
+	h.reconcileOnce(context.Background())
+	if patches != 1 {
+		t.Fatalf("expected exactly one patch when the endpoint first appears, got %d", patches)
+	}
+
+	// The annotation landed on the API-server object.
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get patched pod: %v", err)
+	}
+	if live.Annotations[nebulav1alpha1.EndpointAnnotation] != dns {
+		t.Fatalf("expected endpoint persisted to API server, got %q", live.Annotations[nebulav1alpha1.EndpointAnnotation])
+	}
+
+	// Second tick with the same endpoint: deduped, no additional patch.
+	h.reconcileOnce(context.Background())
+	if patches != 1 {
+		t.Fatalf("an unchanged endpoint must not re-patch; got %d patches", patches)
+	}
+}
+
+func TestReconcileOnce_NotifiesOnProvisioningToInitializing(t *testing.T) {
+	// The Pod starts at "Provisioning" (phase Pending), and the instance comes up
+	// but has not yet passed its readiness checks => InstancePending, which maps to
+	// the "Initializing" reason at the SAME phase (Pending). A phase-only change
+	// check would swallow this and strand the Pod on the stale "Provisioning"
+	// reason; the reason must move and a notification must fire.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil)
+	pod := testPod("default", "p1")
+	_ = h.CreatePod(context.Background(), pod)
+
+	// Sanity: CreatePod left it at the Provisioning reason (still Pending).
+	if got, _ := h.GetPod(context.Background(), "default", "p1"); got.Status.Reason != reasonProvisioning {
+		t.Fatalf("precondition: expected %q, got %q", reasonProvisioning, got.Status.Reason)
+	}
+
+	var mu sync.Mutex
+	var notified []*corev1.Pod
+	h.NotifyPods(context.Background(), func(p *corev1.Pod) {
+		mu.Lock()
+		notified = append(notified, p)
+		mu.Unlock()
+	})
+
+	// Instance is up but not yet reachable (2/2 checks pending) => InstancePending.
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstancePending,
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodPending {
+		t.Fatalf("expected phase to stay Pending, got %q", got.Status.Phase)
+	}
+	if got.Status.Reason != reasonInitializing {
+		t.Fatalf("expected reason to advance to %q, got %q", reasonInitializing, got.Status.Reason)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notified) == 0 {
+		t.Fatal("expected a notification on the Provisioning->Initializing reason change (same phase)")
+	}
+}
+
 func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -316,18 +451,61 @@ func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 func TestNewHandler_PollIntervalFromCapabilities(t *testing.T) {
 	// A provider that declares a cadence overrides the default.
 	custom := &fakeProvider{capabilities: provider.Capabilities{PollInterval: 5 * time.Second}}
-	if got := NewHandler(custom, nil).pollEvery; got != 5*time.Second {
+	if got := NewHandler(custom, nil, nil).pollEvery; got != 5*time.Second {
 		t.Fatalf("expected the provider's PollInterval, got %v", got)
 	}
 	// A provider that leaves it zero falls back to the vnode default.
-	if got := NewHandler(&fakeProvider{}, nil).pollEvery; got != defaultPollInterval {
+	if got := NewHandler(&fakeProvider{}, nil, nil).pollEvery; got != defaultPollInterval {
 		t.Fatalf("expected the default cadence, got %v", got)
+	}
+}
+
+func TestGetPod_ReAdoptsLiveInstanceAfterRestart(t *testing.T) {
+	// Simulate a VK restart: the tracking map is cold (no CreatePod ran this
+	// process), but the external instance for the Pod's claim is still running. A
+	// GetPod must re-adopt it from the provider's List and report its true state,
+	// so VK takes the adopt path instead of re-issuing CreatePod (which would reset
+	// the Pod to Provisioning). This is the fix for "stuck on Provisioning while the
+	// instance is actually running".
+	fp := &fakeProvider{list: []provider.Instance{{
+		ID: "inst-9", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: "1.2.3.4",
+	}}}
+	h := NewHandler(fp, nil, nil)
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod after restart: %v", err)
+	}
+	if got.Status.Phase != corev1.PodRunning {
+		t.Fatalf("expected re-adopted Pod reported Running, got %q", got.Status.Phase)
+	}
+	if got.Status.PodIP != "1.2.3.4" {
+		t.Fatalf("expected endpoint adopted as PodIP, got %q", got.Status.PodIP)
+	}
+
+	// It must now be tracked, so the poll loop advances it and DeletePod can find
+	// the instance id to terminate.
+	if _, err := h.GetPod(context.Background(), "default", "p1"); err != nil {
+		t.Fatalf("expected the re-adopted Pod to be tracked: %v", err)
+	}
+}
+
+func TestGetPod_UnknownClaimStaysNotFound(t *testing.T) {
+	// No tracking and no live instance for this claim => genuinely absent. GetPod
+	// must report NotFound so VK creates it, not silently adopt a phantom.
+	fp := &fakeProvider{list: []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-other", State: provider.InstanceRunning,
+	}}}
+	h := NewHandler(fp, nil, nil)
+
+	if _, err := h.GetPod(context.Background(), "default", "p1"); !errdefs.IsNotFound(err) {
+		t.Fatalf("expected NotFound for an unknown, unlisted claim, got %v", err)
 	}
 }
 
 func TestGetPods_ReturnsTracked(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil)
+	h := NewHandler(fp, nil, nil)
 	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
 	_ = h.CreatePod(context.Background(), testPod("default", "p2"))
 

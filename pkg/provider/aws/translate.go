@@ -148,8 +148,10 @@ func classifyEC2Error(err error, spot bool) error {
 
 // wrapNoCapacity wraps err with provider.ErrNoCapacity plus, conditionally, the
 // Spot-tier marker (ErrSpotCapacity) and the zone-local sweep marker
-// (errZoneLocal). errors.Join lets errors.Is find every marker regardless of how
-// many apply.
+// (errZoneLocal). It builds a single multi-%w chain (Go 1.20+) rather than
+// errors.Join: errors.Is still finds every marker, but the rendered message stays
+// on ONE line (": "-separated) instead of errors.Join's one-error-per-line form,
+// which is far more readable when the chain is surfaced as a Pod Event / log line.
 func wrapNoCapacity(err error, spot, zoneLocal bool) error {
 	errs := []error{err, provider.ErrNoCapacity}
 	if spot {
@@ -158,5 +160,12 @@ func wrapNoCapacity(err error, spot, zoneLocal bool) error {
 	if zoneLocal {
 		errs = append(errs, errZoneLocal)
 	}
-	return errors.Join(errs...)
+	// fmt.Errorf with N "%w" verbs wraps every error (so errors.Is/As unwrap them
+	// all) while joining their messages with ": " on a single line.
+	format := strings.TrimPrefix(strings.Repeat(": %w", len(errs)), ": ")
+	args := make([]any, len(errs))
+	for i, e := range errs {
+		args[i] = e
+	}
+	return fmt.Errorf(format, args...)
 }

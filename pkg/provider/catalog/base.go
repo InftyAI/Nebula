@@ -76,23 +76,38 @@ func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 	return b.Catalog.Offerings(b.ProviderName), nil
 }
 
-// MapAccelerator translates a canonical accelerator type into this provider's
-// own accelerator id using the catalog as the mapping table: it finds the row
-// whose AcceleratorType matches (case-insensitively) and returns that row's
-// AcceleratorID. When AcceleratorID is blank (a provider whose id equals the
-// canonical name) it falls back to the canonical name, so an identity-mapped
-// provider needs no per-name data. Because the mapping lives entirely in the
-// CSV, a provider whose ids diverge (AWS instance types) does NOT need to
-// override this — it just populates the accelerator_id column. Returns ok=false
-// when the provider does not offer the accelerator.
-func (b Base) MapAccelerator(canonical string) (providerAcceleratorID string, ok bool) {
+// MapAccelerator translates a canonical accelerator request (type + count) into
+// this provider's own accelerator id using the catalog as the mapping table. It
+// finds the offering row whose AcceleratorType matches (case-insensitively) and
+// whose GPUCount matches the request, and returns that row's AcceleratorID. When
+// AcceleratorID is blank (a provider whose id equals the canonical name) it falls
+// back to the canonical name, so an identity-mapped provider needs no per-name
+// data. Because the mapping lives entirely in the CSV, a provider whose ids
+// diverge (AWS instance types) does NOT need to override this — it just populates
+// the accelerator_id and gpu_count columns.
+//
+// Count matching honours the two catalog shapes (see Offering.GPUCount): a
+// provider that bakes the count into the offering (AWS: T4x1=g4dn.xlarge,
+// T4x8=g4dn.metal) emits one row per count, so the row whose GPUCount equals the
+// request is the match — this is what keeps (L4, 1) and (L4, 8) on DISTINCT ids so
+// one's capacity block does not exclude the other. A provider that takes the count
+// as a free parameter (Modal) leaves GPUCount 0 on its single row; a 0-count row
+// matches any requested count, since count is not a lookup dimension there.
+// Returns ok=false when the provider offers no row for that (type, count).
+func (b Base) MapAccelerator(canonical string, count int32) (providerAcceleratorID string, ok bool) {
 	for _, o := range b.Catalog.Offerings(b.ProviderName) {
-		if strings.EqualFold(o.AcceleratorType, canonical) {
-			if o.AcceleratorID != "" {
-				return o.AcceleratorID, true
-			}
-			return o.AcceleratorType, true
+		if !strings.EqualFold(o.AcceleratorType, canonical) {
+			continue
 		}
+		// GPUCount 0 => count is not a lookup dimension for this provider (matches any
+		// requested count); otherwise the row's count must equal the request.
+		if o.GPUCount != 0 && o.GPUCount != count {
+			continue
+		}
+		if o.AcceleratorID != "" {
+			return o.AcceleratorID, true
+		}
+		return o.AcceleratorType, true
 	}
 	return "", false
 }

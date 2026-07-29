@@ -18,13 +18,17 @@ package controller
 
 import (
 	"context"
+	"hash/fnv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -73,43 +77,76 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 // registering, or a block expiring). Provider quirks (e.g. Modal being
 // OnDemand-only) are still handled at Provision time, not here.
 //
+// On ok=false it also returns retryAfter: the time until the SOONEST currently-
+// servable candidate (one skipped ONLY because it is blocklisted) frees, or 0 when
+// no candidate can ever be unblocked by a lapsing TTL (every candidate is
+// unregistered or does not offer the accelerator). The caller requeues on a
+// positive hint so a Pod stuck purely on failover retries the moment a block
+// expires, rather than idling until the periodic resync — blocklist TTL expiry
+// emits no event of its own.
+//
 // Strategy (LowestPrice/Weighted price-ranking) is a later swap-in for the inner
 // ordering; today the inner walk is listed order (Ordered), which the caller's
 // flow does not depend on — only that a (provider, capacityType, region) comes
 // back.
-func (r *PodPlacementReconciler) selectPlacement(pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool) {
-	// Only the accelerator type is needed for matching; the count is a provisioning
-	// detail the adapter reads. A malformed request is treated as "no accelerator"
-	// so placement stays a no-op rather than erroring the reconcile — provisioning
-	// would surface the real error.
-	accel, _, _ := util.AcceleratorRequest(pod)
+func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool, time.Duration) {
+	log := logf.FromContext(ctx).WithName("placement-select").WithValues(
+		"pod", pod.Namespace+"/"+pod.Name, "pool", pool.Name)
 
+	// The (type, count) together select the concrete offering: a provider resolves
+	// them through MapAccelerator to its own id (an EC2 instance type on AWS), which
+	// is what the blocklist keys on so L4x1 and L4x8 (distinct instance types) block
+	// independently. A malformed request is treated as "no accelerator" so placement
+	// stays a no-op rather than erroring the reconcile — provisioning would surface
+	// the real error.
+	accel, count, _ := util.AcceleratorRequest(pod)
+
+	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
 	for _, tier := range capacityTiers(pool) { // outer: capacity
 		for _, ref := range pool.Spec.Providers { // provider (Ordered = listed order)
 			prov, ok := r.provider(ref.Name)
 			if !ok {
+				log.V(1).Info("skipping candidate: provider not registered",
+					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
 			}
 			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
-			// Pod only matches a provider whose catalog maps that accelerator.
+			// Pod only matches a provider whose catalog serves that (type, count). The
+			// resolved id is also what the block is keyed on, so it is captured here
+			// from the same lookup that decides servability.
+			acceleratorID := ""
 			if accel != "" {
-				if _, offered := prov.MapAccelerator(accel); !offered {
+				id, offered := prov.MapAccelerator(accel, count)
+				if !offered {
+					log.V(1).Info("skipping candidate: provider does not offer the accelerator",
+						"provider", ref.Name, "accelerator", accel, "count", count)
 					continue
 				}
+				acceleratorID = id
 			}
 			for _, region := range regionsFor(ref) { // inner: region
-				if r.blocked(ref.Name, accel, tier, region) {
-					continue // failed recently; try the next region, then the next tier
+				if until, blocked := r.blockedUntil(ref.Name, acceleratorID, tier, region); blocked {
+					// Servable but failed recently; try the next region, then the next
+					// tier, and remember when this one frees so we can requeue for it.
+					log.Info("skipping candidate: blocked by failover blocklist",
+						"provider", ref.Name, "acceleratorID", acceleratorID,
+						"capacityType", tier, "region", region, "freesIn", until.String())
+					if until > 0 && (soonest == 0 || until < soonest) {
+						soonest = until
+					}
+					continue
 				}
+				log.Info("selected placement candidate",
+					"provider", ref.Name, "capacityType", tier, "region", region)
 				return placement{
 					provider:     ref.Name,
 					capacityType: tier,
 					region:       region,
-				}, true
+				}, true, 0
 			}
 		}
 	}
-	return placement{}, false
+	return placement{}, false, soonest
 }
 
 // capacityTiers is the outer axis to walk: the pool's CapacityTypes in fallback
@@ -136,19 +173,34 @@ func regionsFor(ref nebulav1alpha1.ProviderSpec) []string {
 	return ref.Regions
 }
 
-// blocked reports whether the (provider, accelerator, tier, region) candidate is
-// currently excluded by the failover blocklist. It is nil-safe: with no blocklist
+// blockedUntil reports whether the (provider, acceleratorID, tier, region)
+// candidate is currently excluded by the failover blocklist and, if so, how long
+// until it frees (for the requeue hint). acceleratorID is the provider's resolved
+// id for the request (see selectPlacement), so a capacity block matches only
+// candidates on the same instance type / pool. It is nil-safe: with no blocklist
 // wired (tests, or a blocklist-less build) nothing is ever blocked.
-func (r *PodPlacementReconciler) blocked(provName, accel string, tier nebulav1alpha1.CapacityType, region string) bool {
+func (r *PodPlacementReconciler) blockedUntil(provName, acceleratorID string, tier nebulav1alpha1.CapacityType, region string) (time.Duration, bool) {
 	if r.Blocklist == nil {
-		return false
+		return 0, false
 	}
-	return r.Blocklist.Blocked(failover.Candidate{
-		Provider:        provName,
-		AcceleratorType: accel,
-		CapacityType:    tier,
-		Region:          region,
+	return r.Blocklist.BlockedUntil(failover.Candidate{
+		Provider:      provName,
+		AcceleratorID: acceleratorID,
+		CapacityType:  tier,
+		Region:        region,
 	})
+}
+
+// requeueJitter maps a Pod UID to a stable offset in [0, blockRequeueJitter) to
+// desynchronize the requeues of Pods that share a scope-keyed failover block.
+// It is deterministic (a hash of the UID, not a random draw) so a given Pod's
+// successive retries land at the same offset — the goal is to spread DISTINCT
+// Pods apart, not to move one Pod around between attempts. A missing UID hashes
+// to a fixed value, which is harmless: real Pods always carry a UID.
+func requeueJitter(uid types.UID) time.Duration {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(uid))
+	return time.Duration(h.Sum64() % uint64(blockRequeueJitter))
 }
 
 // ensureClaim creates the NodeClaim for this placement if it does not already
