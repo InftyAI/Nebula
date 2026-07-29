@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Go Version](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)
 
-Run GPU workloads on any NeoCloud or hyperscaler — AWS, Modal, and more — through one Kubernetes API.
+Run GPU workloads on any NeoCloud or hyperscaler through one Kubernetes API.
 
 </div>
 
