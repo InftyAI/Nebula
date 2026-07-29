@@ -94,4 +94,5 @@ placement controller owns those.
 
 - See [docs/deploy.md](docs/deploy.md) to install
 - See [config/samples](config/samples) for example NodePools and a runnable workload.
+- See [docs/add-a-provider.md](docs/add-a-provider.md) to add a provider backend.
 - See [docs/architecture.md](docs/architecture.md) for design details.
