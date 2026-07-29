@@ -38,6 +38,16 @@ import (
 // bounded retry is enough.
 const staleClaimRequeue = 5 * time.Second
 
+// blockRequeueJitter is the width of the window a blocked-everywhere Pod's
+// requeue is spread across, ON TOP OF the block's expiry. A failover block is
+// keyed by scope (provider/accelerator/tier/region), not by Pod, so every Pod
+// contending for the same capacity pool sees the same expiry and, without
+// jitter, would requeue at the same instant — then all retry together, all hit
+// the still-tight pool together, and all re-block with a fresh TTL in lockstep
+// (a synchronized retry storm). A deterministic per-Pod offset in [0, jitter)
+// breaks the herd apart while staying stable across a Pod's own retries.
+const blockRequeueJitter = 30 * time.Second
+
 // PodPlacementReconciler is the middle of the placement flow: it turns a gated,
 // opted-in Pod into a placed one. The webhook holds the Pod SchedulingGated
 // until a provider is chosen; this controller chooses one, records the decision
@@ -67,11 +77,13 @@ type PodPlacementReconciler struct {
 }
 
 // Blocklister is the read side of pkg/failover.Blocklist the placement controller
-// depends on: it asks whether a candidate placement is currently excluded. The
-// concrete type is injected from main; this narrow interface keeps the controller
-// decoupled and a nil value a no-op.
+// depends on: it asks whether a candidate placement is currently excluded and,
+// when it is, how long until it frees (so a Pod stuck on failover can requeue for
+// the exact moment a block lapses rather than idling until the periodic resync).
+// The concrete type is injected from main; this narrow interface keeps the
+// controller decoupled and a nil value a no-op.
 type Blocklister interface {
-	Blocked(c failover.Candidate) bool
+	BlockedUntil(c failover.Candidate) (retryAfter time.Duration, blocked bool)
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
@@ -118,10 +130,23 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	placement, ok := r.selectPlacement(&pod, pool)
+	placement, ok, retryAfter := r.selectPlacement(ctx, &pod, pool)
 	if !ok {
 		// No provider in the pool can serve this Pod's GPU type right now. Leave it
 		// gated; a later reconcile (pool edit, provider registered) can place it.
+		// When the only thing standing in the way is a failover block, requeue for
+		// the moment it lapses — blocklist TTL expiry emits no event, so without this
+		// the Pod would idle until the periodic resync (hours) even though a servable
+		// candidate frees in minutes.
+		if retryAfter > 0 {
+			// Spread the requeue past the shared expiry by a stable per-Pod offset so
+			// Pods contending for the same (scope-keyed) block don't all wake and retry
+			// in lockstep, thundering the same tight pool the instant it frees.
+			retryAfter += requeueJitter(pod.UID)
+			log.Info("all servable candidates are blocked; requeuing for the soonest to free",
+				"pod", pod.Name, "pool", pool.Name, "retryAfter", retryAfter.String())
+			return ctrl.Result{RequeueAfter: retryAfter}, nil
+		}
 		log.Info("no provider in pool can serve the Pod; leaving it gated",
 			"pod", pod.Name, "pool", pool.Name)
 		return ctrl.Result{}, nil

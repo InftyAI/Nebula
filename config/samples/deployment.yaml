@@ -23,7 +23,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gpu-workload-sample
+  name: gpu-workload-sample-l4-8
   namespace: default
   labels:
     app.kubernetes.io/managed-by: nebula
@@ -65,4 +65,4 @@ spec:
             # GPU count. Standard extended resource, so the scheduler's fit check
             # and provisioning read the same number. 8 => 8x the accelerator-type
             # above.
-            nvidia.com/gpu: "1"
+            nvidia.com/gpu: "8"

@@ -32,6 +32,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -218,8 +219,10 @@ func main() {
 	// Register provider backends into the process-wide registry that both
 	// reconcilers resolve through (their Providers field defaults to
 	// provider.Get). Done before SetupWithManager so a pool/claim reconciled at
-	// startup already sees its provider.
-	registerProviders(context.Background())
+	// startup already sees its provider. The manager's client backs the AWS region
+	// source (regions are read from NodePools at call time, not env), so it is
+	// threaded in; the client is only queried at runtime, after the cache has synced.
+	registerProviders(context.Background(), mgr.GetClient())
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
 	// Provision failure and read by the placement controller to skip a candidate
@@ -329,7 +332,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister) error {
 // still run for the providers that ARE configured, and a pool referencing an
 // unregistered provider surfaces as a clear NodePool condition rather than a
 // crash loop.
-func registerProviders(ctx context.Context) {
+func registerProviders(ctx context.Context, c client.Client) {
 	if p, err := modal.NewSDKClient(ctx, os.Getenv("MODAL_APP_NAME")); err != nil {
 		setupLog.Info("skipping Modal provider registration", "reason", err.Error())
 	} else {
@@ -337,15 +340,18 @@ func registerProviders(ctx context.Context) {
 		setupLog.Info("registered provider", "provider", p.Name())
 	}
 
-	// AWS. Region is the only NON-SECRET config, read from AWS_REGION (empty => the
-	// SDK resolves its default from shared config / IMDS). The adapter is otherwise
-	// self-configuring: it resolves the GPU AMI and default-VPC subnets itself, so
-	// no launch template or pre-created infra is needed. Credentials are secrets and
-	// are NEVER read here: the SDK client uses the default credential chain (IRSA /
-	// instance-role / AWS_ACCESS_KEY_ID delivered via a Secret), so nothing
-	// sensitive touches a flag or this call. When AWS is not configured (no
-	// resolvable region, no GPU AMI in the region), registration is a non-fatal skip.
-	if p, err := awsprovider.NewSDKClient(ctx, os.Getenv("AWS_REGION")); err != nil {
+	// AWS. There is NO region env/flag: the regions this provider may use are declared
+	// per-pool in the NodePool (ProviderSpec.Regions) and read at call time via the
+	// region source below, so a pool added at runtime widens the fan-out without a
+	// restart. One AWS provider spans every such region (per-region clients are built
+	// lazily). The adapter is otherwise self-configuring: it resolves each region's
+	// GPU AMI and default-VPC subnets itself, so no launch template or pre-created
+	// infra is needed. Credentials are secrets and are NEVER read here: the SDK client
+	// uses the default credential chain (IRSA / instance-role / AWS_ACCESS_KEY_ID
+	// delivered via a Secret), and one account-global credential authorizes every
+	// region. Registration only fails (and is a non-fatal skip) if the price catalog
+	// cannot load — region config can no longer make it fail.
+	if p, err := awsprovider.NewSDKClient(ctx, awsRegionSource(c)); err != nil {
 		setupLog.Info("skipping AWS provider registration", "reason", err.Error())
 	} else {
 		provider.Register(p)
@@ -360,5 +366,38 @@ func registerProviders(ctx context.Context) {
 		p := fake.New()
 		provider.Register(p)
 		setupLog.Info("registered provider", "provider", p.Name())
+	}
+}
+
+// awsRegionSource returns the AWS adapter's RegionSource: the union of
+// ProviderSpec.Regions across every NodePool that references the "aws" provider. It
+// needs no env/flag — regions are the operator's per-pool declaration — and a pool
+// added/edited at runtime widens the swept set on the next List tick, no restart
+// required.
+//
+// It is evaluated on each List/Offerings tick. The underlying List is served from
+// the manager's informer cache (no API call), so scanning the pools per tick is
+// cheap even though it is O(pools); sweepRegions dedupes the result. On a list error
+// (cache not yet synced at startup, a transient failure) it returns nil and
+// sweepRegions falls back to the regions already provisioned into. It uses a
+// background context, not the registration ctx, since it runs long after
+// registration returns.
+func awsRegionSource(c client.Client) awsprovider.RegionSource {
+	return func() []string {
+		var pools nebulav1alpha1.NodePoolList
+		if err := c.List(context.Background(), &pools); err != nil {
+			setupLog.V(1).Info("aws region source: list NodePools failed; sweeping provisioned regions only",
+				"reason", err.Error())
+			return nil
+		}
+		var regions []string
+		for i := range pools.Items {
+			for _, ps := range pools.Items[i].Spec.Providers {
+				if ps.Name == provider.ProviderAWS {
+					regions = append(regions, ps.Regions...)
+				}
+			}
+		}
+		return regions
 	}
 }

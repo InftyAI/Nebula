@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	smithy "github.com/aws/smithy-go"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
@@ -112,45 +113,60 @@ type subnet struct {
 // compile-time assertion that sdkClient satisfies the adapter's Client seam.
 var _ Client = (*sdkClient)(nil)
 
-// NewSDKClient builds an EC2-backed Provider for region, ready to register.
+// NewSDKClient builds an EC2-backed multi-region Provider, ready to register.
 //
-// It is fully self-configuring: given only credentials and a region, it resolves
-// the GPU AMI and the default VPC's subnets itself, so registering AWS in a new
-// region needs no pre-created Launch Template, tagged subnets, or any other infra
-// — matching the creds-only UX of the NeoCloud adapters.
+// regionSource supplies the regions the List/Offerings fan-out sweeps, sourced from
+// the NodePool at call time (ProviderSpec.Regions). It is NOT env/flag config:
+// regions are the operator's per-pool declaration and change at runtime, and the
+// region a Pod lands in already flows NodePool -> placement -> ProvisionRequest, so
+// provisioning never needed a configured set. See RegionSource and Provider.sweepRegions.
 //
-// Security contract (fixed regardless of backing):
-//   - region is the ONLY non-secret config, passed as a plain argument (flag/env).
-//     Empty means "resolve the SDK's default region" from the standard chain
-//     (AWS_REGION / shared config / IMDS); the resolved value is echoed on
-//     observed instances and stamped onto region-scoped blocks. A region that
-//     resolves to empty is a config skip (ErrConfig).
+// Per-region clients are built LAZILY (see Provider.clientFor): this constructor
+// only loads the catalog — startup pays no per-region AMI+subnet resolution, no
+// region is resolved or validated here (the set is dynamic and comes from the
+// NodePool). The first Provision/List into a region resolves that region's GPU AMI
+// and default-VPC subnets on demand.
+//
+// There is NO default region and NO region env (AWS_REGION is not read): every
+// request carries its own region (admission requires each aws pool to list ≥1 region;
+// placement stamps it), so a fallback would be dead config. This constructor fails
+// ONLY if the catalog cannot load — never on region config.
+//
+// Security contract (and why ONE credential set spans all regions):
+//   - NO non-secret config is accepted as an argument; regions come from the NodePool
+//     (API objects), not env/flags.
 //   - Credentials are SECRETS and are NEVER accepted here. The SDK's default
-//     credential chain (config.LoadDefaultConfig) is used, preferring IRSA /
-//     instance-role and falling back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-//     from the environment (a Kubernetes Secret / .env, not a flag), keeping
-//     secrets out of process arguments and logs.
+//     credential chain (config.LoadDefaultConfig, used per-region in the factory) is
+//     used, preferring IRSA / instance-role and falling back to AWS_ACCESS_KEY_ID /
+//     AWS_SECRET_ACCESS_KEY from the environment. An IAM principal is ACCOUNT-GLOBAL,
+//     so the same credentials authorize every region — only the endpoint
+//     (config.WithRegion) differs per client. No per-region credential is needed.
 //
 // The catalog is loaded via catalog.Load() (embedded CSV / mounted ConfigMap),
 // identical to the other adapters.
-func NewSDKClient(ctx context.Context, region string) (*Provider, error) {
+func NewSDKClient(_ context.Context, regionSource RegionSource) (*Provider, error) {
 	cat, err := catalog.Load()
 	if err != nil {
 		return nil, fmt.Errorf("aws: load price catalog: %w", err)
 	}
 
-	opts := []func(*config.LoadOptions) error{}
-	if region != "" {
-		opts = append(opts, config.WithRegion(region))
+	factory := func(ctx context.Context, region string) (Client, error) {
+		return newSDKClientForRegion(ctx, region)
 	}
-	cfg, err := config.LoadDefaultConfig(ctx, opts...)
+	return New(factory, cat, regionSource), nil
+}
+
+// newSDKClientForRegion builds one region-pinned sdkClient: it loads SDK config for
+// that region (same account-global credential chain, region endpoint overridden),
+// then resolves the region's GPU AMI (required) and default-VPC subnets
+// (best-effort). This is the ClientFactory body the Provider calls lazily per region.
+func newSDKClientForRegion(ctx context.Context, region string) (Client, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
-		return nil, fmt.Errorf("aws: load SDK config: %w", err)
+		return nil, fmt.Errorf("aws: load SDK config for %s: %w", region, err)
 	}
 	if cfg.Region == "" {
-		// Neither the argument nor the SDK chain resolved a region; without one the
-		// EC2 endpoint is undefined. Treat as unconfigured (non-fatal skip).
-		return nil, fmt.Errorf("aws: no region resolved: %w", ErrConfig)
+		return nil, fmt.Errorf("aws: no region resolved for %q: %w", region, ErrConfig)
 	}
 
 	c := &sdkClient{
@@ -173,7 +189,7 @@ func NewSDKClient(ctx context.Context, region string) (*Provider, error) {
 	}
 	c.subnets = subnets
 
-	return New(c, cat, cfg.Region), nil
+	return c, nil
 }
 
 // gpuAMINameFilter matches the Amazon-owned Amazon-Linux-2 ECS GPU-optimized AMI.
@@ -219,11 +235,26 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 		targets = []subnet{{}} // single attempt, letting EC2 pick the subnet
 	}
 
+	log := logf.FromContext(ctx).WithName("aws-run").WithValues(
+		"region", c.region, "instanceType", spec.InstanceType, "spot", spec.Spot)
+	log.V(1).Info("starting zone sweep", "candidateZones", len(targets))
+
 	var lastErr error
-	for _, sn := range targets {
+	for i, sn := range targets {
+		// A zone attempt logs its start and its outcome so a capacity sweep across AZs
+		// is traceable (which zones were tried, in order, and why each was abandoned).
+		// zone "" means no default VPC was discovered and EC2 is picking the subnet.
+		zone := sn.az
+		if zone == "" {
+			zone = "<ec2-chosen>"
+		}
+		log.V(1).Info("zone attempt starting", "zone", zone, "subnet", sn.id, "attempt", i+1, "of", len(targets))
+
 		// Honor the deadline between attempts: a slow first zone must not let the
 		// sweep overrun the provision timeout.
 		if err := ctx.Err(); err != nil {
+			log.Info("zone sweep aborted before completion; provision deadline reached",
+				"zone", zone, "attempted", i, "of", len(targets))
 			if lastErr != nil {
 				return "", lastErr
 			}
@@ -232,6 +263,7 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 
 		id, err := c.runInSubnet(ctx, spec, userData, sn)
 		if err == nil {
+			log.Info("zone attempt succeeded", "zone", zone, "subnet", sn.id, "instanceID", id)
 			return id, nil
 		}
 		classified := classifyEC2Error(err, spec.Spot)
@@ -245,12 +277,18 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 		// futile sweep. It still carries ErrNoCapacity, so ClassifyProvisionError
 		// blocks the region correctly.
 		if !errors.Is(classified, errZoneLocal) {
+			log.Info("zone attempt failed with a non-zone-local error; stopping sweep",
+				"zone", zone, "subnet", sn.id, "error", classified.Error())
 			return "", classified
 		}
+		log.Info("zone attempt failed with a zone-local capacity shortfall; trying next zone",
+			"zone", zone, "subnet", sn.id, "remainingZones", len(targets)-i-1)
 		lastErr = classified
 	}
 	// Every zone was capacity-starved; return the last capacity error so
 	// ClassifyProvisionError can block the region and region-failover can proceed.
+	log.Info("zone sweep exhausted; every candidate zone was capacity-starved",
+		"zonesTried", len(targets))
 	return "", lastErr
 }
 
@@ -441,8 +479,19 @@ func (c *sdkClient) ListInstances(ctx context.Context) ([]EC2Instance, error) {
 	// actually passed their 2/2 checks. A failure here is not fatal — the instances
 	// are still returned (StatusChecksPassed stays false), so the poll loop simply
 	// holds them at Pending one more tick rather than the whole List erroring out.
+	//
+	// It IS logged (not silently swallowed): a PERSISTENT failure here — most often a
+	// missing ec2:DescribeInstanceStatus IAM permission, distinct from the
+	// DescribeInstances grant this same List already relied on — pins every running
+	// instance at StatusChecksPassed=false forever, so its Pod is stranded at
+	// Pending/Provisioning even though the instance is healthy. Without this log that
+	// failure is invisible (List still returns the instances), so surface it.
 	passed, err := c.statusChecksByID(ctx, ids)
 	if err != nil {
+		logf.FromContext(ctx).WithName("aws-list").Error(err,
+			"describe instance status checks failed; instances held at Pending until this recovers "+
+				"(often a missing ec2:DescribeInstanceStatus permission)",
+			"region", c.region, "instances", len(ids))
 		return out, nil
 	}
 	for i := range out {

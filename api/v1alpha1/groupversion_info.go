@@ -100,6 +100,17 @@ const (
 	// default TTL.
 	BlocklistTTLAnnotation = "nebula.inftyai.com/blocklist-ttl"
 
+	// EndpointAnnotation carries the reachable address of the external instance
+	// once it is running (a public DNS name or IP, in the provider's own form).
+	// It is the ONLY way to reach the workload, so it must be visible on the Pod:
+	// PodIP cannot hold it because the API server validates PodIP as a literal IP
+	// and rejects a DNS name (the common AWS case), so the endpoint rides an
+	// annotation instead. Written by the virtual kubelet when it first observes the
+	// instance running; absent until then. Unlike the provisioning-input
+	// annotations above (which the placement controller stamps and VK reads), this
+	// flows the other way — VK writes it for operators/tooling to read.
+	EndpointAnnotation = "nebula.inftyai.com/endpoint"
+
 	// TerminateInstanceFinalizer is held by every NodeClaim to guarantee teardown.
 	// The virtual kubelet owns the happy path (DeletePod → provider.Terminate,
 	// keyed on the Pod-derived claim name), but its teardown is edge-triggered and

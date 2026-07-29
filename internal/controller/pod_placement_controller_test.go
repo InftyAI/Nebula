@@ -37,16 +37,19 @@ import (
 // fakeBlocklist is a test Blocklister that reports a fixed set of candidates as
 // blocked. A candidate is blocked when it matches an entry on every NON-empty
 // field (empty fields are wildcards), mirroring the real blocklist's coverage.
+// A blocked candidate reports retryAfter=until (defaulting to a nonzero duration
+// so the placement controller's requeue-on-block path is exercised).
 type fakeBlocklist struct {
 	blocked []failover.Candidate
+	until   time.Duration
 }
 
-func (b *fakeBlocklist) Blocked(c failover.Candidate) bool {
+func (b *fakeBlocklist) BlockedUntil(c failover.Candidate) (time.Duration, bool) {
 	for _, e := range b.blocked {
 		if e.Provider != "" && e.Provider != c.Provider {
 			continue
 		}
-		if e.AcceleratorType != "" && e.AcceleratorType != c.AcceleratorType {
+		if e.AcceleratorID != "" && e.AcceleratorID != c.AcceleratorID {
 			continue
 		}
 		if e.CapacityType != "" && e.CapacityType != c.CapacityType {
@@ -55,9 +58,13 @@ func (b *fakeBlocklist) Blocked(c failover.Candidate) bool {
 		if e.Region != "" && e.Region != c.Region {
 			continue
 		}
-		return true
+		until := b.until
+		if until == 0 {
+			until = time.Minute
+		}
+		return until, true
 	}
-	return false
+	return 0, false
 }
 
 // newPlacementReconciler wires a PodPlacementReconciler over a fake client.
@@ -386,7 +393,7 @@ func TestPlacement_FailsOverToNextRegionWhenBlocked(t *testing.T) {
 	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
 	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
-		{Provider: provider.ProviderModal, AcceleratorType: "H100", CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"},
+		{Provider: provider.ProviderModal, AcceleratorID: "H100", CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"},
 	}}
 
 	reconcilePod(t, r, "default", "p1")
@@ -425,20 +432,34 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 	}
 }
 
-func TestPlacement_AllCandidatesBlockedLeavesPodGated(t *testing.T) {
-	// Every (tier, provider, region) candidate is blocked (DenyAll on the provider).
-	// Placement has nowhere to go, so it leaves the Pod gated for a later retry
-	// (when a block expires) rather than placing onto a failing candidate.
+func TestPlacement_AllCandidatesBlockedRequeuesForBlockExpiry(t *testing.T) {
+	// Every (tier, provider, region) candidate is blocked (DenyAll on the provider),
+	// but the candidates are servable — the block is a transient failover exclusion.
+	// Placement has nowhere to go now, so it leaves the Pod gated, but it must
+	// requeue for when the soonest block frees (TTL expiry emits no event) rather
+	// than idling until the periodic resync.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand},
 		provider.ProviderModal)
 	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
-	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
-		{Provider: provider.ProviderModal}, // whole-provider block (auth/quota)
-	}}
+	r.Blocklist = &fakeBlocklist{
+		blocked: []failover.Candidate{{Provider: provider.ProviderModal}}, // whole-provider block (auth/quota)
+		until:   2 * time.Minute,
+	}
 
-	reconcilePod(t, r, "default", "p1")
+	res, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "p1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// Requeue lands at the block's expiry plus a stable per-Pod jitter (added so
+	// Pods sharing a scope-keyed block don't wake in lockstep), so it sits in
+	// [2m, 2m+jitter). The jitter must be strictly bounded, never negative.
+	if res.RequeueAfter < 2*time.Minute || res.RequeueAfter >= 2*time.Minute+blockRequeueJitter {
+		t.Fatalf("expected requeue in [2m, 2m+jitter), got %v", res.RequeueAfter)
+	}
 
 	got := getPod(t, c, "default", "p1")
 	if !hasGateNamed(got) {
@@ -448,6 +469,53 @@ func TestPlacement_AllCandidatesBlockedLeavesPodGated(t *testing.T) {
 	var nc nebulav1alpha1.NodeClaim
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err == nil {
 		t.Fatal("expected no claim when placement is blocked everywhere")
+	}
+}
+
+func TestRequeueJitter_StableAndBounded(t *testing.T) {
+	// The offset must be deterministic per UID (a Pod's own retries must not drift,
+	// so it isn't a moving target) and stay within [0, blockRequeueJitter).
+	uids := []types.UID{"uid-1", "uid-2", "uid-3", "", "a-much-longer-pod-uid-value"}
+	for _, uid := range uids {
+		first := requeueJitter(uid)
+		if first < 0 || first >= blockRequeueJitter {
+			t.Fatalf("jitter(%q) = %v, want [0, %v)", uid, first, blockRequeueJitter)
+		}
+		if again := requeueJitter(uid); again != first {
+			t.Fatalf("jitter(%q) not stable: %v then %v", uid, first, again)
+		}
+	}
+
+	// Distinct UIDs should generally land on distinct offsets (that's the whole
+	// point). Not a hard guarantee for any two, but across a spread they must not
+	// all collapse to one value.
+	distinct := map[time.Duration]struct{}{}
+	for _, uid := range uids {
+		distinct[requeueJitter(uid)] = struct{}{}
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("jitter collapsed distinct UIDs to %d offset(s); herd would not spread", len(distinct))
+	}
+}
+
+func TestPlacement_NoServableCandidateDoesNotRequeue(t *testing.T) {
+	// The pool's only provider does not offer the requested accelerator, so no
+	// candidate is servable and none can be freed by a lapsing TTL. Placement leaves
+	// the Pod gated with NO requeue — a Pod edit, pool edit, or the resync is what
+	// retries — rather than spinning on a candidate that will never become servable.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"A100"}} // no H100
+	r, _ := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	res, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "p1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected no requeue when no candidate can ever be unblocked, got %v", res.RequeueAfter)
 	}
 }
 

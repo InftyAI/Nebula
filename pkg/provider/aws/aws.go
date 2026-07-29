@@ -41,9 +41,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -150,28 +152,150 @@ type EC2Instance struct {
 	StatusChecksPassed bool
 }
 
+// ClientFactory builds a Client bound to one region. It is the seam through which
+// the Provider lazily materializes a per-region EC2 client on first use: the real
+// factory (NewSDKClient's) resolves that region's GPU AMI and default-VPC subnets;
+// a test injects a fake. Credentials are NOT a parameter — the factory resolves
+// them from the SDK's default chain, which is account-global, so ONE credential
+// set serves every region and only the region endpoint differs.
+type ClientFactory func(ctx context.Context, region string) (Client, error)
+
+// RegionSource reports the regions the adapter should sweep in List and Offerings.
+// The NodePool is the source of truth: cmd/main.go backs this with a lister over
+// ProviderSpec.Regions across every pool referencing "aws", so the region set is
+// DYNAMIC (a pool added at runtime widens the sweep) and needs no env var or flag —
+// the region a Pod lands in already flows NodePool -> selectPlacement ->
+// RegionAnnotation -> ProvisionRequest.Region, so provisioning never depended on a
+// configured set; only the List/Offerings fan-out did, and this supplies it.
+//
+// It may return an empty slice (no aws pool exists yet, or the cache has not synced):
+// sweepRegions then falls back to the regions already in the lazy client cache
+// (regions actually provisioned into), so a fleet placed by a prior generation is
+// still swept. It must be safe to call concurrently.
+type RegionSource func() []string
+
 // Provider is the EC2 implementation of provider.Provider. It embeds catalog.Base
 // for the generic catalog methods (Name, Offerings, and MapAccelerator — which
 // resolves the accelerator_id/instance-type mapping straight from the catalog, so
 // no override is needed here) and implements the EC2-specific lifecycle.
+//
+// Multi-region: unlike the OnDemand-only NeoClouds, one AWS Provider spans several
+// regions. EC2 is region-partitioned (an instance, its AMI, its subnets, and its
+// capacity all live in one region), so the Provider holds a region -> Client map,
+// each Client pinned to one region, built LAZILY on first use via newClient. The
+// map is keyed by region and guarded by mu. A single registry entry ("aws") and a
+// single virtual node still front all regions; the region is a per-Pod placement
+// choice carried on the ProvisionRequest, not a per-node fact — so it must be an
+// axis inside the one adapter, not a provider-per-region.
+//
+// The region set is NOT configured at construction: it is sourced from the NodePool
+// at call time via regionSource (see RegionSource), because ProviderSpec.Regions is
+// the operator's declaration of which regions this provider may use and it changes
+// at runtime. Provisioning never needed a configured set (the target region rides on
+// the request); only the List/Offerings fan-out does, and sweepRegions derives it
+// from the NodePool plus the regions already provisioned into (the cache keys).
 type Provider struct {
 	catalog.Base
-	client Client
-	// region is the adapter's configured default region, used when a
-	// ProvisionRequest does not pin one and stamped onto observed instances that
-	// do not report their own.
-	region string
+	// newClient lazily builds the Client for a region (AMI/subnet resolution). The
+	// factory seam keeps the adapter SDK-free and unit-testable.
+	newClient ClientFactory
+	// regionSource reports the NodePool-declared regions to sweep in List/Offerings.
+	// May be nil in tests, in which case sweepRegions uses only the cache keys.
+	regionSource RegionSource
+
+	mu      sync.Mutex
+	clients map[string]Client // region -> Client, populated lazily by clientFor
 }
 
-// New returns an EC2 Provider backed by client and price catalog. region is the
-// default region the client was configured with (used when a request omits one);
-// cat is the catalog.Lookup seam so tests can inject a fake.
-func New(client Client, cat catalog.Lookup, region string) *Provider {
+// New returns an EC2 Provider backed by a client factory and price catalog.
+// regionSource supplies the NodePool-declared region set the List/Offerings fan-out
+// sweeps (nil is tolerated — the sweep then uses only the regions already
+// provisioned into). cat is the catalog.Lookup seam so tests can inject a fake.
+//
+// There is deliberately NO default region: every request carries its own region
+// (admission requires each aws pool to list ≥1 region, and placement stamps it onto
+// the ProvisionRequest), and observed instances report their region from the
+// region-pinned client — so nothing needs a fallback, and no AWS_REGION env is read.
+func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource) *Provider {
 	return &Provider{
-		Base:   catalog.Base{ProviderName: provider.ProviderAWS, Catalog: cat},
-		client: client,
-		region: region,
+		Base:         catalog.Base{ProviderName: provider.ProviderAWS, Catalog: cat},
+		newClient:    newClient,
+		regionSource: regionSource,
+		clients:      make(map[string]Client),
 	}
+}
+
+// newSingleRegion is a test/back-compat convenience: a Provider serving exactly one
+// region backed by an already-built Client (no lazy factory). It underpins the
+// existing single-region unit tests, which inject a fakeClient directly. The region
+// is the sole swept region (via a constant regionSource), so List/Offerings behave
+// as the pre-multi-region tests expect.
+func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider {
+	p := New(
+		func(context.Context, string) (Client, error) { return client, nil },
+		cat,
+		func() []string { return []string{region} },
+	)
+	// Pre-seed the cache so even a stray region lookup returns the fake rather than
+	// invoking the (constant) factory.
+	p.clients[region] = client
+	return p
+}
+
+// sweepRegions returns the regions List and Offerings fan out across: the union of
+// the NodePool-declared set (regionSource) and every region already in the lazy
+// client cache. The cache half is what makes teardown survive a NodePool edit — an
+// instance still running in a region just dropped from every pool is still swept and
+// so still observed/reclaimed, rather than being stranded because the region left
+// the declared set. Order is not significant (callers concatenate results).
+func (p *Provider) sweepRegions() []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(r string) {
+		if r == "" || seen[r] {
+			return
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	if p.regionSource != nil {
+		for _, r := range p.regionSource() {
+			add(strings.TrimSpace(r))
+		}
+	}
+	p.mu.Lock()
+	for r := range p.clients {
+		add(r)
+	}
+	p.mu.Unlock()
+	return out
+}
+
+// clientFor returns the Client for region (defaulting an empty region), building
+// and caching it on first use. Construction is serialized under mu: a region's
+// Client is built at most once, and a concurrent caller for the same or another
+// region waits — acceptable because a build is a rare one-time, per-region event
+// (an AMI + subnet resolution), not a hot path. A build failure is NOT cached, so
+// a transient resolution error (throttle, a not-yet-enabled region) is retried on
+// the next call rather than poisoning the region permanently.
+func (p *Provider) clientFor(ctx context.Context, region string) (Client, error) {
+	if region == "" {
+		// No region to build a client for. Unreachable on the normal path (every
+		// request carries a region), so this only guards a legacy unqualified instance
+		// id reaching Terminate/Get — surface it rather than silently guessing.
+		return nil, fmt.Errorf("aws: no region for client: %w", ErrConfig)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.clients[region]; ok {
+		return c, nil
+	}
+	c, err := p.newClient(ctx, region)
+	if err != nil {
+		return nil, fmt.Errorf("aws: build client for region %s: %w", region, err)
+	}
+	p.clients[region] = c
+	return c, nil
 }
 
 // Capabilities implements provider.Provider. See the package doc for why each
@@ -197,32 +321,58 @@ func (p *Provider) Capabilities() provider.Capabilities {
 //   - AWS itself holds the PER-REGION truth: which instance types the configured
 //     region actually offers, queried live via the AvailableInstanceTypes probe.
 //
-// So each static row is stamped with this adapter's region and its Available flag
-// is AND-ed with the live probe: a row survives as available only if the catalog
-// seeded it available AND the region currently offers its instance type. Rows for
-// types the region does not offer are still returned (so the optimizer can see the
-// price) but marked unavailable. A probe failure is surfaced as an error rather
-// than silently reporting the stale seed as truth.
+// So each static row is emitted ONCE PER CONFIGURED REGION, stamped with that
+// region and its Available flag AND-ed with the region's live probe: a row survives
+// as available only if the catalog seeded it available AND that region currently
+// offers its instance type. Rows for types a region does not offer are still
+// returned (so the optimizer can see the price) but marked unavailable.
+//
+// Per-region probe errors are tolerated like List's: a region that fails its probe
+// is skipped for this call rather than failing the whole Offerings (its rows simply
+// do not appear this time). Only if every region fails is an error returned.
 func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 	rows := p.Catalog.Offerings(p.ProviderName)
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	avail, err := p.client.AvailableInstanceTypes(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("aws: probe instance-type availability in %s: %w", p.region, err)
+	log := logf.FromContext(ctx).WithName("aws-offerings")
+
+	regions := p.sweepRegions()
+	out := make([]provider.Offering, 0, len(rows)*len(regions))
+	failed := 0
+	for _, region := range regions {
+		client, err := p.clientFor(ctx, region)
+		if err != nil {
+			failed++
+			log.Error(err, "build client for offerings failed; skipping region", "region", region)
+			continue
+		}
+		avail, err := client.AvailableInstanceTypes(ctx)
+		if err != nil {
+			failed++
+			log.Error(err, "probe instance-type availability failed; skipping region", "region", region)
+			continue
+		}
+		for _, o := range rows {
+			o.Region = region
+			o.Available = o.Available && avail[o.AcceleratorID]
+			out = append(out, o)
+		}
 	}
-	out := make([]provider.Offering, len(rows))
-	for i, o := range rows {
-		o.Region = p.region
-		o.Available = o.Available && avail[o.AcceleratorID]
-		out[i] = o
+	if failed == len(regions) && failed > 0 {
+		return nil, fmt.Errorf("aws: offerings probe failed in all %d region(s)", failed)
 	}
 	return out, nil
 }
 
 // Provision implements provider.Provider. The Pod is the source of truth for the
 // workload; req carries the claim identity, capacity tier, and region.
+//
+// The returned instance id is the RAW EC2 id ("i-..."), not region-qualified: the
+// id is what the NodeClaim ledger records and the user sees, so it stays a clean
+// EC2 id. Terminate/Get do not need the region encoded in it — they locate the
+// instance by sweeping the swept regions (the same set List covers), since a
+// wrong-region lookup is a harmless no-op (see Terminate/Get).
 func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest) (string, error) {
 	if pod == nil {
 		return "", errors.New("aws: nil pod")
@@ -231,9 +381,17 @@ func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.
 		return "", errors.New("aws: empty ClaimName in ProvisionRequest")
 	}
 
-	// Idempotency: if an instance already carries this claim tag, return it rather
-	// than launching a second (guards a retry after a partial create).
-	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
+	region := req.Region
+	client, err := p.clientFor(ctx, region)
+	if err != nil {
+		return "", err
+	}
+
+	// Idempotency: if an instance already carries this claim tag IN THIS REGION,
+	// return it rather than launching a second (guards a retry after a partial
+	// create). A claim is placed in exactly one region per attempt, so scanning the
+	// target region's client is sufficient.
+	if existing, err := findByClaim(ctx, client, req.ClaimName); err != nil {
 		return "", err
 	} else if existing != nil {
 		return existing.ID, nil
@@ -246,39 +404,180 @@ func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.
 	// The Provision deadline is enforced generically by the vnode handler (from
 	// Capabilities.ProvisionTimeout), so RunInstance simply honors ctx as it fails
 	// over across zones — no adapter-local WithTimeout here.
-	return p.client.RunInstance(ctx, spec)
+	id, err := client.RunInstance(ctx, spec)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
-// Terminate implements provider.Provider. Idempotent by the Client contract.
+// Terminate implements provider.Provider. Idempotent by the Client contract. The
+// instanceID is a raw EC2 id, which does not carry its region, so teardown sweeps
+// the swept regions and terminates the instance wherever it lives. This is safe
+// and cheap: TerminateInstance is idempotent and a wrong-region lookup returns
+// InvalidInstanceID.NotFound, which the Client maps to nil — so terminating in a
+// region the instance is not in is a harmless no-op. It stops at the first region
+// that actually owns the instance.
+//
+// A legacy region-qualified id ("<region>/i-...") from before this change is still
+// honored: splitID peels the region off and it routes straight to that region.
 func (p *Provider) Terminate(ctx context.Context, instanceID string) error {
 	if instanceID == "" {
 		return nil // nothing provisioned yet; treat as already gone
 	}
-	return p.client.TerminateInstance(ctx, instanceID)
+	// Back-compat: a legacy qualified id routes directly to its region.
+	if region, rawID := splitID(instanceID); region != "" {
+		client, err := p.clientFor(ctx, region)
+		if err != nil {
+			return err
+		}
+		return client.TerminateInstance(ctx, rawID)
+	}
+
+	// Raw id: sweep the regions and terminate wherever it lives. Confirm ownership
+	// with a Describe first so we only issue TerminateInstance against the region
+	// that actually has it — and so a region whose client cannot be built does not
+	// mask a successful terminate elsewhere.
+	var lastErr error
+	for _, region := range p.sweepRegions() {
+		client, err := p.clientFor(ctx, region)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ec2, err := client.DescribeInstance(ctx, instanceID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if ec2 == nil {
+			continue // not in this region
+		}
+		return client.TerminateInstance(ctx, instanceID)
+	}
+	// Not found in any region we could reach: already gone (idempotent success),
+	// unless every reachable region errored, in which case surface that for retry.
+	return lastErr
 }
 
-// Get implements provider.Provider.
+// Get implements provider.Provider. instanceID is a raw EC2 id, which does not
+// carry its region, so the lookup sweeps the swept regions and returns the first
+// region's view of the instance. A per-region client-build/describe error is
+// tolerated and the sweep continues; only if every region errored (and none held
+// the instance) is that error surfaced.
+//
+// A legacy region-qualified id ("<region>/i-...") routes directly to its region.
 func (p *Provider) Get(ctx context.Context, instanceID string) (*provider.Instance, error) {
-	ec2, err := p.client.DescribeInstance(ctx, instanceID)
-	if err != nil {
-		return nil, err
+	if region, rawID := splitID(instanceID); region != "" {
+		client, err := p.clientFor(ctx, region)
+		if err != nil {
+			return nil, err
+		}
+		ec2, err := client.DescribeInstance(ctx, rawID)
+		if err != nil {
+			return nil, err
+		}
+		if ec2 == nil {
+			return nil, nil // absent => terminated, per interface contract
+		}
+		inst := p.toInstance(*ec2)
+		return &inst, nil
 	}
-	if ec2 == nil {
-		return nil, nil // absent => terminated, per interface contract
+
+	var lastErr error
+	for _, region := range p.sweepRegions() {
+		client, err := p.clientFor(ctx, region)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ec2, err := client.DescribeInstance(ctx, instanceID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if ec2 == nil {
+			continue // not in this region
+		}
+		inst := p.toInstance(*ec2)
+		return &inst, nil
 	}
-	inst := p.toInstance(*ec2)
-	return &inst, nil
+	// Absent from every reachable region => terminated (nil,nil), unless a region
+	// errored and might have held it, in which case surface the error for retry.
+	return nil, lastErr
 }
 
-// List implements provider.Provider.
+// List implements provider.Provider. It FANS OUT across every region sweepRegions
+// yields (the NodePool-declared set unioned with regions already provisioned into)
+// and concatenates the results, so the poll loop and the NodeClaim teardown backstop
+// see instances wherever they live — including regions this process never
+// provisioned into itself (a restart, or an instance placed by a prior leader).
+//
+// Per-region errors are TOLERATED, not fatal: one region throttling or briefly
+// unreachable must not blank the whole list (which the vnode poll loop would read
+// as "every tracked pod's instance vanished" and mark them Terminated). A region
+// that errors is logged and skipped for this tick; the regions that answered still
+// contribute. Only if EVERY region fails is an error returned, so a total outage
+// still surfaces rather than silently reporting an empty fleet.
+//
+// Each instance's ID is the raw EC2 id; a downstream Terminate/Get re-locates it by
+// sweeping the same regions (a wrong-region lookup is a harmless no-op), so the id
+// stays a clean EC2 id rather than a region-qualified token.
 func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
-	instances, err := p.client.ListInstances(ctx)
-	if err != nil {
-		return nil, err
+	log := logf.FromContext(ctx).WithName("aws-list")
+
+	type result struct {
+		region    string
+		instances []provider.Instance
+		err       error
 	}
-	out := make([]provider.Instance, 0, len(instances))
-	for _, ec2 := range instances {
-		out = append(out, p.toInstance(ec2))
+	regions := p.sweepRegions()
+	// No region to sweep (no aws NodePool yet and nothing provisioned): an empty
+	// fleet, not an error. Returning nil here is correct — there are provably no
+	// Nebula instances to observe — and avoids the "all regions failed" path below
+	// firing on a zero-length set.
+	if len(regions) == 0 {
+		return nil, nil
+	}
+	results := make([]result, len(regions))
+	var wg sync.WaitGroup
+	for i, region := range regions {
+		wg.Add(1)
+		go func(i int, region string) {
+			defer wg.Done()
+			client, err := p.clientFor(ctx, region)
+			if err != nil {
+				results[i] = result{region: region, err: err}
+				return
+			}
+			raw, err := client.ListInstances(ctx)
+			if err != nil {
+				results[i] = result{region: region, err: err}
+				return
+			}
+			insts := make([]provider.Instance, 0, len(raw))
+			for _, ec2 := range raw {
+				insts = append(insts, p.toInstance(ec2))
+			}
+			results[i] = result{region: region, instances: insts}
+		}(i, region)
+	}
+	wg.Wait()
+
+	out := make([]provider.Instance, 0)
+	failed := 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+			log.Error(r.err, "list instances in region failed; skipping this region for this tick", "region", r.region)
+			continue
+		}
+		out = append(out, r.instances...)
+	}
+	// Every region failed => surface the outage rather than reporting an empty
+	// fleet, which would strand or falsely terminate tracked pods.
+	if failed == len(regions) && failed > 0 {
+		return nil, fmt.Errorf("aws: list failed in all %d region(s)", failed)
 	}
 	return out, nil
 }
@@ -293,12 +592,14 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 //     Spot, leaving OnDemand serviceable. ClassifyError does not see the request,
 //     so we detect the Spot case here (ErrNoCapacity wrapped with the spot marker)
 //     and pass the right tier.
-//   - EC2 capacity is per-region and this adapter is bound to one region (its
-//     client's), so an accelerator/capacity block is confined to p.region — a
-//     "no capacity in us-east-1" failure does not disqualify the same request
-//     against the us-west-2 adapter. Whole-provider blocks (auth/quota) are left
-//     region-wide, since bad credentials fail in every region.
-func (p *Provider) ClassifyProvisionError(err error, accelerator string) provider.BlockScope {
+//   - EC2 capacity is per-region and this adapter is multi-region, so an
+//     accelerator/capacity block is confined to the region that ACTUALLY FAILED
+//     (the region the failing request targeted) — a "no capacity in us-east-1"
+//     failure does not disqualify the same request in us-west-2. Whole-provider
+//     blocks (auth/quota) are left region-wide, since bad credentials fail in every
+//     region. The region is passed in because the error alone does not carry it and
+//     the adapter has no default region to assume.
+func (p *Provider) ClassifyProvisionError(err error, acceleratorID, region string) provider.BlockScope {
 	if err == nil {
 		return provider.BlockScope{}
 	}
@@ -306,40 +607,52 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator string) provide
 	if errors.Is(err, ErrSpotCapacity) {
 		tier = nebulav1alpha1.CapacitySpot
 	}
-	scope := provider.ClassifyError(err, tier, accelerator)
-	// Accelerator/capacity blocks are per-region (EC2 capacity is regional and
-	// this adapter is bound to one region); a DenyAll (auth/quota) fails in every
-	// region, so it stays region-wide (Region left nil). The exact-region pointer
-	// confines the block to p.region so the same request survives in another region.
-	//
-	// p.region is correct ONLY because this adapter is single-region: the client is
-	// pinned to cfg.Region at construction and runInSubnet ignores spec.Region, so
-	// every launch lands in p.region regardless of the request's Region — the block
-	// region and the launch region are the same. If the adapter is ever made
-	// multi-region (runInSubnet honoring spec.Region, re-resolving AMI/subnets per
-	// region), this MUST become the request's region (regionOrDefault(req.Region)) —
-	// which means threading it through ClassifyProvisionError — or failover would
-	// block the wrong region and keep retrying the one that actually failed.
+	scope := provider.ClassifyError(err, tier, acceleratorID)
+	// Confine an accelerator/capacity block to the region that failed. A DenyAll
+	// (auth/quota) fails in every region, so it stays region-wide (Region left nil).
+	// An empty region (should not happen — every request carries one) maps to &"" =
+	// the wildcard, which blocks the accelerator in ALL regions: the safe over-broad
+	// choice, since a stale-but-effective block beats a block pinned to a guessed
+	// region that never matches.
 	if !scope.DenyAll {
-		region := p.region
-		scope.Region = &region
+		r := region
+		scope.Region = &r
 	}
 	return scope
 }
 
-// findByClaim returns the instance tagged with claimName, or nil if none.
-func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider.Instance, error) {
-	instances, err := p.client.ListInstances(ctx)
+// findByClaim returns the instance in this client's region tagged with claimName,
+// or nil if none. It scans one region's client (the launch target), since a claim
+// is placed in exactly one region per provision attempt.
+func findByClaim(ctx context.Context, client Client, claimName string) (*EC2Instance, error) {
+	instances, err := client.ListInstances(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, ec2 := range instances {
-		if ec2.Tags[ClaimTagKey] == claimName {
-			inst := p.toInstance(ec2)
-			return &inst, nil
+	for i := range instances {
+		if instances[i].Tags[ClaimTagKey] == claimName {
+			return &instances[i], nil
 		}
 	}
 	return nil, nil
+}
+
+// idSep separates the region prefix from the raw EC2 id in a legacy region-qualified
+// instance id ("<region>/<ec2-id>"). "/" cannot appear in either a region name or
+// an EC2 instance id, so it is an unambiguous delimiter. Current ids are raw EC2
+// ids; this exists only so splitID can still route ids recorded before that change.
+const idSep = "/"
+
+// splitID recognizes a LEGACY region-qualified id ("<region>/i-..."): it returns
+// the region and the raw EC2 id. A current, raw EC2 id (no separator) yields an
+// empty region, signaling the caller to locate the instance by sweeping regions
+// instead. It is the one remaining reader of the old format, kept so ids persisted
+// on a NodeClaim before the id stopped being qualified still terminate correctly.
+func splitID(instanceID string) (region, rawID string) {
+	if i := strings.Index(instanceID, idSep); i >= 0 {
+		return instanceID[:i], instanceID[i+len(idSep):]
+	}
+	return "", instanceID
 }
 
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
@@ -364,8 +677,9 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 	// nvidia.com/gpu resource. On EC2 both are lookup keys: the instance type is the
 	// one whose (accelerator_type, gpu_count) pair matches, since the GPU count is
 	// baked into the instance type (T4x1 = g4dn.xlarge, T4x8 = g4dn.metal) rather
-	// than a free knob. So — unlike the identity-mapped NeoClouds — this does NOT
-	// use the type-only MapAccelerator; it resolves by type AND count.
+	// than a free knob. MapAccelerator (from the embedded catalog.Base) resolves by
+	// that (type, count) key straight from the catalog, so no AWS-specific lookup is
+	// needed here.
 	canonical, count, err := util.AcceleratorRequest(pod)
 	if err != nil {
 		return InstanceSpec{}, fmt.Errorf("aws: %w", err)
@@ -374,7 +688,7 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 		return InstanceSpec{}, errors.New(
 			"aws: pod requests no accelerator; EC2 GPU provisioning needs an accelerator type and count")
 	}
-	instanceType, ok := p.instanceTypeFor(canonical, count)
+	instanceType, ok := p.MapAccelerator(canonical, count)
 	if !ok {
 		return InstanceSpec{}, fmt.Errorf("aws: no EC2 instance type for %s x%d", canonical, count)
 	}
@@ -385,37 +699,9 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 		Command:      append(append([]string{}, c.Command...), c.Args...),
 		Env:          env,
 		Spot:         req.CapacityType == nebulav1alpha1.CapacitySpot,
-		Region:       p.regionOrDefault(req.Region),
+		Region:       req.Region,
 		Tags:         map[string]string{ClaimTagKey: req.ClaimName},
 	}, nil
-}
-
-// instanceTypeFor resolves the EC2 instance type serving canonical accelerators
-// at the requested count, by matching a catalog offering on BOTH the accelerator
-// type (case-insensitively) and gpu_count. This is the AWS-specific replacement
-// for the type-only MapAccelerator: because an EC2 instance type has a fixed GPU
-// count, (type, count) — not type alone — selects it. Region and capacity tier
-// are NOT part of the key here: the same (type, count) maps to the same instance
-// type in every region/tier, so the first matching row's AcceleratorID is
-// authoritative. Returns ok=false when no offering serves that pair (e.g. an
-// unsupported accelerator, or a count with no single-instance shape — there is no
-// T4x2 instance type).
-func (p *Provider) instanceTypeFor(canonical string, count int32) (instanceType string, ok bool) {
-	for _, o := range p.Catalog.Offerings(p.ProviderName) {
-		if o.GPUCount == count && strings.EqualFold(o.AcceleratorType, canonical) && o.AcceleratorID != "" {
-			return o.AcceleratorID, true
-		}
-	}
-	return "", false
-}
-
-// regionOrDefault returns the requested region, or the adapter's configured
-// default when the request does not pin one.
-func (p *Provider) regionOrDefault(region string) string {
-	if region != "" {
-		return region
-	}
-	return p.region
 }
 
 // toInstance normalizes an observed EC2 instance into the provider-agnostic
@@ -425,10 +711,9 @@ func (p *Provider) toInstance(ec2 EC2Instance) provider.Instance {
 	if ec2.Spot {
 		tier = nebulav1alpha1.CapacitySpot
 	}
+	// The region-pinned SDK client always stamps its region onto observed instances
+	// (see sdkClient.observe), so ec2.Region is set; no default fallback is needed.
 	region := ec2.Region
-	if region == "" {
-		region = p.region
-	}
 	return provider.Instance{
 		ID:           ec2.ID,
 		ClaimName:    ec2.Tags[ClaimTagKey],

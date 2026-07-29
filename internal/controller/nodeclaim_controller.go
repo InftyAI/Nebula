@@ -53,6 +53,14 @@ import (
 // because we KNOW the Pod existed and is now gone.
 const placementGracePeriod = 15 * time.Second
 
+// podReasonInitializing is the Pod status.Reason the virtual node stamps while the
+// external instance exists but is not yet reachable (see pkg/vnode/status.go
+// reasonInitializing). The claim keys off it to distinguish Initializing from
+// Provisioning, since both share the Pending phase. Kept in sync with vnode's
+// value by hand — it is a stable, user-facing reason string, not worth an exported
+// package coupling.
+const podReasonInitializing = "Initializing"
+
 // NodeClaimReconciler reconciles a NodeClaim object.
 //
 // Ownership model: the virtual kubelet owns the instance lifecycle — its pod
@@ -125,27 +133,12 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	if pod != nil {
 		// The workload is present. We do not mirror the Pod's fine-grained runtime
-		// status, but we DO reflect the one coarse transition that matters to the
-		// ledger: the external instance going away. VK reports a vanished instance
-		// as a terminal Pod phase (Failed/Succeeded, see pkg/vnode/status.go). A Pod
-		// with restartPolicy: Never lingers in that terminal phase rather than being
-		// deleted, so keying only off Pod existence would wedge the claim at Bound
-		// forever — reflect Terminated instead.
-		if isTerminal(pod.Status.Phase) {
-			return ctrl.Result{}, r.markTerminated(ctx, &nc)
-		}
-		// The Pod exists but is not yet running (VK is still provisioning the
-		// instance). Do NOT mark Bound yet: Bound is the guard that makes a later
-		// disappearance trustworthy, and we only earn that trust once the instance
-		// is actually up. Record the instance id early (it exists the moment
-		// Provision returned) and reflect Provisioning; the Pod watch re-enqueues us
-		// when it transitions to Running.
-		if pod.Status.Phase != corev1.PodRunning {
-			return ctrl.Result{}, r.markProvisioning(ctx, &nc)
-		}
-		// Running: the instance is up. Record that we have observed it placed (this
-		// is the guard that makes a later disappearance trustworthy) and stop.
-		return ctrl.Result{}, r.markBound(ctx, &nc)
+		// status, but we DO reflect the coarse phase that matters to the ledger.
+		// desiredPhase maps the served Pod onto the claim phase (Terminated / Bound /
+		// Initializing / Provisioning); markPhase persists it (and the instance id)
+		// idempotently. An empty desiredPhase means "hold the current phase, just keep
+		// the id fresh" — the Bound-flap guard (see desiredPhase).
+		return ctrl.Result{}, r.markPhase(ctx, &nc, r.desiredPhase(&nc, pod))
 	}
 
 	// The served Pod is absent. Decide whether this is a real teardown or a
@@ -277,61 +270,48 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 	return provider.Get(name)
 }
 
-// markBound records that the served Pod has been observed running. This is the
-// persisted guard the self-delete path trusts: a claim in phase Bound whose Pod
-// later disappears is a real teardown, whereas a claim that never reached Bound
-// is treated as possible cache lag. It does NOT copy the Pod's fine-grained
-// runtime status — the Pod is the source of truth for that — but it does record
-// status.InstanceID: the provider id is the one datum that must not be lost, so
-// the teardown backstop can reclaim the instance even if VK (which otherwise
-// holds the id only in memory) has died. The id is resolved once, best-effort;
-// if the provider List is unavailable the Bound transition still proceeds and
-// the backstop falls back to re-deriving the id by claim name. Idempotent.
-
-// markProvisioning records that the served Pod exists but is not yet running.
-// The claim sits in phase Provisioning (it never earns the Bound teardown guard
-// while the instance is still coming up), but we capture status.InstanceID as
-// soon as it is resolvable so the backstop can reclaim a half-provisioned
-// instance. Idempotent.
-func (r *NodeClaimReconciler) markProvisioning(ctx context.Context, nc *nebulav1alpha1.NodeClaim) error {
-	changed := false
-	if nc.Status.Phase != nebulav1alpha1.NodeClaimProvisioning {
-		nc.Status.Phase = nebulav1alpha1.NodeClaimProvisioning
-		changed = true
+// desiredPhase maps a present served Pod onto the claim phase to record. The
+// claim does NOT mirror the Pod's fine-grained runtime status — it tracks only
+// the coarse lifecycle its teardown job needs:
+//
+//   - Terminal Pod (Failed/Succeeded) => Terminated. VK reports a vanished
+//     instance this way; a restartPolicy:Never Pod lingers terminal rather than
+//     being deleted, so keying off existence alone would wedge the claim at Bound.
+//   - Bound already => "" (hold). Bound is the durable teardown guard, and a
+//     transient Running->Pending flap (e.g. a status-check blip) must NOT strip it
+//     — losing it would make a later disappearance read as cache lag and skip
+//     teardown. Returning "" holds the phase while markPhase still refreshes the id.
+//   - Running => Bound. The instance is confirmed up; earn the guard.
+//   - Pending with reason Initializing => Initializing (instance exists, booting).
+//   - Otherwise => Provisioning (still allocating; instance does not exist yet).
+//
+// Neither Initializing nor Provisioning earns the Bound guard.
+func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) nebulav1alpha1.NodeClaimPhase {
+	switch {
+	case isTerminal(pod.Status.Phase):
+		return nebulav1alpha1.NodeClaimTerminated
+	case r.wasBound(nc):
+		return "" // hold Bound (or Terminated); never downgrade
+	case pod.Status.Phase == corev1.PodRunning:
+		return nebulav1alpha1.NodeClaimBound
+	case pod.Status.Reason == podReasonInitializing:
+		return nebulav1alpha1.NodeClaimInitializing
+	default:
+		return nebulav1alpha1.NodeClaimProvisioning
 	}
-	if r.recordInstanceID(ctx, nc) {
-		changed = true
-	}
-	if !changed {
-		return nil
-	}
-	return r.patchStatus(ctx, nc)
 }
 
-func (r *NodeClaimReconciler) markBound(ctx context.Context, nc *nebulav1alpha1.NodeClaim) error {
+// markPhase persists the claim's coarse phase and best-effort records
+// status.InstanceID, in one idempotent status write. An empty phase means "leave
+// the phase as-is" (the Bound-flap hold, see desiredPhase); the id is still
+// refreshed. The provider id is the one datum that must not be lost — the teardown
+// backstop reclaims the instance by it even if VK (which otherwise holds it only
+// in memory) has died — so it is captured as soon as it resolves, regardless of
+// phase. A no-op (phase unchanged and id already set) writes nothing.
+func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.NodeClaim, phase nebulav1alpha1.NodeClaimPhase) error {
 	changed := false
-	if nc.Status.Phase != nebulav1alpha1.NodeClaimBound {
-		nc.Status.Phase = nebulav1alpha1.NodeClaimBound
-		changed = true
-	}
-	if r.recordInstanceID(ctx, nc) {
-		changed = true
-	}
-	if !changed {
-		return nil
-	}
-	return r.patchStatus(ctx, nc)
-}
-
-// markTerminated records that the external instance is gone (the served Pod
-// reached a terminal phase). Terminal, so once set it never advances. Like
-// markBound it best-effort records status.InstanceID for the backstop; the id is
-// still worth capturing here because the instance may already be gone from the
-// provider but the finalizer path is independent. Idempotent.
-func (r *NodeClaimReconciler) markTerminated(ctx context.Context, nc *nebulav1alpha1.NodeClaim) error {
-	changed := false
-	if nc.Status.Phase != nebulav1alpha1.NodeClaimTerminated {
-		nc.Status.Phase = nebulav1alpha1.NodeClaimTerminated
+	if phase != "" && nc.Status.Phase != phase {
+		nc.Status.Phase = phase
 		changed = true
 	}
 	if r.recordInstanceID(ctx, nc) {

@@ -62,7 +62,7 @@ func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
 }
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
-func (f *fakeProvider) MapAccelerator(c string) (string, bool) {
+func (f *fakeProvider) MapAccelerator(c string, _ int32) (string, bool) {
 	if f.gpus == nil {
 		return c, true // offer any accelerator
 	}
@@ -73,7 +73,7 @@ func (f *fakeProvider) MapAccelerator(c string) (string, bool) {
 	}
 	return "", false
 }
-func (f *fakeProvider) ClassifyProvisionError(error, string) provider.BlockScope {
+func (f *fakeProvider) ClassifyProvisionError(error, string, string) provider.BlockScope {
 	return provider.BlockScope{}
 }
 
@@ -230,6 +230,54 @@ func TestReconcile_PendingPodDoesNotMarkBound(t *testing.T) {
 	}
 	if got.Status.InstanceID != "inst-1" {
 		t.Fatalf("expected instance id captured early, got %q", got.Status.InstanceID)
+	}
+}
+
+func TestReconcile_InitializingPodMarksInitializing(t *testing.T) {
+	// A served Pod that is Pending with reason Initializing (instance exists and is
+	// booting, e.g. EC2 running but <2/2 checks) must move the claim to the distinct
+	// Initializing phase — NOT Provisioning (which means still allocating) and NOT
+	// Bound (the guard is earned only when running).
+	pod := newPod("p1", "default", "uid-1", corev1.PodPending)
+	pod.Status.Reason = podReasonInitializing
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	prov := &fakeProvider{
+		name: "fake",
+		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
+	}
+	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimInitializing {
+		t.Fatalf("expected phase Initializing, got %q", got.Status.Phase)
+	}
+	if got.Status.InstanceID != "inst-1" {
+		t.Fatalf("expected instance id captured, got %q", got.Status.InstanceID)
+	}
+}
+
+func TestReconcile_BoundClaimDoesNotDowngradeOnStatusFlap(t *testing.T) {
+	// A claim already Bound whose Pod briefly drops back to Pending (a status-check
+	// flap surfacing as reason Initializing) must NOT downgrade: Bound is the durable
+	// teardown guard, and losing it would make a later disappearance read as cache
+	// lag and skip teardown. The phase holds at Bound.
+	pod := newPod("p1", "default", "uid-1", corev1.PodPending)
+	pod.Status.Reason = podReasonInitializing
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Status.Phase = nebulav1alpha1.NodeClaimBound
+	prov := &fakeProvider{
+		name: "fake",
+		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
+	}
+	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimBound {
+		t.Fatalf("Bound must not downgrade on a transient flap, got %q", got.Status.Phase)
 	}
 }
 

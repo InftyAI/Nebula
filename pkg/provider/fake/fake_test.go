@@ -120,10 +120,10 @@ func TestMapAcceleratorFromCatalog(t *testing.T) {
 	p := New()
 	// A GPU in the fixed catalog resolves (case-insensitively); one that is not
 	// offered reports ok=false, so selectPlacement skips the fake for it.
-	if _, ok := p.MapAccelerator("h100"); !ok {
+	if _, ok := p.MapAccelerator("h100", 1); !ok {
 		t.Fatal("expected H100 to be offered by the fake catalog")
 	}
-	if _, ok := p.MapAccelerator("TPU-v4"); ok {
+	if _, ok := p.MapAccelerator("TPU-v4", 1); ok {
 		t.Fatal("did not expect TPU-v4 to be offered by the fake catalog")
 	}
 }
