@@ -186,6 +186,10 @@ type placement struct {
 	// Empty means the provider's configured default region; region-simple
 	// providers leave it empty.
 	region string
+	// acceleratorID is the provider's own identifier for what serves this request
+	// (e.g. AWS "p5.48xlarge"), resolved via MapAccelerator(type, count). Empty for
+	// a CPU-only Pod, which requests no accelerator.
+	acceleratorID string
 }
 
 // needsPlacement reports whether the Pod is an opted-in workload still held by

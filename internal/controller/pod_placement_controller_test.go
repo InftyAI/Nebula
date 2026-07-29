@@ -181,6 +181,11 @@ func TestPlacement_UngatesAndRoutesAndCreatesClaim(t *testing.T) {
 	if nc.Spec.Provider != provider.ProviderModal || nc.Spec.PodRef.UID != "uid-1" || nc.Spec.PoolRef != "pool-a" {
 		t.Fatalf("unexpected claim spec: %+v", nc.Spec)
 	}
+	// The provider's resolved accelerator id is recorded for reporting (the fake's
+	// MapAccelerator echoes the canonical type, so H100 -> "H100").
+	if nc.Spec.AcceleratorID != "H100" {
+		t.Fatalf("expected claim to record acceleratorID H100, got %q", nc.Spec.AcceleratorID)
+	}
 }
 
 func TestPlacement_FirstMatchingProviderWins(t *testing.T) {
@@ -245,6 +250,14 @@ func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
 	got := getPod(t, c, "default", "p1")
 	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected a CPU-only Pod to place on modal, got %v", got.Spec.NodeSelector)
+	}
+	// A CPU-only claim requests no accelerator, so the id is left empty.
+	var nc nebulav1alpha1.NodeClaim
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err != nil {
+		t.Fatalf("expected NodeClaim default-p1: %v", err)
+	}
+	if nc.Spec.AcceleratorID != "" {
+		t.Fatalf("expected empty acceleratorID for a CPU-only claim, got %q", nc.Spec.AcceleratorID)
 	}
 }
 

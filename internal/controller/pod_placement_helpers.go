@@ -139,9 +139,10 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				log.Info("selected placement candidate",
 					"provider", ref.Name, "capacityType", tier, "region", region)
 				return placement{
-					provider:     ref.Name,
-					capacityType: tier,
-					region:       region,
+					provider:      ref.Name,
+					capacityType:  tier,
+					region:        region,
+					acceleratorID: acceleratorID,
 				}, true, 0
 			}
 		}
@@ -234,10 +235,11 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 				Name:      pod.Name,
 				UID:       string(pod.UID),
 			},
-			Provider:     p.provider,
-			CapacityType: p.capacityType,
-			Region:       p.region,
-			PoolRef:      pool.Name,
+			Provider:      p.provider,
+			CapacityType:  p.capacityType,
+			Region:        p.region,
+			AcceleratorID: p.acceleratorID,
+			PoolRef:       pool.Name,
 		},
 	}
 	err = r.Create(ctx, claim)

@@ -41,6 +41,17 @@ type NodeClaimSpec struct {
 	// +optional
 	Region string `json:"region,omitempty"`
 
+	// AcceleratorID is the provider's own identifier for what actually serves this
+	// claim (e.g. AWS "p5.48xlarge", RunPod "NVIDIA H100 80GB HBM3"), resolved at
+	// placement time from the Pod's requested accelerator type + count via the
+	// provider's MapAccelerator. Unlike Provider/CapacityType/Region it is NOT a
+	// provisioning input (the provider re-derives it from the Pod) — it is recorded
+	// for reporting, like PoolRef, so `kubectl get nc` shows the concrete SKU behind
+	// each instance without cross-referencing the Pod. Empty for a CPU-only claim,
+	// which requests no accelerator.
+	// +optional
+	AcceleratorID string `json:"acceleratorID,omitempty"`
+
 	// PoolRef is the NodePool whose policy produced this claim, for reporting.
 	// +optional
 	PoolRef string `json:"poolRef,omitempty"`
@@ -139,9 +150,10 @@ type NodeClaimStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.provider`
 // +kubebuilder:printcolumn:name="Region",type=string,JSONPath=`.spec.region`
-// +kubebuilder:printcolumn:name="Instance",type=string,JSONPath=`.status.instanceID`
-// +kubebuilder:printcolumn:name="CapacityType",type=string,JSONPath=`.spec.capacityType`
+// +kubebuilder:printcolumn:name="ACCELERATOR_ID",type=string,JSONPath=`.spec.acceleratorID`
+// +kubebuilder:printcolumn:name="CAPACITY_TYPE",type=string,JSONPath=`.spec.capacityType`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Instance",type=string,JSONPath=`.status.instanceID`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // NodeClaim represents one external GPU instance and its lifecycle.
