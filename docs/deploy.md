@@ -8,7 +8,6 @@ cluster, including wiring provider credentials.
 - [Webhook TLS (no cert-manager)](#webhook-tls-no-cert-manager)
 - [What `deploy-all` does](#what-deploy-all-does)
 - [Configuration](#configuration)
-- [Adding a provider](#adding-a-provider)
 - [Manual deployment](#manual-deployment)
 - [Verifying the deployment](#verifying-the-deployment)
 
@@ -134,6 +133,8 @@ cert-manager, and drop the `gen-webhook-cert.sh` calls from `hack/deploy.sh`.
 |---|---|---|---|
 | `MODAL_TOKEN_ID` | Modal | yes | From `modal token new` |
 | `MODAL_TOKEN_SECRET` | Modal | yes | From `modal token new` |
+| `AWS_ACCESS_KEY_ID` | AWS | dev only | Prefer IRSA / instance role in production and leave blank — the SDK's default credential chain finds the role. Set only for local/dev. |
+| `AWS_SECRET_ACCESS_KEY` | AWS | dev only | Pairs with `AWS_ACCESS_KEY_ID`; both required together or both blank. |
 
 Non-secret config, passed as `make` variables:
 
@@ -143,34 +144,6 @@ Non-secret config, passed as `make` variables:
 | `NAMESPACE` | `nebula-system` | Namespace the manager runs in |
 | `DEPLOY_KIND_CLUSTER` | *(empty)* | If set, load the image into this Kind cluster instead of pushing. Separate from the e2e `KIND_CLUSTER`, so a plain `make deploy-all` pushes. |
 | `KUBECTL` | `kubectl` | kubectl binary to use |
-
----
-
-## Adding a provider
-
-When a new provider adapter lands, wire its credentials in two places:
-
-1. **`hack/deploy.sh`** — add a row to the `PROVIDER_SECRETS` table:
-
-   ```bash
-   PROVIDER_SECRETS=(
-     "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET"
-     "nebula-runpod-credentials|RUNPOD_API_KEY|"
-   )
-   ```
-   Format: `<secret-name>|<REQUIRED_KEYS>|<OPTIONAL_KEYS>`.
-
-2. **`config/manager/manager.yaml`** — add an optional `secretRef` under
-   `envFrom`:
-
-   ```yaml
-   - secretRef:
-       name: nebula-runpod-credentials
-       optional: true
-   ```
-
-Then add the new keys to `.env.example`. Nothing else changes — the script
-creates the Secret from `.env` and skips it if the keys are blank.
 
 ---
 

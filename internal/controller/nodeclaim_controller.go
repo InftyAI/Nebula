@@ -143,10 +143,13 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// The served Pod is absent. Decide whether this is a real teardown or a
 	// transient cache-lag false-negative.
-	if r.wasBound(&nc) {
+	if r.wasBound(&nc) || nc.Status.Phase == nebulav1alpha1.NodeClaimTerminating {
 		// We previously observed the Pod, so its disappearance is real: this is a
-		// teardown (normal delete, or a force-delete during a VK outage). Delete
-		// the claim so its finalizer fires the backstop.
+		// teardown (normal delete, or a force-delete during a VK outage). A
+		// Terminating claim counts too — it was set only from a Pod carrying a
+		// DeletionTimestamp, so that Pod provably existed and its disappearance is
+		// the delete completing, not cache lag. Delete the claim so its finalizer
+		// fires the backstop.
 		log.Info("served Pod is gone after being observed placed; deleting claim to trigger teardown",
 			"pod", nc.Spec.PodRef.Name)
 		return ctrl.Result{}, r.deleteSelf(ctx, &nc)
@@ -277,6 +280,12 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 //   - Terminal Pod (Failed/Succeeded) => Terminated. VK reports a vanished
 //     instance this way; a restartPolicy:Never Pod lingers terminal rather than
 //     being deleted, so keying off existence alone would wedge the claim at Bound.
+//   - Pod being deleted (DeletionTimestamp set) => Terminating. The workload is on
+//     its way out but the instance may not be reclaimed yet, so this is a forward
+//     transition from ANY phase — it is checked before the Bound-hold below so a
+//     Bound (or Provisioning) Pod that starts deleting is not stranded on its prior
+//     phase. Terminal wins over it: an already-gone instance is Terminated, not
+//     merely terminating.
 //   - Bound already => "" (hold). Bound is the durable teardown guard, and a
 //     transient Running->Pending flap (e.g. a status-check blip) must NOT strip it
 //     — losing it would make a later disappearance read as cache lag and skip
@@ -290,6 +299,8 @@ func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *co
 	switch {
 	case isTerminal(pod.Status.Phase):
 		return nebulav1alpha1.NodeClaimTerminated
+	case !pod.DeletionTimestamp.IsZero():
+		return nebulav1alpha1.NodeClaimTerminating
 	case r.wasBound(nc):
 		return "" // hold Bound (or Terminated); never downgrade
 	case pod.Status.Phase == corev1.PodRunning:
