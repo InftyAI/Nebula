@@ -111,25 +111,25 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				continue // unregistered; NodePool status surfaces this separately
 			}
 			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
-			// Pod only matches a provider whose catalog serves that (type, count). The
-			// resolved id is also what the block is keyed on, so it is captured here
-			// from the same lookup that decides servability.
-			acceleratorID := ""
+			// Pod only matches a provider whose catalog serves that (type, count).
+			// MapAccelerator is consulted only for that servability check — the block
+			// key and the reported identity are the POOL (type:count), not the
+			// provider's SKU, so a launch spanning alternates and a post-launch SKU
+			// swap never desync the key. Empty for a CPU-only Pod.
+			accelerator := util.AcceleratorPool(accel, count)
 			if accel != "" {
-				id, offered := prov.MapAccelerator(accel, count)
-				if !offered {
+				if _, offered := prov.MapAccelerator(accel, count); !offered {
 					log.V(1).Info("skipping candidate: provider does not offer the accelerator",
 						"provider", ref.Name, "accelerator", accel, "count", count)
 					continue
 				}
-				acceleratorID = id
 			}
 			for _, region := range regionsFor(ref) { // inner: region
-				if until, blocked := r.blockedUntil(ref.Name, acceleratorID, tier, region); blocked {
+				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
 					log.Info("skipping candidate: blocked by failover blocklist",
-						"provider", ref.Name, "acceleratorID", acceleratorID,
+						"provider", ref.Name, "accelerator", accelerator,
 						"capacityType", tier, "region", region, "freesIn", until.String())
 					if until > 0 && (soonest == 0 || until < soonest) {
 						soonest = until
@@ -139,10 +139,10 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				log.Info("selected placement candidate",
 					"provider", ref.Name, "capacityType", tier, "region", region)
 				return placement{
-					provider:      ref.Name,
-					capacityType:  tier,
-					region:        region,
-					acceleratorID: acceleratorID,
+					provider:     ref.Name,
+					capacityType: tier,
+					region:       region,
+					accelerator:  accelerator,
 				}, true, 0
 			}
 		}
@@ -174,21 +174,21 @@ func regionsFor(ref nebulav1alpha1.ProviderSpec) []string {
 	return ref.Regions
 }
 
-// blockedUntil reports whether the (provider, acceleratorID, tier, region)
+// blockedUntil reports whether the (provider, accelerator, tier, region)
 // candidate is currently excluded by the failover blocklist and, if so, how long
-// until it frees (for the requeue hint). acceleratorID is the provider's resolved
-// id for the request (see selectPlacement), so a capacity block matches only
-// candidates on the same instance type / pool. It is nil-safe: with no blocklist
-// wired (tests, or a blocklist-less build) nothing is ever blocked.
-func (r *PodPlacementReconciler) blockedUntil(provName, acceleratorID string, tier nebulav1alpha1.CapacityType, region string) (time.Duration, bool) {
+// until it frees (for the requeue hint). accelerator is the request's pool
+// identity (type:count; see selectPlacement), so a capacity block matches only
+// candidates on the same pool. It is nil-safe: with no blocklist wired (tests, or
+// a blocklist-less build) nothing is ever blocked.
+func (r *PodPlacementReconciler) blockedUntil(provName, accelerator string, tier nebulav1alpha1.CapacityType, region string) (time.Duration, bool) {
 	if r.Blocklist == nil {
 		return 0, false
 	}
 	return r.Blocklist.BlockedUntil(failover.Candidate{
-		Provider:      provName,
-		AcceleratorID: acceleratorID,
-		CapacityType:  tier,
-		Region:        region,
+		Provider:     provName,
+		Accelerator:  accelerator,
+		CapacityType: tier,
+		Region:       region,
 	})
 }
 
@@ -235,11 +235,11 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 				Name:      pod.Name,
 				UID:       string(pod.UID),
 			},
-			Provider:      p.provider,
-			CapacityType:  p.capacityType,
-			Region:        p.region,
-			AcceleratorID: p.acceleratorID,
-			PoolRef:       pool.Name,
+			Provider:     p.provider,
+			CapacityType: p.capacityType,
+			Region:       p.region,
+			Accelerator:  p.accelerator,
+			PoolRef:      pool.Name,
 		},
 	}
 	err = r.Create(ctx, claim)

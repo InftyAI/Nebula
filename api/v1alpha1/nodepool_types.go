@@ -140,7 +140,7 @@ const (
 type FailoverPolicy struct {
 	// BlocklistTTL is how long a failed placement is excluded before the
 	// provider becomes a candidate for it again.
-	// +kubebuilder:default="10m"
+	// +kubebuilder:default="3m"
 	BlocklistTTL metav1.Duration `json:"blocklistTTL,omitempty"`
 }
 

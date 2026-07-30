@@ -38,7 +38,7 @@ spec:
         app: gpu-workload-sample
         nebula.inftyai.com/enabled: "true"
         nebula.inftyai.com/nodepool: sample
-        nebula.inftyai.com/accelerator-type: a100-40gb
+        nebula.inftyai.com/accelerator-type: l4
     spec:
       # Do NOT set nodeName or a provider nodeSelector yourself — the placement
       # controller fills the nodeSelector in when it ungates the Pod. Setting

@@ -77,24 +77,33 @@ func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 }
 
 // MapAccelerator translates a canonical accelerator request (type + count) into
-// this provider's own accelerator id using the catalog as the mapping table. It
-// finds the offering row whose AcceleratorType matches (case-insensitively) and
-// whose GPUCount matches the request, and returns that row's AcceleratorID. When
-// AcceleratorID is blank (a provider whose id equals the canonical name) it falls
-// back to the canonical name, so an identity-mapped provider needs no per-name
-// data. Because the mapping lives entirely in the CSV, a provider whose ids
-// diverge (AWS instance types) does NOT need to override this — it just populates
-// the accelerator_id and gpu_count columns.
+// this provider's own accelerator ids using the catalog as the mapping table. It
+// finds the offering rows whose AcceleratorType matches (case-insensitively) and
+// whose GPUCount matches the request, and returns their AcceleratorIDs in catalog
+// order — the PRIMARY (first matching row) first, then any interchangeable
+// alternates, de-duplicated. When a row's AcceleratorID is blank (a provider whose
+// id equals the canonical name) it falls back to the canonical name, so an
+// identity-mapped provider needs no per-name data. Because the mapping lives
+// entirely in the CSV, a provider whose ids diverge (AWS instance types) does NOT
+// need to override this — it just populates the accelerator_id and gpu_count
+// columns, and adds a row per alternate to widen the launch.
 //
 // Count matching honours the two catalog shapes (see Offering.GPUCount): a
 // provider that bakes the count into the offering (AWS: T4x1=g4dn.xlarge,
 // T4x8=g4dn.metal) emits one row per count, so the row whose GPUCount equals the
-// request is the match — this is what keeps (L4, 1) and (L4, 8) on DISTINCT ids so
-// one's capacity block does not exclude the other. A provider that takes the count
-// as a free parameter (Modal) leaves GPUCount 0 on its single row; a 0-count row
-// matches any requested count, since count is not a lookup dimension there.
-// Returns ok=false when the provider offers no row for that (type, count).
-func (b Base) MapAccelerator(canonical string, count int32) (providerAcceleratorID string, ok bool) {
+// request is the match — this is what keeps (L4, 1) and (L4, 8) on DISTINCT primary
+// ids so one's capacity block does not exclude the other. A provider that takes the
+// count as a free parameter (Modal) leaves GPUCount 0 on its single row; a 0-count
+// row matches any requested count, since count is not a lookup dimension there.
+//
+// Dedup collapses the catalog's per-capacity-type/per-region row duplicates (an
+// instance type is the same object whether the row prices Spot or OnDemand). The
+// primary — ids[0] — is the identity failover blocks on; alternates broaden a
+// single launch but never the blocklist. Returns ok=false when the provider offers
+// no row for that (type, count).
+func (b Base) MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool) {
+	var ids []string
+	seen := make(map[string]bool)
 	for _, o := range b.Catalog.Offerings(b.ProviderName) {
 		if !strings.EqualFold(o.AcceleratorType, canonical) {
 			continue
@@ -104,10 +113,15 @@ func (b Base) MapAccelerator(canonical string, count int32) (providerAccelerator
 		if o.GPUCount != 0 && o.GPUCount != count {
 			continue
 		}
-		if o.AcceleratorID != "" {
-			return o.AcceleratorID, true
+		id := o.AcceleratorID
+		if id == "" {
+			id = o.AcceleratorType
 		}
-		return o.AcceleratorType, true
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
 	}
-	return "", false
+	return ids, len(ids) > 0
 }

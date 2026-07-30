@@ -29,7 +29,7 @@ func TestClassifyError(t *testing.T) {
 	const accel = "H100"
 	// capacityScope is the expected accelerator-scoped block: the accelerator id is
 	// promoted to an exact-match pointer.
-	capacityScope := BlockScope{CapacityType: tier, AcceleratorID: ptrStr(accel)}
+	capacityScope := BlockScope{CapacityType: tier, Accelerator: ptrStr(accel)}
 	tests := []struct {
 		name string
 		err  error
@@ -37,14 +37,20 @@ func TestClassifyError(t *testing.T) {
 	}{
 		{"nil", nil, BlockScope{}},
 		{"auth sentinel", ErrAuth, BlockScope{DenyAll: true}},
-		{"quota sentinel", ErrQuota, BlockScope{DenyAll: true}},
+		// Quota is scoped like capacity (per accelerator + tier), NOT DenyAll: cloud
+		// quotas are per-resource and, for a multi-region adapter, per-region, so one
+		// exhausted quota must not fence off other regions/accelerators.
+		{"quota sentinel", ErrQuota, capacityScope},
 		{"no-capacity sentinel", ErrNoCapacity, capacityScope},
 		{"unsupported sentinel", ErrUnsupportedAccelerator, capacityScope},
 		{"wrapped sentinel", fmt.Errorf("provision failed: %w", ErrNoCapacity), capacityScope},
 		{"string unauthorized", fmt.Errorf("HTTP 401 unauthorized"), BlockScope{DenyAll: true}},
-		{"string quota", fmt.Errorf("account limit exceeded"), BlockScope{DenyAll: true}},
+		{"string quota", fmt.Errorf("account limit exceeded"), capacityScope},
 		{"string capacity", fmt.Errorf("no capacity available"), capacityScope},
-		{"unknown conservative", fmt.Errorf("weird transient blip"), BlockScope{DenyAll: true}},
+		// An unrecognized error is scoped like capacity (this accelerator + tier), NOT
+		// DenyAll: a DenyAll would fence off the whole provider on a failure we can't
+		// even identify, so failover past the one failing candidate is the safer default.
+		{"unknown capacity-scoped", fmt.Errorf("weird transient blip"), capacityScope},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -64,12 +70,12 @@ func TestClassifyError_TierStamped(t *testing.T) {
 	}
 }
 
-// An empty accelerator (CPU-only Pod) must leave AcceleratorID nil ("not
+// An empty accelerator (CPU-only Pod) must leave Accelerator nil ("not
 // applicable"), never a wildcard that would widen the block across every GPU.
 func TestClassifyError_EmptyAcceleratorStaysNil(t *testing.T) {
 	got := ClassifyError(ErrNoCapacity, nebulav1alpha1.CapacityOnDemand, "")
-	if got.AcceleratorID != nil {
-		t.Fatalf("expected nil AcceleratorID for a CPU-only request, got %+v", got.AcceleratorID)
+	if got.Accelerator != nil {
+		t.Fatalf("expected nil Accelerator for a CPU-only request, got %+v", got.Accelerator)
 	}
 	if got.DenyAll || got.CapacityType != nebulav1alpha1.CapacityOnDemand {
 		t.Fatalf("expected an OnDemand capacity scope, got %+v", got)

@@ -20,8 +20,11 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -44,6 +47,7 @@ type fakeEC2 struct {
 	describePages []*ec2.DescribeInstancesOutput
 	describeErr   error
 	describeIdx   int
+	lastDescribe  *ec2.DescribeInstancesInput
 
 	// statusPages seeds DescribeInstanceStatus (reachability checks); statusErr
 	// injects a failure. Left nil, the fake reports no status rows — every instance
@@ -58,6 +62,12 @@ type fakeEC2 struct {
 	offeringPages []*ec2.DescribeInstanceTypeOfferingsOutput
 	offeringErr   error
 	offeringIdx   int
+	// offeringMu guards the offering* fields so a concurrency test can drive the
+	// single-flight lookup from many goroutines without racing the fake's counters.
+	offeringMu sync.Mutex
+	// offeringCalls counts DescribeInstanceTypeOfferings invocations (distinct calls,
+	// not pages) so a test can assert single-flight coalescing.
+	offeringCalls int
 	// lastOfferingIn records the last DescribeInstanceTypeOfferings input so a test
 	// can assert the region filter was applied.
 	lastOfferingIn *ec2.DescribeInstanceTypeOfferingsInput
@@ -66,6 +76,23 @@ type fakeEC2 struct {
 	imagesErr  error
 	subnetsOut *ec2.DescribeSubnetsOutput
 	subnetsErr error
+
+	// fleet path. lastFleet records the last CreateFleet input; fleetOut/fleetErr
+	// seed its result. createdLTs/deletedLTs record ephemeral launch-template names
+	// so a test can assert one is created and torn down; ltCreateErr injects a
+	// CreateLaunchTemplate failure.
+	lastFleet   *ec2.CreateFleetInput
+	fleetOut    *ec2.CreateFleetOutput
+	fleetErr    error
+	fleetCalls  int
+	createdLTs  []string
+	lastLTData  ec2types.RequestLaunchTemplateData // last CreateLaunchTemplate data
+	deletedLTs  []string
+	ltCreateErr error
+
+	// describeLTsOut/Err seed DescribeLaunchTemplates for the stale-template sweep.
+	describeLTsOut *ec2.DescribeLaunchTemplatesOutput
+	describeLTsErr error
 }
 
 func (f *fakeEC2) DescribeImages(
@@ -103,6 +130,53 @@ func (f *fakeEC2) RunInstances(
 	return f.runOut, nil
 }
 
+func (f *fakeEC2) CreateLaunchTemplate(
+	_ context.Context, in *ec2.CreateLaunchTemplateInput, _ ...func(*ec2.Options),
+) (*ec2.CreateLaunchTemplateOutput, error) {
+	if f.ltCreateErr != nil {
+		return nil, f.ltCreateErr
+	}
+	if in.LaunchTemplateName != nil {
+		f.createdLTs = append(f.createdLTs, *in.LaunchTemplateName)
+	}
+	if in.LaunchTemplateData != nil {
+		f.lastLTData = *in.LaunchTemplateData
+	}
+	return &ec2.CreateLaunchTemplateOutput{}, nil
+}
+
+func (f *fakeEC2) DeleteLaunchTemplate(
+	_ context.Context, in *ec2.DeleteLaunchTemplateInput, _ ...func(*ec2.Options),
+) (*ec2.DeleteLaunchTemplateOutput, error) {
+	if in.LaunchTemplateName != nil {
+		f.deletedLTs = append(f.deletedLTs, *in.LaunchTemplateName)
+	}
+	return &ec2.DeleteLaunchTemplateOutput{}, nil
+}
+
+func (f *fakeEC2) CreateFleet(
+	_ context.Context, in *ec2.CreateFleetInput, _ ...func(*ec2.Options),
+) (*ec2.CreateFleetOutput, error) {
+	f.lastFleet = in
+	f.fleetCalls++
+	if f.fleetErr != nil {
+		return nil, f.fleetErr
+	}
+	return f.fleetOut, nil
+}
+
+func (f *fakeEC2) DescribeLaunchTemplates(
+	_ context.Context, _ *ec2.DescribeLaunchTemplatesInput, _ ...func(*ec2.Options),
+) (*ec2.DescribeLaunchTemplatesOutput, error) {
+	if f.describeLTsErr != nil {
+		return nil, f.describeLTsErr
+	}
+	if f.describeLTsOut != nil {
+		return f.describeLTsOut, nil
+	}
+	return &ec2.DescribeLaunchTemplatesOutput{}, nil
+}
+
 func (f *fakeEC2) TerminateInstances(
 	_ context.Context, in *ec2.TerminateInstancesInput, _ ...func(*ec2.Options),
 ) (*ec2.TerminateInstancesOutput, error) {
@@ -114,8 +188,9 @@ func (f *fakeEC2) TerminateInstances(
 }
 
 func (f *fakeEC2) DescribeInstances(
-	_ context.Context, _ *ec2.DescribeInstancesInput, _ ...func(*ec2.Options),
+	_ context.Context, in *ec2.DescribeInstancesInput, _ ...func(*ec2.Options),
 ) (*ec2.DescribeInstancesOutput, error) {
+	f.lastDescribe = in
 	if f.describeErr != nil {
 		return nil, f.describeErr
 	}
@@ -145,7 +220,10 @@ func (f *fakeEC2) DescribeInstanceStatus(
 func (f *fakeEC2) DescribeInstanceTypeOfferings(
 	_ context.Context, in *ec2.DescribeInstanceTypeOfferingsInput, _ ...func(*ec2.Options),
 ) (*ec2.DescribeInstanceTypeOfferingsOutput, error) {
+	f.offeringMu.Lock()
+	defer f.offeringMu.Unlock()
 	f.lastOfferingIn = in
+	f.offeringCalls++
 	if f.offeringErr != nil {
 		return nil, f.offeringErr
 	}
@@ -277,16 +355,185 @@ func TestClassifyEC2Error(t *testing.T) {
 	}
 }
 
+// fleetWith builds an instant-fleet output that launched a single instance id.
+func fleetWith(id string) *ec2.CreateFleetOutput {
+	return &ec2.CreateFleetOutput{
+		Instances: []ec2types.CreateFleetInstance{{InstanceIds: []string{id}}},
+	}
+}
+
+// fleetNoCapacity builds an instant-fleet output that launched NOTHING and reports
+// the reason in Errors — how CreateFleet(instant) surfaces a capacity shortfall
+// (the API call itself succeeds).
+func fleetNoCapacity(code string) *ec2.CreateFleetOutput {
+	return &ec2.CreateFleetOutput{
+		Errors: []ec2types.CreateFleetError{{ErrorCode: awssdk.String(code)}},
+	}
+}
+
+// offeringPage builds a DescribeInstanceTypeOfferings page listing the AZs (Location
+// values) that offer a type — the AZ-granularity shape instanceTypeAZs reads.
+func offeringPage(azs ...string) *ec2.DescribeInstanceTypeOfferingsOutput {
+	out := &ec2.DescribeInstanceTypeOfferingsOutput{}
+	for _, az := range azs {
+		out.InstanceTypeOfferings = append(out.InstanceTypeOfferings, ec2types.InstanceTypeOffering{
+			Location: awssdk.String(az),
+		})
+	}
+	return out
+}
+
+func TestFleetOverrides_PrunesUnofferedAZ(t *testing.T) {
+	subnets := []subnet{
+		{id: "sn-a", az: "us-east-1a"},
+		{id: "sn-e", az: "us-east-1e"}, // g6.48xlarge not offered here
+	}
+	// Offerings say the type lives only in us-east-1a.
+	offerings := map[string]map[string]bool{"g6.48xlarge": {"us-east-1a": true}}
+	got := fleetOverrides([]string{"g6.48xlarge"}, subnets, offerings)
+	if len(got) != 1 || got[0].SubnetId == nil || *got[0].SubnetId != "sn-a" {
+		t.Fatalf("expected only the us-east-1a subnet to survive pruning, got %+v", got)
+	}
+}
+
+func TestFleetOverrides_UnknownOfferingsDoesNotPrune(t *testing.T) {
+	subnets := []subnet{{id: "sn-a", az: "us-east-1a"}, {id: "sn-e", az: "us-east-1e"}}
+	// nil offered set for the type => unknown => fail-open, keep every subnet.
+	got := fleetOverrides([]string{"g6.48xlarge"}, subnets, nil)
+	if len(got) != 2 {
+		t.Fatalf("unknown offerings must not prune; want 2 overrides, got %d", len(got))
+	}
+}
+
+func TestFleetOverrides_EmptyOfferedSetKeepsAll(t *testing.T) {
+	subnets := []subnet{{id: "sn-a", az: "us-east-1a"}, {id: "sn-e", az: "us-east-1e"}}
+	// Resolved-but-empty offered set (type offered in no listed AZ) would zero the
+	// launch; fail-open keeps all subnets so a stale map can never wedge provisioning.
+	offerings := map[string]map[string]bool{"g6.48xlarge": {}}
+	got := fleetOverrides([]string{"g6.48xlarge"}, subnets, offerings)
+	if len(got) != 2 {
+		t.Fatalf("an empty offered set must keep all subnets (fail-open); got %d", len(got))
+	}
+}
+
+// RunInstance prunes the dead (type, AZ) pair using DescribeInstanceTypeOfferings,
+// so the fleet grid never carries a subnet whose AZ does not offer the type; the
+// resolved offering set is cached so a second provision issues no further lookup.
+func TestSDKRunInstance_PrunesUnofferedAZAndCaches(t *testing.T) {
+	f := &fakeEC2{
+		fleetOut:      fleetWith("i-1"),
+		offeringPages: []*ec2.DescribeInstanceTypeOfferingsOutput{offeringPage("us-east-1a")},
+	}
+	c := newSDKClient(f)
+	c.subnets = []subnet{{id: "sn-a", az: "us-east-1a"}, {id: "sn-e", az: "us-east-1e"}}
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"g6.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	}); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	ovs := f.lastFleet.LaunchTemplateConfigs[0].Overrides
+	if len(ovs) != 1 || ovs[0].SubnetId == nil || *ovs[0].SubnetId != "sn-a" {
+		t.Fatalf("expected the us-east-1e override pruned, got %+v", ovs)
+	}
+	// The AZ-scoped offerings query filters to the single type.
+	if f.offeringCalls != 1 {
+		t.Fatalf("expected one offerings lookup, got %d", f.offeringCalls)
+	}
+
+	// A second provision reuses the cached offered set — no further lookup.
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"g6.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c2"},
+	}); err != nil {
+		t.Fatalf("second RunInstance: %v", err)
+	}
+	if f.offeringCalls != 1 {
+		t.Fatalf("offerings must be cached across provisions; got %d lookups", f.offeringCalls)
+	}
+}
+
+// A burst of concurrent provisions for the same NEW type must coalesce into ONE
+// DescribeInstanceTypeOfferings (single-flight): the first caller runs the lookup
+// while the rest wait on it, so the shared cache is populated with a single call
+// rather than one per goroutine.
+func TestInstanceTypeAZs_SingleFlightCoalesces(t *testing.T) {
+	f := &fakeEC2{offeringPages: []*ec2.DescribeInstanceTypeOfferingsOutput{offeringPage("us-east-1a")}}
+	c := newSDKClient(f)
+
+	const n = 8
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			got := c.instanceTypeAZs(context.Background(), []string{"g6.48xlarge"})
+			if !got["g6.48xlarge"]["us-east-1a"] {
+				t.Errorf("expected us-east-1a in the resolved offered set, got %+v", got)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if f.offeringCalls != 1 {
+		t.Fatalf("single-flight must coalesce %d concurrent lookups into 1, got %d", n, f.offeringCalls)
+	}
+}
+
+// A failed lookup must NOT be cached: the slot is dropped so a later provision
+// retries the Describe rather than fail-open forever on a transient throttle.
+func TestInstanceTypeAZs_ErrorNotCachedRetries(t *testing.T) {
+	f := &fakeEC2{
+		offeringErr:   errors.New("throttled"),
+		offeringPages: []*ec2.DescribeInstanceTypeOfferingsOutput{offeringPage("us-east-1a")},
+	}
+	c := newSDKClient(f)
+
+	// First lookup fails -> unresolved (fail-open) and not cached.
+	if got := c.instanceTypeAZs(context.Background(), []string{"g6.48xlarge"}); got["g6.48xlarge"] != nil {
+		t.Fatalf("a failed lookup must be unresolved (nil), got %+v", got["g6.48xlarge"])
+	}
+	// Clear the injected error; the retry must re-issue the Describe and now succeed.
+	f.offeringMu.Lock()
+	f.offeringErr = nil
+	f.offeringMu.Unlock()
+
+	got := c.instanceTypeAZs(context.Background(), []string{"g6.48xlarge"})
+	if !got["g6.48xlarge"]["us-east-1a"] {
+		t.Fatalf("a retry after a transient error must resolve the offered set, got %+v", got)
+	}
+	if f.offeringCalls != 2 {
+		t.Fatalf("expected the failed lookup to be retried (2 calls), got %d", f.offeringCalls)
+	}
+}
+
+// A DescribeInstanceTypeOfferings failure must fail open: the launch keeps every
+// subnet (today's behavior) rather than shrinking or wedging.
+func TestSDKRunInstance_OfferingLookupErrorFailsOpen(t *testing.T) {
+	f := &fakeEC2{fleetOut: fleetWith("i-1"), offeringErr: errors.New("throttled")}
+	c := newSDKClient(f)
+	c.subnets = []subnet{{id: "sn-a", az: "us-east-1a"}, {id: "sn-e", az: "us-east-1e"}}
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"g6.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	}); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	if ovs := f.lastFleet.LaunchTemplateConfigs[0].Overrides; len(ovs) != 2 {
+		t.Fatalf("an offerings lookup error must not prune; want 2 overrides, got %d", len(ovs))
+	}
+}
+
 func TestSDKRunInstance_OnDemand(t *testing.T) {
-	f := &fakeEC2{runOut: &ec2.RunInstancesOutput{
-		Instances: []ec2types.Instance{{InstanceId: awssdk.String("i-42")}},
-	}}
+	f := &fakeEC2{fleetOut: fleetWith("i-42")}
 	c := newSDKClient(f)
 
 	id, err := c.RunInstance(context.Background(), InstanceSpec{
-		InstanceType: "p5.48xlarge",
-		Image:        "img",
-		Tags:         map[string]string{ClaimTagKey: "claim-a"},
+		InstanceTypes: []string{"p5.48xlarge"},
+		Image:         "img",
+		Tags:          map[string]string{ClaimTagKey: "claim-a"},
 	})
 	if err != nil {
 		t.Fatalf("RunInstance: %v", err)
@@ -294,100 +541,318 @@ func TestSDKRunInstance_OnDemand(t *testing.T) {
 	if id != "i-42" {
 		t.Fatalf("id = %q, want i-42", id)
 	}
-	if f.lastRun.InstanceType != ec2types.InstanceType("p5.48xlarge") {
-		t.Fatalf("InstanceType = %q", f.lastRun.InstanceType)
+	// The launch goes through an instant fleet, not RunInstances.
+	if f.fleetCalls != 1 {
+		t.Fatalf("fleetCalls = %d, want 1", f.fleetCalls)
 	}
-	if f.lastRun.ImageId == nil || *f.lastRun.ImageId != "ami-123" {
-		t.Fatalf("AMI not set from resolved GPU AMI: %+v", f.lastRun.ImageId)
+	if f.lastFleet.Type != ec2types.FleetTypeInstant {
+		t.Fatalf("fleet Type = %q, want instant", f.lastFleet.Type)
 	}
-	// Security groups are deliberately unset: the default-VPC subnet supplies the
-	// default SG (outbound-open, no inbound exposure).
-	if len(f.lastRun.SecurityGroupIds) != 0 {
-		t.Fatalf("SecurityGroupIds must be unset, got %+v", f.lastRun.SecurityGroupIds)
+	// OnDemand: the fleet's default target-capacity type is on-demand.
+	if f.lastFleet.TargetCapacitySpecification.DefaultTargetCapacityType != ec2types.DefaultTargetCapacityTypeOnDemand {
+		t.Fatalf("capacity type = %q, want on-demand", f.lastFleet.TargetCapacitySpecification.DefaultTargetCapacityType)
 	}
-	// OnDemand: no spot market option.
-	if f.lastRun.InstanceMarketOptions != nil {
-		t.Fatalf("OnDemand request must not set market options")
+	// Exactly one instance requested.
+	if got := f.lastFleet.TargetCapacitySpecification.TotalTargetCapacity; got == nil || *got != 1 {
+		t.Fatalf("TotalTargetCapacity = %v, want 1", got)
 	}
-	// Claim tag rides on the instance tag spec.
-	if len(f.lastRun.TagSpecifications) == 0 || *f.lastRun.TagSpecifications[0].Tags[0].Value != "claim-a" {
-		t.Fatalf("claim tag not set: %+v", f.lastRun.TagSpecifications)
+	// The ephemeral launch template is created and torn down: none survives.
+	if len(f.createdLTs) != 1 {
+		t.Fatalf("createdLTs = %v, want exactly one ephemeral template", f.createdLTs)
+	}
+	if len(f.deletedLTs) != 1 || f.deletedLTs[0] != f.createdLTs[0] {
+		t.Fatalf("deletedLTs = %v, want the created template %v torn down", f.deletedLTs, f.createdLTs)
+	}
+	// The fleet references that template by name.
+	cfg := f.lastFleet.LaunchTemplateConfigs[0]
+	if cfg.LaunchTemplateSpecification.LaunchTemplateName == nil ||
+		*cfg.LaunchTemplateSpecification.LaunchTemplateName != f.createdLTs[0] {
+		t.Fatalf("fleet references %+v, want template %q", cfg.LaunchTemplateSpecification, f.createdLTs[0])
 	}
 }
 
-func TestSDKRunInstance_SpotSetsMarketOption(t *testing.T) {
-	f := &fakeEC2{runOut: &ec2.RunInstancesOutput{
-		Instances: []ec2types.Instance{{InstanceId: awssdk.String("i-spot")}},
-	}}
+func TestSDKRunInstance_SpotSetsCapacityType(t *testing.T) {
+	f := &fakeEC2{fleetOut: fleetWith("i-spot")}
 	c := newSDKClient(f)
 
 	if _, err := c.RunInstance(context.Background(), InstanceSpec{
-		InstanceType: "p5.48xlarge", Image: "img", Spot: true,
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img", Spot: true,
 		Tags: map[string]string{ClaimTagKey: "c"},
 	}); err != nil {
 		t.Fatalf("RunInstance: %v", err)
 	}
-	if f.lastRun.InstanceMarketOptions == nil ||
-		f.lastRun.InstanceMarketOptions.MarketType != ec2types.MarketTypeSpot {
-		t.Fatalf("Spot request must set spot market option: %+v", f.lastRun.InstanceMarketOptions)
+	// Spot is requested via the fleet's default target-capacity type.
+	if f.lastFleet.TargetCapacitySpecification.DefaultTargetCapacityType != ec2types.DefaultTargetCapacityTypeSpot {
+		t.Fatalf("Spot request must set spot capacity type: %q",
+			f.lastFleet.TargetCapacitySpecification.DefaultTargetCapacityType)
 	}
 }
 
-func TestSDKRunInstance_CapacityErrorWrapped(t *testing.T) {
-	f := &fakeEC2{runErr: apiErr("InsufficientInstanceCapacity")}
+// One override per discovered subnet: EC2 does the per-AZ capacity search inside
+// the single fleet call rather than the adapter sweeping RunInstances per zone.
+func TestSDKRunInstance_OneOverridePerSubnet(t *testing.T) {
+	f := &fakeEC2{fleetOut: fleetWith("i-1")}
+	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", subnets: []subnet{
+		{id: "subnet-a", az: "us-east-1a"},
+		{id: "subnet-b", az: "us-east-1b"},
+		{id: "subnet-c", az: "us-east-1c"},
+	}}
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	}); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	// Still ONE fleet call, regardless of subnet count.
+	if f.fleetCalls != 1 {
+		t.Fatalf("fleetCalls = %d, want 1 (server-side sweep, not per-zone)", f.fleetCalls)
+	}
+	overrides := f.lastFleet.LaunchTemplateConfigs[0].Overrides
+	if len(overrides) != 3 {
+		t.Fatalf("overrides = %d, want one per subnet (3)", len(overrides))
+	}
+	for i, want := range []string{"subnet-a", "subnet-b", "subnet-c"} {
+		if overrides[i].SubnetId == nil || *overrides[i].SubnetId != want {
+			t.Fatalf("override[%d] subnet = %v, want %q", i, overrides[i].SubnetId, want)
+		}
+	}
+}
+
+// Several interchangeable instance types are spanned in ONE fleet: the overrides
+// are the (instance type, subnet) grid, so EC2 lands on whichever pair has
+// capacity. The launch template carries no instance type — it lives in the
+// overrides — so one template serves every candidate type.
+func TestSDKRunInstance_SpansInstanceTypesAndSubnets(t *testing.T) {
+	f := &fakeEC2{fleetOut: fleetWith("i-1")}
+	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", subnets: []subnet{
+		{id: "subnet-a", az: "us-east-1a"},
+		{id: "subnet-b", az: "us-east-1b"},
+	}}
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge", "p4d.24xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	}); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	overrides := f.lastFleet.LaunchTemplateConfigs[0].Overrides
+	// 2 types x 2 subnets = 4 overrides, primary type first.
+	type pair struct{ it, sn string }
+	got := make([]pair, 0, len(overrides))
+	for _, o := range overrides {
+		sn := ""
+		if o.SubnetId != nil {
+			sn = *o.SubnetId
+		}
+		got = append(got, pair{string(o.InstanceType), sn})
+	}
+	want := []pair{
+		{"p5.48xlarge", "subnet-a"}, {"p5.48xlarge", "subnet-b"},
+		{"p4d.24xlarge", "subnet-a"}, {"p4d.24xlarge", "subnet-b"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("overrides = %v, want the (type, subnet) grid %v", got, want)
+	}
+	// The launch template must NOT pin an instance type (the overrides do).
+	if it := f.lastLTData.InstanceType; it != "" {
+		t.Fatalf("launch template InstanceType = %q, want unset (overrides carry it)", it)
+	}
+}
+
+// With no discovered subnets (no default VPC) the fleet still spans every
+// instance type — one override per type, subnet unset for EC2 to pick.
+func TestSDKRunInstance_NoSubnetsStillSpansTypes(t *testing.T) {
+	f := &fakeEC2{fleetOut: fleetWith("i-1")}
+	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123"} // no subnets
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge", "p4d.24xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	}); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	overrides := f.lastFleet.LaunchTemplateConfigs[0].Overrides
+	if len(overrides) != 2 {
+		t.Fatalf("overrides = %d, want one per instance type (2) when no subnets", len(overrides))
+	}
+	for i, want := range []string{"p5.48xlarge", "p4d.24xlarge"} {
+		if string(overrides[i].InstanceType) != want {
+			t.Fatalf("override[%d] type = %q, want %q", i, overrides[i].InstanceType, want)
+		}
+		if overrides[i].SubnetId != nil {
+			t.Fatalf("override[%d] subnet = %v, want unset (no default VPC)", i, *overrides[i].SubnetId)
+		}
+	}
+}
+
+// A fleet that launches nothing reports the reason in out.Errors (the API call
+// succeeds). A capacity code must map back to the wrapped ErrNoCapacity (+ Spot)
+// so region/tier failover still fires — same contract the old per-zone sweep had.
+func TestSDKRunInstance_FleetNoCapacityWrapped(t *testing.T) {
+	f := &fakeEC2{fleetOut: fleetNoCapacity("InsufficientInstanceCapacity")}
 	c := newSDKClient(f)
 
 	_, err := c.RunInstance(context.Background(), InstanceSpec{
-		InstanceType: "p5.48xlarge", Image: "img", Spot: true,
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img", Spot: true,
 		Tags: map[string]string{ClaimTagKey: "c"},
 	})
 	if !errors.Is(err, provider.ErrNoCapacity) || !errors.Is(err, ErrSpotCapacity) {
 		t.Fatalf("err = %v, want wrapped ErrNoCapacity + ErrSpotCapacity", err)
 	}
-}
-
-// A zone-local capacity shortfall must make RunInstance sweep EVERY discovered
-// subnet before giving up — a sibling AZ may still have capacity.
-func TestSDKRunInstance_ZoneLocalSweepsAllSubnets(t *testing.T) {
-	f := &fakeEC2{runErr: apiErr("InsufficientInstanceCapacity")}
-	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", subnets: []subnet{
-		{id: "subnet-a", az: "us-east-1a"},
-		{id: "subnet-b", az: "us-east-1b"},
-		{id: "subnet-c", az: "us-east-1c"},
-	}}
-
-	_, err := c.RunInstance(context.Background(), InstanceSpec{
-		InstanceType: "p5.48xlarge", Image: "img",
-		Tags: map[string]string{ClaimTagKey: "c"},
-	})
-	if !errors.Is(err, provider.ErrNoCapacity) {
-		t.Fatalf("err = %v, want ErrNoCapacity after exhausting all zones", err)
-	}
-	if f.runCalls != 3 {
-		t.Fatalf("runCalls = %d, want 3 (one attempt per subnet)", f.runCalls)
+	// The ephemeral template is torn down even on the no-capacity path.
+	if len(f.deletedLTs) != 1 {
+		t.Fatalf("deletedLTs = %v, want the template torn down on failure too", f.deletedLTs)
 	}
 }
 
-// A region/account-scoped Spot limit must STOP the sweep at the first subnet:
-// every AZ would fail identically, so iterating them wastes the deadline. It still
-// bubbles up ErrNoCapacity so region-level failover fires.
-func TestSDKRunInstance_RegionScopedStopsSweep(t *testing.T) {
-	f := &fakeEC2{runErr: apiErr("MaxSpotInstanceCountExceeded")}
-	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", subnets: []subnet{
-		{id: "subnet-a", az: "us-east-1a"},
-		{id: "subnet-b", az: "us-east-1b"},
-		{id: "subnet-c", az: "us-east-1c"},
-	}}
+// A CreateFleet grid returns a MIX of per-override reasons: one AZ does not offer
+// the type (InvalidFleetConfiguration) while the rest are capacity-starved. Both are
+// capacity-class, so the launch is still ErrNoCapacity (never a whole-provider block)
+// and the AZ-availability error does not derail failover.
+func TestSDKRunInstance_FleetMixedCapacityErrors(t *testing.T) {
+	f := &fakeEC2{fleetOut: &ec2.CreateFleetOutput{Errors: []ec2types.CreateFleetError{
+		{ErrorCode: awssdk.String("InvalidFleetConfiguration"),
+			ErrorMessage: awssdk.String("g6.48xlarge is not supported in us-east-1e")},
+		{ErrorCode: awssdk.String("InsufficientInstanceCapacity"),
+			ErrorMessage: awssdk.String("insufficient capacity in us-east-1d")},
+	}}}
+	c := newSDKClient(f)
 
 	_, err := c.RunInstance(context.Background(), InstanceSpec{
-		InstanceType: "p5.48xlarge", Image: "img", Spot: true,
+		InstanceTypes: []string{"g6.48xlarge"}, Image: "img", Spot: true,
 		Tags: map[string]string{ClaimTagKey: "c"},
 	})
 	if !errors.Is(err, provider.ErrNoCapacity) || !errors.Is(err, ErrSpotCapacity) {
-		t.Fatalf("err = %v, want ErrNoCapacity + ErrSpotCapacity", err)
+		t.Fatalf("err = %v, want wrapped ErrNoCapacity + ErrSpotCapacity for a mixed capacity grid", err)
 	}
-	if f.runCalls != 1 {
-		t.Fatalf("runCalls = %d, want 1 (region-scoped error must not sweep)", f.runCalls)
+}
+
+// A terminal reason (auth) hiding among per-AZ capacity errors must win: it fails
+// everywhere, so fleetError surfaces it rather than the more numerous capacity
+// errors, and RunInstance reports ErrAuth (a whole-provider block) not no-capacity.
+func TestSDKRunInstance_FleetAuthOutranksCapacity(t *testing.T) {
+	f := &fakeEC2{fleetOut: &ec2.CreateFleetOutput{Errors: []ec2types.CreateFleetError{
+		{ErrorCode: awssdk.String("InsufficientInstanceCapacity")},
+		{ErrorCode: awssdk.String("UnauthorizedOperation"),
+			ErrorMessage: awssdk.String("not authorized to launch")},
+	}}}
+	c := newSDKClient(f)
+
+	_, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"g6.48xlarge"}, Image: "img", Spot: true,
+		Tags: map[string]string{ClaimTagKey: "c"},
+	})
+	if !errors.Is(err, provider.ErrAuth) {
+		t.Fatalf("err = %v, want ErrAuth to outrank the capacity errors in the grid", err)
+	}
+}
+
+// A fleet that launches nothing AND reports no reason must still fail over: map it
+// to a generic no-capacity rather than wedging on a nil error.
+func TestSDKRunInstance_FleetEmptyIsNoCapacity(t *testing.T) {
+	f := &fakeEC2{fleetOut: &ec2.CreateFleetOutput{}}
+	c := newSDKClient(f)
+
+	_, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	})
+	if !errors.Is(err, provider.ErrNoCapacity) {
+		t.Fatalf("err = %v, want ErrNoCapacity for an empty fleet result", err)
+	}
+}
+
+// A top-level CreateFleet error (throttle/malformed/auth on the fleet API) is
+// classified too, so a capacity-shaped top-level error also fails over.
+func TestSDKRunInstance_FleetTopLevelErrorClassified(t *testing.T) {
+	f := &fakeEC2{fleetErr: apiErr("InsufficientInstanceCapacity")}
+	c := newSDKClient(f)
+
+	_, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	})
+	if !errors.Is(err, provider.ErrNoCapacity) {
+		t.Fatalf("err = %v, want classified ErrNoCapacity", err)
+	}
+	// Template is still cleaned up after a top-level fleet failure.
+	if len(f.deletedLTs) != 1 {
+		t.Fatalf("deletedLTs = %v, want cleanup after top-level fleet error", f.deletedLTs)
+	}
+}
+
+// A launch-template create failure aborts the provision before any fleet call and
+// leaves nothing to clean up.
+func TestSDKRunInstance_LaunchTemplateCreateFails(t *testing.T) {
+	f := &fakeEC2{ltCreateErr: errors.New("boom")}
+	c := newSDKClient(f)
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	}); err == nil {
+		t.Fatal("expected the launch-template create error to abort the provision")
+	}
+	if f.fleetCalls != 0 {
+		t.Fatalf("fleetCalls = %d, want 0 (no fleet after template create failed)", f.fleetCalls)
+	}
+	if len(f.deletedLTs) != 0 {
+		t.Fatalf("deletedLTs = %v, want none (nothing was created)", f.deletedLTs)
+	}
+}
+
+// RunInstance opportunistically sweeps leaked ephemeral templates: one older than
+// the staleness cutoff is deleted; a young one (a possible concurrent provision)
+// is left alone. The sweep must never fail the provision it piggybacks on.
+func TestSDKRunInstance_SweepsStaleLaunchTemplates(t *testing.T) {
+	old := time.Now().Add(-2 * staleLaunchTemplateAge) // provably orphaned
+	young := time.Now().Add(-1 * time.Minute)          // could be in-flight
+	f := &fakeEC2{
+		fleetOut: fleetWith("i-1"),
+		describeLTsOut: &ec2.DescribeLaunchTemplatesOutput{
+			LaunchTemplates: []ec2types.LaunchTemplate{
+				{LaunchTemplateName: awssdk.String("nebula-stale"), CreateTime: &old},
+				{LaunchTemplateName: awssdk.String("nebula-young"), CreateTime: &young},
+			},
+		},
+	}
+	c := newSDKClient(f)
+
+	if _, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "claim-a"},
+	}); err != nil {
+		t.Fatalf("RunInstance: %v", err)
+	}
+	// deletedLTs holds the swept stale template plus this provision's own template.
+	// The young one must NOT be deleted.
+	deleted := map[string]bool{}
+	for _, n := range f.deletedLTs {
+		deleted[n] = true
+	}
+	if !deleted["nebula-stale"] {
+		t.Fatalf("stale template not swept; deletedLTs = %v", f.deletedLTs)
+	}
+	if deleted["nebula-young"] {
+		t.Fatalf("young template was swept but may be in-flight; deletedLTs = %v", f.deletedLTs)
+	}
+}
+
+// A sweep describe failure must be swallowed: the provision still succeeds.
+func TestSDKRunInstance_SweepFailureIsNonFatal(t *testing.T) {
+	f := &fakeEC2{
+		fleetOut:       fleetWith("i-1"),
+		describeLTsErr: errors.New("throttled"),
+	}
+	c := newSDKClient(f)
+
+	id, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p5.48xlarge"}, Image: "img",
+		Tags: map[string]string{ClaimTagKey: "c"},
+	})
+	if err != nil || id != "i-1" {
+		t.Fatalf("RunInstance = (%q, %v), want a successful launch despite the sweep failing", id, err)
 	}
 }
 
@@ -526,6 +991,36 @@ func TestSDKList_PagesAndFiltersByClaimTag(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].ID != "i-1" || list[1].ID != "i-2" {
 		t.Fatalf("list = %+v, want both pages", list)
+	}
+
+	// The query must be scoped server-side to (a) the Nebula claim tag and (b) live
+	// instance states — terminated/shutting-down are excluded so torn-down instances
+	// (which EC2 keeps visible for ~1h) are neither counted nor matched by claim.
+	filters := map[string][]string{}
+	for _, fl := range f.lastDescribe.Filters {
+		filters[awssdk.ToString(fl.Name)] = fl.Values
+	}
+	if got := filters["tag-key"]; len(got) != 1 || got[0] != ClaimTagKey {
+		t.Fatalf("tag-key filter = %v, want [%s]", got, ClaimTagKey)
+	}
+	states := filters["instance-state-name"]
+	if len(states) == 0 {
+		t.Fatal("expected an instance-state-name filter to exclude terminated instances")
+	}
+	for _, s := range states {
+		if s == "terminated" || s == "shutting-down" {
+			t.Fatalf("instance-state-name filter must not include %q; got %v", s, states)
+		}
+	}
+	wantStates := map[string]bool{"pending": true, "running": true, "stopping": true, "stopped": true}
+	for _, s := range states {
+		if !wantStates[s] {
+			t.Fatalf("unexpected instance-state-name value %q; got %v", s, states)
+		}
+		delete(wantStates, s)
+	}
+	if len(wantStates) != 0 {
+		t.Fatalf("instance-state-name filter missing states %v; got %v", wantStates, states)
 	}
 }
 

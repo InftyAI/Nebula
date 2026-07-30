@@ -41,6 +41,14 @@ import (
 // informerResync is the full-resync period for the virtual node's informers.
 const informerResync = time.Minute
 
+// podSyncWorkers is the number of concurrent workers the pod controller runs per
+// queue (create/delete/status-sync). VK serializes work per pod key, so distinct
+// pods provision in parallel while the same key never runs twice at once — this
+// removes the head-of-line blocking where one slow (cold-region) provision stalled
+// pods that would otherwise succeed instantly. Kept modest to bound concurrent
+// CreateFleet bursts against the provider's API rate limits.
+const podSyncWorkers = 8
+
 // NodeName returns the virtual node name for a provider: "nebula-<provider>".
 // One static node per provider (see docs/architecture.md §3); the scheduler
 // routes an ungated Pod to it via the ProviderLabel nodeSelector.
@@ -166,7 +174,7 @@ func (r *Runner) run(
 	ctx context.Context, pc *vknode.PodController, nc *vknode.NodeController,
 	nodeSpec *corev1.Node, np *vknode.NaiveNodeProviderV2,
 ) error {
-	go pc.Run(ctx, 1) //nolint:errcheck
+	go pc.Run(ctx, podSyncWorkers) //nolint:errcheck
 
 	select {
 	case <-ctx.Done():

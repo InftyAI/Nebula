@@ -51,18 +51,18 @@ type entry struct {
 	expiresAt time.Time
 }
 
-// Candidate is a placement being considered — the (provider, acceleratorID, tier,
+// Candidate is a placement being considered — the (provider, accelerator, tier,
 // region) tuple the blocklist is queried against. It is the query counterpart to a
 // recorded BlockScope: Blocked reports whether any live entry's scope covers it.
-// AcceleratorID is the provider's RESOLVED id for what would serve the request
-// (the (type, count) mapped through MapAccelerator), not the bare accelerator
-// type, so a block recorded against one instance type/capacity pool matches only
-// candidates that share it.
+// Accelerator is the request's POOL identity (type:count, e.g. "H100:8"), not the
+// provider's SKU id, so a block recorded against one (type, count) pool matches
+// only candidates that share it — and stays stable even when a launch spans
+// several interchangeable provider instance types.
 type Candidate struct {
-	Provider      string
-	AcceleratorID string
-	CapacityType  nebulav1alpha1.CapacityType
-	Region        string
+	Provider     string
+	Accelerator  string
+	CapacityType nebulav1alpha1.CapacityType
+	Region       string
 }
 
 // Blocklist is a concurrency-safe, TTL-bounded set of provider blocks. The zero
@@ -207,7 +207,7 @@ func scopeCovers(scope provider.BlockScope, c Candidate) bool {
 	if scope.DenyAll {
 		return true
 	}
-	if !ptrMatches(scope.AcceleratorID, c.AcceleratorID) {
+	if !ptrMatches(scope.Accelerator, c.Accelerator) {
 		return false
 	}
 	if scope.CapacityType != "" && scope.CapacityType != c.CapacityType {
@@ -230,7 +230,7 @@ func scopeCovers(scope provider.BlockScope, c Candidate) bool {
 func scopeEqual(a, b provider.BlockScope) bool {
 	return a.DenyAll == b.DenyAll &&
 		a.CapacityType == b.CapacityType &&
-		ptrEqual(a.AcceleratorID, b.AcceleratorID) &&
+		ptrEqual(a.Accelerator, b.Accelerator) &&
 		ptrEqual(a.Region, b.Region)
 }
 

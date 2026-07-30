@@ -288,11 +288,13 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		return SandboxSpec{}, fmt.Errorf("modal: %w", err)
 	}
 	if canonical != "" {
-		modalGPU, ok := p.MapAccelerator(canonical, count)
+		// Modal takes the count as a free parameter and has no interchangeable
+		// alternates, so it always maps to a single id; take the primary (ids[0]).
+		ids, ok := p.MapAccelerator(canonical, count)
 		if !ok {
 			return SandboxSpec{}, fmt.Errorf("modal: unsupported accelerator %q", canonical)
 		}
-		spec.GPU = modalGPU
+		spec.GPU = ids[0]
 		spec.GPUCount = count
 	}
 	// No annotation => CPU-only sandbox (GPU/"" GPUCount 0), handled naturally.

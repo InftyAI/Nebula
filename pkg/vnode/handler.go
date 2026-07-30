@@ -53,7 +53,7 @@ const defaultPollInterval = 15 * time.Second
 // carries no BlocklistTTLAnnotation (an out-of-band Pod, or one placed before the
 // annotation existed). It mirrors FailoverPolicy.BlocklistTTL's own default so the
 // behaviour is identical whether or not the pool policy reached the handler.
-const defaultBlocklistTTL = 10 * time.Minute
+const defaultBlocklistTTL = 3 * time.Minute
 
 // Blocklister records a failed placement so the placement controller can fail over
 // to the next candidate instead of hot-looping against a provider that just
@@ -596,22 +596,24 @@ func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, err error) {
 	if h.blocklist == nil {
 		return
 	}
-	// The accelerator id and region are properties of the REQUEST, not the error; the
-	// provider cannot see them, so we resolve them off the Pod and hand them over. The
-	// accelerator (type + count from the Pod) is mapped through the provider to its
-	// RESOLVED id (an EC2 instance type on AWS), so the block is keyed on the concrete
-	// capacity pool that failed — an L4x8 shortage must not exclude L4x1. "" for either
-	// means "not applicable" (a CPU-only Pod, or a region-simple provider), which the
-	// provider treats accordingly.
+	// The accelerator pool and region are properties of the REQUEST, not the error;
+	// the provider cannot see them, so we resolve them off the Pod and hand them over.
+	// The block is keyed on the POOL identity (type:count, e.g. "H100:8") — the SAME
+	// key placement resolves and queries a candidate by (selectPlacement uses
+	// util.AcceleratorPool). A block filed under any other key would never be queried,
+	// and failover would silently re-place onto the candidate that just failed. We key
+	// on the pool, NOT the provider's resolved SKU, because a single launch may span
+	// several interchangeable instance types (AWS's fleet): the pool stays truthful
+	// whichever alternate lands, and a block is only written when the WHOLE launch
+	// failed (it succeeds if any alternate had capacity), so the pool key correctly
+	// names a request whose every equivalent option is dry. It keeps distinct
+	// (type, count) pools on distinct keys, so an H100:8 shortage never excludes
+	// H100:1. "" for either means "not applicable" (a CPU-only Pod, or a region-simple
+	// provider), which the provider treats accordingly.
 	accel, count, _ := util.AcceleratorRequest(pod)
-	acceleratorID := ""
-	if accel != "" {
-		// ok=false only if the provider stopped offering the (type, count) since
-		// provisioning; leave the id "" and let the provider scope from the error.
-		acceleratorID, _ = h.prov.MapAccelerator(accel, count)
-	}
+	accelerator := util.AcceleratorPool(accel, count)
 	region := pod.Annotations[nebulav1alpha1.RegionAnnotation]
-	scope := h.prov.ClassifyProvisionError(err, acceleratorID, region)
+	scope := h.prov.ClassifyProvisionError(err, accelerator, region)
 
 	if scope == (provider.BlockScope{}) {
 		// An empty scope means the error is not one we know how to blocklist; do not

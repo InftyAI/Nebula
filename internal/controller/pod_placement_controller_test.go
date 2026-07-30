@@ -49,7 +49,7 @@ func (b *fakeBlocklist) BlockedUntil(c failover.Candidate) (time.Duration, bool)
 		if e.Provider != "" && e.Provider != c.Provider {
 			continue
 		}
-		if e.AcceleratorID != "" && e.AcceleratorID != c.AcceleratorID {
+		if e.Accelerator != "" && e.Accelerator != c.Accelerator {
 			continue
 		}
 		if e.CapacityType != "" && e.CapacityType != c.CapacityType {
@@ -181,10 +181,10 @@ func TestPlacement_UngatesAndRoutesAndCreatesClaim(t *testing.T) {
 	if nc.Spec.Provider != provider.ProviderModal || nc.Spec.PodRef.UID != "uid-1" || nc.Spec.PoolRef != "pool-a" {
 		t.Fatalf("unexpected claim spec: %+v", nc.Spec)
 	}
-	// The provider's resolved accelerator id is recorded for reporting (the fake's
-	// MapAccelerator echoes the canonical type, so H100 -> "H100").
-	if nc.Spec.AcceleratorID != "H100" {
-		t.Fatalf("expected claim to record acceleratorID H100, got %q", nc.Spec.AcceleratorID)
+	// The request's POOL identity (type:count) is recorded for reporting: H100 with
+	// no explicit count defaults to 1, so the pool is "H100:1".
+	if nc.Spec.Accelerator != "H100:1" {
+		t.Fatalf("expected claim to record accelerator H100:1, got %q", nc.Spec.Accelerator)
 	}
 }
 
@@ -251,13 +251,13 @@ func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
 	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected a CPU-only Pod to place on modal, got %v", got.Spec.NodeSelector)
 	}
-	// A CPU-only claim requests no accelerator, so the id is left empty.
+	// A CPU-only claim requests no accelerator, so the pool identity is left empty.
 	var nc nebulav1alpha1.NodeClaim
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err != nil {
 		t.Fatalf("expected NodeClaim default-p1: %v", err)
 	}
-	if nc.Spec.AcceleratorID != "" {
-		t.Fatalf("expected empty acceleratorID for a CPU-only claim, got %q", nc.Spec.AcceleratorID)
+	if nc.Spec.Accelerator != "" {
+		t.Fatalf("expected empty accelerator for a CPU-only claim, got %q", nc.Spec.Accelerator)
 	}
 }
 
@@ -406,7 +406,7 @@ func TestPlacement_FailsOverToNextRegionWhenBlocked(t *testing.T) {
 	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
 	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
-		{Provider: provider.ProviderModal, AcceleratorID: "H100", CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"},
+		{Provider: provider.ProviderModal, Accelerator: "H100:1", CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"},
 	}}
 
 	reconcilePod(t, r, "default", "p1")

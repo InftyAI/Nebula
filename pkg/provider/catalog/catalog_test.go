@@ -19,6 +19,7 @@ package catalog
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -190,7 +191,7 @@ func TestBaseMapAccelerator_CaseInsensitive(t *testing.T) {
 	}
 
 	// A canonical accelerator supplied in any case must resolve, and the returned
-	// id is always the catalog's canonical casing — so a lowercase
+	// primary id is always the catalog's canonical casing — so a lowercase
 	// accelerator-type label ("h100") maps cleanly to the provider's accelerator ("H100").
 	cases := map[string]struct {
 		in     string
@@ -205,10 +206,41 @@ func TestBaseMapAccelerator_CaseInsensitive(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			got, ok := base.MapAccelerator(tc.in, 1)
-			if ok != tc.wantOK || got != tc.want {
-				t.Fatalf("MapAccelerator(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
+			primary := ""
+			if len(got) > 0 {
+				primary = got[0]
+			}
+			if ok != tc.wantOK || primary != tc.want {
+				t.Fatalf("MapAccelerator(%q) = (%v, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
 			}
 		})
+	}
+}
+
+// Several catalog rows for the SAME (type, count) but different instance types are
+// interchangeable alternates: MapAccelerator returns them all, primary (first row)
+// first, so an AWS launch fleet can span them and land on whichever has capacity.
+func TestBaseMapAccelerator_AlternatesPrimaryFirst(t *testing.T) {
+	base := Base{
+		ProviderName: "aws",
+		Catalog: fakeLookup{rows: []provider.Offering{
+			// Primary first, then two alternates for L4 x1. The per-capacity-type
+			// duplicate (the second p4d row) must be deduped, not returned twice.
+			{AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1, CapacityType: nebulav1alpha1.CapacityOnDemand},
+			{AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1, CapacityType: nebulav1alpha1.CapacitySpot},
+			{AcceleratorType: "L4", AcceleratorID: "gr6.4xlarge", GPUCount: 1, CapacityType: nebulav1alpha1.CapacityOnDemand},
+			// A different count must NOT bleed into the x1 result.
+			{AcceleratorType: "L4", AcceleratorID: "g6.48xlarge", GPUCount: 8, CapacityType: nebulav1alpha1.CapacityOnDemand},
+		}},
+	}
+
+	got, ok := base.MapAccelerator("L4", 1)
+	if !ok {
+		t.Fatal("expected L4 x1 to resolve")
+	}
+	want := []string{"g6.xlarge", "gr6.4xlarge"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MapAccelerator(L4, 1) = %v, want %v (primary first, deduped, count-filtered)", got, want)
 	}
 }
 
