@@ -136,9 +136,9 @@ const (
 type FailoverPolicy struct {
 	// BlocklistTTL is the BASE duration a failed placement is excluded before the
 	// provider becomes a candidate for it again. The controller adds a random jitter
-	// (up to a minute) on top so Pods that failed for the same reason do not all
-	// retry the just-freed candidate in lockstep, so the effective exclusion is this
-	// value plus that jitter.
+	// (up to 30s) on top so Pods that failed for the same reason do not all retry the
+	// just-freed candidate in lockstep, so the effective exclusion is this value plus
+	// that jitter.
 	// +kubebuilder:default="30s"
 	BlocklistTTL metav1.Duration `json:"blocklistTTL,omitempty"`
 }
