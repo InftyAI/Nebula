@@ -116,9 +116,13 @@ type Client interface {
 // RunInstances call. The adapter builds it from the Pod (source of truth) plus
 // the resolved instance type and capacity tier.
 type InstanceSpec struct {
-	// InstanceType is the EC2 instance type resolved from the accelerator (e.g.
-	// "p5.48xlarge"), via the catalog's accelerator_id column.
-	InstanceType string
+	// InstanceTypes are the EC2 instance types that can serve the accelerator (e.g.
+	// "p5.48xlarge"), resolved from the catalog's accelerator_id column, PRIMARY
+	// first then interchangeable alternates. The launch fleet spans them all in one
+	// request so EC2 lands on whichever (type, AZ) pair has capacity; the primary
+	// (InstanceTypes[0]) is the one the blocklist keys on. Always has at least one
+	// element for a GPU launch.
+	InstanceTypes []string
 	// Image is the container image, from the Pod's first container. The Client is
 	// responsible for launching it (e.g. via a GPU AMI + user-data, or ECS/EKS).
 	Image string
@@ -595,11 +599,13 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 //   - EC2 capacity is per-region and this adapter is multi-region, so an
 //     accelerator/capacity block is confined to the region that ACTUALLY FAILED
 //     (the region the failing request targeted) — a "no capacity in us-east-1"
-//     failure does not disqualify the same request in us-west-2. Whole-provider
-//     blocks (auth/quota) are left region-wide, since bad credentials fail in every
-//     region. The region is passed in because the error alone does not carry it and
-//     the adapter has no default region to assume.
-func (p *Provider) ClassifyProvisionError(err error, acceleratorID, region string) provider.BlockScope {
+//     failure does not disqualify the same request in us-west-2. This includes
+//     quota: EC2 vCPU limits are regional (and per-instance-family, per-tier), so a
+//     VcpuLimitExceeded in one region must not fence off the others. Only a DenyAll
+//     block (auth) is left region-wide, since bad credentials fail in every region.
+//     The region is passed in because the error alone does not carry it and the
+//     adapter has no default region to assume.
+func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
 	if err == nil {
 		return provider.BlockScope{}
 	}
@@ -607,9 +613,9 @@ func (p *Provider) ClassifyProvisionError(err error, acceleratorID, region strin
 	if errors.Is(err, ErrSpotCapacity) {
 		tier = nebulav1alpha1.CapacitySpot
 	}
-	scope := provider.ClassifyError(err, tier, acceleratorID)
-	// Confine an accelerator/capacity block to the region that failed. A DenyAll
-	// (auth/quota) fails in every region, so it stays region-wide (Region left nil).
+	scope := provider.ClassifyError(err, tier, accelerator)
+	// Confine an accelerator/capacity/quota block to the region that failed. A
+	// DenyAll (auth) fails in every region, so it stays region-wide (Region left nil).
 	// An empty region (should not happen — every request carries one) maps to &"" =
 	// the wildcard, which blocks the accelerator in ALL regions: the safe over-broad
 	// choice, since a stale-but-effective block beats a block pinned to a guessed
@@ -678,8 +684,9 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 	// one whose (accelerator_type, gpu_count) pair matches, since the GPU count is
 	// baked into the instance type (T4x1 = g4dn.xlarge, T4x8 = g4dn.metal) rather
 	// than a free knob. MapAccelerator (from the embedded catalog.Base) resolves by
-	// that (type, count) key straight from the catalog, so no AWS-specific lookup is
-	// needed here.
+	// that (type, count) key straight from the catalog, returning the PRIMARY instance
+	// type first then any interchangeable alternates — the launch fleet spans them all
+	// so EC2 can land on whichever (type, AZ) pair has capacity.
 	canonical, count, err := util.AcceleratorRequest(pod)
 	if err != nil {
 		return InstanceSpec{}, fmt.Errorf("aws: %w", err)
@@ -688,19 +695,19 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 		return InstanceSpec{}, errors.New(
 			"aws: pod requests no accelerator; EC2 GPU provisioning needs an accelerator type and count")
 	}
-	instanceType, ok := p.MapAccelerator(canonical, count)
+	instanceTypes, ok := p.MapAccelerator(canonical, count)
 	if !ok {
 		return InstanceSpec{}, fmt.Errorf("aws: no EC2 instance type for %s x%d", canonical, count)
 	}
 
 	return InstanceSpec{
-		InstanceType: instanceType,
-		Image:        c.Image,
-		Command:      append(append([]string{}, c.Command...), c.Args...),
-		Env:          env,
-		Spot:         req.CapacityType == nebulav1alpha1.CapacitySpot,
-		Region:       req.Region,
-		Tags:         map[string]string{ClaimTagKey: req.ClaimName},
+		InstanceTypes: instanceTypes,
+		Image:         c.Image,
+		Command:       append(append([]string{}, c.Command...), c.Args...),
+		Env:           env,
+		Spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
+		Region:        req.Region,
+		Tags:          map[string]string{ClaimTagKey: req.ClaimName},
 	}, nil
 }
 

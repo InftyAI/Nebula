@@ -81,7 +81,7 @@ func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
 }
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
-func (f *fakeProvider) MapAccelerator(c string, _ int32) (string, bool)        { return c, true }
+func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool)      { return []string{c}, true }
 func (f *fakeProvider) ClassifyProvisionError(_ error, accel, region string) provider.BlockScope {
 	f.classifyAccel = accel
 	f.classifyRegion = region
@@ -160,16 +160,18 @@ func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	accel, region := "H100", "us-east-1"
 	scope := provider.BlockScope{
-		AcceleratorID: &accel,
-		CapacityType:  nebulav1alpha1.CapacitySpot,
-		Region:        &region,
+		Accelerator:  &accel,
+		CapacityType: nebulav1alpha1.CapacitySpot,
+		Region:       &region,
 	}
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl)
 
 	pod := testPod("default", "p1")
-	pod.Annotations = map[string]string{nebulav1alpha1.BlocklistTTLAnnotation: "3m"}
+	// A non-default TTL so this asserts the annotation is honored, not that it
+	// happens to equal defaultBlocklistTTL.
+	pod.Annotations = map[string]string{nebulav1alpha1.BlocklistTTLAnnotation: "7m"}
 	pod.Labels = map[string]string{nebulav1alpha1.AcceleratorTypeLabel: "H100"}
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
@@ -178,10 +180,11 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	if bl.calls != 1 {
 		t.Fatalf("expected exactly one Record call, got %d", bl.calls)
 	}
-	// The handler must resolve the accelerator off the Pod and hand it to the
-	// provider (which owns scope assembly), not mutate the returned scope itself.
-	if fp.classifyAccel != "H100" {
-		t.Fatalf("handler passed accelerator %q to ClassifyProvisionError, want H100", fp.classifyAccel)
+	// The handler must resolve the accelerator POOL identity (type:count) off the Pod
+	// and hand it to the provider (which owns scope assembly), not mutate the returned
+	// scope itself. The Pod labels H100 with no explicit count, so the pool is "H100:1".
+	if fp.classifyAccel != "H100:1" {
+		t.Fatalf("handler passed accelerator %q to ClassifyProvisionError, want H100:1", fp.classifyAccel)
 	}
 	if bl.prov != "fake" {
 		t.Fatalf("recorded provider = %q, want fake", bl.prov)
@@ -190,8 +193,8 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 		t.Fatalf("recorded scope = %+v, want %+v", bl.scope, scope)
 	}
 	// TTL comes from the Pod annotation the placement controller stamped.
-	if bl.ttl != 3*time.Minute {
-		t.Fatalf("recorded ttl = %v, want 3m from the annotation", bl.ttl)
+	if bl.ttl != 7*time.Minute {
+		t.Fatalf("recorded ttl = %v, want 7m from the annotation", bl.ttl)
 	}
 }
 

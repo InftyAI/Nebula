@@ -35,16 +35,16 @@ func ptr(s string) *string { return &s }
 
 func spotH100EastScope() provider.BlockScope {
 	return provider.BlockScope{
-		AcceleratorID: ptr("H100"),
-		CapacityType:  nebulav1alpha1.CapacitySpot,
-		Region:        ptr("us-east-1"),
+		Accelerator:  ptr("H100"),
+		CapacityType: nebulav1alpha1.CapacitySpot,
+		Region:       ptr("us-east-1"),
 	}
 }
 
 // cand builds a query Candidate compactly, keeping the table rows within the
 // line-length limit.
 func cand(prov, accel string, tier nebulav1alpha1.CapacityType, region string) Candidate {
-	return Candidate{Provider: prov, AcceleratorID: accel, CapacityType: tier, Region: region}
+	return Candidate{Provider: prov, Accelerator: accel, CapacityType: tier, Region: region}
 }
 
 const (
@@ -100,13 +100,13 @@ func TestBlocked_ScopeMatchIsPrecise(t *testing.T) {
 func TestBlocked_WildcardFieldsMatchAnyValue(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
-	// Wildcard AcceleratorID + wildcard Region (&"") => blocks Spot on aws
+	// Wildcard Accelerator + wildcard Region (&"") => blocks Spot on aws
 	// everywhere, any GPU. The pointers are deliberately non-nil-empty: nil would
 	// mean "no such axis" and match only an empty candidate field.
 	bl.Record("aws", provider.BlockScope{
-		AcceleratorID: ptr(""),
-		CapacityType:  spot,
-		Region:        ptr(""),
+		Accelerator:  ptr(""),
+		CapacityType: spot,
+		Region:       ptr(""),
 	}, 10*time.Minute)
 
 	if !bl.Blocked(cand("aws", "H100", spot, "us-east-1")) {
@@ -122,12 +122,12 @@ func TestBlocked_WildcardFieldsMatchAnyValue(t *testing.T) {
 
 // A nil axis is "not applicable": it matches only a candidate whose field is empty,
 // never a populated one. This is how a region-simple provider (Modal: nil Region)
-// or a CPU-only Pod (nil AcceleratorID) blocks without widening across an axis it
+// or a CPU-only Pod (nil Accelerator) blocks without widening across an axis it
 // never had. Contrast &"" (wildcard), which matches any value — see the test above.
 func TestBlocked_NilFieldMatchesOnlyEmptyCandidate(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
-	// A region-simple provider's block: nil Region, nil AcceleratorID, Spot only.
+	// A region-simple provider's block: nil Region, nil Accelerator, Spot only.
 	bl.Record("modal", provider.BlockScope{CapacityType: spot}, 10*time.Minute)
 
 	// A region-simple candidate carries an empty region and (CPU Pod) empty
@@ -138,7 +138,7 @@ func TestBlocked_NilFieldMatchesOnlyEmptyCandidate(t *testing.T) {
 	// A populated candidate field is NOT matched by a nil axis: it is out of scope,
 	// not wildcarded in.
 	if bl.Blocked(cand("modal", "H100", spot, "")) {
-		t.Error("nil AcceleratorID must not match a populated accelerator")
+		t.Error("nil Accelerator must not match a populated accelerator")
 	}
 	if bl.Blocked(cand("modal", "", spot, "us-east-1")) {
 		t.Error("nil Region must not match a populated region")
@@ -155,7 +155,7 @@ func TestBlocked_DenyAllBlocksWholeProvider(t *testing.T) {
 		t.Error("DenyAll must block any aws candidate")
 	}
 	// ...but a different provider is untouched (a block never spans providers).
-	if bl.Blocked(Candidate{Provider: "modal", AcceleratorID: "H100"}) {
+	if bl.Blocked(Candidate{Provider: "modal", Accelerator: "H100"}) {
 		t.Error("DenyAll on aws must not block modal")
 	}
 }
@@ -226,10 +226,10 @@ func TestRecord_NoOpOnInvalidInput(t *testing.T) {
 	bl.Record("aws", provider.BlockScope{DenyAll: true}, 0)
 	bl.Record("aws", provider.BlockScope{DenyAll: true}, -time.Minute)
 
-	if bl.Blocked(Candidate{Provider: "aws", AcceleratorID: "H100"}) {
+	if bl.Blocked(Candidate{Provider: "aws", Accelerator: "H100"}) {
 		t.Error("invalid Record inputs must not block anything")
 	}
-	if bl.Blocked(Candidate{Provider: "", AcceleratorID: "H100"}) {
+	if bl.Blocked(Candidate{Provider: "", Accelerator: "H100"}) {
 		t.Error("empty-provider block must not exist")
 	}
 }
@@ -282,10 +282,10 @@ func TestRecord_DistinctScopesStaySeparate(t *testing.T) {
 	// Scopes differing on any single axis are different blocks and must NOT coalesce.
 	bl.Record("aws", spotH100EastScope(), 10*time.Minute) // H100/Spot/us-east-1
 	bl.Record("aws", provider.BlockScope{                 // different region
-		AcceleratorID: ptr("H100"), CapacityType: spot, Region: ptr("us-west-2"),
+		Accelerator: ptr("H100"), CapacityType: spot, Region: ptr("us-west-2"),
 	}, 10*time.Minute)
 	bl.Record("aws", provider.BlockScope{ // different tier
-		AcceleratorID: ptr("H100"), CapacityType: onDemand, Region: ptr("us-east-1"),
+		Accelerator: ptr("H100"), CapacityType: onDemand, Region: ptr("us-east-1"),
 	}, 10*time.Minute)
 	bl.Record("modal", spotH100EastScope(), 10*time.Minute) // different provider
 
@@ -301,7 +301,7 @@ func TestRecord_NilAndWildcardScopesDoNotCoalesce(t *testing.T) {
 	// nil (axis not applicable) and &"" (wildcard) are semantically different scopes,
 	// so scopeEqual must keep them as separate entries.
 	nilAxes := provider.BlockScope{CapacityType: spot}
-	wildcardAxes := provider.BlockScope{AcceleratorID: ptr(""), Region: ptr(""), CapacityType: spot}
+	wildcardAxes := provider.BlockScope{Accelerator: ptr(""), Region: ptr(""), CapacityType: spot}
 	bl.Record("aws", nilAxes, 10*time.Minute)
 	bl.Record("aws", wildcardAxes, 10*time.Minute)
 

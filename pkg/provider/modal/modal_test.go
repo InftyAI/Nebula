@@ -268,12 +268,16 @@ func TestClassifyProvisionError(t *testing.T) {
 		want provider.BlockScope
 	}{
 		{"auth sentinel", provider.ErrAuth, denyAll},
-		{"quota sentinel", provider.ErrQuota, denyAll},
+		// Quota is scoped like capacity (accelerator + tier), not DenyAll: an
+		// exhausted quota for one accelerator must not fence off the whole provider.
+		{"quota sentinel", provider.ErrQuota, onDemand},
 		{"capacity sentinel", provider.ErrNoCapacity, onDemand},
 		{"wrapped capacity", fmt.Errorf("provision: %w", provider.ErrNoCapacity), onDemand},
 		{"string unauthorized", fmt.Errorf("401 unauthorized"), denyAll},
 		{"string no capacity", fmt.Errorf("no capacity available in region"), onDemand},
-		{"unknown", fmt.Errorf("weird transient blip"), denyAll},
+		// An unrecognized error is scoped like capacity, not DenyAll: a whole-provider
+		// block on an unidentifiable failure is too broad; failover routes around it.
+		{"unknown capacity-scoped", fmt.Errorf("weird transient blip"), onDemand},
 		{"nil", nil, provider.BlockScope{}},
 	}
 	for _, tt := range tests {

@@ -23,8 +23,8 @@ spec:
     - jsonPath: .spec.region
       name: Region
       type: string
-    - jsonPath: .spec.acceleratorID
-      name: ACCELERATOR_ID
+    - jsonPath: .spec.accelerator
+      name: ACCELERATOR
       type: string
     - jsonPath: .spec.capacityType
       name: CAPACITY_TYPE
@@ -70,16 +70,19 @@ spec:
               ledger, not a spec: its reason to exist is to survive the Node so teardown can
               reclaim the external instance and never leak a paid GPU.
             properties:
-              acceleratorID:
+              accelerator:
                 description: |-
-                  AcceleratorID is the provider's own identifier for what actually serves this
-                  claim (e.g. AWS "p5.48xlarge", RunPod "NVIDIA H100 80GB HBM3"), resolved at
-                  placement time from the Pod's requested accelerator type + count via the
-                  provider's MapAccelerator. Unlike Provider/CapacityType/Region it is NOT a
-                  provisioning input (the provider re-derives it from the Pod) — it is recorded
-                  for reporting, like PoolRef, so `kubectl get nc` shows the concrete SKU behind
-                  each instance without cross-referencing the Pod. Empty for a CPU-only claim,
-                  which requests no accelerator.
+                  Accelerator is the requested accelerator pool this claim serves, as
+                  "type:count" (e.g. "H100:8"), resolved at placement time from the Pod's
+                  accelerator type + count. It names the POOL, not the concrete SKU: a launch
+                  may span several interchangeable provider instance types (AWS's fleet tries
+                  alternates), so the exact instance type is only known post-launch from the
+                  observed instance — this field stays truthful regardless of which alternate
+                  lands. Unlike Provider/CapacityType/Region it is NOT a provisioning input (the
+                  provider re-derives it from the Pod) — it is recorded for reporting, like
+                  PoolRef, so `kubectl get nc` shows what each instance serves without
+                  cross-referencing the Pod. Empty for a CPU-only claim, which requests no
+                  accelerator.
                 type: string
               capacityType:
                 description: |-

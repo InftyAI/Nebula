@@ -24,6 +24,10 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
 
+// acceleratorSep joins the accelerator type and count in the canonical
+// "type:count" identity (e.g. "H100:8").
+const acceleratorSep = ":"
+
 // NvidiaGPUResource is the extended-resource key a GPU count is expressed under.
 // It mirrors the ecosystem-standard nvidia.com/gpu so a Pod's accelerator count
 // drives both the scheduler's fit check (against the virtual node's advertised
@@ -58,6 +62,21 @@ func AcceleratorRequest(pod *corev1.Pod) (accelerator string, count int32, err e
 		n = 1 // a GPU type with no explicit count means one GPU
 	}
 	return typ, n, nil
+}
+
+// AcceleratorPool is the canonical identity of the accelerator POOL a request
+// targets: the type and count joined as "type:count" (e.g. "H100:8"). It is the
+// key the failover blocklist records/queries and the value the NodeClaim reports,
+// chosen over the provider's resolved SKU id because a single launch may span
+// several interchangeable instance types (AWS's fleet) — the pool identity stays
+// truthful whichever alternate lands, and it keeps distinct (type, count) pairs on
+// distinct keys so an H100:8 shortage never disqualifies H100:1. Returns "" for a
+// CPU-only request (empty type), which has no accelerator pool.
+func AcceleratorPool(accelerator string, count int32) string {
+	if accelerator == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s%s%d", accelerator, acceleratorSep, count)
 }
 
 // gpuCount returns the largest nvidia.com/gpu quantity requested across the

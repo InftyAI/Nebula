@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -63,6 +65,30 @@ type ec2API interface {
 	DescribeSubnets(
 		ctx context.Context, in *ec2.DescribeSubnetsInput, optFns ...func(*ec2.Options),
 	) (*ec2.DescribeSubnetsOutput, error)
+	// CreateLaunchTemplate / DeleteLaunchTemplate manage the EPHEMERAL launch
+	// template a CreateFleet launch references: RunInstance creates one carrying the
+	// per-Pod fields (AMI, user-data, tags) that CreateFleet's overrides cannot
+	// express, fleets against it, then deletes it — so no launch template survives
+	// the call and the self-configuring model is preserved.
+	CreateLaunchTemplate(
+		ctx context.Context, in *ec2.CreateLaunchTemplateInput, optFns ...func(*ec2.Options),
+	) (*ec2.CreateLaunchTemplateOutput, error)
+	DeleteLaunchTemplate(
+		ctx context.Context, in *ec2.DeleteLaunchTemplateInput, optFns ...func(*ec2.Options),
+	) (*ec2.DeleteLaunchTemplateOutput, error)
+	// DescribeLaunchTemplates lists the Nebula-tagged ephemeral templates so
+	// RunInstance can sweep any leaked by a crash between create and delete (see
+	// sweepStaleLaunchTemplates).
+	DescribeLaunchTemplates(
+		ctx context.Context, in *ec2.DescribeLaunchTemplatesInput, optFns ...func(*ec2.Options),
+	) (*ec2.DescribeLaunchTemplatesOutput, error)
+	// CreateFleet launches instances across candidate AZs in ONE server-side call.
+	// RunInstance uses an "instant" fleet (synchronous: instances/errors returned in
+	// the response) to collapse the former per-AZ RunInstances sweep into a single
+	// request — EC2 itself iterates the subnet overrides for capacity.
+	CreateFleet(
+		ctx context.Context, in *ec2.CreateFleetInput, optFns ...func(*ec2.Options),
+	) (*ec2.CreateFleetOutput, error)
 }
 
 // sdkClient is the real Client, backed by aws-sdk-go-v2's EC2 API. All
@@ -70,9 +96,14 @@ type ec2API interface {
 // SDK-free; the pure translation (user-data, error mapping) lives in translate.go.
 //
 // Execution model (see the package doc): a NodeClaim maps to one EC2 instance
-// launched DIRECTLY from RunInstances — no Launch Template, no pre-created infra.
-// Everything the launch needs is SELF-CONFIGURED from credentials alone at
-// construction, so registering AWS in a new region requires nothing but access:
+// launched via a CreateFleet "instant" request, which lets EC2 do the per-AZ
+// capacity search server-side in ONE call. CreateFleet cannot take an inline AMI /
+// user-data (its overrides only cover instance type / subnet / price), so the
+// launch references a launch template — but an EPHEMERAL one, created for this
+// provision and deleted before the call returns. No launch template or other
+// pre-created infra survives, so the self-configuring model holds: everything the
+// launch needs is derived from credentials alone at construction, and registering
+// AWS in a new region requires nothing but access:
 //
 //   - amiID: the region's GPU AMI (NVIDIA driver + container runtime baked in),
 //     resolved live via DescribeImages against the Amazon-owned ECS GPU-optimized
@@ -101,6 +132,35 @@ type sdkClient struct {
 	// default VPC: RunInstance then makes a single attempt letting EC2 pick the
 	// subnet (still valid, just no zone failover).
 	subnets []subnet
+
+	// azOfferings caches, per instance type, the AZ-offering lookup for that type in
+	// this region (DescribeInstanceTypeOfferings at AZ granularity). RunInstance
+	// consults it to prune fleet overrides that target an AZ where the type is not
+	// offered at all — e.g. g6.48xlarge in us-east-1e — which EC2 would otherwise
+	// reject per-override with InvalidFleetConfiguration, wasting a grid slot on a
+	// permanently-dead pair. Offerings are stable per region, so each type is looked
+	// up at most once (populated lazily on first use).
+	//
+	// offeringsMu guards ONLY the map bookkeeping — never a network call. Each entry
+	// is single-flight: the first caller for a type inserts an entry with an open
+	// `done` channel, releases the lock, runs the one Describe, fills the entry, and
+	// closes `done`; concurrent callers for the same type find the entry and wait on
+	// `done` without the lock and without issuing a duplicate Describe. So a burst of
+	// N pods for a new type costs ONE lookup, and cache hits never block on I/O.
+	offeringsMu sync.Mutex
+	azOfferings map[string]*offeringEntry
+}
+
+// offeringEntry is a single-flight cache slot for one instance type's AZ offerings.
+// done is closed once the lookup finishes; readers block on it, then read azs/err
+// (which are written exactly once, before done closes, so no lock is needed to read
+// them afterwards). azs is nil on a failed lookup (err set) — a fail-open signal
+// fleetOverrides reads as "unknown, don't prune". A resolved-but-empty azs means the
+// type is offered in no AZ of this region.
+type offeringEntry struct {
+	done chan struct{}
+	azs  map[string]bool
+	err  error
 }
 
 // subnet is one candidate launch target: its id and the AZ it lives in (for
@@ -206,126 +266,367 @@ const gpuAMINameFilter = "amzn2-ami-ecs-gpu-hvm-*-x86_64-ebs"
 // for the other providers.
 var ErrConfig = errors.New("aws: not configured")
 
-// RunInstance implements Client. It launches exactly one instance directly (from
-// the resolved GPU AMI into a default-VPC subnet), overriding only the
-// workload-specific fields.
+// RunInstance implements Client. It launches exactly one instance via a
+// CreateFleet "instant" request, so EC2 does the per-availability-zone capacity
+// search server-side in ONE call rather than the adapter issuing a RunInstances
+// per zone and sweeping them serially.
 //
-// EC2 capacity is per-availability-zone, so a launch is not a single shot: when a
-// zone reports InsufficientInstanceCapacity (or a Spot-capacity variant),
-// RunInstance retries in the next discovered zone before giving up. Only when
-// every candidate zone is capacity-starved does it return the wrapped
-// ErrNoCapacity, so the outer region-level failover (ClassifyProvisionError +
-// NodePool regions) fires only after this cheaper inner failover is exhausted. A
-// non-capacity failure (auth, quota, bad config) is terminal and returned
-// immediately — retrying other zones would not help and only burns the deadline.
-// The ctx deadline (set by the vnode handler from Capabilities.ProvisionTimeout)
-// bounds the whole sweep.
+// EC2 capacity is per-AZ, so the fleet is given one launch-template OVERRIDE per
+// discovered default-VPC subnet: EC2 tries them itself and returns whichever it
+// lands, collapsing the former N-call zone sweep into a single round-trip that no
+// longer burns the provision deadline attempt-by-attempt. When no subnets were
+// discovered (no default VPC) the fleet runs with no overrides, letting EC2 pick
+// the subnet — a valid launch, just without cross-AZ capacity search.
 //
-// When no subnets were discovered (no default VPC), the loop runs once with a
-// zero-value target, letting EC2 pick the subnet — a valid single-shot launch,
-// just without zone failover.
+// Because CreateFleet's overrides cannot carry an AMI or user-data, the launch
+// references an ephemeral launch template built here (createLaunchTemplate) and
+// torn down before returning (best-effort; a stray template is swept by
+// name/tag). An instant fleet reports capacity shortfalls in the response's
+// Errors (not as a Go error), so a fleet that returns no instance is mapped back
+// through classifyEC2Error to the wrapped ErrNoCapacity the region-level failover
+// (ClassifyProvisionError + NodePool regions) expects. A non-capacity failure
+// (auth, quota, bad config) surfaces the same way and is terminal.
 func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string, error) {
 	userData, err := buildUserData(spec)
 	if err != nil {
 		return "", err
 	}
 
-	targets := c.subnets
-	if len(targets) == 0 {
-		targets = []subnet{{}} // single attempt, letting EC2 pick the subnet
-	}
-
 	log := logf.FromContext(ctx).WithName("aws-run").WithValues(
-		"region", c.region, "instanceType", spec.InstanceType, "spot", spec.Spot)
-	log.V(1).Info("starting zone sweep", "candidateZones", len(targets))
+		"region", c.region, "instanceTypes", spec.InstanceTypes, "spot", spec.Spot)
 
-	var lastErr error
-	for i, sn := range targets {
-		// A zone attempt logs its start and its outcome so a capacity sweep across AZs
-		// is traceable (which zones were tried, in order, and why each was abandoned).
-		// zone "" means no default VPC was discovered and EC2 is picking the subnet.
-		zone := sn.az
-		if zone == "" {
-			zone = "<ec2-chosen>"
-		}
-		log.V(1).Info("zone attempt starting", "zone", zone, "subnet", sn.id, "attempt", i+1, "of", len(targets))
+	// Opportunistically reap any ephemeral launch template a prior provision leaked
+	// (crash between create and delete). Best-effort and staleness-gated, so it
+	// cannot touch a concurrent provision's own template; see sweepStaleLaunchTemplates.
+	c.sweepStaleLaunchTemplates(ctx)
 
-		// Honor the deadline between attempts: a slow first zone must not let the
-		// sweep overrun the provision timeout.
-		if err := ctx.Err(); err != nil {
-			log.Info("zone sweep aborted before completion; provision deadline reached",
-				"zone", zone, "attempted", i, "of", len(targets))
-			if lastErr != nil {
-				return "", lastErr
-			}
-			return "", err
-		}
-
-		id, err := c.runInSubnet(ctx, spec, userData, sn)
-		if err == nil {
-			log.Info("zone attempt succeeded", "zone", zone, "subnet", sn.id, "instanceID", id)
-			return id, nil
-		}
-		classified := classifyEC2Error(err, spec.Spot)
-		// Only a ZONE-LOCAL capacity shortfall justifies trying the next zone: a
-		// sibling AZ's default subnet may still satisfy the launch. Everything else
-		// is terminal for this sweep and surfaced immediately — auth/quota/unknown
-		// (retrying other zones would not help), and crucially a region/account-
-		// scoped capacity error (a Spot price ceiling or per-region Spot limit), for
-		// which every AZ would fail identically. Stopping now hands such an error
-		// straight to region/tier failover instead of burning the deadline on a
-		// futile sweep. It still carries ErrNoCapacity, so ClassifyProvisionError
-		// blocks the region correctly.
-		if !errors.Is(classified, errZoneLocal) {
-			log.Info("zone attempt failed with a non-zone-local error; stopping sweep",
-				"zone", zone, "subnet", sn.id, "error", classified.Error())
-			return "", classified
-		}
-		log.Info("zone attempt failed with a zone-local capacity shortfall; trying next zone",
-			"zone", zone, "subnet", sn.id, "remainingZones", len(targets)-i-1)
-		lastErr = classified
+	ltName, err := c.createLaunchTemplate(ctx, spec, userData)
+	if err != nil {
+		return "", err // classifyEC2Error not needed: template creation is not a capacity path
 	}
-	// Every zone was capacity-starved; return the last capacity error so
-	// ClassifyProvisionError can block the region and region-failover can proceed.
-	log.Info("zone sweep exhausted; every candidate zone was capacity-starved",
-		"zonesTried", len(targets))
-	return "", lastErr
+	// Best-effort teardown: no launch template must survive the provision. A delete
+	// failure only leaves a cheap, uniquely-named artifact behind, so it is logged,
+	// not surfaced — failing the provision over a dangling template would be worse.
+	defer func() {
+		if _, derr := c.ec2.DeleteLaunchTemplate(ctx, &ec2.DeleteLaunchTemplateInput{
+			LaunchTemplateName: awssdk.String(ltName),
+		}); derr != nil {
+			log.Error(derr, "deleting ephemeral launch template; it will need sweeping", "launchTemplate", ltName)
+		}
+	}()
+
+	// Prune subnets whose AZ does not OFFER a requested type before building the grid,
+	// so we never emit a (type, subnet) override EC2 would reject outright with
+	// InvalidFleetConfiguration (e.g. g6.48xlarge in us-east-1e). Fail-open: a lookup
+	// error yields nil offerings and offeredAZs keeps every subnet, so a transient
+	// DescribeInstanceTypeOfferings failure can never shrink the grid below today's.
+	offerings := c.instanceTypeAZs(ctx, spec.InstanceTypes)
+
+	// One override per (instance type, subnet) pair => EC2 searches that whole grid
+	// for capacity in a single call, landing on whichever pair is available. The
+	// instance types are interchangeable alternates the accelerator maps to (primary
+	// first); spanning them broadens the launch beyond a single type's per-AZ
+	// capacity. The launch template carries no instance type — it lives here in the
+	// overrides — so a template built once serves every type. No subnets (no default
+	// VPC) => one override per type with the subnet unset, letting EC2 pick it (still
+	// no cross-AZ search).
+	overrides := fleetOverrides(spec.InstanceTypes, c.subnets, offerings)
+	log.V(1).Info("launching via instant fleet",
+		"candidateInstanceTypes", len(spec.InstanceTypes), "candidateSubnets", len(c.subnets),
+		"overrides", len(overrides))
+
+	out, err := c.ec2.CreateFleet(ctx, &ec2.CreateFleetInput{
+		Type: ec2types.FleetTypeInstant, // synchronous: instances/errors in the response
+		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
+			TotalTargetCapacity:       awssdk.Int32(1),
+			DefaultTargetCapacityType: fleetCapacityType(spec.Spot),
+		},
+		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{{
+			LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{
+				LaunchTemplateName: awssdk.String(ltName),
+				Version:            awssdk.String("$Latest"),
+			},
+			Overrides: overrides,
+		}},
+	})
+	if err != nil {
+		// A top-level error is the whole request failing (throttle, malformed, auth
+		// on the fleet API itself); classify so a capacity-shaped error still fails
+		// over correctly.
+		return "", classifyEC2Error(err, spec.Spot)
+	}
+
+	if id := firstFleetInstanceID(out); id != "" {
+		log.Info("instant fleet launched instance", "instanceID", id)
+		return id, nil
+	}
+
+	// No instance: an instant fleet reports why in out.Errors. Map the reported
+	// error code back through the same classifier so a capacity shortfall carries
+	// ErrNoCapacity (and, for Spot, ErrSpotCapacity) exactly as the old per-zone
+	// sweep did, letting region/tier failover proceed.
+	err = fleetError(out, spec.Spot)
+	log.Info("instant fleet launched no instance", "error", err.Error())
+	return "", err
 }
 
-// runInSubnet issues one RunInstances attempt. sn.id empty => let EC2 pick the
-// subnet (no default VPC discovered); otherwise launch into that subnet (and thus
-// its AZ). SecurityGroupIds is deliberately unset: launching into a default-VPC
-// subnet attaches that VPC's default SG (outbound-open, no inbound exposure),
-// which is all a fire-and-forget container launch needs.
-func (c *sdkClient) runInSubnet(ctx context.Context, spec InstanceSpec, userData string, sn subnet) (string, error) {
-	in := &ec2.RunInstancesInput{
-		MinCount:     awssdk.Int32(1),
-		MaxCount:     awssdk.Int32(1),
-		ImageId:      awssdk.String(c.amiID),
-		InstanceType: ec2types.InstanceType(spec.InstanceType),
-		UserData:     awssdk.String(userData),
-		TagSpecifications: []ec2types.TagSpecification{{
+// staleLaunchTemplateAge bounds how old an ephemeral launch template must be
+// before sweepStaleLaunchTemplates deletes it. It is far longer than any in-flight
+// provision could take (the provision deadline is ProvisionTimeout, a couple of
+// minutes), so the sweep can never race a live provision's own template: anything
+// older than this was provably orphaned by a crash between create and delete.
+const staleLaunchTemplateAge = 30 * time.Minute
+
+// sweepStaleLaunchTemplates deletes Nebula-tagged ephemeral launch templates older
+// than staleLaunchTemplateAge. RunInstance's defer already deletes the template it
+// created in the happy path; this reaps the rare leak — a crash (or a persistent
+// DeleteLaunchTemplate failure) between create and delete — that the defer cannot.
+//
+// It runs opportunistically on the (infrequent) provision path rather than the
+// per-tick poll loop, so a leak is bounded to "cleaned up by the next provision in
+// this region" without adding a DescribeLaunchTemplates to every poll. It is
+// entirely best-effort: any error is logged and swallowed so a sweep hiccup never
+// fails the provision it is piggybacking on. The age gate is what keeps it safe —
+// it never touches a template young enough to belong to a concurrent provision.
+func (c *sdkClient) sweepStaleLaunchTemplates(ctx context.Context) {
+	log := logf.FromContext(ctx).WithName("aws-lt-sweep").WithValues("region", c.region)
+
+	in := &ec2.DescribeLaunchTemplatesInput{
+		Filters: []ec2types.Filter{{
+			Name:   awssdk.String("tag-key"),
+			Values: []string{ClaimTagKey},
+		}},
+	}
+	cutoff := time.Now().Add(-staleLaunchTemplateAge)
+	for {
+		page, err := c.ec2.DescribeLaunchTemplates(ctx, in)
+		if err != nil {
+			log.V(1).Info("stale launch-template sweep skipped; describe failed", "error", err.Error())
+			return
+		}
+		for _, lt := range page.LaunchTemplates {
+			if lt.LaunchTemplateName == nil || lt.CreateTime == nil {
+				continue
+			}
+			if lt.CreateTime.After(cutoff) {
+				continue // young enough to belong to an in-flight provision; leave it
+			}
+			if _, err := c.ec2.DeleteLaunchTemplate(ctx, &ec2.DeleteLaunchTemplateInput{
+				LaunchTemplateName: lt.LaunchTemplateName,
+			}); err != nil {
+				log.V(1).Info("failed to delete a stale launch template; will retry next sweep",
+					"launchTemplate", *lt.LaunchTemplateName, "error", err.Error())
+				continue
+			}
+			log.Info("swept a leaked ephemeral launch template", "launchTemplate", *lt.LaunchTemplateName)
+		}
+		if page.NextToken == nil {
+			break
+		}
+		in.NextToken = page.NextToken
+	}
+}
+
+// createLaunchTemplate creates the ephemeral launch template a CreateFleet launch
+// references, carrying the per-Pod fields the fleet's overrides cannot express
+// (AMI, user-data, identity tags), and returns its name. The
+// name is derived from the claim so a retried provision reuses a stable name; a
+// leftover template from a crashed prior attempt collides on create, which is
+// treated as reuse rather than an error.
+//
+// SecurityGroupIds is deliberately unset: launching into a default-VPC subnet
+// attaches that VPC's default SG (outbound-open, no inbound exposure), which is
+// all a fire-and-forget container launch needs. The subnet AND the instance type
+// are chosen by the fleet overrides, not the template — one template serves every
+// candidate instance type — so both are intentionally absent here.
+func (c *sdkClient) createLaunchTemplate(ctx context.Context, spec InstanceSpec, userData string) (string, error) {
+	name := launchTemplateName(spec.Tags[ClaimTagKey])
+
+	// InstanceMarketOptions is deliberately NOT set here. With EC2 Fleet the Spot
+	// vs OnDemand market is selected by the fleet's DefaultTargetCapacityType (see
+	// RunInstance), and specifying it BOTH in the launch template and on the fleet
+	// is rejected with InvalidFleetConfiguration. Leaving it out also keeps the
+	// template tier-agnostic, so the stable per-claim template is safely reused when
+	// failover retries the same claim under the other tier.
+	ltData := &ec2types.RequestLaunchTemplateData{
+		ImageId:  awssdk.String(c.amiID),
+		UserData: awssdk.String(userData),
+		TagSpecifications: []ec2types.LaunchTemplateTagSpecificationRequest{{
 			ResourceType: ec2types.ResourceTypeInstance,
 			Tags:         ec2Tags(spec.Tags),
 		}},
 	}
-	if sn.id != "" {
-		in.SubnetId = awssdk.String(sn.id)
+
+	_, err := c.ec2.CreateLaunchTemplate(ctx, &ec2.CreateLaunchTemplateInput{
+		LaunchTemplateName: awssdk.String(name),
+		LaunchTemplateData: ltData,
+		// Tag the template itself so a leaked one (delete failed / process crashed
+		// between create and delete) is identifiable for an out-of-band sweep.
+		TagSpecifications: []ec2types.TagSpecification{{
+			ResourceType: ec2types.ResourceTypeLaunchTemplate,
+			Tags:         ec2Tags(spec.Tags),
+		}},
+	})
+	if err != nil {
+		// A stable name means a crashed prior attempt may have left the template;
+		// AlreadyExists is reuse, not a failure — the fleet references it by name.
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidLaunchTemplateName.AlreadyExistsException" {
+			return name, nil
+		}
+		return "", err
 	}
-	if spec.Spot {
-		in.InstanceMarketOptions = &ec2types.InstanceMarketOptionsRequest{
-			MarketType: ec2types.MarketTypeSpot,
+	return name, nil
+}
+
+// launchTemplateName derives the ephemeral template's name from the claim so it is
+// stable across a retried provision (create then collides => reuse) and greppable
+// for an out-of-band sweep of leaked templates.
+func launchTemplateName(claim string) string {
+	return "nebula-" + claim
+}
+
+// fleetOverrides builds the CreateFleet launch-template overrides: one per
+// (instance type, subnet) pair so EC2 searches that whole grid for capacity in a
+// single call and lands on whichever pair is available. The instance types are the
+// interchangeable alternates the accelerator resolves to (primary first); spanning
+// them widens the launch past any single type's per-AZ capacity. When no subnets
+// were discovered (no default VPC) it emits one override per instance type with the
+// subnet unset, so EC2 still tries every type — it just cannot search across AZs.
+//
+// offerings maps a type to the set of AZs that OFFER it (nil = unknown, don't prune;
+// see instanceTypeAZs): a (type, subnet) pair whose AZ is not in the type's offered
+// set is dropped so a permanently-unavailable pair (e.g. g6.48xlarge in us-east-1e)
+// never becomes an override EC2 would reject with InvalidFleetConfiguration. Pruning
+// is skipped for a type whose offered set is unknown (fail-open) OR when it would
+// leave the type with no subnet at all — in that last case the type keeps its full
+// subnet list so a stale/empty offerings map can never zero out the launch.
+func fleetOverrides(
+	instanceTypes []string, subnets []subnet, offerings map[string]map[string]bool,
+) []ec2types.FleetLaunchTemplateOverridesRequest {
+	var overrides []ec2types.FleetLaunchTemplateOverridesRequest
+	for _, it := range instanceTypes {
+		if len(subnets) == 0 {
+			overrides = append(overrides, ec2types.FleetLaunchTemplateOverridesRequest{
+				InstanceType: ec2types.InstanceType(it),
+			})
+			continue
+		}
+		usable := offeredSubnets(it, subnets, offerings)
+		for _, sn := range usable {
+			overrides = append(overrides, ec2types.FleetLaunchTemplateOverridesRequest{
+				InstanceType: ec2types.InstanceType(it),
+				SubnetId:     awssdk.String(sn.id),
+			})
 		}
 	}
+	return overrides
+}
 
-	out, err := c.ec2.RunInstances(ctx, in)
-	if err != nil {
-		return "", err // caller classifies (needs the raw error to detect capacity)
+// offeredSubnets filters subnets to those in an AZ that offers it, per offerings.
+// It fails open: an unknown offered set (nil — lookup skipped or failed) keeps every
+// subnet, and a filter that would remove ALL subnets also keeps every subnet, so
+// pruning only ever narrows a launch that still has at least one usable AZ left.
+func offeredSubnets(it string, subnets []subnet, offerings map[string]map[string]bool) []subnet {
+	azs := offerings[it]
+	if azs == nil {
+		return subnets // offered set unknown: do not prune
 	}
-	if len(out.Instances) == 0 || out.Instances[0].InstanceId == nil {
-		return "", errors.New("aws: RunInstances returned no instance id")
+	kept := make([]subnet, 0, len(subnets))
+	for _, sn := range subnets {
+		if azs[sn.az] {
+			kept = append(kept, sn)
+		}
 	}
-	return *out.Instances[0].InstanceId, nil
+	if len(kept) == 0 {
+		return subnets // pruning would zero the launch: keep all, let EC2 decide
+	}
+	return kept
+}
+
+// fleetCapacityType maps the Spot flag to the fleet's default target-capacity
+// type. CreateFleet takes the tier here rather than a per-instance market option.
+func fleetCapacityType(spot bool) ec2types.DefaultTargetCapacityType {
+	if spot {
+		return ec2types.DefaultTargetCapacityTypeSpot
+	}
+	return ec2types.DefaultTargetCapacityTypeOnDemand
+}
+
+// firstFleetInstanceID digs the launched instance id out of an instant fleet's
+// response, or "" when the fleet placed nothing (every candidate was starved /
+// rejected — the reason is in out.Errors, read by fleetError).
+func firstFleetInstanceID(out *ec2.CreateFleetOutput) string {
+	if out == nil {
+		return ""
+	}
+	for _, inst := range out.Instances {
+		for _, id := range inst.InstanceIds {
+			return id
+		}
+	}
+	return ""
+}
+
+// fleetError turns an instant fleet that launched nothing into the classified
+// error region/tier failover expects. An instant fleet does not fail the API call
+// on a capacity shortfall — it succeeds and reports a PER-OVERRIDE reason for every
+// (instance type, subnet) pair it could not place in out.Errors — so the reported
+// codes are run back through classifyEC2Error to recover ErrNoCapacity /
+// ErrSpotCapacity / ErrQuota / ErrAuth. An empty Errors list (no instance and no
+// reason) is treated as a generic no-capacity so the caller still fails over rather
+// than wedging.
+//
+// The grid's errors are usually a MIX — one subnet's AZ may not offer the type
+// (InvalidFleetConfiguration) while the rest are genuinely capacity-starved
+// (InsufficientInstanceCapacity), and a terminal reason (auth/quota) can hide
+// behind them. Picking out.Errors[0] blindly would surface whichever AZ EC2 listed
+// first, so the most AUTHORITATIVE error is chosen instead (auth > quota > capacity
+// > unknown): a real terminal reason is never masked by a per-AZ availability gap,
+// and its true message is preserved for the log/Event.
+func fleetError(out *ec2.CreateFleetOutput, spot bool) error {
+	if out != nil {
+		var best *ec2types.CreateFleetError
+		bestRank := -1
+		for i := range out.Errors {
+			e := &out.Errors[i]
+			if e.ErrorCode == nil {
+				continue
+			}
+			if r := fleetErrorRank(*e.ErrorCode); r > bestRank {
+				bestRank, best = r, e
+			}
+		}
+		if best != nil {
+			msg := ""
+			if best.ErrorMessage != nil {
+				msg = *best.ErrorMessage
+			}
+			return classifyEC2Error(apiErrorFromFleet(*best.ErrorCode, msg), spot)
+		}
+	}
+	// No reason reported: assume capacity so the region is blocked and failover runs.
+	return wrapNoCapacity(errors.New("aws: instant fleet returned no instance"), spot, false)
+}
+
+// fleetErrorRank orders CreateFleet per-override error codes by how authoritative
+// the reason is, so fleetError surfaces the one that best explains the whole
+// launch: auth (fails everywhere) > quota (region/account ceiling) > capacity
+// (per-AZ shortfall, incl. an AZ that doesn't offer the type) > unknown. A higher
+// rank wins. This never changes the derived BlockScope for a uniform grid; it only
+// picks the representative error when the grid's reasons differ.
+func fleetErrorRank(code string) int {
+	switch code {
+	case "UnauthorizedOperation", "AuthFailure", "Blocked", "OptInRequired", "PendingVerification":
+		return 3
+	case "InstanceLimitExceeded", "VcpuLimitExceeded", "RequestLimitExceeded",
+		"SpotMaxPriceTooLow", "MaxSpotInstanceCountExceeded":
+		return 2
+	case "InsufficientInstanceCapacity", "InsufficientHostCapacity", "Unsupported", "InvalidFleetConfiguration":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // resolveGPUAMI finds the region's GPU AMI: the newest Amazon-owned image whose
@@ -445,12 +746,25 @@ func (c *sdkClient) DescribeInstance(ctx context.Context, id string) (*EC2Instan
 // carrying the ClaimTagKey tag — the tag every Nebula instance is launched with —
 // so instances Nebula does not own are never returned, and pages through all
 // results. This is the engine of the poll loop.
+//
+// The instance-state filter excludes terminated/shutting-down instances, which EC2
+// keeps visible in DescribeInstances for ~1h after teardown. Without it a torn-down
+// instance would still be counted as "live" every tick (inflating the poll count)
+// and — worse, since claim names are reused across pod restarts — findByClaim could
+// match a corpse and mis-report a freshly re-created Pod off a dead instance. Only
+// states that represent a live (or resumable) instance are returned.
 func (c *sdkClient) ListInstances(ctx context.Context) ([]EC2Instance, error) {
 	in := &ec2.DescribeInstancesInput{
-		Filters: []ec2types.Filter{{
-			Name:   awssdk.String("tag-key"),
-			Values: []string{ClaimTagKey},
-		}},
+		Filters: []ec2types.Filter{
+			{
+				Name:   awssdk.String("tag-key"),
+				Values: []string{ClaimTagKey},
+			},
+			{
+				Name:   awssdk.String("instance-state-name"),
+				Values: []string{"pending", "running", "stopping", "stopped"},
+			},
+		},
 	}
 	var out []EC2Instance
 	var ids []string
@@ -565,6 +879,98 @@ func (c *sdkClient) AvailableInstanceTypes(ctx context.Context) (map[string]bool
 		in.NextToken = page.NextToken
 	}
 	return out, nil
+}
+
+// instanceTypeAZs returns, for each of the requested types, the set of AZs in this
+// region that offer it — used by RunInstance to prune fleet overrides targeting an
+// AZ that does not offer the type. Offerings are stable per region, so a resolved
+// type is cached on the client (azOfferings) and never re-queried.
+//
+// It is fail-open by construction: a type whose DescribeInstanceTypeOfferings lookup
+// fails is left OUT of the returned map (its entry stays nil), which fleetOverrides
+// reads as "unknown, don't prune". A transient API error therefore degrades to
+// today's behavior (full grid), never to a shrunk or empty launch. Each miss is one
+// AZ-scoped Describe (filtered to the single type), cached thereafter.
+func (c *sdkClient) instanceTypeAZs(ctx context.Context, instanceTypes []string) map[string]map[string]bool {
+	log := logf.FromContext(ctx).WithName("aws-offerings").WithValues("region", c.region)
+
+	out := map[string]map[string]bool{}
+	for _, it := range instanceTypes {
+		e, mine := c.offeringSlot(it)
+		if mine {
+			// This goroutine owns the single-flight lookup for it: run the one Describe
+			// OUTSIDE the lock, fill the entry, and release everyone waiting on done.
+			e.azs, e.err = c.describeTypeAZs(ctx, it)
+			if e.err != nil {
+				// Do NOT cache a failure: drop the slot so a later provision retries
+				// rather than fail-open forever on a transient throttle.
+				c.offeringsMu.Lock()
+				delete(c.azOfferings, it)
+				c.offeringsMu.Unlock()
+			}
+			close(e.done)
+		} else {
+			<-e.done // another goroutine is (or has) resolved it; wait without the lock.
+		}
+
+		if e.err != nil {
+			// Fail-open: leave this type unresolved so fleetOverrides does not prune it.
+			log.V(1).Info("offering lookup failed; not pruning this type", "instanceType", it, "error", e.err.Error())
+			continue
+		}
+		out[it] = e.azs // resolved set (may be empty: offered in no AZ of this region)
+	}
+	return out
+}
+
+// offeringSlot returns the single-flight cache slot for an instance type, creating
+// it if absent. The bool is true for the goroutine that CREATED the slot — the one
+// responsible for running the lookup and closing e.done; all others receive the
+// existing slot (mine=false) and must wait on e.done. Holds offeringsMu only for the
+// map read/insert, never across the network call.
+func (c *sdkClient) offeringSlot(it string) (*offeringEntry, bool) {
+	c.offeringsMu.Lock()
+	defer c.offeringsMu.Unlock()
+	if c.azOfferings == nil {
+		c.azOfferings = map[string]*offeringEntry{}
+	}
+	if e, ok := c.azOfferings[it]; ok {
+		return e, false
+	}
+	e := &offeringEntry{done: make(chan struct{})}
+	c.azOfferings[it] = e
+	return e, true
+}
+
+// describeTypeAZs lists the AZs in this region that offer one instance type, via
+// DescribeInstanceTypeOfferings at AZ granularity (LocationType=availability-zone),
+// paging through all results. An empty result means the type is offered in no AZ of
+// this region.
+func (c *sdkClient) describeTypeAZs(ctx context.Context, instanceType string) (map[string]bool, error) {
+	in := &ec2.DescribeInstanceTypeOfferingsInput{
+		LocationType: ec2types.LocationTypeAvailabilityZone,
+		Filters: []ec2types.Filter{{
+			Name:   awssdk.String("instance-type"),
+			Values: []string{instanceType},
+		}},
+	}
+	azs := map[string]bool{}
+	for {
+		page, err := c.ec2.DescribeInstanceTypeOfferings(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range page.InstanceTypeOfferings {
+			if o.Location != nil {
+				azs[*o.Location] = true
+			}
+		}
+		if page.NextToken == nil {
+			break
+		}
+		in.NextToken = page.NextToken
+	}
+	return azs, nil
 }
 
 // observe normalizes a live EC2 SDK instance into the adapter-level EC2Instance

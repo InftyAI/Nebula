@@ -98,6 +98,22 @@ func shellQuote(s string) string {
 // distinguishes the two.
 var errZoneLocal = errors.New("aws: zone-local capacity shortfall")
 
+// apiErrorFromFleet reconstructs a smithy.APIError from a CreateFleet per-attempt
+// error so an instant fleet's failure (reported in out.Errors, not as a returned Go
+// error) can be run through classifyEC2Error alongside the RunInstances-style
+// errors. The fleet reuses the same EC2 error codes (InsufficientInstanceCapacity,
+// SpotMaxPriceTooLow, ...), so the same classifier applies once the code is wrapped
+// back into the smithy.APIError shape it reads. AWS's human-readable message is
+// preserved (falling back to the code when absent) so the surfaced error names the
+// ACTUAL reason — e.g. "g6.48xlarge is not supported in us-east-1e" — instead of
+// echoing the bare code twice.
+func apiErrorFromFleet(code, message string) error {
+	if message == "" {
+		message = code
+	}
+	return &smithy.GenericAPIError{Code: code, Message: message}
+}
+
 // classifyEC2Error maps a raw EC2 API error onto the shared provider sentinels so
 // the adapter's ClassifyProvisionError can derive a BlockScope uniformly. It
 // recognizes EC2's error codes (smithy.APIError) first, falling back to the
@@ -130,7 +146,14 @@ func classifyEC2Error(err error, spot bool) error {
 	}
 
 	switch apiErr.ErrorCode() {
-	case "InsufficientInstanceCapacity", "InsufficientHostCapacity", "Unsupported":
+	case "InsufficientInstanceCapacity", "InsufficientHostCapacity", "Unsupported",
+		// InvalidFleetConfiguration, in a CreateFleet per-override error, is how EC2
+		// reports "this instance type is not offered in the AZ of this subnet" (e.g.
+		// g6.48xlarge in us-east-1e) — an availability gap in ONE zone, exactly like
+		// Unsupported. A sibling AZ may still satisfy the launch, so it is zone-local
+		// no-capacity, not a malformed request: treat it as capacity so region/tier
+		// failover routes around it rather than surfacing an opaque config error.
+		"InvalidFleetConfiguration":
 		return wrapNoCapacity(err, spot, true /* zoneLocal */)
 	case "SpotMaxPriceTooLow", "MaxSpotInstanceCountExceeded":
 		// Region/account-scoped Spot limits: NOT zone-local, so the sweep stops.

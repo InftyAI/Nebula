@@ -41,16 +41,19 @@ type NodeClaimSpec struct {
 	// +optional
 	Region string `json:"region,omitempty"`
 
-	// AcceleratorID is the provider's own identifier for what actually serves this
-	// claim (e.g. AWS "p5.48xlarge", RunPod "NVIDIA H100 80GB HBM3"), resolved at
-	// placement time from the Pod's requested accelerator type + count via the
-	// provider's MapAccelerator. Unlike Provider/CapacityType/Region it is NOT a
-	// provisioning input (the provider re-derives it from the Pod) — it is recorded
-	// for reporting, like PoolRef, so `kubectl get nc` shows the concrete SKU behind
-	// each instance without cross-referencing the Pod. Empty for a CPU-only claim,
-	// which requests no accelerator.
+	// Accelerator is the requested accelerator pool this claim serves, as
+	// "type:count" (e.g. "H100:8"), resolved at placement time from the Pod's
+	// accelerator type + count. It names the POOL, not the concrete SKU: a launch
+	// may span several interchangeable provider instance types (AWS's fleet tries
+	// alternates), so the exact instance type is only known post-launch from the
+	// observed instance — this field stays truthful regardless of which alternate
+	// lands. Unlike Provider/CapacityType/Region it is NOT a provisioning input (the
+	// provider re-derives it from the Pod) — it is recorded for reporting, like
+	// PoolRef, so `kubectl get nc` shows what each instance serves without
+	// cross-referencing the Pod. Empty for a CPU-only claim, which requests no
+	// accelerator.
 	// +optional
-	AcceleratorID string `json:"acceleratorID,omitempty"`
+	Accelerator string `json:"accelerator,omitempty"`
 
 	// PoolRef is the NodePool whose policy produced this claim, for reporting.
 	// +optional
@@ -150,7 +153,7 @@ type NodeClaimStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.spec.provider`
 // +kubebuilder:printcolumn:name="Region",type=string,JSONPath=`.spec.region`
-// +kubebuilder:printcolumn:name="ACCELERATOR_ID",type=string,JSONPath=`.spec.acceleratorID`
+// +kubebuilder:printcolumn:name="ACCELERATOR",type=string,JSONPath=`.spec.accelerator`
 // +kubebuilder:printcolumn:name="CAPACITY_TYPE",type=string,JSONPath=`.spec.capacityType`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Instance",type=string,JSONPath=`.status.instanceID`

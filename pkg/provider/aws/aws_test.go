@@ -27,6 +27,7 @@ import (
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	smithy "github.com/aws/smithy-go"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -176,9 +177,10 @@ func TestProvision_MapsAcceleratorToInstanceType(t *testing.T) {
 	if id != "i-1" {
 		t.Fatalf("id = %q, want i-1", id)
 	}
-	// AWS requests by instance type: H100 must resolve to its accelerator_id.
-	if f.lastSpec.InstanceType != "p5.48xlarge" {
-		t.Fatalf("InstanceType = %q, want p5.48xlarge", f.lastSpec.InstanceType)
+	// AWS requests by instance type: H100 must resolve to its accelerator_id as the
+	// primary (fleet) instance type.
+	if got := primaryType(f.lastSpec); got != "p5.48xlarge" {
+		t.Fatalf("primary InstanceType = %q, want p5.48xlarge", got)
 	}
 	if f.lastSpec.Image != "myimg:latest" {
 		t.Fatalf("image = %q", f.lastSpec.Image)
@@ -210,9 +212,18 @@ func TestProvision_LowercaseAcceleratorLabel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if f.lastSpec.InstanceType != "p5.48xlarge" {
-		t.Fatalf("InstanceType = %q, want p5.48xlarge from lowercase label", f.lastSpec.InstanceType)
+	if got := primaryType(f.lastSpec); got != "p5.48xlarge" {
+		t.Fatalf("primary InstanceType = %q, want p5.48xlarge from lowercase label", got)
 	}
+}
+
+// primaryType returns the fleet's primary (blocklist-keyed) instance type, or ""
+// when the spec carries none.
+func primaryType(spec InstanceSpec) string {
+	if len(spec.InstanceTypes) == 0 {
+		return ""
+	}
+	return spec.InstanceTypes[0]
 }
 
 func TestProvision_CountSelectsInstanceType(t *testing.T) {
@@ -233,8 +244,8 @@ func TestProvision_CountSelectsInstanceType(t *testing.T) {
 		if _, err := p.Provision(context.Background(), gpuPod("T4", tc.count), req); err != nil {
 			t.Fatalf("Provision(T4 x%d): %v", tc.count, err)
 		}
-		if f.lastSpec.InstanceType != tc.wantType {
-			t.Fatalf("T4 x%d -> InstanceType %q, want %q", tc.count, f.lastSpec.InstanceType, tc.wantType)
+		if got := primaryType(f.lastSpec); got != tc.wantType {
+			t.Fatalf("T4 x%d -> primary InstanceType %q, want %q", tc.count, got, tc.wantType)
 		}
 	}
 }
@@ -448,15 +459,15 @@ func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	const accel = "H100"
 	denyAll := provider.BlockScope{DenyAll: true}
-	// EC2 capacity/accelerator blocks are confined to the adapter's region (an
+	// EC2 capacity/accelerator/quota blocks are confined to the adapter's region (an
 	// exact-match Region pointer) AND to the requested accelerator (passed in by the
-	// caller — the provider owns the whole scope). Auth/quota (DenyAll) ignores both.
+	// caller — the provider owns the whole scope). Only auth (DenyAll) ignores both.
 	region, wantAccel := testRegion, accel
 	onDemandRegional := provider.BlockScope{
-		AcceleratorID: &wantAccel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: &region,
+		Accelerator: &wantAccel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: &region,
 	}
 	spotRegional := provider.BlockScope{
-		AcceleratorID: &wantAccel, CapacityType: nebulav1alpha1.CapacitySpot, Region: &region,
+		Accelerator: &wantAccel, CapacityType: nebulav1alpha1.CapacitySpot, Region: &region,
 	}
 
 	// A Spot capacity failure the Client wraps with both sentinels: no-capacity
@@ -470,12 +481,26 @@ func TestClassifyProvisionError(t *testing.T) {
 		want provider.BlockScope
 	}{
 		{"auth is provider-wide (no region)", provider.ErrAuth, denyAll},
-		{"quota is provider-wide (no region)", provider.ErrQuota, denyAll},
+		// A vCPU/instance-limit quota is a regional, per-family, per-tier ceiling, so
+		// it blocks only this accelerator + tier in this region — never the whole
+		// provider. Otherwise one region's quota would strand every other region.
+		{"quota is regional OnDemand", provider.ErrQuota, onDemandRegional},
 		{"capacity is regional OnDemand", provider.ErrNoCapacity, onDemandRegional},
 		{"wrapped capacity is regional", fmt.Errorf("run: %w", provider.ErrNoCapacity), onDemandRegional},
 		{"spot capacity blocks only Spot in region", spotNoCapacity, spotRegional},
 		{"string no-capacity is regional OnDemand", stringNoCapacity, onDemandRegional},
-		{"unknown is provider-wide", fmt.Errorf("weird transient blip"), denyAll},
+		// An unrecognized error is confined to this accelerator + tier + region, NOT
+		// DenyAll: a whole-provider block on an unidentifiable failure is too broad, so
+		// failover routes around the one failing candidate instead.
+		{"unknown is regional OnDemand", fmt.Errorf("weird transient blip"), onDemandRegional},
+		// InvalidFleetConfiguration, in a CreateFleet per-override error, means the
+		// instance type is not offered in that subnet's AZ — a zone-local availability
+		// gap classifyEC2Error maps to no-capacity, so it blocks only this
+		// accelerator/tier/region (a sibling AZ or region may still serve it), never
+		// DenyAll.
+		{"invalid fleet config is regional OnDemand",
+			&smithy.GenericAPIError{Code: "InvalidFleetConfiguration", Message: "not supported in AZ"},
+			onDemandRegional},
 		{"nil", nil, provider.BlockScope{}},
 	}
 	for _, tt := range tests {

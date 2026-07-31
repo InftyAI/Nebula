@@ -40,54 +40,63 @@ var (
 	// ErrAuth: credentials/authorization failed. Whole-provider — nothing will
 	// succeed until it is fixed.
 	ErrAuth = errors.New("provider: authentication failed")
-	// ErrQuota: account quota/limit reached. Whole-provider until quota frees up.
+	// ErrQuota: a resource quota/limit was reached. Scoped like a capacity failure
+	// (accelerator + tier), NOT whole-provider: cloud quotas are per-resource and,
+	// for a multi-region adapter, per-region — e.g. an AWS vCPU limit is a regional,
+	// per-instance-family, per-tier ceiling, so exhausting it in one region says
+	// nothing about the same request in another. The adapter confines it to the
+	// failing region (see aws.ClassifyProvisionError). Transient until quota frees up.
 	ErrQuota = errors.New("provider: quota exceeded")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be
 // blocklisted at, using the shared sentinels first and a string-heuristic
 // fallback for raw API messages that were not wrapped. It encodes the rule that
-// a narrow failure (this accelerator has no capacity) must not disqualify other
-// accelerators on the same provider, while auth/quota widen to the whole
-// provider; an unrecognized error is treated conservatively as whole-provider so
-// a failure does not hot-loop (the blocklist TTL bounds the blast radius).
+// a narrow failure (this accelerator has no capacity, or its quota is exhausted)
+// must not disqualify other accelerators — or, for a multi-region adapter, other
+// regions — on the same provider. Only auth (which fails everywhere) widens to the
+// whole provider via DenyAll; every other case — including an unrecognized error —
+// is scoped to the failing accelerator/tier/region so failover can route around it
+// rather than fencing off the entire provider (the blocklist TTL bounds it either
+// way).
 //
 // It is the single place the SHARED part of a scope is derived — category
-// (DenyAll vs capacity-scoped), the capacity tier, and the accelerator id — so
+// (DenyAll vs capacity-scoped), the capacity tier, and the accelerator pool — so
 // every adapter's ClassifyProvisionError delegates here and then only decorates
 // with what is provider-specific (AWS adds its region). No scope is assembled
-// anywhere else: the vnode handler resolves the accelerator id off the Pod and
+// anywhere else: the vnode handler resolves the accelerator pool off the Pod and
 // passes it in, rather than mutating the returned scope.
 //
 // capacityType is the tier the failing request used; it is stamped onto
 // accelerator-scoped scopes so the block is precise (a Spot failure does not
-// block OnDemand). acceleratorID is the provider's RESOLVED id for what served the
-// failing request (the (type, count) mapped through MapAccelerator — an EC2
-// instance type on AWS, the canonical name on Modal; "" for a CPU-only Pod): on a
-// capacity-scoped block a non-empty id becomes an exact-match pointer (narrowing
-// the block to the instance type / capacity pool that actually failed), while ""
-// leaves AcceleratorID nil ("not applicable") so the block does not widen across
-// every accelerator. Auth/quota (DenyAll) ignores both, since bad credentials fail
-// for every accelerator and tier.
-func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, acceleratorID string) BlockScope {
+// block OnDemand). accelerator is the request's POOL identity (type:count, e.g.
+// "H100:8"; "" for a CPU-only Pod), NOT the provider's SKU id — so the block stays
+// truthful when a launch spans several interchangeable instance types: on a
+// capacity-scoped block a non-empty pool becomes an exact-match pointer (narrowing
+// the block to the (type, count) pool that actually failed), while "" leaves
+// Accelerator nil ("not applicable") so the block does not widen across every
+// accelerator. Auth (DenyAll) ignores both, since bad credentials fail for
+// every accelerator and tier; quota is scoped like capacity (per accelerator and
+// tier, and per region once the adapter confines it).
+func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelerator string) BlockScope {
 	if err == nil {
 		return BlockScope{}
 	}
 
 	// capacityScope builds an accelerator/tier-scoped block, promoting a non-empty
-	// accelerator id to an exact-match pointer and leaving it nil otherwise.
+	// accelerator pool to an exact-match pointer and leaving it nil otherwise.
 	capacityScope := func() BlockScope {
 		s := BlockScope{CapacityType: capacityType}
-		if acceleratorID != "" {
-			s.AcceleratorID = &acceleratorID
+		if accelerator != "" {
+			s.Accelerator = &accelerator
 		}
 		return s
 	}
 
 	switch {
-	case errors.Is(err, ErrAuth), errors.Is(err, ErrQuota):
+	case errors.Is(err, ErrAuth):
 		return BlockScope{DenyAll: true}
-	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator):
+	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator), errors.Is(err, ErrQuota):
 		return capacityScope()
 	}
 
@@ -97,11 +106,17 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 	case containsAny(msg, "unauthorized", "forbidden", "authentication", "invalid token", "api key"):
 		return BlockScope{DenyAll: true}
 	case containsAny(msg, "quota", "limit exceeded", "rate limit"):
-		return BlockScope{DenyAll: true}
+		return capacityScope()
 	case containsAny(msg, "no capacity", "capacity", "unavailable", "out of", "no gpu"):
 		return capacityScope()
 	default:
-		return BlockScope{DenyAll: true}
+		// An unrecognized error is scoped like capacity (this accelerator + tier, and
+		// per region once the adapter confines it), NOT DenyAll. A DenyAll on an
+		// unknown error fences off the WHOLE provider — every region and accelerator —
+		// which is far too broad a blast radius for a failure we can't even identify
+		// (e.g. a transient malformed-request blip in one region). Failover past the
+		// one failing candidate is the safer default; the TTL still bounds it.
+		return capacityScope()
 	}
 }
 

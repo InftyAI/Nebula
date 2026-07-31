@@ -7,7 +7,6 @@ metadata:
 spec:
   # strategy (the inner, provider-ranking axis).
   providers:
-  - name: modal
   - name: aws
     regions:
     - us-east-1
@@ -18,7 +17,7 @@ spec:
     - eu-west-1
     - ca-central-1
     - sa-east-1
-  - name: modal
+  # - name: modal
   # - name: runpod
   # Outer axis: try OnDemand on every provider first, fall back to Spot.
   capacityTypes:
@@ -27,4 +26,4 @@ spec:
   # Inner axis: within the active capacity tier.
   strategy: Ordered
   failover:
-    blocklistTTL: 10m
+    blocklistTTL: 3m

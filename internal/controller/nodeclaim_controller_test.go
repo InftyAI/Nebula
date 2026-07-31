@@ -62,16 +62,16 @@ func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
 }
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
-func (f *fakeProvider) MapAccelerator(c string, _ int32) (string, bool) {
+func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool) {
 	if f.gpus == nil {
-		return c, true // offer any accelerator
+		return []string{c}, true // offer any accelerator
 	}
 	for _, g := range f.gpus {
 		if g == c {
-			return c, true
+			return []string{c}, true
 		}
 	}
-	return "", false
+	return nil, false
 }
 func (f *fakeProvider) ClassifyProvisionError(error, string, string) provider.BlockScope {
 	return provider.BlockScope{}

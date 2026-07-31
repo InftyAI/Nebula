@@ -87,17 +87,24 @@ type Provider interface {
 	// --- Translation -----------------------------------------------------
 
 	// MapAccelerator translates a canonical Nebula accelerator request (type +
-	// count) into this provider's identifier for what actually serves it (e.g.
-	// RunPod's "NVIDIA H100 80GB HBM3", or AWS's "g6.48xlarge"). Count is part of
-	// the key because on some providers the GPU count is baked into the offering
-	// rather than a free knob: on AWS (L4, 1) and (L4, 8) resolve to DIFFERENT
-	// instance types (g6.xlarge vs g6.48xlarge) — distinct capacity pools — so the
-	// id must distinguish them. Providers that attach an arbitrary count to a single
-	// offering (Modal) ignore count and return the same id for every count. Returns
-	// ok=false if the provider does not offer that (type, count). The returned id is
-	// what failover keys a capacity block on, so two requests that share a capacity
-	// pool must return the same id and two that do not must differ.
-	MapAccelerator(canonical string, count int32) (providerAcceleratorID string, ok bool)
+	// count) into the provider ids that can serve it — the PRIMARY first, then any
+	// interchangeable alternates. Count is part of the key because on some providers
+	// the GPU count is baked into the offering rather than a free knob: on AWS
+	// (L4, 1) and (L4, 8) resolve to DIFFERENT instance types (g6.xlarge vs
+	// g6.48xlarge) — distinct capacity pools — so the id must distinguish them.
+	// Providers that attach an arbitrary count to a single offering (Modal) ignore
+	// count and return the same id for every count. Returns ok=false if the provider
+	// offers no id for that (type, count).
+	//
+	// Most of the system uses ids[0], the PRIMARY: it is what failover keys a
+	// capacity block on, so two requests that share a capacity pool must return the
+	// same primary and two that do not must differ. Any further ids are equivalent
+	// alternates a provider may try within a SINGLE provisioning attempt (AWS's
+	// launch fleet spans several instance types so EC2 lands on whichever has
+	// capacity) — they broaden one launch, they do NOT widen the blocklist: an
+	// alternate running dry never disables the primary. A provider with no alternates
+	// returns a single-element slice.
+	MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool)
 
 	// ClassifyProvisionError maps a Provision error to the granularity at which
 	// the failing placement should be blocklisted. This keeps failover precise:
@@ -266,18 +273,17 @@ type Offering struct {
 // mixes the two: a NodePool candidate is resolved to fully-concrete values before
 // it is matched against these patterns.
 type BlockScope struct {
-	// AcceleratorID: nil => not applicable (CPU-only Pod, or a DenyAll scope);
-	// &"" => wildcard, matches every accelerator; &"g6.48xlarge" => exactly that
-	// one. It is the provider's RESOLVED id for what serves the failing request —
-	// the (type, count) mapped through MapAccelerator (an EC2 instance type on AWS,
-	// the canonical GPU name on Modal) — NOT the bare accelerator type. Keying on
-	// the resolved id is what confines a capacity block to the pool that actually
-	// ran out: an L4x8 (g6.48xlarge) Spot shortage must not exclude L4x1
-	// (g6.xlarge), a different instance type and capacity pool, though both are
-	// "L4". A capacity error carries no accelerator (it is classified from the error
-	// alone), so the adapter leaves this nil and the vnode handler fills it in from
-	// the failing Pod's resolved request.
-	AcceleratorID *string
+	// Accelerator: nil => not applicable (CPU-only Pod, or a DenyAll scope);
+	// &"" => wildcard, matches every accelerator; &"H100:8" => exactly that one
+	// pool. It is the request's POOL identity (type:count), NOT the provider's SKU
+	// id. Keying on the pool is what confines a capacity block to what actually ran
+	// out: an L4:8 Spot shortage must not exclude L4:1, a different pool, though both
+	// are "L4" — and it stays stable when a launch spans several interchangeable
+	// provider instance types (so a post-launch SKU choice never desyncs the key). A
+	// capacity error carries no accelerator (it is classified from the error alone),
+	// so the adapter leaves this nil and the vnode handler fills it in from the
+	// failing Pod's request.
+	Accelerator *string
 	// CapacityType empty => blocks all capacity types.
 	CapacityType nebulav1alpha1.CapacityType
 	// Region: nil => the provider has no region axis (a region-simple provider like
