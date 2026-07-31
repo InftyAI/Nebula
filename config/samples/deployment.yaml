@@ -28,7 +28,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: nebula
 spec:
-  replicas: 8
+  replicas: 2
   selector:
     matchLabels:
       app: gpu-workload-sample
@@ -38,7 +38,7 @@ spec:
         app: gpu-workload-sample
         nebula.inftyai.com/enabled: "true"
         nebula.inftyai.com/nodepool: sample
-        nebula.inftyai.com/accelerator-type: a100-40gb
+        nebula.inftyai.com/accelerator-type: t4
     spec:
       # Do NOT set nodeName or a provider nodeSelector yourself — the placement
       # controller fills the nodeSelector in when it ungates the Pod. Setting
@@ -65,4 +65,4 @@ spec:
             # GPU count. Standard extended resource, so the scheduler's fit check
             # and provisioning read the same number. 8 => 8x the accelerator-type
             # above.
-            nvidia.com/gpu: "8"
+            nvidia.com/gpu: "1"

@@ -142,6 +142,11 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// Sandd, when Enabled, makes the cloud-init also install and start the SandD
+	// sandbox daemon on the host (backgrounded, before the workload container) so
+	// commands and interactive shells can be run on the box over the tunnel. A zero
+	// value injects nothing. See buildUserData and provider.SanddConfig.
+	Sandd provider.SanddConfig
 }
 
 // EC2Instance is the adapter-level view of one EC2 instance as observed.
@@ -211,6 +216,9 @@ type Provider struct {
 	// regionSource reports the NodePool-declared regions to sweep in List/Offerings.
 	// May be nil in tests, in which case sweepRegions uses only the cache keys.
 	regionSource RegionSource
+	// sandd is the optional SandD daemon config stamped onto every InstanceSpec so
+	// buildUserData can bootstrap it. Zero value => disabled (no injection).
+	sandd provider.SanddConfig
 
 	mu      sync.Mutex
 	clients map[string]Client // region -> Client, populated lazily by clientFor
@@ -225,11 +233,16 @@ type Provider struct {
 // (admission requires each aws pool to list ≥1 region, and placement stamps it onto
 // the ProvisionRequest), and observed instances report their region from the
 // region-pinned client — so nothing needs a fallback, and no AWS_REGION env is read.
-func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource) *Provider {
+//
+// sandd is the optional SandD daemon config baked into every instance's user-data;
+// its zero value disables injection, so tests and the non-SandD path pass
+// provider.SanddConfig{}.
+func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource, sandd provider.SanddConfig) *Provider {
 	return &Provider{
 		Base:         catalog.Base{ProviderName: provider.ProviderAWS, Catalog: cat},
 		newClient:    newClient,
 		regionSource: regionSource,
+		sandd:        sandd,
 		clients:      make(map[string]Client),
 	}
 }
@@ -244,6 +257,7 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 		func(context.Context, string) (Client, error) { return client, nil },
 		cat,
 		func() []string { return []string{region} },
+		provider.SanddConfig{}, // single-region test convenience: no SandD injection
 	)
 	// Pre-seed the cache so even a stray region lookup returns the fake rather than
 	// invoking the (constant) factory.
@@ -714,6 +728,9 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 		Spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:        req.Region,
 		Tags:          map[string]string{ClaimTagKey: req.ClaimName},
+		// SandD daemon (opt-in): keyed by the claim name so a daemon that dials home
+		// correlates 1:1 with this instance's NodeClaim. Zero value => no injection.
+		Sandd: p.sandd,
 	}, nil
 }
 

@@ -347,6 +347,112 @@ func TestBuildUserData_QuotesHostileValues(t *testing.T) {
 	}
 }
 
+// TestBuildUserData_SanddDisabled: the zero SanddConfig is the default, so a spec
+// that does not opt in must render EXACTLY the plain bootstrap — no sandd/tunnel
+// tokens leak in, so existing clusters are unaffected.
+func TestBuildUserData_SanddDisabled(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{Image: "img"})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+	if strings.Contains(script, "sandd") || strings.Contains(script, "tunnel") {
+		t.Fatalf("sandd disabled but bootstrap injected it:\n%s", script)
+	}
+}
+
+// TestBuildUserData_SanddEnabled: when opted in, the daemon must be started BEFORE
+// the workload `docker run`, be BACKGROUNDED (so cloud-init reaches the workload),
+// and be FAIL-OPEN (its block cannot trip the workload's `set -euo pipefail`). It
+// must carry the tunnel flags and the claim-derived daemon id. The daemon runs
+// alongside the workload (it is the box's command/shell channel), so its bootstrap
+// must not be able to abort the workload.
+func TestBuildUserData_SanddEnabled(t *testing.T) {
+	spec := InstanceSpec{
+		Image: "img",
+		Tags:  map[string]string{ClaimTagKey: "claim-abc"},
+		Sandd: provider.SanddConfig{
+			AuthKey:       "tskey-secret",
+			ControlServer: "http://headscale:8080",
+			ServerURL:     "ws://100.64.0.1:8765/ws",
+		},
+	}
+	encoded, err := buildUserData(spec)
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	// Ordering: the sandd bootstrap precedes the workload pull/run — a daemon started
+	// after the foreground `docker run` would only come up once the workload exited.
+	sanddIdx := strings.Index(script, "setsid sandd")
+	runIdx := strings.Index(script, "docker run")
+	if sanddIdx < 0 {
+		t.Fatalf("sandd enabled but daemon not started:\n%s", script)
+	}
+	if runIdx < 0 || sanddIdx > runIdx {
+		t.Fatalf("sandd must start before the workload docker run (sandd=%d run=%d):\n%s", sanddIdx, runIdx, script)
+	}
+
+	// Fail-open: the block is a `( set +e ... ) || true` subshell so a failed install
+	// cannot abort the workload under the script's pipefail.
+	if !strings.Contains(script, "set +e") || !strings.Contains(script, ") || true\n") {
+		t.Fatalf("sandd block must be fail-open (set +e + || true):\n%s", script)
+	}
+
+	// Backgrounded: the daemon must be launched with a trailing `&` so cloud-init
+	// proceeds to the workload rather than blocking on the long-lived daemon.
+	if !strings.Contains(script, ">/var/log/sandd.log 2>&1 &\n") {
+		t.Fatalf("sandd daemon must be backgrounded:\n%s", script)
+	}
+
+	// Tunnel flags + claim-derived id are present.
+	for _, want := range []string{
+		"--tunnel",
+		"--server-url 'ws://100.64.0.1:8765/ws'",
+		"--tunnel-server 'http://headscale:8080'",
+		"--daemon-id 'claim-abc'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("sandd bootstrap missing %q:\n%s", want, script)
+		}
+	}
+
+	// The auth key must NOT appear on the daemon command line (it would show in `ps`);
+	// it is stashed in a root-only file and read back via $(cat ...).
+	if strings.Contains(script, "--tunnel-authkey 'tskey-secret'") {
+		t.Fatalf("auth key must not be passed on the command line:\n%s", script)
+	}
+	if !strings.Contains(script, "/etc/sandd.authkey") {
+		t.Fatalf("auth key must be stashed in a root-only file:\n%s", script)
+	}
+}
+
+// TestBuildUserData_SanddQuotesHostileValues: sandd config values are shell-quoted
+// like every other injected value, so a hostile auth key/URL cannot break out.
+func TestBuildUserData_SanddQuotesHostileValues(t *testing.T) {
+	spec := InstanceSpec{
+		Image: "img",
+		Tags:  map[string]string{ClaimTagKey: "c"},
+		Sandd: provider.SanddConfig{
+			AuthKey:       "k'; rm -rf /; echo '",
+			ControlServer: "http://h:8080",
+			ServerURL:     "ws://s:8765/ws",
+		},
+	}
+	encoded, err := buildUserData(spec)
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+	if strings.Contains(script, "\nrm -rf /") {
+		t.Fatalf("hostile sandd value escaped quoting:\n%s", script)
+	}
+}
+
 func TestClassifyEC2Error(t *testing.T) {
 	tests := []struct {
 		name      string

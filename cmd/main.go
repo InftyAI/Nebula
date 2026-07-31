@@ -351,7 +351,17 @@ func registerProviders(ctx context.Context, c client.Client) {
 	// delivered via a Secret), and one account-global credential authorizes every
 	// region. Registration only fails (and is a non-fatal skip) if the price catalog
 	// cannot load — region config can no longer make it fail.
-	if p, err := awsprovider.NewSDKClient(ctx, awsRegionSource(c)); err != nil {
+	// SandD daemon (opt-in): if SANDD_TUNNEL_AUTHKEY is set, every AWS instance also
+	// boots the SandD sandbox daemon in tunnel mode so commands and interactive
+	// shells can be run on the box over the mesh with no inbound access. Absent the
+	// authkey the zero SanddConfig injects nothing, so this is off by default. The
+	// authkey is a secret (delivered via a mounted Secret) and is NEVER logged.
+	sanddCfg := provider.SanddConfig{
+		AuthKey:       os.Getenv("SANDD_TUNNEL_AUTHKEY"),
+		ControlServer: os.Getenv("SANDD_TUNNEL_SERVER"),
+		ServerURL:     os.Getenv("SANDD_SERVER_URL"),
+	}
+	if p, err := awsprovider.NewSDKClient(ctx, awsRegionSource(c), sanddCfg); err != nil {
 		setupLog.Info("skipping AWS provider registration", "reason", err.Error())
 	} else {
 		provider.Register(p)

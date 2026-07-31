@@ -52,6 +52,17 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
 	b.WriteString("set -euo pipefail\n")
+
+	// SandD daemon (opt-in): install and start it on the HOST, BEFORE the workload,
+	// so commands and interactive shells can be run on the box while the container
+	// runs. It goes first because the workload's `docker run` is a foreground process
+	// the script blocks on until it exits (that is by design — cloud-init "finishes"
+	// when the workload does); a daemon started after it would only come up once the
+	// workload was already gone. See writeSanddBootstrap for the fail-open guarantee.
+	if spec.Sandd.Enabled() {
+		writeSanddBootstrap(&b, spec.Sandd, spec.Tags[ClaimTagKey])
+	}
+
 	// Pull first so an image error surfaces before we try to run.
 	fmt.Fprintf(&b, "docker pull %s\n", shellQuote(spec.Image))
 
@@ -86,6 +97,52 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	b.WriteString("\n")
 
 	return base64.StdEncoding.EncodeToString([]byte(b.String())), nil
+}
+
+// sanddInstallURL is the SandD daemon install script. The bootstrap pipes it to
+// bash with --tunnel so Tailscale is installed alongside the daemon (see the
+// SandD install.sh --tunnel path).
+const sanddInstallURL = "https://raw.githubusercontent.com/InftyAI/SandD/main/hack/scripts/install.sh"
+
+// writeSanddBootstrap appends the SandD sandbox-daemon bootstrap to the user-data
+// script. daemonID is the NodeClaim name (from ClaimTagKey), so a daemon that dials
+// home is identifiable as this exact instance.
+//
+// Two properties are load-bearing:
+//   - FAIL-OPEN: the workload runs under `set -euo pipefail`, and the daemon runs
+//     alongside it (it does not run the workload), so a failure to install or start
+//     the daemon must never abort the workload. The whole block runs inside a
+//     `( set +e ; ... ) || true` subshell so a failed install/curl/tailscale step
+//     cannot trip pipefail and kill the instance before `docker run`.
+//   - BACKGROUNDED & DETACHED: the daemon is a long-running process, so it is run
+//     with `setsid ... &` and its output redirected to a log file. If it blocked in
+//     the foreground, cloud-init would never reach `docker run` and the workload
+//     would never start.
+//
+// The auth key is written to a root-only file rather than passed on the command
+// line so it does not linger in the process table (`ps`) for any workload the
+// container can see.
+func writeSanddBootstrap(b *strings.Builder, cfg provider.SanddConfig, daemonID string) {
+	b.WriteString("# --- SandD daemon (opt-in; fail-open, never aborts the workload) ---\n")
+	b.WriteString("(\n")
+	b.WriteString("  set +e\n")
+	// Install the daemon + Tailscale. Piped to bash; the subshell's `set +e` means a
+	// non-zero exit here is swallowed rather than tripping the outer pipefail.
+	fmt.Fprintf(b, "  curl -fsSL %s | bash -s -- --tunnel\n", shellQuote(sanddInstallURL))
+	// Keep the auth key off the command line: stash it in a root-only file the daemon
+	// reads via env, so it is not visible in `ps`.
+	b.WriteString("  install -m 600 /dev/null /etc/sandd.authkey\n")
+	fmt.Fprintf(b, "  printf '%%s' %s > /etc/sandd.authkey\n", shellQuote(cfg.AuthKey))
+	// Launch detached & backgrounded so cloud-init proceeds to the workload. Output
+	// goes to a log for post-hoc debugging via the daemon itself.
+	b.WriteString("  setsid sandd \\\n")
+	fmt.Fprintf(b, "    --server-url %s \\\n", shellQuote(cfg.ServerURL))
+	fmt.Fprintf(b, "    --daemon-id %s \\\n", shellQuote(daemonID))
+	b.WriteString("    --tunnel \\\n")
+	b.WriteString("    --tunnel-authkey \"$(cat /etc/sandd.authkey)\" \\\n")
+	fmt.Fprintf(b, "    --tunnel-server %s \\\n", shellQuote(cfg.ControlServer))
+	b.WriteString("    >/var/log/sandd.log 2>&1 &\n")
+	b.WriteString(") || true\n")
 }
 
 // sortedKeys returns m's keys in sorted order, for deterministic rendering.

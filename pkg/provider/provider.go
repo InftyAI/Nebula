@@ -297,3 +297,41 @@ type BlockScope struct {
 	// provider; it never spans providers.
 	DenyAll bool
 }
+
+// SanddConfig configures the SandD sandbox daemon (see github.com/InftyAI/SandD)
+// shared by every provider adapter: when set, a launched instance also runs SandD
+// in tunnel mode, giving remote command execution and interactive shell/PTY
+// sessions on the box with NO inbound access — the daemon dials OUT to the
+// controller over the Tailscale/headscale mesh, which is what makes it work for
+// instances in a private VPC with no public IP or open port. It is the access and
+// control channel for the machine, not a troubleshooting-only add-on.
+//
+// It lives here, in the provider-agnostic seam, because it is not AWS-specific: it
+// is a property of "let an agent run commands / shell into a Nebula-provisioned
+// box" that any adapter can honour. Each adapter injects it in whatever way fits its
+// launch model (AWS bakes it into cloud-init as a host daemon alongside the
+// workload container; a serverless-sandbox provider would prepend it to the sandbox
+// command). AWS is the first to wire it in.
+//
+// It is OPT-IN: a zero value (empty AuthKey) injects nothing, so the bootstrap is
+// unchanged for clusters that do not enable it. AuthKey is a Tailscale/headscale
+// auth key — a secret — delivered to the controller as one and never logged. The
+// daemon runs ALONGSIDE the workload (it does not run it), so an adapter that
+// honours it MUST launch the daemon such that its own failure can never abort the
+// workload itself.
+type SanddConfig struct {
+	// AuthKey is the Tailscale/headscale pre-auth key the daemon joins the mesh
+	// with (sandd --tunnel-authkey). Empty disables SandD injection entirely.
+	AuthKey string
+	// ControlServer is the headscale control-plane URL (sandd --tunnel-server),
+	// e.g. "http://headscale.internal:8080". Required when AuthKey is set.
+	ControlServer string
+	// ServerURL is the controller's SandD WebSocket URL reachable OVER the mesh
+	// (sandd --server-url), e.g. "ws://100.64.0.1:8765/ws". Required when AuthKey
+	// is set.
+	ServerURL string
+}
+
+// Enabled reports whether the SandD daemon should be injected. A missing AuthKey
+// means the operator did not opt in, so an adapter emits its plain bootstrap.
+func (s SanddConfig) Enabled() bool { return s.AuthKey != "" }
