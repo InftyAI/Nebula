@@ -23,7 +23,7 @@ type NodeClaimSpec struct {
 	Provider string `json:"provider"`
 
 	// CapacityType is the purchase tier the placement optimizer selected
-	// (Spot/OnDemand/Reserved). It is stored durably here because it is the one
+	// (Spot/OnDemand). It is stored durably here because it is the one
 	// provisioning input that cannot be read off the Pod, and Provision needs it
 	// to re-issue the request after a controller restart. Immutable, like
 	// Provider. Empty means "let the provider use its default" (e.g. Modal is

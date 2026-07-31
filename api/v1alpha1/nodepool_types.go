@@ -46,10 +46,9 @@ type NodePoolSpec struct {
 	// CapacityTypes is the OUTER axis: the purchase models to try, in fallback
 	// order. e.g. [Spot, OnDemand] means "use spot on any provider first; only
 	// when spot is exhausted everywhere, drop to on-demand". A single-element
-	// list pins the pool to that type. This replaces a spot on/off flag and
-	// extends to Reserved without new fields.
+	// list pins the pool to that type. This replaces a spot on/off flag.
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:default={Reserved,OnDemand,Spot}
+	// +kubebuilder:default={OnDemand,Spot}
 	CapacityTypes []CapacityType `json:"capacityTypes,omitempty"`
 
 	// Strategy is the INNER axis: how to rank providers within the active
@@ -116,7 +115,7 @@ const (
 
 // CapacityType is the purchase model (the outer axis). Each provider maps it to
 // its own concept — e.g. RunPod Spot -> interruptible/podRentInterruptable.
-// +kubebuilder:validation:Enum=Spot;OnDemand;Reserved
+// +kubebuilder:validation:Enum=Spot;OnDemand
 type CapacityType string
 
 const (
@@ -124,9 +123,6 @@ const (
 	CapacitySpot CapacityType = "Spot"
 	// CapacityOnDemand is standard pay-as-you-go capacity.
 	CapacityOnDemand CapacityType = "OnDemand"
-	// CapacityReserved is pre-committed/reserved capacity (not all providers
-	// support it; reserved for future use).
-	CapacityReserved CapacityType = "Reserved"
 )
 
 // FailoverPolicy tunes capacity-error failover. Failover is always on — backing
