@@ -295,6 +295,42 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 	log := logf.FromContext(ctx).WithName("aws-run").WithValues(
 		"region", c.region, "instanceTypes", spec.InstanceTypes, "spot", spec.Spot)
 
+	// Prune subnets whose AZ does not OFFER a requested type before building the grid,
+	// so we never emit a (type, subnet) override EC2 would reject outright with
+	// InvalidFleetConfiguration (e.g. g6.48xlarge in us-east-1e). Fail-open: a lookup
+	// error yields nil offerings and offeredSubnets keeps every subnet, so a transient
+	// DescribeInstanceTypeOfferings failure can never shrink the grid below today's.
+	// Done BEFORE any launch template is created so a region that offers none of the
+	// requested types costs neither the template create/delete pair nor a CreateFleet.
+	offerings := c.instanceTypeAZs(ctx, spec.InstanceTypes)
+
+	// One override per (instance type, subnet) pair => EC2 searches that whole grid
+	// for capacity in a single call, landing on whichever pair is available. The
+	// instance types are interchangeable alternates the accelerator maps to (primary
+	// first); spanning them broadens the launch beyond a single type's per-AZ
+	// capacity. The launch template carries no instance type — it lives here in the
+	// overrides — so a template built once serves every type. No subnets (no default
+	// VPC) => one override per type with the subnet unset, letting EC2 pick it (still
+	// no cross-AZ search).
+	overrides := fleetOverrides(spec.InstanceTypes, c.subnets, offerings)
+	log.V(1).Info("preparing instant fleet",
+		"candidateInstanceTypes", len(spec.InstanceTypes), "candidateSubnets", len(c.subnets),
+		"overrides", len(overrides))
+
+	// No override survived the prune: every requested type is offered in NO configured
+	// AZ of this region (a known-empty offered set — offerings are stable and we just
+	// queried them). CreateFleet would only bounce with InvalidFleetConfiguration, so
+	// short-circuit to a region-scoped no-capacity (NOT zone-local: no sibling AZ can
+	// help) and let region/tier failover route elsewhere — without the doomed API call
+	// or its Warning event. A fail-open (unknown) offered set never lands here: it
+	// keeps every subnet, so overrides is non-empty.
+	if len(overrides) == 0 {
+		log.Info("skipping instant fleet: no requested type offered in any configured AZ of this region")
+		return "", wrapNoCapacity(
+			fmt.Errorf("aws: none of %v offered in any availability zone of %s", spec.InstanceTypes, c.region),
+			spec.Spot, false /* zoneLocal */)
+	}
+
 	// Opportunistically reap any ephemeral launch template a prior provision leaked
 	// (crash between create and delete). Best-effort and staleness-gated, so it
 	// cannot touch a concurrent provision's own template; see sweepStaleLaunchTemplates.
@@ -315,25 +351,7 @@ func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string,
 		}
 	}()
 
-	// Prune subnets whose AZ does not OFFER a requested type before building the grid,
-	// so we never emit a (type, subnet) override EC2 would reject outright with
-	// InvalidFleetConfiguration (e.g. g6.48xlarge in us-east-1e). Fail-open: a lookup
-	// error yields nil offerings and offeredAZs keeps every subnet, so a transient
-	// DescribeInstanceTypeOfferings failure can never shrink the grid below today's.
-	offerings := c.instanceTypeAZs(ctx, spec.InstanceTypes)
-
-	// One override per (instance type, subnet) pair => EC2 searches that whole grid
-	// for capacity in a single call, landing on whichever pair is available. The
-	// instance types are interchangeable alternates the accelerator maps to (primary
-	// first); spanning them broadens the launch beyond a single type's per-AZ
-	// capacity. The launch template carries no instance type — it lives here in the
-	// overrides — so a template built once serves every type. No subnets (no default
-	// VPC) => one override per type with the subnet unset, letting EC2 pick it (still
-	// no cross-AZ search).
-	overrides := fleetOverrides(spec.InstanceTypes, c.subnets, offerings)
-	log.V(1).Info("launching via instant fleet",
-		"candidateInstanceTypes", len(spec.InstanceTypes), "candidateSubnets", len(c.subnets),
-		"overrides", len(overrides))
+	log.V(1).Info("launching via instant fleet", "overrides", len(overrides))
 
 	out, err := c.ec2.CreateFleet(ctx, &ec2.CreateFleetInput{
 		Type: ec2types.FleetTypeInstant, // synchronous: instances/errors in the response
@@ -524,9 +542,16 @@ func fleetOverrides(
 }
 
 // offeredSubnets filters subnets to those in an AZ that offers it, per offerings.
-// It fails open: an unknown offered set (nil — lookup skipped or failed) keeps every
-// subnet, and a filter that would remove ALL subnets also keeps every subnet, so
-// pruning only ever narrows a launch that still has at least one usable AZ left.
+// The two outcomes turn on whether the offered set is KNOWN:
+//   - unknown (nil — lookup skipped or failed): fail open, keep every subnet, so a
+//     transient DescribeInstanceTypeOfferings failure never shrinks the launch.
+//   - known: keep only the subnets whose AZ offers the type. When that intersection
+//     is EMPTY the type is offered in no configured AZ of this region, so return nil
+//     (no usable subnet) rather than the old fail-open "keep all". RunInstance reads
+//     an all-types-empty override set as a region no-capacity and skips the doomed
+//     CreateFleet — this is the source of the InvalidFleetConfiguration event churn
+//     (e.g. p4d.24xlarge in us-west-1, offered in neither AZ). A known-empty result
+//     is trustworthy: offerings are stable and we just queried them.
 func offeredSubnets(it string, subnets []subnet, offerings map[string]map[string]bool) []subnet {
 	azs := offerings[it]
 	if azs == nil {
@@ -538,10 +563,7 @@ func offeredSubnets(it string, subnets []subnet, offerings map[string]map[string
 			kept = append(kept, sn)
 		}
 	}
-	if len(kept) == 0 {
-		return subnets // pruning would zero the launch: keep all, let EC2 decide
-	}
-	return kept
+	return kept // may be empty: type offered in no configured AZ of this region
 }
 
 // fleetCapacityType maps the Spot flag to the fleet's default target-capacity

@@ -101,12 +101,24 @@ func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 // primary — ids[0] — is the identity failover blocks on; alternates broaden a
 // single launch but never the blocklist. Returns ok=false when the provider offers
 // no row for that (type, count).
+//
+// Availability gates the mapping: a row whose Available is false (the catalog's
+// availability column, e.g. a type we no longer wish to schedule onto) contributes
+// no id, so a (type, count) whose every row is unavailable maps to ok=false. This
+// is the single seam placement (servability check), AWS Provision and Modal
+// Provision all consult, so flipping a CSV row's availability off removes it from
+// scheduling everywhere without touching Go — no launch is attempted for it.
 func (b Base) MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool) {
 	offerings := b.Catalog.Offerings(b.ProviderName)
 	ids := make([]string, 0, len(offerings))
 	seen := make(map[string]bool)
 	for _, o := range offerings {
 		if !strings.EqualFold(o.AcceleratorType, canonical) {
+			continue
+		}
+		// An unavailable row cannot serve the request: skip it so its id is not
+		// offered up for a launch that the provider would only reject.
+		if !o.Available {
 			continue
 		}
 		// GPUCount 0 => count is not a lookup dimension for this provider (matches any
