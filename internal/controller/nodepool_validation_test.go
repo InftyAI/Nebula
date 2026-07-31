@@ -71,4 +71,38 @@ var _ = Describe("NodePool spec validation (CEL)", func() {
 		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
 	})
+
+	It("rejects a capacityType outside the Spot;OnDemand enum", func() {
+		// "Reserved" was a formerly-declared tier that never worked (the AWS adapter
+		// aliased it to a plain OnDemand launch) and has been removed from the enum.
+		// The CRD's x-kubernetes enum must now reject it so a stale spec cannot be
+		// admitted and silently degrade to OnDemand.
+		pool := &nebulav1alpha1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-capacity-type"},
+			Spec: nebulav1alpha1.NodePoolSpec{
+				Providers:     []nebulav1alpha1.ProviderSpec{{Name: "modal"}},
+				CapacityTypes: []nebulav1alpha1.CapacityType{"Reserved"},
+				Strategy:      nebulav1alpha1.StrategyOrdered,
+			},
+		}
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Unsupported value: \"Reserved\""))
+	})
+
+	It("admits the Spot and OnDemand capacity tiers", func() {
+		pool := &nebulav1alpha1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "ok-capacity-types"},
+			Spec: nebulav1alpha1.NodePoolSpec{
+				Providers: []nebulav1alpha1.ProviderSpec{{Name: "modal"}},
+				CapacityTypes: []nebulav1alpha1.CapacityType{
+					nebulav1alpha1.CapacityOnDemand,
+					nebulav1alpha1.CapacitySpot,
+				},
+				Strategy: nebulav1alpha1.StrategyOrdered,
+			},
+		}
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+	})
 })
