@@ -75,7 +75,7 @@ const (
 	AcceleratorTypeLabel = "nebula.inftyai.com/accelerator-type"
 
 	// CapacityTypeAnnotation carries the optimizer-chosen purchase tier
-	// (Spot/OnDemand/Reserved). It is the one provisioning input that cannot be
+	// (Spot/OnDemand). It is the one provisioning input that cannot be
 	// read off the Pod's own spec, so the placement controller writes it here
 	// when it ungates the Pod. The virtual kubelet — which provisions solely from
 	// the Pod — reads it back on CreatePod. Empty means "let the provider use its

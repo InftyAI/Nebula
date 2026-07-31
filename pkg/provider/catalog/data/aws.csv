@@ -26,7 +26,7 @@
 #   accelerator_type  canonical Nebula accelerator type
 #   accelerator_id    EC2 instance type that serves {accelerator_type, gpu_count}
 #   gpu_count         accelerators the instance type provides (the lookup key)
-#   capacity_type     Spot | OnDemand | Reserved
+#   capacity_type     Spot | OnDemand
 #   price_per_hour    approximate USD/instance-hour (seed; live probe may override)
 #   available         seed availability (the live probe is authoritative per region)
 #   region            BLANK — stamped per configured region by the live probe

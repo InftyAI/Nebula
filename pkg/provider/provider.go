@@ -133,7 +133,7 @@ type ProvisionRequest struct {
 	// ClaimName is the NodeClaim name; providers without native tags encode it
 	// into the instance name so List/Terminate can find the instance later.
 	ClaimName string
-	// CapacityType is the tier the optimizer selected (Spot/OnDemand/Reserved).
+	// CapacityType is the tier the optimizer selected (Spot/OnDemand).
 	// This is the one workload-independent decision that cannot be expressed on
 	// the Pod, so it must be passed explicitly.
 	CapacityType nebulav1alpha1.CapacityType

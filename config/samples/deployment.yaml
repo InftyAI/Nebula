@@ -23,7 +23,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gpu-workload-sample-a100
+  name: gpu-workload-sample
   namespace: default
   labels:
     app.kubernetes.io/managed-by: nebula
@@ -38,7 +38,7 @@ spec:
         app: gpu-workload-sample
         nebula.inftyai.com/enabled: "true"
         nebula.inftyai.com/nodepool: sample
-        nebula.inftyai.com/accelerator-type: a100-40gb
+        nebula.inftyai.com/accelerator-type: l4
     spec:
       # Do NOT set nodeName or a provider nodeSelector yourself — the placement
       # controller fills the nodeSelector in when it ungates the Pod. Setting

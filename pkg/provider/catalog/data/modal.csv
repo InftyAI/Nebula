@@ -22,7 +22,7 @@
 #                     parameter (off the Pod's nvidia.com/gpu resource), so it is
 #                     not a catalog lookup dimension. AWS, where the count is baked
 #                     into the instance type, fills it in.
-#   capacity_type     Spot | OnDemand | Reserved
+#   capacity_type     Spot | OnDemand
 #   price_per_hour    approximate on-demand USD/GPU-hour
 #   available         whether Modal currently offers it (a live probe may override)
 #   region            BLANK — Modal is region-simple

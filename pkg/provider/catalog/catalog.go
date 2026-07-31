@@ -125,7 +125,7 @@ func (c *Catalog) Offerings(providerName string) []provider.Offering {
 const (
 	colAccelerator   = "accelerator_type" // required: canonical Nebula accelerator type
 	colAcceleratorID = "accelerator_id"   // optional: provider's own accelerator id (e.g. AWS instance type)
-	colCapacityType  = "capacity_type"    // required: Spot | OnDemand | Reserved
+	colCapacityType  = "capacity_type"    // required: Spot | OnDemand
 	colPrice         = "price_per_hour"   // required: approximate USD/GPU-hour
 	colAvailable     = "available"        // required: whether the provider offers it
 	colGPUCount      = "gpu_count"        // optional: accelerators the id provides (AWS: baked into instance type)
