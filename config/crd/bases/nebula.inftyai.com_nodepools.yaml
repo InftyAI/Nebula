@@ -98,10 +98,13 @@ spec:
                   RunPod reports no capacity) is temporarily excluded and re-tried.
                 properties:
                   blocklistTTL:
-                    default: 3m
+                    default: 30s
                     description: |-
-                      BlocklistTTL is how long a failed placement is excluded before the
-                      provider becomes a candidate for it again.
+                      BlocklistTTL is the BASE duration a failed placement is excluded before the
+                      provider becomes a candidate for it again. The controller adds a random jitter
+                      (up to a minute) on top so Pods that failed for the same reason do not all
+                      retry the just-freed candidate in lockstep, so the effective exclusion is this
+                      value plus that jitter.
                     type: string
                 type: object
               providers:

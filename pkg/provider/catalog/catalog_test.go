@@ -185,8 +185,8 @@ func TestBaseMapAccelerator_CaseInsensitive(t *testing.T) {
 	base := Base{
 		ProviderName: "modal",
 		Catalog: fakeLookup{rows: []provider.Offering{
-			{AcceleratorType: "H100", CapacityType: nebulav1alpha1.CapacityOnDemand},
-			{AcceleratorType: "A100-80GB", CapacityType: nebulav1alpha1.CapacityOnDemand},
+			{AcceleratorType: "H100", CapacityType: nebulav1alpha1.CapacityOnDemand, Available: true},
+			{AcceleratorType: "A100-80GB", CapacityType: nebulav1alpha1.CapacityOnDemand, Available: true},
 		}},
 	}
 
@@ -221,16 +221,17 @@ func TestBaseMapAccelerator_CaseInsensitive(t *testing.T) {
 // interchangeable alternates: MapAccelerator returns them all, primary (first row)
 // first, so an AWS launch fleet can span them and land on whichever has capacity.
 func TestBaseMapAccelerator_AlternatesPrimaryFirst(t *testing.T) {
+	od, sp := nebulav1alpha1.CapacityOnDemand, nebulav1alpha1.CapacitySpot
 	base := Base{
 		ProviderName: "aws",
 		Catalog: fakeLookup{rows: []provider.Offering{
 			// Primary first, then two alternates for L4 x1. The per-capacity-type
 			// duplicate (the second p4d row) must be deduped, not returned twice.
-			{AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1, CapacityType: nebulav1alpha1.CapacityOnDemand},
-			{AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1, CapacityType: nebulav1alpha1.CapacitySpot},
-			{AcceleratorType: "L4", AcceleratorID: "gr6.4xlarge", GPUCount: 1, CapacityType: nebulav1alpha1.CapacityOnDemand},
+			{AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1, CapacityType: od, Available: true},
+			{AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1, CapacityType: sp, Available: true},
+			{AcceleratorType: "L4", AcceleratorID: "gr6.4xlarge", GPUCount: 1, CapacityType: od, Available: true},
 			// A different count must NOT bleed into the x1 result.
-			{AcceleratorType: "L4", AcceleratorID: "g6.48xlarge", GPUCount: 8, CapacityType: nebulav1alpha1.CapacityOnDemand},
+			{AcceleratorType: "L4", AcceleratorID: "g6.48xlarge", GPUCount: 8, CapacityType: od, Available: true},
 		}},
 	}
 
@@ -241,6 +242,32 @@ func TestBaseMapAccelerator_AlternatesPrimaryFirst(t *testing.T) {
 	want := []string{"g6.xlarge", "gr6.4xlarge"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("MapAccelerator(L4, 1) = %v, want %v (primary first, deduped, count-filtered)", got, want)
+	}
+}
+
+// An offering whose availability column is false must not contribute an id, and a
+// (type, count) whose every matching row is unavailable must map to ok=false so
+// placement/Provision skip it — the CSV's availability flag is the scheduling gate.
+func TestBaseMapAccelerator_SkipsUnavailable(t *testing.T) {
+	base := Base{
+		ProviderName: "aws",
+		Catalog: fakeLookup{rows: []provider.Offering{
+			// A100-80GB has one available alternate and one unavailable primary: only
+			// the available id survives.
+			{AcceleratorType: "A100-80GB", AcceleratorID: "p4d.24xlarge", GPUCount: 8, Available: false},
+			{AcceleratorType: "A100-80GB", AcceleratorID: "p4de.24xlarge", GPUCount: 8, Available: true},
+			// H100 has only unavailable rows: it maps to nothing.
+			{AcceleratorType: "H100", AcceleratorID: "p5.48xlarge", GPUCount: 8, Available: false},
+		}},
+	}
+
+	got, ok := base.MapAccelerator("A100-80GB", 8)
+	if !ok || !reflect.DeepEqual(got, []string{"p4de.24xlarge"}) {
+		t.Fatalf("MapAccelerator(A100-80GB, 8) = (%v, %v), want p4de.24xlarge — unavailable primary dropped", got, ok)
+	}
+
+	if got, ok := base.MapAccelerator("H100", 8); ok || len(got) > 0 {
+		t.Fatalf("MapAccelerator(H100, 8) = (%v, %v), want (nil, false) — every row unavailable", got, ok)
 	}
 }
 

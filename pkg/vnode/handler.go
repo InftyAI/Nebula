@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -49,11 +50,24 @@ import (
 // reclaims sooner; an OnDemand-only one can poll lazily).
 const defaultPollInterval = 15 * time.Second
 
-// defaultBlocklistTTL bounds how long a failed placement is excluded when the Pod
+// defaultBlocklistTTL is the BASE exclusion for a failed placement when the Pod
 // carries no BlocklistTTLAnnotation (an out-of-band Pod, or one placed before the
 // annotation existed). It mirrors FailoverPolicy.BlocklistTTL's own default so the
-// behaviour is identical whether or not the pool policy reached the handler.
-const defaultBlocklistTTL = 3 * time.Minute
+// behaviour is identical whether or not the pool policy reached the handler. The
+// effective TTL is this base plus a random jitter of up to blocklistJitter (see
+// recordBlock), so it is deliberately short: the jitter, not a long fixed floor,
+// is what spreads retries.
+const defaultBlocklistTTL = 30 * time.Second
+
+// blocklistJitter is the upper bound on the random delay ADDED to the base TTL for
+// every recorded block. Without it, all Pods that failed for one (accelerator,
+// tier, region) scope re-block in lockstep and their exclusions lapse at the same
+// instant, so they stampede the same just-freed candidate together — and, because
+// records coalesce on the LATEST expiry (see Blocklist.Record), the shared entry
+// would otherwise carry an identical deadline for all of them. A per-record jitter
+// in [0, blocklistJitter) decorrelates those wake-ups so freed capacity is sampled
+// across a spread of moments instead of one thundering retry.
+const blocklistJitter = 1 * time.Minute
 
 // Blocklister records a failed placement so the placement controller can fail over
 // to the next candidate instead of hot-looping against a provider that just
@@ -109,6 +123,11 @@ type Handler struct {
 	// nowFn and pollEvery are seams for tests.
 	nowFn     func() metav1.Time
 	pollEvery time.Duration
+
+	// jitterFn returns the random delay added to a block's base TTL (see
+	// recordBlock). A seam so tests can pin it (e.g. to 0) and assert an exact TTL;
+	// production wires it to a uniform draw in [0, blocklistJitter).
+	jitterFn func() time.Duration
 }
 
 // trackedPod is the virtual node's local record of one pod it provisioned for.
@@ -144,6 +163,9 @@ func NewHandler(prov provider.Provider, client kubernetes.Interface, blocklist B
 		tracked:   make(map[string]*trackedPod),
 		nowFn:     metav1.Now,
 		pollEvery: poll,
+		// rand/v2's top-level source is auto-seeded and safe for concurrent use, so
+		// every handler draws an independent jitter without shared seeding.
+		jitterFn: func() time.Duration { return time.Duration(rand.Int64N(int64(blocklistJitter))) },
 	}
 }
 
@@ -621,7 +643,11 @@ func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, err error) {
 		return
 	}
 
-	ttl := blocklistTTL(pod)
+	// Effective TTL = base (pool policy or default) + a per-record jitter, so Pods
+	// that failed for the SAME scope do not all re-probe the just-freed candidate at
+	// the same instant. Coalescing keeps the latest expiry, so distinct jittered
+	// records spread the shared entry's deadline instead of pinning it.
+	ttl := blocklistTTL(pod) + h.jitterFn()
 	// Use the request-scoped logger from ctx (it carries the virtualNode/provider
 	// values controller-runtime attached upstream); a logf.FromContext on a fresh
 	// context.Background() would fall back to the global delegate and could be

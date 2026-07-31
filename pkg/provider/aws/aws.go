@@ -126,8 +126,13 @@ type InstanceSpec struct {
 	// Image is the container image, from the Pod's first container. The Client is
 	// responsible for launching it (e.g. via a GPU AMI + user-data, or ECS/EKS).
 	Image string
-	// Command is the container command+args, from the Pod.
+	// Command is the Pod container's command, kept SEPARATE from Args to preserve
+	// Kubernetes container semantics: command overrides the image ENTRYPOINT (Docker
+	// --entrypoint), not its CMD. Empty means "use the image's own ENTRYPOINT".
 	Command []string
+	// Args is the Pod container's args, appended after the entrypoint just as CMD
+	// arguments. Empty means "use the image's own CMD".
+	Args []string
 	// Env is the environment, flattened from the Pod's container env.
 	Env map[string]string
 	// Spot requests interruptible capacity when true (OnDemand otherwise).
@@ -703,7 +708,8 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 	return InstanceSpec{
 		InstanceTypes: instanceTypes,
 		Image:         c.Image,
-		Command:       append(append([]string{}, c.Command...), c.Args...),
+		Command:       append([]string{}, c.Command...),
+		Args:          append([]string{}, c.Args...),
 		Env:           env,
 		Spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:        req.Region,

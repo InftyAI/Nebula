@@ -55,15 +55,32 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	// Pull first so an image error surfaces before we try to run.
 	fmt.Fprintf(&b, "docker pull %s\n", shellQuote(spec.Image))
 
-	// docker run --gpus all -d, with env and command appended. Env keys are sorted
-	// so the rendered script is deterministic (stable across reconciles and easy to
-	// assert in tests).
+	// docker run --rm --gpus all, with env, then the image, then the workload's
+	// command/args. Kubernetes container semantics are preserved by mapping the two
+	// Pod fields the way the kubelet does, NOT by concatenating them:
+	//   - Command (Pod command) overrides the image ENTRYPOINT => Docker --entrypoint,
+	//     which takes a single program; Command[0] is the entrypoint and Command[1:]
+	//     become leading arguments (Docker only lets --entrypoint carry the program).
+	//   - Args (Pod args) are appended after as CMD arguments.
+	// When Command is empty the image's own ENTRYPOINT runs; when Args is empty the
+	// image's own CMD runs — so an image with a baked-in entrypoint launches exactly
+	// as it would under a kubelet. Env keys are sorted so the rendered script is
+	// deterministic (stable across reconciles and easy to assert in tests).
 	b.WriteString("docker run --rm --gpus all")
 	for _, k := range sortedKeys(spec.Env) {
 		fmt.Fprintf(&b, " -e %s", shellQuote(k+"="+spec.Env[k]))
 	}
+	// runArgs are everything that follows the image: the entrypoint's own arguments
+	// (Command[1:]) then the CMD arguments (Args), in that order.
+	var runArgs []string
+	if len(spec.Command) > 0 {
+		fmt.Fprintf(&b, " --entrypoint %s", shellQuote(spec.Command[0]))
+		runArgs = append(runArgs, spec.Command[1:]...)
+	}
+	runArgs = append(runArgs, spec.Args...)
+
 	b.WriteString(" " + shellQuote(spec.Image))
-	for _, arg := range spec.Command {
+	for _, arg := range runArgs {
 		b.WriteString(" " + shellQuote(arg))
 	}
 	b.WriteString("\n")

@@ -195,8 +195,13 @@ func TestProvision_MapsAcceleratorToInstanceType(t *testing.T) {
 	if got := f.lastSpec.Tags[ClaimTagKey]; got != "claim-a" {
 		t.Fatalf("claim tag = %q, want claim-a", got)
 	}
-	if len(f.lastSpec.Command) != 2 || f.lastSpec.Command[0] != "run" {
-		t.Fatalf("command = %v", f.lastSpec.Command)
+	// Command and Args ride through SEPARATELY (no flattening), preserving the
+	// Pod's Kubernetes container semantics for the user-data renderer.
+	if len(f.lastSpec.Command) != 1 || f.lastSpec.Command[0] != "run" {
+		t.Fatalf("command = %v, want [run]", f.lastSpec.Command)
+	}
+	if len(f.lastSpec.Args) != 1 || f.lastSpec.Args[0] != "--flag" {
+		t.Fatalf("args = %v, want [--flag]", f.lastSpec.Args)
 	}
 }
 

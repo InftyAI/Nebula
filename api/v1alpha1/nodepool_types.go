@@ -134,9 +134,12 @@ const (
 // type, so a failed H100 request does not block A100 requests on the same
 // provider) for BlocklistTTL, then reconsiders it. This spec only tunes that.
 type FailoverPolicy struct {
-	// BlocklistTTL is how long a failed placement is excluded before the
-	// provider becomes a candidate for it again.
-	// +kubebuilder:default="3m"
+	// BlocklistTTL is the BASE duration a failed placement is excluded before the
+	// provider becomes a candidate for it again. The controller adds a random jitter
+	// (up to a minute) on top so Pods that failed for the same reason do not all
+	// retry the just-freed candidate in lockstep, so the effective exclusion is this
+	// value plus that jitter.
+	// +kubebuilder:default="30s"
 	BlocklistTTL metav1.Duration `json:"blocklistTTL,omitempty"`
 }
 

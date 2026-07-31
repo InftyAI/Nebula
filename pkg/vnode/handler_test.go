@@ -167,6 +167,7 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl)
+	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base TTL is asserted exactly
 
 	pod := testPod("default", "p1")
 	// A non-default TTL so this asserts the annotation is honored, not that it
@@ -217,6 +218,7 @@ func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl)
+	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is asserted exactly
 
 	// No BlocklistTTLAnnotation on the Pod => the handler's built-in default.
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
@@ -224,6 +226,36 @@ func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
 	}
 	if bl.ttl != defaultBlocklistTTL {
 		t.Fatalf("recorded ttl = %v, want default %v", bl.ttl, defaultBlocklistTTL)
+	}
+}
+
+// The recorded TTL is the base (annotation or default) PLUS the handler's jitter,
+// so Pods failing for one scope do not re-probe the freed candidate in lockstep.
+func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
+	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl)
+	h.jitterFn = func() time.Duration { return 20 * time.Second } // deterministic jitter
+
+	pod := testPod("default", "p1")
+	pod.Annotations = map[string]string{nebulav1alpha1.BlocklistTTLAnnotation: "30s"}
+	if err := h.CreatePod(context.Background(), pod); err == nil {
+		t.Fatal("expected CreatePod to return the provision error")
+	}
+	if want := 30*time.Second + 20*time.Second; bl.ttl != want {
+		t.Fatalf("recorded ttl = %v, want base+jitter %v", bl.ttl, want)
+	}
+}
+
+// The production jitter draw stays within [0, blocklistJitter) — never negative
+// (which would shorten the block below its base) and never at/over the bound.
+func TestProductionJitterInRange(t *testing.T) {
+	h := NewHandler(&fakeProvider{}, nil, nil)
+	for i := 0; i < 1000; i++ {
+		j := h.jitterFn()
+		if j < 0 || j >= blocklistJitter {
+			t.Fatalf("jitter %v out of [0, %v)", j, blocklistJitter)
+		}
 	}
 }
 

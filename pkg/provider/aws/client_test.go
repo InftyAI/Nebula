@@ -247,6 +247,7 @@ func TestBuildUserData(t *testing.T) {
 	spec := InstanceSpec{
 		Image:   "myrepo/train:v1",
 		Command: []string{"python", "train.py"},
+		Args:    []string{"--epochs", "3"},
 		Env:     map[string]string{"B": "2", "A": "1"},
 	}
 	encoded, err := buildUserData(spec)
@@ -269,8 +270,55 @@ func TestBuildUserData(t *testing.T) {
 	if idxA, idxB := strings.Index(script, "'A=1'"), strings.Index(script, "'B=2'"); idxA < 0 || idxB < 0 || idxA > idxB {
 		t.Fatalf("env not rendered in sorted order:\n%s", script)
 	}
-	if !strings.Contains(script, "'python' 'train.py'") {
-		t.Fatalf("script missing command:\n%s", script)
+	// Kubernetes semantics: Command[0] overrides the image ENTRYPOINT (--entrypoint),
+	// Command[1:] are its leading args, and Args follow as CMD arguments — the whole
+	// tail rendered after the image, in that order.
+	if !strings.Contains(script, "--entrypoint 'python'") {
+		t.Fatalf("command[0] not mapped to --entrypoint:\n%s", script)
+	}
+	if !strings.Contains(script, "'myrepo/train:v1' 'train.py' '--epochs' '3'") {
+		t.Fatalf("command tail/args not rendered after the image in order:\n%s", script)
+	}
+}
+
+// TestBuildUserData_ArgsWithoutCommand covers a Pod that sets args but not command:
+// the image's own ENTRYPOINT must run (no --entrypoint emitted) with args appended
+// as CMD, exactly as a kubelet would launch it.
+func TestBuildUserData_ArgsWithoutCommand(t *testing.T) {
+	spec := InstanceSpec{
+		Image: "srv:v2",
+		Args:  []string{"--port", "8080"},
+	}
+	encoded, err := buildUserData(spec)
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if strings.Contains(script, "--entrypoint") {
+		t.Fatalf("no command was set; --entrypoint must not be emitted:\n%s", script)
+	}
+	if !strings.Contains(script, "'srv:v2' '--port' '8080'") {
+		t.Fatalf("args not appended after the image as CMD:\n%s", script)
+	}
+}
+
+// TestBuildUserData_NoCommandOrArgs covers a bare image: the image's own
+// ENTRYPOINT/CMD run, so the run line is just the image with no trailing tokens.
+func TestBuildUserData_NoCommandOrArgs(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{Image: "bare:v1"})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if strings.Contains(script, "--entrypoint") {
+		t.Fatalf("no command was set; --entrypoint must not be emitted:\n%s", script)
+	}
+	if !strings.Contains(script, "--gpus all 'bare:v1'\n") {
+		t.Fatalf("bare image must run with no trailing command/args:\n%s", script)
 	}
 }
 
@@ -405,14 +453,16 @@ func TestFleetOverrides_UnknownOfferingsDoesNotPrune(t *testing.T) {
 	}
 }
 
-func TestFleetOverrides_EmptyOfferedSetKeepsAll(t *testing.T) {
+func TestFleetOverrides_KnownEmptyOfferedSetPrunesAll(t *testing.T) {
 	subnets := []subnet{{id: "sn-a", az: "us-east-1a"}, {id: "sn-e", az: "us-east-1e"}}
-	// Resolved-but-empty offered set (type offered in no listed AZ) would zero the
-	// launch; fail-open keeps all subnets so a stale map can never wedge provisioning.
+	// Resolved-but-empty offered set: the type is offered in NO configured AZ. Unlike
+	// an unknown (nil) set, this is trustworthy, so it prunes to nothing rather than
+	// failing open — RunInstance reads the empty grid as a region no-capacity and skips
+	// the doomed CreateFleet instead of letting EC2 bounce it.
 	offerings := map[string]map[string]bool{"g6.48xlarge": {}}
 	got := fleetOverrides([]string{"g6.48xlarge"}, subnets, offerings)
-	if len(got) != 2 {
-		t.Fatalf("an empty offered set must keep all subnets (fail-open); got %d", len(got))
+	if len(got) != 0 {
+		t.Fatalf("a known-empty offered set must prune every subnet; got %d", len(got))
 	}
 }
 
@@ -451,6 +501,38 @@ func TestSDKRunInstance_PrunesUnofferedAZAndCaches(t *testing.T) {
 	}
 	if f.offeringCalls != 1 {
 		t.Fatalf("offerings must be cached across provisions; got %d lookups", f.offeringCalls)
+	}
+}
+
+// When a requested type is offered in NO configured AZ of the region (a known-empty
+// offered set, e.g. p4d.24xlarge in us-west-1), RunInstance must short-circuit to a
+// region-scoped no-capacity WITHOUT creating a launch template or calling CreateFleet
+// — the fleet would only bounce with InvalidFleetConfiguration. The error must carry
+// ErrNoCapacity (so failover proceeds) but NOT errZoneLocal (no sibling AZ can help).
+func TestSDKRunInstance_NoOfferedAZShortCircuits(t *testing.T) {
+	f := &fakeEC2{
+		fleetOut:      fleetWith("i-1"), // would succeed IF a fleet were launched
+		offeringPages: []*ec2.DescribeInstanceTypeOfferingsOutput{offeringPage()},
+	}
+	c := newSDKClient(f)
+	c.subnets = []subnet{{id: "sn-a", az: "us-west-1a"}, {id: "sn-b", az: "us-west-1b"}}
+
+	_, err := c.RunInstance(context.Background(), InstanceSpec{
+		InstanceTypes: []string{"p4d.24xlarge"}, Image: "img", Spot: true,
+		Tags: map[string]string{ClaimTagKey: "c"},
+	})
+	if !errors.Is(err, provider.ErrNoCapacity) {
+		t.Fatalf("want ErrNoCapacity, got %v", err)
+	}
+	if errors.Is(err, errZoneLocal) {
+		t.Fatal("a region-wide unavailability must not be zone-local (no sibling AZ helps)")
+	}
+	// No doomed API calls: neither a launch template nor a fleet.
+	if f.fleetCalls != 0 {
+		t.Fatalf("CreateFleet must be skipped when no AZ offers the type; got %d calls", f.fleetCalls)
+	}
+	if len(f.createdLTs) != 0 {
+		t.Fatalf("no launch template must be created on the short-circuit; got %v", f.createdLTs)
 	}
 }
 
@@ -591,7 +673,10 @@ func TestSDKRunInstance_SpotSetsCapacityType(t *testing.T) {
 // One override per discovered subnet: EC2 does the per-AZ capacity search inside
 // the single fleet call rather than the adapter sweeping RunInstances per zone.
 func TestSDKRunInstance_OneOverridePerSubnet(t *testing.T) {
-	f := &fakeEC2{fleetOut: fleetWith("i-1")}
+	f := &fakeEC2{
+		fleetOut:      fleetWith("i-1"),
+		offeringPages: []*ec2.DescribeInstanceTypeOfferingsOutput{offeringPage("us-east-1a", "us-east-1b", "us-east-1c")},
+	}
 	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", subnets: []subnet{
 		{id: "subnet-a", az: "us-east-1a"},
 		{id: "subnet-b", az: "us-east-1b"},
@@ -624,7 +709,14 @@ func TestSDKRunInstance_OneOverridePerSubnet(t *testing.T) {
 // capacity. The launch template carries no instance type — it lives in the
 // overrides — so one template serves every candidate type.
 func TestSDKRunInstance_SpansInstanceTypesAndSubnets(t *testing.T) {
-	f := &fakeEC2{fleetOut: fleetWith("i-1")}
+	f := &fakeEC2{
+		fleetOut: fleetWith("i-1"),
+		// One offering page per type lookup (p5 then p4d), each offered in both AZs.
+		offeringPages: []*ec2.DescribeInstanceTypeOfferingsOutput{
+			offeringPage("us-east-1a", "us-east-1b"),
+			offeringPage("us-east-1a", "us-east-1b"),
+		},
+	}
 	c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", subnets: []subnet{
 		{id: "subnet-a", az: "us-east-1a"},
 		{id: "subnet-b", az: "us-east-1b"},
