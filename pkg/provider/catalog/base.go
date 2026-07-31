@@ -102,9 +102,10 @@ func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 // single launch but never the blocklist. Returns ok=false when the provider offers
 // no row for that (type, count).
 func (b Base) MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool) {
-	var ids []string
+	offerings := b.Catalog.Offerings(b.ProviderName)
+	ids := make([]string, 0, len(offerings))
 	seen := make(map[string]bool)
-	for _, o := range b.Catalog.Offerings(b.ProviderName) {
+	for _, o := range offerings {
 		if !strings.EqualFold(o.AcceleratorType, canonical) {
 			continue
 		}
