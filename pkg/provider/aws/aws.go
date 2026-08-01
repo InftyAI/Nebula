@@ -142,10 +142,10 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
-	// Sandd, when Enabled, makes the cloud-init also install and start the SandD
-	// sandbox daemon on the host (backgrounded, before the workload container) so
-	// commands and interactive shells can be run on the box over the tunnel. A zero
-	// value injects nothing. See buildUserData and provider.SanddConfig.
+	// Sandd, when Enabled, makes the workload's docker run start the SandD daemon
+	// INSIDE the container (via an entrypoint shim) so commands and interactive
+	// shells run in the user's own env/cwd/code over the tunnel. A zero value injects
+	// nothing. See buildUserData/writeSanddEntrypoint and provider.SanddConfig.
 	Sandd provider.SanddConfig
 }
 

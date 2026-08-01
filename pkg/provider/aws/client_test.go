@@ -362,16 +362,17 @@ func TestBuildUserData_SanddDisabled(t *testing.T) {
 	}
 }
 
-// TestBuildUserData_SanddEnabled: when opted in, the daemon must be started BEFORE
-// the workload `docker run`, be BACKGROUNDED (so cloud-init reaches the workload),
-// and be FAIL-OPEN (its block cannot trip the workload's `set -euo pipefail`). It
-// must carry the tunnel flags and the claim-derived daemon id. The daemon runs
-// alongside the workload (it is the box's command/shell channel), so its bootstrap
-// must not be able to abort the workload.
+// TestBuildUserData_SanddEnabled: when opted in, sandd runs INSIDE the container via
+// an entrypoint shim so its shells see the user's env/cwd/code. The shim must
+// override the image ENTRYPOINT with /bin/sh, carry daemon config as container env
+// (incl. the claim-derived DAEMON_ID), start the daemon fail-open + backgrounded,
+// and exec the user's effective command so the workload becomes PID 1.
 func TestBuildUserData_SanddEnabled(t *testing.T) {
 	spec := InstanceSpec{
-		Image: "img",
-		Tags:  map[string]string{ClaimTagKey: "claim-abc"},
+		Image:   "img",
+		Command: []string{"python", "train.py"},
+		Args:    []string{"--epochs", "3"},
+		Tags:    map[string]string{ClaimTagKey: "claim-abc"},
 		Sandd: provider.SanddConfig{
 			AuthKey:       "tskey-secret",
 			ControlServer: "http://headscale:8080",
@@ -385,48 +386,45 @@ func TestBuildUserData_SanddEnabled(t *testing.T) {
 	raw, _ := base64.StdEncoding.DecodeString(encoded)
 	script := string(raw)
 
-	// Ordering: the sandd bootstrap precedes the workload pull/run — a daemon started
-	// after the foreground `docker run` would only come up once the workload exited.
-	sanddIdx := strings.Index(script, "setsid sandd")
-	runIdx := strings.Index(script, "docker run")
-	if sanddIdx < 0 {
-		t.Fatalf("sandd enabled but daemon not started:\n%s", script)
-	}
-	if runIdx < 0 || sanddIdx > runIdx {
-		t.Fatalf("sandd must start before the workload docker run (sandd=%d run=%d):\n%s", sanddIdx, runIdx, script)
+	// The shim commandeers the container ENTRYPOINT as /bin/sh.
+	if !strings.Contains(script, "--entrypoint '/bin/sh'") {
+		t.Fatalf("sandd shim must override the image entrypoint with /bin/sh:\n%s", script)
 	}
 
-	// Fail-open: the block is a `( set +e ... ) || true` subshell so a failed install
-	// cannot abort the workload under the script's pipefail.
-	if !strings.Contains(script, "set +e") || !strings.Contains(script, ") || true\n") {
-		t.Fatalf("sandd block must be fail-open (set +e + || true):\n%s", script)
-	}
-
-	// Backgrounded: the daemon must be launched with a trailing `&` so cloud-init
-	// proceeds to the workload rather than blocking on the long-lived daemon.
-	if !strings.Contains(script, ">/var/log/sandd.log 2>&1 &\n") {
-		t.Fatalf("sandd daemon must be backgrounded:\n%s", script)
-	}
-
-	// Tunnel flags + claim-derived id are present.
+	// Daemon config is delivered as container env (so a process INSIDE the container
+	// sees it), including the claim-derived DAEMON_ID and the tunnel key/server.
 	for _, want := range []string{
-		"--tunnel",
-		"--server-url 'ws://100.64.0.1:8765/ws'",
-		"--tunnel-server 'http://headscale:8080'",
-		"--daemon-id 'claim-abc'",
+		"-e 'DAEMON_ID=claim-abc'",
+		"-e 'SERVER_URL=ws://100.64.0.1:8765/ws'",
+		"-e 'SANDD_TUNNEL_AUTHKEY=tskey-secret'",
+		"-e 'SANDD_TUNNEL_SERVER=http://headscale:8080'",
+		"-e 'SANDD_BINARY_URL=" + sanddBinaryURL + "'",
 	} {
 		if !strings.Contains(script, want) {
-			t.Fatalf("sandd bootstrap missing %q:\n%s", want, script)
+			t.Fatalf("sandd shim missing container env %q:\n%s", want, script)
 		}
 	}
 
-	// The auth key must NOT appear on the daemon command line (it would show in `ps`);
-	// it is stashed in a root-only file and read back via $(cat ...).
-	if strings.Contains(script, "--tunnel-authkey 'tskey-secret'") {
-		t.Fatalf("auth key must not be passed on the command line:\n%s", script)
+	// Fail-open + backgrounded: the daemon bring-up is a `( set +e ... ) || true`
+	// subshell ending in `&`, so a failed fetch/start cannot stop the workload.
+	if !strings.Contains(script, "set +e") || !strings.Contains(script, ") || true") {
+		t.Fatalf("sandd bring-up must be fail-open (set +e + || true):\n%s", script)
 	}
-	if !strings.Contains(script, "/etc/sandd.authkey") {
-		t.Fatalf("auth key must be stashed in a root-only file:\n%s", script)
+	if !strings.Contains(script, "&\n") {
+		t.Fatalf("sandd daemon must be backgrounded:\n%s", script)
+	}
+
+	// The shim execs the user's effective command so the workload is PID 1, and that
+	// command (image then argv) is rendered after the shim payload in kubelet order:
+	// Command[0]+Command[1:] then Args.
+	if !strings.Contains(script, `exec "$@"`) {
+		t.Fatalf("shim must exec the user command as PID 1:\n%s", script)
+	}
+	if !strings.Contains(script, "'img' '-c'") {
+		t.Fatalf("shim payload must follow the image on the run line:\n%s", script)
+	}
+	if !strings.Contains(script, "'sandd-shim' 'python' 'train.py' '--epochs' '3'\n") {
+		t.Fatalf("user effective command not rendered after the shim in order:\n%s", script)
 	}
 }
 

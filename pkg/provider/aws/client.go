@@ -208,10 +208,10 @@ var _ Client = (*sdkClient)(nil)
 //
 // sandd is the OPTIONAL SandD daemon config: its zero value (empty AuthKey) leaves
 // the bootstrap untouched, so passing provider.SanddConfig{} is a no-op. When set,
-// every instance this provider launches also starts the SandD sandbox daemon in
-// tunnel mode (see buildUserData), the box's command-execution/shell channel. Unlike
-// credentials, the auth key IS accepted here — it is delivered to the controller as
-// a secret and stamped into the (base64) user-data.
+// every workload this provider launches runs the SandD daemon inside its container
+// in tunnel mode (see buildUserData), the workload's command-execution/shell
+// channel. Unlike credentials, the auth key IS accepted here — it is delivered to
+// the controller as a secret and stamped into the (base64) user-data.
 func NewSDKClient(_ context.Context, regionSource RegionSource, sandd provider.SanddConfig) (*Provider, error) {
 	cat, err := catalog.Load()
 	if err != nil {

@@ -53,16 +53,6 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	b.WriteString("#!/bin/bash\n")
 	b.WriteString("set -euo pipefail\n")
 
-	// SandD daemon (opt-in): install and start it on the HOST, BEFORE the workload,
-	// so commands and interactive shells can be run on the box while the container
-	// runs. It goes first because the workload's `docker run` is a foreground process
-	// the script blocks on until it exits (that is by design — cloud-init "finishes"
-	// when the workload does); a daemon started after it would only come up once the
-	// workload was already gone. See writeSanddBootstrap for the fail-open guarantee.
-	if spec.Sandd.Enabled() {
-		writeSanddBootstrap(&b, spec.Sandd, spec.Tags[ClaimTagKey])
-	}
-
 	// Pull first so an image error surfaces before we try to run.
 	fmt.Fprintf(&b, "docker pull %s\n", shellQuote(spec.Image))
 
@@ -81,14 +71,27 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	for _, k := range sortedKeys(spec.Env) {
 		fmt.Fprintf(&b, " -e %s", shellQuote(k+"="+spec.Env[k]))
 	}
-	// runArgs are everything that follows the image: the entrypoint's own arguments
-	// (Command[1:]) then the CMD arguments (Args), in that order.
+
+	// SandD daemon (opt-in): run it INSIDE the container so its shells/commands see
+	// the user's own env, cwd, filesystem and code (a host-side daemon would only see
+	// the host). We cannot assume the user's image has sandd, so a shell entrypoint
+	// shim fetches the static musl binary at boot, starts it backgrounded, then execs
+	// the user's real program — see writeSanddEntrypoint. This overrides the image's
+	// ENTRYPOINT with the shim, so the shim (not Docker) is responsible for launching
+	// the workload with the right Command/Args; runArgs is left empty in that case.
 	var runArgs []string
-	if len(spec.Command) > 0 {
-		fmt.Fprintf(&b, " --entrypoint %s", shellQuote(spec.Command[0]))
-		runArgs = append(runArgs, spec.Command[1:]...)
+	if spec.Sandd.Enabled() {
+		runArgs = writeSanddEntrypoint(&b, spec)
+	} else {
+		// No shim: map Command/Args straight onto Docker's --entrypoint/CMD as before.
+		// runArgs are everything that follows the image: the entrypoint's own arguments
+		// (Command[1:]) then the CMD arguments (Args), in that order.
+		if len(spec.Command) > 0 {
+			fmt.Fprintf(&b, " --entrypoint %s", shellQuote(spec.Command[0]))
+			runArgs = append(runArgs, spec.Command[1:]...)
+		}
+		runArgs = append(runArgs, spec.Args...)
 	}
-	runArgs = append(runArgs, spec.Args...)
 
 	b.WriteString(" " + shellQuote(spec.Image))
 	for _, arg := range runArgs {
@@ -99,50 +102,75 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	return base64.StdEncoding.EncodeToString([]byte(b.String())), nil
 }
 
-// sanddInstallURL is the SandD daemon install script. The bootstrap pipes it to
-// bash with --tunnel so Tailscale is installed alongside the daemon (see the
-// SandD install.sh --tunnel path).
-const sanddInstallURL = "https://raw.githubusercontent.com/InftyAI/SandD/main/hack/scripts/install.sh"
+// sanddBinaryURL is the statically-linked (musl) SandD daemon release asset. Being
+// static, this one binary runs in any container image regardless of its libc, so the
+// shim can fetch it into an arbitrary user image at boot. It is pinned to the same
+// asset name install.sh resolves; amd64 matches the x86_64 GPU instance types.
+const sanddBinaryURL = "https://github.com/InftyAI/SandD/releases/latest/download/sandd-linux-amd64"
 
-// writeSanddBootstrap appends the SandD sandbox-daemon bootstrap to the user-data
-// script. daemonID is the NodeClaim name (from ClaimTagKey), so a daemon that dials
-// home is identifiable as this exact instance.
+// sanddShimScript is the container ENTRYPOINT shim (run as `/bin/sh -c <script>`).
+// It fetches the static sandd binary, starts it backgrounded in tunnel mode, then
+// execs the user's real program so the daemon shares the WORKLOAD's namespace — its
+// shells and commands see the user's env, cwd, filesystem and code.
 //
-// Two properties are load-bearing:
-//   - FAIL-OPEN: the workload runs under `set -euo pipefail`, and the daemon runs
-//     alongside it (it does not run the workload), so a failure to install or start
-//     the daemon must never abort the workload. The whole block runs inside a
-//     `( set +e ; ... ) || true` subshell so a failed install/curl/tailscale step
-//     cannot trip pipefail and kill the instance before `docker run`.
-//   - BACKGROUNDED & DETACHED: the daemon is a long-running process, so it is run
-//     with `setsid ... &` and its output redirected to a log file. If it blocked in
-//     the foreground, cloud-init would never reach `docker run` and the workload
-//     would never start.
+// Load-bearing properties:
+//   - FAIL-OPEN: the whole daemon bring-up is a `( set +e ; ... ) || true` subshell,
+//     so a failed fetch/start can never stop the workload from launching.
+//   - BACKGROUNDED: sandd is a long-lived process started with `&`; the shim then
+//     `exec "$@"` REPLACES the shell with the user's program, so the workload is PID 1
+//     (signals/exit codes behave as without the shim) and the shell adds no overhead.
 //
-// The auth key is written to a root-only file rather than passed on the command
-// line so it does not linger in the process table (`ps`) for any workload the
-// container can see.
-func writeSanddBootstrap(b *strings.Builder, cfg provider.SanddConfig, daemonID string) {
-	b.WriteString("# --- SandD daemon (opt-in; fail-open, never aborts the workload) ---\n")
-	b.WriteString("(\n")
-	b.WriteString("  set +e\n")
-	// Install the daemon + Tailscale. Piped to bash; the subshell's `set +e` means a
-	// non-zero exit here is swallowed rather than tripping the outer pipefail.
-	fmt.Fprintf(b, "  curl -fsSL %s | bash -s -- --tunnel\n", shellQuote(sanddInstallURL))
-	// Keep the auth key off the command line: stash it in a root-only file the daemon
-	// reads via env, so it is not visible in `ps`.
-	b.WriteString("  install -m 600 /dev/null /etc/sandd.authkey\n")
-	fmt.Fprintf(b, "  printf '%%s' %s > /etc/sandd.authkey\n", shellQuote(cfg.AuthKey))
-	// Launch detached & backgrounded so cloud-init proceeds to the workload. Output
-	// goes to a log for post-hoc debugging via the daemon itself.
-	b.WriteString("  setsid sandd \\\n")
-	fmt.Fprintf(b, "    --server-url %s \\\n", shellQuote(cfg.ServerURL))
-	fmt.Fprintf(b, "    --daemon-id %s \\\n", shellQuote(daemonID))
-	b.WriteString("    --tunnel \\\n")
-	b.WriteString("    --tunnel-authkey \"$(cat /etc/sandd.authkey)\" \\\n")
-	fmt.Fprintf(b, "    --tunnel-server %s \\\n", shellQuote(cfg.ControlServer))
-	b.WriteString("    >/var/log/sandd.log 2>&1 &\n")
-	b.WriteString(") || true\n")
+// Config arrives as container env (SERVER_URL/DAEMON_ID are read by sandd natively;
+// the tunnel key/server are referenced here as flags) so no secret is embedded in
+// this script literal. Requires /bin/sh and curl-or-wget in the image (documented in
+// writeSanddEntrypoint); distroless/scratch images have neither and are unsupported.
+const sanddShimScript = `( set +e
+  BIN=/tmp/.sandd
+  curl -fsSL "$SANDD_BINARY_URL" -o "$BIN" 2>/dev/null || wget -qO "$BIN" "$SANDD_BINARY_URL" 2>/dev/null
+  chmod +x "$BIN" 2>/dev/null
+  "$BIN" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
+) || true
+exec "$@"`
+
+// writeSanddEntrypoint appends the in-container SandD shim to a `docker run` line: it
+// emits the `-e` env carrying daemon config, overrides the image ENTRYPOINT with
+// `/bin/sh` running sanddShimScript, and returns the post-image argv (the shim's
+// `-c` payload plus the user's effective command) for buildUserData to render.
+//
+// Because the shim commandeers --entrypoint, the image's OWN ENTRYPOINT is bypassed:
+// the shim can only relaunch the workload from what Nebula can see, i.e. the Pod's
+// Command+Args. A Pod that sets neither (relying on the image's baked-in ENTRYPOINT)
+// cannot be faithfully reconstructed here — a known limitation of the in-container
+// model; such Pods should set an explicit command.
+//
+// The auth key is delivered as container env, so it is visible to the workload
+// itself (the tenant owns this container). That is inherent to running the daemon
+// INSIDE the container — the container must hold the credential to dial home — and is
+// acceptable only because the daemon is single-tenant (one per container).
+func writeSanddEntrypoint(b *strings.Builder, spec InstanceSpec) []string {
+	cfg := spec.Sandd
+	// Daemon config as env: SERVER_URL/DAEMON_ID are the names sandd reads natively;
+	// the rest the shim references. Rendered via the same shellQuote path as user env
+	// so hostile values cannot break out. (Not sorted with user env: these are fixed.)
+	for _, kv := range [][2]string{
+		{"SERVER_URL", cfg.ServerURL},
+		{"DAEMON_ID", spec.Tags[ClaimTagKey]},
+		{"SANDD_TUNNEL_AUTHKEY", cfg.AuthKey},
+		{"SANDD_TUNNEL_SERVER", cfg.ControlServer},
+		{"SANDD_BINARY_URL", sanddBinaryURL},
+	} {
+		fmt.Fprintf(b, " -e %s", shellQuote(kv[0]+"="+kv[1]))
+	}
+	fmt.Fprintf(b, " --entrypoint %s", shellQuote("/bin/sh"))
+
+	// `sh -c <script> <arg0> <argv...>`: arg0 ("sandd-shim") becomes $0, and the
+	// user's effective argv fills $@, which the shim `exec "$@"`s. Command[0] is the
+	// program and Command[1:]+Args its arguments — the same effective argv the kubelet
+	// would run, just launched by the shim instead of Docker's --entrypoint/CMD.
+	runArgs := []string{"-c", sanddShimScript, "sandd-shim"}
+	runArgs = append(runArgs, spec.Command...)
+	runArgs = append(runArgs, spec.Args...)
+	return runArgs
 }
 
 // sortedKeys returns m's keys in sorted order, for deterministic rendering.

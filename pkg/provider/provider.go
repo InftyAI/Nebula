@@ -308,10 +308,13 @@ type BlockScope struct {
 //
 // It lives here, in the provider-agnostic seam, because it is not AWS-specific: it
 // is a property of "let an agent run commands / shell into a Nebula-provisioned
-// box" that any adapter can honour. Each adapter injects it in whatever way fits its
-// launch model (AWS bakes it into cloud-init as a host daemon alongside the
-// workload container; a serverless-sandbox provider would prepend it to the sandbox
-// command). AWS is the first to wire it in.
+// workload" that any adapter can honour. Each adapter injects it in whatever way
+// fits its launch model, but the daemon runs INSIDE the workload container (not on
+// the host) so its shells see the user's own env, cwd, filesystem and code — one
+// daemon per container, so it is single-tenant by construction. AWS does this with
+// an entrypoint shim that fetches the static daemon and execs the user command; a
+// serverless-sandbox provider would prepend it to the sandbox command. AWS is the
+// first to wire it in.
 //
 // It is OPT-IN: a zero value (empty AuthKey) injects nothing, so the bootstrap is
 // unchanged for clusters that do not enable it. AuthKey is a Tailscale/headscale
