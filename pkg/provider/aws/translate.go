@@ -108,27 +108,43 @@ func buildUserData(spec InstanceSpec) (string, error) {
 // asset name install.sh resolves; amd64 matches the x86_64 GPU instance types.
 const sanddBinaryURL = "https://github.com/InftyAI/SandD/releases/latest/download/sandd-linux-amd64"
 
+// tailscaleTarballURL is the static (no-libc) Tailscale bundle. sandd --tunnel does
+// NOT install Tailscale — it requires `tailscale`/`tailscaled` already on PATH (see
+// setup_tunnel in sandd) — so the shim must fetch them too. The static build runs in
+// any image, and tailscaled's userspace-networking mode (below) needs no TUN device
+// or NET_ADMIN, so this works in an unprivileged container. Pinned: unlike sandd, a
+// tarball has no /latest/ redirect, and pinning the mesh client is prudent anyway.
+const tailscaleTarballURL = "https://pkgs.tailscale.com/stable/tailscale_1.78.1_amd64.tgz"
+
 // sanddShimScript is the container ENTRYPOINT shim (run as `/bin/sh -c <script>`).
-// It fetches the static sandd binary, starts it backgrounded in tunnel mode, then
-// execs the user's real program so the daemon shares the WORKLOAD's namespace — its
-// shells and commands see the user's env, cwd, filesystem and code.
+// It fetches the static Tailscale + sandd binaries, starts sandd backgrounded in
+// tunnel mode (which brings up tailscaled in userspace-networking mode and joins the
+// mesh), then execs the user's real program so the daemon shares the WORKLOAD's
+// namespace — its shells and commands see the user's env, cwd, filesystem and code.
 //
 // Load-bearing properties:
-//   - FAIL-OPEN: the whole daemon bring-up is a `( set +e ; ... ) || true` subshell,
-//     so a failed fetch/start can never stop the workload from launching.
+//   - FAIL-OPEN: the whole bring-up is a `( set +e ; ... ) || true` subshell, so any
+//     failed fetch/start can never stop the workload from launching.
 //   - BACKGROUNDED: sandd is a long-lived process started with `&`; the shim then
 //     `exec "$@"` REPLACES the shell with the user's program, so the workload is PID 1
 //     (signals/exit codes behave as without the shim) and the shell adds no overhead.
+//   - UNPRIVILEGED: tailscaled runs with --tun=userspace-networking, so no /dev/net/tun
+//     or NET_ADMIN is required — the container needs no extra capabilities.
 //
-// Config arrives as container env (SERVER_URL/DAEMON_ID are read by sandd natively;
-// the tunnel key/server are referenced here as flags) so no secret is embedded in
-// this script literal. Requires /bin/sh and curl-or-wget in the image (documented in
-// writeSanddEntrypoint); distroless/scratch images have neither and are unsupported.
+// The binaries are put on PATH (/tmp, added to $PATH) because sandd shells out to
+// `tailscale`/`tailscaled` by name. Config arrives as container env so no secret is
+// embedded in this script literal. Requires /bin/sh and curl-or-wget and outbound
+// network in the image (documented in writeSanddEntrypoint); distroless/scratch
+// images have neither shell nor fetcher and are unsupported.
 const sanddShimScript = `( set +e
-  BIN=/tmp/.sandd
-  curl -fsSL "$SANDD_BINARY_URL" -o "$BIN" 2>/dev/null || wget -qO "$BIN" "$SANDD_BINARY_URL" 2>/dev/null
-  chmod +x "$BIN" 2>/dev/null
-  "$BIN" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
+  D=/tmp/.sandd-bin
+  mkdir -p "$D" /var/lib/tailscale
+  fetch() { curl -fsSL "$1" -o "$2" 2>/dev/null || wget -qO "$2" "$1" 2>/dev/null; }
+  fetch "$SANDD_BINARY_URL" "$D/sandd" && chmod +x "$D/sandd"
+  fetch "$TAILSCALE_TARBALL_URL" "$D/ts.tgz" &&
+    tar -xzf "$D/ts.tgz" -C "$D" --strip-components=1 2>/dev/null
+  export PATH="$D:$PATH"
+  "$D/sandd" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
 ) || true
 exec "$@"`
 
@@ -158,6 +174,7 @@ func writeSanddEntrypoint(b *strings.Builder, spec InstanceSpec) []string {
 		{"SANDD_TUNNEL_AUTHKEY", cfg.AuthKey},
 		{"SANDD_TUNNEL_SERVER", cfg.ControlServer},
 		{"SANDD_BINARY_URL", sanddBinaryURL},
+		{"TAILSCALE_TARBALL_URL", tailscaleTarballURL},
 	} {
 		fmt.Fprintf(b, " -e %s", shellQuote(kv[0]+"="+kv[1]))
 	}

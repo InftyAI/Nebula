@@ -97,6 +97,18 @@ spec:
           # - secretRef:
           #     name: nebula-runpod-credentials
           #     optional: true
+          # SandD sandbox daemon (opt-in, cross-provider — see pkg/provider
+          # SanddConfig). If this Secret is present, its SANDD_TUNNEL_AUTHKEY /
+          # SANDD_TUNNEL_SERVER / SANDD_SERVER_URL are projected as env and every
+          # supporting adapter runs the daemon inside the workload container, so an
+          # operator can exec/shell into the user's own environment over the mesh
+          # (kubectl exec does NOT work against a virtual node). optional=true so an
+          # absent Secret simply leaves SandD off (empty AuthKey => zero value =>
+          # nothing injected). The authkey is a secret and is NEVER logged. See
+          # examples/sandd for a full working deployment (headscale + controller).
+          - secretRef:
+              name: nebula-sandd-config
+              optional: true
         ports: []
         securityContext:
           readOnlyRootFilesystem: true

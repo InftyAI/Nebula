@@ -1,0 +1,102 @@
+# SandD controller — a `Server()` in tunnel mode. This is the box YOU drive:
+# `server.exec(daemon_id, ...)` / `server.new_session(...)` run commands and open
+# PTYs on the GPU workloads. It joins the same headscale mesh, takes the first IP
+# (100.64.0.1), and listens for daemons on :8765 OVER the mesh — no port is
+# exposed to the cluster or the internet.
+#
+# SAMPLE, not part of the kustomize overlay: the controller is the USER-FACING
+# piece — you replace the inline script below with your own controller logic — so
+# it is applied by hand and adapted, not deployed as a fixed resource. It sets its
+# own namespace and full name (nothing rewrites them here). Apply after the
+# config/sandd overlay is up — see config/sandd/README.md.
+#
+# The image is SandD's tunnel-server build (Python `sandd` package + Tailscale
+# client preinstalled). Build/push it from the SandD repo:
+#   docker build -f hack/docker/Dockerfile.tunnel -t inftyai/sandd-server:latest-tunnel .
+#
+# Auth comes from the sandd-controller-auth Secret (SANDD_TUNNEL_AUTHKEY,
+# SANDD_TUNNEL_SERVER), which you create by hand — see README.md, step 3.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandd-controller
+  namespace: nebula-system
+  labels:
+    app: sandd-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandd-controller
+  template:
+    metadata:
+      labels:
+        app: sandd-controller
+    spec:
+      # Pin the pod's OS hostname so it is DETERMINISTIC. Tailscale derives a
+      # node's name (and thus its MagicDNS name) from the OS hostname, so this is
+      # what makes the controller reliably reachable at
+      # sandd-controller.<base_domain> on the mesh — independent of join order or
+      # which 100.64.x.x IP it happens to get. headscale's base_domain is
+      # nebula.mesh (see config/sandd/headscale.yaml), so the daemons dial
+      # ws://sandd-controller.nebula.mesh:8765/ws (SANDD_SERVER_URL below).
+      hostname: sandd-controller
+      containers:
+        - name: controller
+          image: inftyai/sandd-server:latest-tunnel
+          # Start the Server in tunnel mode and keep it alive. It joins the mesh
+          # (via SANDD_TUNNEL_AUTHKEY/SERVER), then loops listing daemons — you
+          # attach with `kubectl exec` and drive `server` from a Python REPL
+          # (see README, "Using it"), or replace this with your own controller
+          # script — this is the whole point of shipping it as an example.
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import os, time
+              from sandd import Server, TunnelConfig
+              cfg = TunnelConfig(
+                  authkey=os.environ["SANDD_TUNNEL_AUTHKEY"],
+                  server=os.environ["SANDD_TUNNEL_SERVER"],
+              )
+              print("controller: joining mesh + starting Server on :8765", flush=True)
+              server = Server(connect="tunnel", tunnel_config=cfg)
+              print("controller: ready, waiting for daemons", flush=True)
+              while True:
+                  try:
+                      ds = server.list_daemons()
+                      print(f"controller: {len(ds)} daemon(s):", [d.id for d in ds], flush=True)
+                  except Exception as e:
+                      print("controller: list_daemons error:", e, flush=True)
+                  time.sleep(15)
+          # The controller's auth key + headscale URL. Created by hand (README
+          # step 3); this deployment fails to start until it exists.
+          envFrom:
+            - secretRef:
+                name: sandd-controller-auth
+          ports:
+            # Informational only — the daemons reach this over the mesh, not via a
+            # Service. Not exposed cluster-wide.
+            - name: sandd-ws
+              containerPort: 8765
+          # tailscaled runs in --tun=userspace-networking mode, so a TUN device is
+          # not required. NET_ADMIN is granted to match SandD's reference tunnel
+          # setup and cover any environment where userspace networking still probes
+          # for it; this is trusted control-plane infra (unlike the user workload,
+          # which needs NO privileges). Drop this block if your cluster forbids it
+          # and userspace networking works without it.
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          volumeMounts:
+            - name: tailscale-state
+              mountPath: /var/lib/tailscale
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: tailscale-state
+          emptyDir: {}

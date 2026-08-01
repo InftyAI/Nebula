@@ -405,6 +405,16 @@ func TestBuildUserData_SanddEnabled(t *testing.T) {
 		}
 	}
 
+	// sandd --tunnel shells out to tailscale/tailscaled, which a stock user image does
+	// not have, so the shim must also fetch the static Tailscale bundle and put it on
+	// PATH before starting the daemon.
+	if !strings.Contains(script, tailscaleTarballURL) {
+		t.Fatalf("sandd shim must fetch the Tailscale bundle (%s):\n%s", tailscaleTarballURL, script)
+	}
+	if !strings.Contains(script, `export PATH=`) {
+		t.Fatalf("sandd shim must put the fetched binaries on PATH:\n%s", script)
+	}
+
 	// Fail-open + backgrounded: the daemon bring-up is a `( set +e ... ) || true`
 	// subshell ending in `&`, so a failed fetch/start cannot stop the workload.
 	if !strings.Contains(script, "set +e") || !strings.Contains(script, ") || true") {

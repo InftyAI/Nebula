@@ -1,0 +1,50 @@
+# Nebula SandD config — SAMPLE, not applied by kustomize.
+#
+# This is the Secret that FLIPS SANDD ON for the manager. It is consumed via an
+# optional `envFrom.secretRef` (name: nebula-sandd-config, see
+# config/manager/manager.yaml). When present, the manager reads these three values
+# at startup and every supporting provider adapter runs the SandD daemon INSIDE
+# each workload container it provisions — so an operator/agent can exec and open
+# shells in the user's own environment over the mesh (kubectl exec does NOT work
+# against a Nebula virtual node).
+#
+# It is OPT-IN: absent this Secret, SANDD_TUNNEL_AUTHKEY is empty, the SanddConfig
+# zero value injects nothing, and the bootstrap is unchanged. The manager reads
+# env only at startup, so `kubectl rollout restart deploy/nebula-controller-manager`
+# after creating/rotating this Secret.
+#
+# Deploying headscale (config/sandd overlay) + a controller
+# (config/samples/sandd-controller.yaml) is the OTHER half; this Secret is what
+# makes the manager actually inject the daemon. Prefer
+# `kubectl create secret` over committing real values (README step 4):
+#
+#   kubectl -n nebula-system create secret generic nebula-sandd-config \
+#     --from-literal=SANDD_TUNNEL_AUTHKEY=<reusable headscale pre-auth key> \
+#     --from-literal=SANDD_TUNNEL_SERVER=http://<headscale-lb-address>:8080 \
+#     --from-literal=SANDD_SERVER_URL=ws://100.64.0.1:8765/ws
+#
+# The key NAMES matter — main.go reads exactly these from the environment
+# (see registerProviders): SANDD_TUNNEL_AUTHKEY, SANDD_TUNNEL_SERVER,
+# SANDD_SERVER_URL. envFrom projects every key as an env var of the same name.
+#
+# This YAML is provided only for teams that manage Secrets declaratively (sealed
+# secrets, SOPS, GitOps). Replace the placeholders — do NOT commit a real authkey
+# in plaintext; it joins the mesh.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nebula-sandd-config
+  namespace: nebula-system
+type: Opaque
+stringData:
+  # Reusable headscale pre-auth key (a secret). Empty => SandD stays OFF.
+  SANDD_TUNNEL_AUTHKEY: "REPLACE_ME"
+  # headscale control-server URL — the SAME address the controller and the GPU
+  # boxes dial (the LoadBalancer address from headscale.yaml).
+  SANDD_TUNNEL_SERVER: "http://REPLACE_WITH_LOADBALANCER_ADDRESS:8080"
+  # The controller's SandD WebSocket URL, reachable OVER the mesh. Addressed by
+  # its MagicDNS name (headscale base_domain is nebula.mesh; the controller pins
+  # hostname: sandd-controller in config/samples/sandd-controller.yaml), so this
+  # resolves to whatever mesh IP the controller has — robust to join order and IP
+  # reassignment, unlike a hardcoded 100.64.0.1.
+  SANDD_SERVER_URL: "ws://sandd-controller.nebula.mesh:8765/ws"
