@@ -1,0 +1,38 @@
+# SandD controller auth — SAMPLE, not applied by kustomize.
+#
+# This Secret carries the controller's OWN mesh credentials. It is consumed by the
+# controller Deployment via `envFrom.secretRef` (name: sandd-controller-auth, see
+# config/samples/sandd-controller.yaml), which fails to start until it exists.
+#
+# It is SEPARATE from nebula-sandd-config (config/samples/sandd-config.yaml) on
+# purpose, even though AUTHKEY + TUNNEL_SERVER hold the same values: the two feed
+# DIFFERENT pods (this one → the controller; nebula-sandd-config → the manager),
+# and nebula-sandd-config doubles as the injection ON switch. Merging them would
+# make deploying a controller silently flip injection on. Keep them distinct.
+#
+# Note there is NO SANDD_SERVER_URL here: the controller IS the server (it listens
+# on :8765), so it does not dial itself. Only the manager's Secret carries that key
+# (it tells each workload's daemon where to dial).
+#
+# Prefer `kubectl create secret` over committing real values (README step 3):
+#
+#   kubectl -n nebula-system create secret generic sandd-controller-auth \
+#     --from-literal=SANDD_TUNNEL_AUTHKEY=<reusable headscale pre-auth key> \
+#     --from-literal=SANDD_TUNNEL_SERVER=http://<headscale-lb-address>:8080
+#
+# This YAML is provided only for teams that manage Secrets declaratively (sealed
+# secrets, SOPS, GitOps). Replace the placeholders — do NOT commit a real authkey
+# in plaintext; it joins the mesh.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sandd-controller-auth
+  namespace: nebula-system
+type: Opaque
+stringData:
+  # Reusable headscale pre-auth key (a secret). The SAME key the manager's Secret
+  # and every GPU daemon use to join the mesh.
+  SANDD_TUNNEL_AUTHKEY: "f641eeb28474064c22a5744aa63407e365da1d059026e39f"
+  # headscale control-server URL — the LoadBalancer address from headscale.yaml,
+  # identical to nebula-sandd-config's SANDD_TUNNEL_SERVER.
+  SANDD_TUNNEL_SERVER: "http://k8s-nebulasy-nebulahe-d7d09ad3c3-19bbf71952ff4e76.elb.eu-north-1.amazonaws.com:8080"

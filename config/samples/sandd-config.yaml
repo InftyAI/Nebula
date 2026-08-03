@@ -38,10 +38,10 @@ metadata:
 type: Opaque
 stringData:
   # Reusable headscale pre-auth key (a secret). Empty => SandD stays OFF.
-  SANDD_TUNNEL_AUTHKEY: "REPLACE_ME"
+  SANDD_TUNNEL_AUTHKEY: "f641eeb28474064c22a5744aa63407e365da1d059026e39f"
   # headscale control-server URL — the SAME address the controller and the GPU
   # boxes dial (the LoadBalancer address from headscale.yaml).
-  SANDD_TUNNEL_SERVER: "http://REPLACE_WITH_LOADBALANCER_ADDRESS:8080"
+  SANDD_TUNNEL_SERVER: "http://k8s-nebulasy-nebulahe-d7d09ad3c3-19bbf71952ff4e76.elb.eu-north-1.amazonaws.com:8080"
   # The controller's SandD WebSocket URL, reachable OVER the mesh. Addressed by
   # its MagicDNS name (headscale base_domain is nebula.mesh; the controller pins
   # hostname: sandd-controller in config/samples/sandd-controller.yaml), so this

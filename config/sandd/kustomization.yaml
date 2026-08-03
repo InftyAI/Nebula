@@ -10,6 +10,12 @@
 # This overlay deploys only the shared INFRASTRUCTURE that backs the channel:
 #   - headscale.yaml : the Tailscale control server (assigns mesh IPs)
 #
+# headscale's LoadBalancer Service is deliberately NOT here: it must be applied on
+# its own, FIRST, so its ELB hostname is known before headscale starts (that
+# address is headscale's server_url). Everything in this folder is applied together
+# by `make deploy`, so the Service lives in config/samples/headscale-service.yaml
+# and is hand-applied — see README.md step 1.
+#
 # The CONTROLLER (a SandD Server() you drive with your own exec/session logic) is
 # deliberately NOT here — it is the user-facing piece, so it ships as a hand-applied
 # sample (config/samples/sandd-controller.yaml) you adapt, not a fixed resource.

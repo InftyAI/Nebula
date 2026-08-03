@@ -12,10 +12,14 @@
 #
 # The image is SandD's tunnel-server build (Python `sandd` package + Tailscale
 # client preinstalled). Build/push it from the SandD repo:
-#   docker build -f hack/docker/Dockerfile.tunnel -t inftyai/sandd-server:latest-tunnel .
+#   docker build -f hack/docker/Dockerfile.server-tunnel -t inftyai/sandd-server-tunnel:latest.
 #
 # Auth comes from the sandd-controller-auth Secret (SANDD_TUNNEL_AUTHKEY,
-# SANDD_TUNNEL_SERVER), which you create by hand — see README.md, step 3.
+# SANDD_TUNNEL_SERVER), which you create by hand — see README.md, step 3. Mint the
+# controller's key as REUSABLE + EPHEMERAL: reusable so restarts can re-register,
+# ephemeral so headscale reaps the node once you delete the experiment (no orphan
+# offline nodes piling up). The PVC below keeps the node key stable WHILE the
+# experiment runs, so the ephemeral node isn't reaped mid-run under it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +29,14 @@ metadata:
     app: sandd-controller
 spec:
   replicas: 1
+  # Recreate (not the default RollingUpdate): the controller's identity lives on a
+  # single ReadWriteOnce PVC (tailscale-state below). RollingUpdate starts the new
+  # pod before killing the old one, so both would race for the same RWO volume ->
+  # the new pod hangs on a "Multi-Attach" error. Recreate tears the old pod down
+  # first, so the new one reclaims the same tailscale node key and keeps its
+  # MagicDNS name (sandd-controller.nebula.mesh) across restarts.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: sandd-controller
@@ -43,17 +55,68 @@ spec:
       hostname: sandd-controller
       containers:
         - name: controller
-          image: inftyai/sandd-server:latest-tunnel
+          image: inftyai/sandd-server-tunnel:latest
           # Start the Server in tunnel mode and keep it alive. It joins the mesh
-          # (via SANDD_TUNNEL_AUTHKEY/SERVER), then loops listing daemons — you
-          # attach with `kubectl exec` and drive `server` from a Python REPL
-          # (see README, "Using it"), or replace this with your own controller
-          # script — this is the whole point of shipping it as an example.
+          # (via SANDD_TUNNEL_AUTHKEY/SERVER), then loops listing daemons and runs
+          # a set of PROBES (nvidia-smi + a PyTorch CUDA matmul) on each workload
+          # the first time it connects, printing the output to the pod log
+          # (`kubectl logs`). You can also attach with `kubectl exec` and drive
+          # `server` from a Python REPL (see README, "Using it"), or replace this
+          # with your own controller script — this is the point of the example.
           command: ["python3", "-u", "-c"]
           args:
             - |
               import os, time
+              from collections import Counter
               from sandd import Server, TunnelConfig
+
+              # How many times we've run exec(), in total and per probe label.
+              # A single counter tracks both: exec_counts["<total>"] is the grand
+              # total, exec_counts[label] the count for each probe.
+              exec_counts = Counter()
+
+              # Commands run on each GPU workload when it first connects. Each is
+              # (label, shell command); the shell string is executed by the daemon
+              # inside the workload container. Edit / extend this list with your own
+              # probes.
+              PROBES = [
+                  # GPU inventory + driver/CUDA versions.
+                  ("nvidia-smi", "nvidia-smi"),
+                  # PyTorch: confirm CUDA is visible and exercise a real GPU op
+                  # (matmul on device) so we validate the runtime, not just imports.
+                  ("pytorch", "python3 -c '"
+                      "import torch; "
+                      "print(\"torch\", torch.__version__, \"cuda?\", torch.cuda.is_available()); "
+                      "print(\"device_count\", torch.cuda.device_count()); "
+                      "d = \"cuda\" if torch.cuda.is_available() else \"cpu\"; "
+                      "x = torch.rand(1024, 1024, device=d); "
+                      "y = (x @ x).sum().item(); "
+                      "print(\"matmul_ok_on\", d, \"sum\", y)"
+                      "'"),
+              ]
+
+              def run_probes(server, daemon_id):
+                  """Run each probe on one daemon and print its output."""
+                  for label, cmd in PROBES:
+                      # Count every attempt (before it can fail), so the total
+                      # reflects commands executed, not just successes.
+                      exec_counts[label] += 1
+                      exec_counts["<total>"] += 1
+                      n = exec_counts["<total>"]
+                      print(f"controller: [{daemon_id}] running {label} "
+                            f"(exec #{n}, {label} x{exec_counts[label]})", flush=True)
+                      try:
+                          r = server.exec(daemon_id, cmd, timeout=120)
+                      except Exception as e:
+                          print(f"controller: [{daemon_id}] {label} EXEC ERROR: {e}", flush=True)
+                          continue
+                      # exec returns a CommandResult (.stdout/.stderr/.exit_code).
+                      print(f"controller: [{daemon_id}] {label} exit={r.exit_code}", flush=True)
+                      if r.stdout.strip():
+                          print(f"----- {label} stdout -----\n{r.stdout.rstrip()}", flush=True)
+                      if r.stderr.strip():
+                          print(f"----- {label} stderr -----\n{r.stderr.rstrip()}", flush=True)
+
               cfg = TunnelConfig(
                   authkey=os.environ["SANDD_TUNNEL_AUTHKEY"],
                   server=os.environ["SANDD_TUNNEL_SERVER"],
@@ -61,13 +124,28 @@ spec:
               print("controller: joining mesh + starting Server on :8765", flush=True)
               server = Server(connect="tunnel", tunnel_config=cfg)
               print("controller: ready, waiting for daemons", flush=True)
+
+              # Probe each daemon ONCE, the first time we see it, then keep listing
+              # for liveness. `probed` guards against re-running on every poll.
+              probed = set()
               while True:
                   try:
                       ds = server.list_daemons()
-                      print(f"controller: {len(ds)} daemon(s):", [d.id for d in ds], flush=True)
+                      ids = [d.id for d in ds]
+                      print(f"controller: {len(ds)} daemon(s):", ids, flush=True)
+                      for did in ids:
+                          if did not in probed:
+                              probed.add(did)
+                              run_probes(server, did)
+                      # Drop ids that have disconnected so a reconnecting daemon is
+                      # re-probed rather than silently skipped.
+                      probed &= set(ids)
+                      # Running tally of commands executed so far, per probe.
+                      per_probe = {k: v for k, v in exec_counts.items() if k != "<total>"}
+                      print(f"controller: exec total={exec_counts['<total>']} {per_probe}", flush=True)
                   except Exception as e:
-                      print("controller: list_daemons error:", e, flush=True)
-                  time.sleep(15)
+                      print("controller: loop error:", e, flush=True)
+                  time.sleep(5)
           # The controller's auth key + headscale URL. Created by hand (README
           # step 3); this deployment fails to start until it exists.
           envFrom:
@@ -78,15 +156,16 @@ spec:
             # Service. Not exposed cluster-wide.
             - name: sandd-ws
               containerPort: 8765
-          # tailscaled runs in --tun=userspace-networking mode, so a TUN device is
-          # not required. NET_ADMIN is granted to match SandD's reference tunnel
-          # setup and cover any environment where userspace networking still probes
-          # for it; this is trusted control-plane infra (unlike the user workload,
-          # which needs NO privileges). Drop this block if your cluster forbids it
-          # and userspace networking works without it.
+          # NO added capabilities. tailscaled runs in --tun=userspace-networking
+          # mode (userspace TCP/IP stack, no kernel TUN/route), so NET_ADMIN is not
+          # needed: inbound mesh TCP is forwarded to the local :8765 listener
+          # without touching the host's routing or firewall. NET_ADMIN would let the
+          # container rewrite routes/firewall rules and sniff/inject traffic, so we
+          # keep it off even on this trusted control-plane side.
           securityContext:
+            allowPrivilegeEscalation: false
             capabilities:
-              add: ["NET_ADMIN"]
+              drop: ["ALL"]
           volumeMounts:
             - name: tailscale-state
               mountPath: /var/lib/tailscale
@@ -99,4 +178,36 @@ spec:
               memory: "512Mi"
       volumes:
         - name: tailscale-state
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: sandd-controller-tailscale
+---
+# Persists tailscaled's node key across controller restarts. With emptyDir the
+# controller re-registered as a BRAND-NEW headscale node every restart; the old
+# (now offline) node still held the clean MagicDNS name, so the new one got a
+# random -suffix and daemons dialing sandd-controller.nebula.mesh hit a dead node
+# ("Active daemons: 0"). A persistent /var/lib/tailscale means the same node key
+# is presented on restart -> headscale recognizes the same node and keeps the
+# name. Pair with the reusable+ephemeral controller auth key: ephemeral reaps the
+# node after you delete the experiment (no orphan pile-up); the PVC keeps identity
+# stable WHILE the experiment runs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sandd-controller-tailscale
+  namespace: nebula-system
+  labels:
+    app: sandd-controller
+spec:
+  # Reuse the cluster's existing EBS SC. gp3 is the default here, so this could be
+  # omitted, but pinning it keeps the sample from silently following whatever the
+  # default becomes later. Swap to gp3-retain if you want the EBS volume (and thus
+  # the controller's identity) to survive `delete pvc`; gp3 is Delete, which is the
+  # right call for disposable experiment controllers.
+  storageClassName: gp3
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # tailscale state is tiny (node key + a little metadata); 1Gi is the common
+      # minimum granularity for dynamically-provisioned block volumes.
+      storage: 1Gi

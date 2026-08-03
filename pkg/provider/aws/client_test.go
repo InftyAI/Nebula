@@ -392,31 +392,54 @@ func TestBuildUserData_SanddEnabled(t *testing.T) {
 	}
 
 	// Daemon config is delivered as container env (so a process INSIDE the container
-	// sees it), including the claim-derived DAEMON_ID and the tunnel key/server.
+	// sees it), including the claim-derived DAEMON_ID and the tunnel key/server. The
+	// binary URLs are NOT container env anymore — the host fetches them (see below).
 	for _, want := range []string{
 		"-e 'DAEMON_ID=claim-abc'",
 		"-e 'SERVER_URL=ws://100.64.0.1:8765/ws'",
 		"-e 'SANDD_TUNNEL_AUTHKEY=tskey-secret'",
 		"-e 'SANDD_TUNNEL_SERVER=http://headscale:8080'",
-		"-e 'SANDD_BINARY_URL=" + sanddBinaryURL + "'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("sandd shim missing container env %q:\n%s", want, script)
 		}
 	}
 
-	// sandd --tunnel shells out to tailscale/tailscaled, which a stock user image does
-	// not have, so the shim must also fetch the static Tailscale bundle and put it on
-	// PATH before starting the daemon.
-	if !strings.Contains(script, tailscaleTarballURL) {
-		t.Fatalf("sandd shim must fetch the Tailscale bundle (%s):\n%s", tailscaleTarballURL, script)
+	// The binaries are fetched on the HOST (which has curl+tar) before docker run, so
+	// the user image needs no fetcher/package manager. Both URLs must appear in the
+	// host-side fetch, targeting sanddHostDir.
+	for _, want := range []string{sanddBinaryURL, tailscaleTarballURL, "mkdir -p " + sanddHostDir} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("host fetch must download %q into %s:\n%s", want, sanddHostDir, script)
+		}
 	}
-	if !strings.Contains(script, `export PATH=`) {
-		t.Fatalf("sandd shim must put the fetched binaries on PATH:\n%s", script)
+	// The host fetch must precede docker run (binaries exist before the container mounts them).
+	if strings.Index(script, sanddBinaryURL) > strings.Index(script, "docker run") {
+		t.Fatalf("host fetch must run BEFORE docker run:\n%s", script)
+	}
+	// The binaries reach the container via a read-only bind mount, not an in-container fetch.
+	if !strings.Contains(script, "-v '"+sanddHostDir+":"+sanddHostDir+":ro'") {
+		t.Fatalf("sandd binaries must be bind-mounted read-only at %s:\n%s", sanddHostDir, script)
+	}
+	if !strings.Contains(script, `export PATH="`+sanddHostDir) {
+		t.Fatalf("shim must put the mounted binaries on PATH:\n%s", script)
+	}
+	// No in-container fetch/install: the image is not required to have curl/wget or a
+	// package manager. Guard against regressing to the old per-container-install model.
+	for _, absent := range []string{"apt-get", "apk add", "SANDD_BINARY_URL", "curl -fsSL \"$SANDD_BINARY_URL\""} {
+		if strings.Contains(script, absent) {
+			t.Fatalf("shim must NOT fetch/install inside the container (found %q):\n%s", absent, script)
+		}
 	}
 
-	// Fail-open + backgrounded: the daemon bring-up is a `( set +e ... ) || true`
-	// subshell ending in `&`, so a failed fetch/start cannot stop the workload.
+	// Bring-up must be observable (not silent): steps log with a [sandd] prefix to
+	// stderr so they reach the EC2 instance console for debugging.
+	if !strings.Contains(script, "[sandd]") {
+		t.Fatalf("sandd bring-up must log steps with a [sandd] prefix:\n%s", script)
+	}
+
+	// Fail-open + backgrounded: both the host fetch and the container bring-up are
+	// `( set +e ... ) || true` subshells; the daemon start ends in `&`.
 	if !strings.Contains(script, "set +e") || !strings.Contains(script, ") || true") {
 		t.Fatalf("sandd bring-up must be fail-open (set +e + || true):\n%s", script)
 	}

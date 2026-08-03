@@ -5,12 +5,16 @@
 #     HTTP listener. For production see https://headscale.net and back it with a
 #     PersistentVolume + a real database + TLS.
 #
-# It MUST be reachable by out-of-cluster GPU boxes (they join the same mesh), so
-# it is exposed with a Service type=LoadBalancer. The controller joins over the
-# same address, so one URL serves both sides.
+# It MUST be reachable by out-of-cluster GPU boxes (they join the same mesh). The
+# LoadBalancer Service that exposes it is hand-applied FIRST — it lives OUTSIDE this
+# overlay (config/samples/headscale-service.yaml) precisely because everything in
+# config/sandd/ is applied together by `make deploy`, whereas the Service must go up
+# on its own so its ELB hostname is known before this Deployment starts. See that
+# file and the README for why. This file (the ConfigMap + Deployment) is what the
+# ../sandd kustomize overlay deploys.
 #
 # Namespace + the nebula- name prefix are added by config/default's kustomize, so
-# they are omitted here (the ConfigMap/Service refs below stay unprefixed too).
+# they are omitted here (the ConfigMap ref below stays unprefixed too).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -19,17 +23,19 @@ data:
   config.yaml: |
     # server_url MUST equal the address clients actually dial (the LoadBalancer
     # DNS name/IP). headscale rejects a client whose --login-server disagrees with
-    # this. If your LB address is not known ahead of time, edit this to the
-    # resolved address and restart the Deployment. Port 8080 matches the Service.
-    server_url: http://REPLACE_WITH_LOADBALANCER_ADDRESS:8080
+    # this. Apply config/samples/headscale-service.yaml FIRST, read its ELB
+    # hostname, and set it here BEFORE `make deploy` — headscale starts correct, no
+    # restart.
+    # Port 8080 matches the Service.
+    server_url: http://k8s-nebulasy-nebulahe-d7d09ad3c3-19bbf71952ff4e76.elb.eu-north-1.amazonaws.com:8080
     listen_addr: 0.0.0.0:8080
     metrics_listen_addr: 0.0.0.0:9090
     grpc_listen_addr: 0.0.0.0:50443
     grpc_allow_insecure: true
 
-    # Mesh IP range (RFC 6598 CGNAT, as Tailscale/headscale recommend). The first
-    # client (the controller) gets 100.64.0.1, which is why SANDD_SERVER_URL is
-    # ws://100.64.0.1:8765/ws.
+    # Mesh IP range (RFC 6598 CGNAT, as Tailscale/headscale recommend). Nodes are
+    # addressed by MagicDNS name (base_domain below), not raw IP, so which node
+    # gets which 100.64.x.x address does not matter.
     prefixes:
       v4: 100.64.0.0/10
       v6: fd7a:115c:a1e0::/48
@@ -85,8 +91,10 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-            - name: grpc
-              containerPort: 50443
+            # grpc (:50443) is intentionally NOT published on the LoadBalancer
+            # (see config/samples/headscale-service.yaml): the admin API mints
+            # users/keys, so it stays reachable only in-pod via `kubectl exec`. The
+            # process still listens on it (grpc_listen_addr) for that local CLI use.
           volumeMounts:
             - name: config
               mountPath: /etc/headscale/config.yaml
@@ -106,27 +114,9 @@ spec:
             # Unprefixed: config/default's namePrefix rewrites this reference to
             # the generated nebula-headscale-config ConfigMap.
             name: headscale-config
-        # emptyDir => state is EPHEMERAL (example only). Replace with a
-        # PersistentVolumeClaim for anything you care about keeping.
+        # emptyDir => state is EPHEMERAL: on a reschedule (node scale-down, spot
+        # reclaim, rollout) the SQLite DB is WIPED, which invalidates every issued
+        # auth key and drops the whole mesh. Fine for kind/dev; on EKS replace with
+        # a PersistentVolumeClaim (EBS gp3, RWO — fine at replicas: 1). See README.
         - name: data
           emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: headscale
-  labels:
-    app: headscale
-spec:
-  # LoadBalancer so out-of-cluster GPU boxes can reach the control server. Swap
-  # for NodePort + DNS, or front with an Ingress, if you have no LB provider.
-  type: LoadBalancer
-  selector:
-    app: headscale
-  ports:
-    - name: http
-      port: 8080
-      targetPort: 8080
-    - name: grpc
-      port: 50443
-      targetPort: 50443

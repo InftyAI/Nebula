@@ -1,0 +1,47 @@
+# headscale Service — SEPARATED from the Deployment on purpose, and applied FIRST.
+#
+# Why standalone + first: the LoadBalancer address is a chicken-and-egg for
+# headscale's server_url (which MUST equal the address clients dial, or headscale
+# rejects them). AWS provisions the ELB and assigns its hostname the moment this
+# Service exists — independently of whether any headscale pod is running yet. So
+# the workflow is:
+#   1. kubectl apply -f config/samples/headscale-service.yaml   # this file
+#   2. read the ELB hostname from `kubectl get svc nebula-headscale`
+#   3. put it into server_url in config/sandd/headscale.yaml
+#   4. make deploy   # headscale comes up already-correct — NO restart needed
+#
+# It lives here in config/samples/ (hand-applied), NOT in the config/sandd overlay
+# alongside headscale.yaml: everything in that folder is applied together by
+# `make deploy`, whereas this must go up on its own, first. Keeping it in the
+# overlay too would also create a SECOND, differently-named Service (the overlay
+# adds the nebula- prefix) and thus a second ELB. Because it is not
+# kustomize-processed, it sets its own
+# namespace and the nebula- name explicitly, matching the prefixed Deployment/
+# ConfigMap the overlay generates. Its selector matches the pod labels, so it
+# finds the Deployment's pods regardless.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nebula-headscale
+  namespace: nebula-system
+  labels:
+    app: headscale
+  # On EKS, uncomment to get an internet-facing NLB (L4 — headscale is raw
+  # HTTP/gRPC, so NOT an ALB). Without these you get a legacy Classic LB.
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  # LoadBalancer so out-of-cluster GPU boxes (any provider) can reach the control
+  # server. Swap for NodePort + DNS, or front with an Ingress, if you have no LB.
+  type: LoadBalancer
+  selector:
+    app: headscale
+  ports:
+    # Only :8080 (the control endpoint) is exposed. The gRPC admin API (:50443)
+    # is deliberately NOT here — it mints users/auth keys, so it must never be
+    # public; run the headscale CLI via `kubectl exec` into the pod instead.
+    - name: http
+      port: 8080
+      targetPort: 8080

@@ -56,6 +56,14 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	// Pull first so an image error surfaces before we try to run.
 	fmt.Fprintf(&b, "docker pull %s\n", shellQuote(spec.Image))
 
+	// SandD (opt-in): fetch the daemon + Tailscale binaries on the HOST now, before
+	// the container starts. They are bind-mounted read-only into the container by
+	// writeSanddEntrypoint, so the user's image needs no fetcher. Fail-open: a failed
+	// download just leaves the mount empty and the shim skips the daemon.
+	if spec.Sandd.Enabled() {
+		fmt.Fprintf(&b, sanddHostFetchScript, sanddHostDir, sanddBinaryURL, tailscaleTarballURL)
+	}
+
 	// docker run --rm --gpus all, with env, then the image, then the workload's
 	// command/args. Kubernetes container semantics are preserved by mapping the two
 	// Pod fields the way the kubelet does, NOT by concatenating them:
@@ -116,35 +124,67 @@ const sanddBinaryURL = "https://github.com/InftyAI/SandD/releases/latest/downloa
 // tarball has no /latest/ redirect, and pinning the mesh client is prudent anyway.
 const tailscaleTarballURL = "https://pkgs.tailscale.com/stable/tailscale_1.78.1_amd64.tgz"
 
-// sanddShimScript is the container ENTRYPOINT shim (run as `/bin/sh -c <script>`).
-// It fetches the static Tailscale + sandd binaries, starts sandd backgrounded in
-// tunnel mode (which brings up tailscaled in userspace-networking mode and joins the
-// mesh), then execs the user's real program so the daemon shares the WORKLOAD's
-// namespace — its shells and commands see the user's env, cwd, filesystem and code.
+// sanddHostDir is where the host fetches the sandd + tailscale binaries and where
+// they are bind-mounted (read-only) into the workload container. Fetching on the
+// HOST — the AL2 GPU AMI, which has curl+tar — instead of inside the container means
+// the user's image needs no fetcher or package manager (works on distroless too),
+// and the download happens once per instance rather than per container start.
+const sanddHostDir = "/opt/sandd"
+
+// sanddHostFetchScript downloads the static sandd + Tailscale binaries into
+// sanddHostDir on the HOST, as a fragment of the user-data run BEFORE `docker run`.
+// It is a fmt format string: %[1]s=dir, %[2]s=sandd URL, %[3]s=tailscale URL (all
+// trusted package constants, so no shell-injection concern).
+//
+// FAIL-OPEN: wrapped in `( set +e ... ) || true` so a failed download never aborts
+// the (set -euo pipefail) user-data — the container-side shim then simply finds no
+// binary and skips the daemon, leaving the workload untouched. Every step logs to
+// stderr with a `[sandd]` prefix, which reaches the instance CONSOLE
+// (get-console-output) — the place to debug bring-up on a Nebula virtual node, since
+// kubectl logs/exec do not work against it.
+const sanddHostFetchScript = `( set +e
+  log() { echo "[sandd] $*" >&2; }
+  mkdir -p %[1]s
+  if curl -fsSL %[2]s -o %[1]s/sandd; then chmod +x %[1]s/sandd; log "fetched sandd binary"
+  else log "FAILED to fetch sandd binary from %[2]s — SandD disabled"; fi
+  if curl -fsSL %[3]s -o %[1]s/ts.tgz && tar -xzf %[1]s/ts.tgz -C %[1]s --strip-components=1; then log "fetched tailscale bundle"
+  else log "FAILED to fetch/extract tailscale bundle from %[3]s — SandD disabled"; fi
+) || true
+`
+
+// sanddShimScript is the container ENTRYPOINT shim (run as `/bin/sh -c <script>`). It
+// puts the HOST-fetched, bind-mounted binaries (sanddHostDir, mounted :ro) on PATH,
+// starts sandd backgrounded in tunnel mode (which brings up tailscaled in
+// userspace-networking mode and joins the mesh), then execs the user's real program
+// so the daemon shares the WORKLOAD's namespace — its shells and commands see the
+// user's env, cwd, filesystem and code. It is a fmt format string: %[1]s=sanddHostDir.
 //
 // Load-bearing properties:
-//   - FAIL-OPEN: the whole bring-up is a `( set +e ; ... ) || true` subshell, so any
-//     failed fetch/start can never stop the workload from launching.
+//   - NO FETCH/INSTALL in the container: binaries come from the read-only bind mount,
+//     so the user's image needs only /bin/sh (works on distroless/minimal images too).
+//   - FAIL-OPEN: the whole bring-up is a `( set +e ; ... ) || true` subshell, so a
+//     missing binary or failed start can never stop the workload from launching.
 //   - BACKGROUNDED: sandd is a long-lived process started with `&`; the shim then
 //     `exec "$@"` REPLACES the shell with the user's program, so the workload is PID 1
 //     (signals/exit codes behave as without the shim) and the shell adds no overhead.
 //   - UNPRIVILEGED: tailscaled runs with --tun=userspace-networking, so no /dev/net/tun
 //     or NET_ADMIN is required — the container needs no extra capabilities.
 //
-// The binaries are put on PATH (/tmp, added to $PATH) because sandd shells out to
-// `tailscale`/`tailscaled` by name. Config arrives as container env so no secret is
-// embedded in this script literal. Requires /bin/sh and curl-or-wget and outbound
-// network in the image (documented in writeSanddEntrypoint); distroless/scratch
-// images have neither shell nor fetcher and are unsupported.
+// Config arrives as container env so no secret is embedded in this script literal.
+// Logs to stderr with a `[sandd]` prefix (reaches the console, as above); the daemon's
+// OWN output goes to /tmp/sandd.log inside the container (reachable via SandD once the
+// mesh is up). /var/lib/tailscale is created in-container (per-container state — never
+// shared, unlike the read-only binaries).
 const sanddShimScript = `( set +e
-  D=/tmp/.sandd-bin
-  mkdir -p "$D" /var/lib/tailscale
-  fetch() { curl -fsSL "$1" -o "$2" 2>/dev/null || wget -qO "$2" "$1" 2>/dev/null; }
-  fetch "$SANDD_BINARY_URL" "$D/sandd" && chmod +x "$D/sandd"
-  fetch "$TAILSCALE_TARBALL_URL" "$D/ts.tgz" &&
-    tar -xzf "$D/ts.tgz" -C "$D" --strip-components=1 2>/dev/null
-  export PATH="$D:$PATH"
-  "$D/sandd" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
+  log() { echo "[sandd] $*" >&2; }
+  mkdir -p /var/lib/tailscale
+  export PATH="%[1]s:$PATH"
+  if [ -x "%[1]s/sandd" ] && command -v tailscaled >/dev/null 2>&1; then
+    log "starting sandd --tunnel (daemon log: /tmp/sandd.log)"
+    "%[1]s/sandd" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
+  else
+    log "sandd binary not mounted at %[1]s (host fetch failed?); not starting daemon (workload continues normally)"
+  fi
 ) || true
 exec "$@"`
 
@@ -173,18 +213,20 @@ func writeSanddEntrypoint(b *strings.Builder, spec InstanceSpec) []string {
 		{"DAEMON_ID", spec.Tags[ClaimTagKey]},
 		{"SANDD_TUNNEL_AUTHKEY", cfg.AuthKey},
 		{"SANDD_TUNNEL_SERVER", cfg.ControlServer},
-		{"SANDD_BINARY_URL", sanddBinaryURL},
-		{"TAILSCALE_TARBALL_URL", tailscaleTarballURL},
 	} {
 		fmt.Fprintf(b, " -e %s", shellQuote(kv[0]+"="+kv[1]))
 	}
+	// Bind-mount the HOST-fetched binaries read-only (see buildUserData / sanddHostDir).
+	// :ro is safe to share across containers — the files are immutable executables; the
+	// daemon's writable state lives in the container's own /var/lib/tailscale and /tmp.
+	fmt.Fprintf(b, " -v %s", shellQuote(sanddHostDir+":"+sanddHostDir+":ro"))
 	fmt.Fprintf(b, " --entrypoint %s", shellQuote("/bin/sh"))
 
 	// `sh -c <script> <arg0> <argv...>`: arg0 ("sandd-shim") becomes $0, and the
 	// user's effective argv fills $@, which the shim `exec "$@"`s. Command[0] is the
 	// program and Command[1:]+Args its arguments — the same effective argv the kubelet
 	// would run, just launched by the shim instead of Docker's --entrypoint/CMD.
-	runArgs := []string{"-c", sanddShimScript, "sandd-shim"}
+	runArgs := []string{"-c", fmt.Sprintf(sanddShimScript, sanddHostDir), "sandd-shim"}
 	runArgs = append(runArgs, spec.Command...)
 	runArgs = append(runArgs, spec.Args...)
 	return runArgs
