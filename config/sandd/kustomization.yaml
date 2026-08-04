@@ -20,9 +20,11 @@
 # deliberately NOT here — it is the user-facing piece, so it ships as a hand-applied
 # sample (config/samples/sandd-controller.yaml) you adapt, not a fixed resource.
 #
-# This overlay also does NOT flip the manager on by itself: the manager injects the
-# daemon only when the nebula-sandd-config Secret is present (envFrom in
-# ../manager/manager.yaml, optional=true). So enabling SandD is: deploy this overlay,
-# apply a controller, then create nebula-sandd-config (see README.md).
+# This overlay flips the manager ON: it ships nebula-sandd-config (manager-config.yaml),
+# which the manager's optional envFrom reads to enable injection. So deploying this
+# overlay + a controller is all it takes — but SANDD_TUNNEL_SERVER in that ConfigMap
+# is a per-cluster placeholder (the headscale LB hostname), so injection only works
+# once you fill it in (see README.md). Comment the resource out to keep SandD off.
 resources:
   - headscale.yaml
+  - manager-config.yaml

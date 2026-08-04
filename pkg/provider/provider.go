@@ -316,25 +316,45 @@ type BlockScope struct {
 // serverless-sandbox provider would prepend it to the sandbox command. AWS is the
 // first to wire it in.
 //
-// It is OPT-IN: a zero value (empty AuthKey) injects nothing, so the bootstrap is
-// unchanged for clusters that do not enable it. AuthKey is a Tailscale/headscale
-// auth key — a secret — delivered to the controller as one and never logged. The
-// daemon runs ALONGSIDE the workload (it does not run it), so an adapter that
-// honours it MUST launch the daemon such that its own failure can never abort the
-// workload itself.
+// It is OPT-IN: a zero value (nil KeyMinter) injects nothing, so the bootstrap is
+// unchanged for clusters that do not enable it. The daemon runs ALONGSIDE the
+// workload (it does not run it), so an adapter that honours it MUST launch the
+// daemon such that its own failure can never abort the workload itself.
 type SanddConfig struct {
 	// AuthKey is the Tailscale/headscale pre-auth key the daemon joins the mesh
-	// with (sandd --tunnel-authkey). Empty disables SandD injection entirely.
+	// with (sandd --tunnel-authkey). It is NOT operator-configured: the adapter
+	// fills it in per instance from the key minted by KeyMinter (see
+	// resolveSanddConfig), so the minted key — not the seam — is what the launch
+	// bootstrap bakes in. It is a secret and is never logged.
 	AuthKey string
 	// ControlServer is the headscale control-plane URL (sandd --tunnel-server),
-	// e.g. "http://headscale.internal:8080". Required when AuthKey is set.
+	// e.g. "http://headscale.internal:8080". Required when SandD is enabled.
 	ControlServer string
 	// ServerURL is the controller's SandD WebSocket URL reachable OVER the mesh
-	// (sandd --server-url), e.g. "ws://100.64.0.1:8765/ws". Required when AuthKey
-	// is set.
+	// (sandd --server-url), e.g. "ws://100.64.0.1:8765/ws". Required when SandD is
+	// enabled.
 	ServerURL string
+	// KeyMinter is what enables SandD: when non-nil it mints a FRESH per-instance
+	// mesh key at provision time (see DaemonKeyMinter), so each workload gets its own
+	// single-use, ephemeral credential (tenant isolation + auto-reaped nodes). It is
+	// a seam so the manager can inject an HTTP client to the key broker while this
+	// package stays transport-agnostic and unit-testable. Nil => SandD off.
+	KeyMinter DaemonKeyMinter
 }
 
-// Enabled reports whether the SandD daemon should be injected. A missing AuthKey
-// means the operator did not opt in, so an adapter emits its plain bootstrap.
-func (s SanddConfig) Enabled() bool { return s.AuthKey != "" }
+// DaemonKeyMinter mints a single-use, ephemeral headscale pre-auth key for one
+// workload daemon. The manager backs it with an HTTP call to the in-cluster key
+// broker (which alone holds headscale admin authority); tests inject a fake. It is
+// called on the Provision path, so it MUST honour ctx (the Provision deadline) and
+// return promptly. The returned key is a secret and must never be logged.
+type DaemonKeyMinter interface {
+	MintDaemonKey(ctx context.Context) (string, error)
+}
+
+// Enabled reports whether the SandD daemon should be injected. It is true in both
+// states of the config: BEFORE minting a KeyMinter is wired (the operator opted in
+// via the key broker); AFTER minting resolveSanddConfig has cleared the minter and
+// set AuthKey to the freshly minted key, which rides onto the launch spec. Checking
+// both is what keeps the resolved spec "enabled" so the adapter still injects. With
+// neither, the operator did not opt in and the adapter emits its plain bootstrap.
+func (s SanddConfig) Enabled() bool { return s.AuthKey != "" || s.KeyMinter != nil }

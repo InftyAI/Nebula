@@ -51,6 +51,7 @@ import (
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
+	"github.com/InftyAI/Nebula/pkg/sandd"
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
 )
@@ -351,16 +352,20 @@ func registerProviders(ctx context.Context, c client.Client) {
 	// delivered via a Secret), and one account-global credential authorizes every
 	// region. Registration only fails (and is a non-fatal skip) if the price catalog
 	// cannot load — region config can no longer make it fail.
-	// SandD daemon (opt-in): if SANDD_TUNNEL_AUTHKEY is set, every AWS workload runs
-	// the SandD daemon inside its container in tunnel mode, so commands and
-	// interactive shells can be run in the user's own environment over the mesh with
-	// no inbound access. Absent the authkey the zero SanddConfig injects nothing, so
-	// this is off by default. The authkey is a secret (delivered via a mounted
-	// Secret) and is NEVER logged.
+	// SandD daemon (opt-in): SandD turns on when SANDD_KEYBROKER_URL points at the
+	// in-cluster key broker. When set, every AWS workload runs the SandD daemon inside
+	// its container in tunnel mode — commands and interactive shells run in the user's
+	// own environment over the mesh with no inbound access — and the adapter mints a
+	// FRESH single-use, ephemeral key per workload (tenant isolation + auto-reaped
+	// nodes). Unset => nil minter => the zero SanddConfig injects nothing, so this is
+	// off by default. Minted keys are secrets and are NEVER logged.
 	sanddCfg := provider.SanddConfig{
-		AuthKey:       os.Getenv("SANDD_TUNNEL_AUTHKEY"),
 		ControlServer: os.Getenv("SANDD_TUNNEL_SERVER"),
 		ServerURL:     os.Getenv("SANDD_SERVER_URL"),
+	}
+	if minter := sandd.NewBrokerClient(os.Getenv("SANDD_KEYBROKER_URL")); minter != nil {
+		sanddCfg.KeyMinter = minter
+		setupLog.Info("SandD per-daemon key minting enabled via key broker")
 	}
 	if p, err := awsprovider.NewSDKClient(ctx, awsRegionSource(c), sanddCfg); err != nil {
 		setupLog.Info("skipping AWS provider registration", "reason", err.Error())

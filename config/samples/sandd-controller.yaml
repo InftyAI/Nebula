@@ -14,12 +14,13 @@
 # client preinstalled). Build/push it from the SandD repo:
 #   docker build -f hack/docker/Dockerfile.server-tunnel -t inftyai/sandd-server-tunnel:latest.
 #
-# Auth comes from the sandd-controller-auth Secret (SANDD_TUNNEL_AUTHKEY,
-# SANDD_TUNNEL_SERVER), which you create by hand — see README.md, step 3. Mint the
-# controller's key as REUSABLE + EPHEMERAL: reusable so restarts can re-register,
-# ephemeral so headscale reaps the node once you delete the experiment (no orphan
-# offline nodes piling up). The PVC below keeps the node key stable WHILE the
-# experiment runs, so the ephemeral node isn't reaped mid-run under it.
+# The controller mints its own mesh key at startup from the in-cluster key broker
+# (SANDD_KEYBROKER_URL below), as REUSABLE + EPHEMERAL: reusable so restarts can
+# re-register, ephemeral so headscale reaps the node once you delete the experiment
+# (no orphan offline nodes piling up). The PVC below keeps the node key stable WHILE
+# the experiment runs, so the ephemeral node isn't reaped mid-run under it. The
+# headscale URL it joins (SANDD_TUNNEL_SERVER) is set inline in env below — see
+# README.md, step 2.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -56,101 +57,60 @@ spec:
       containers:
         - name: controller
           image: inftyai/sandd-server-tunnel:latest
-          # Start the Server in tunnel mode and keep it alive. It joins the mesh
-          # (via SANDD_TUNNEL_AUTHKEY/SERVER), then loops listing daemons and runs
-          # a set of PROBES (nvidia-smi + a PyTorch CUDA matmul) on each workload
+          # Start the Server in tunnel mode and keep it alive. It joins the mesh, then
+          # loops listing daemons and runs ONE command (nvidia-smi -L) on each workload
           # the first time it connects, printing the output to the pod log
-          # (`kubectl logs`). You can also attach with `kubectl exec` and drive
-          # `server` from a Python REPL (see README, "Using it"), or replace this
-          # with your own controller script — this is the point of the example.
+          # (`kubectl logs`) — just enough to show exec over the mesh works. Attach with
+          # `kubectl exec` to drive `server` yourself (see README, "Using it"), or
+          # replace this with your own controller logic — this is the point of the example.
           command: ["python3", "-u", "-c"]
           args:
             - |
-              import os, time
-              from collections import Counter
+              import os, time, json, urllib.request
               from sandd import Server, TunnelConfig
 
-              # How many times we've run exec(), in total and per probe label.
-              # A single counter tracks both: exec_counts["<total>"] is the grand
-              # total, exec_counts[label] the count for each probe.
-              exec_counts = Counter()
+              # Mint a reusable+ephemeral key for this controller from the in-cluster
+              # broker (crash-loops if unreachable — the broker is required, not optional).
+              # NEVER print the key itself, only that we got one.
+              broker = os.environ["SANDD_KEYBROKER_URL"].rstrip("/")
+              req = urllib.request.Request(f"{broker}/keys?kind=controller", method="POST")
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  authkey = json.load(resp)["key"]
+              print("controller: minted key, joining mesh", flush=True)
 
-              # Commands run on each GPU workload when it first connects. Each is
-              # (label, shell command); the shell string is executed by the daemon
-              # inside the workload container. Edit / extend this list with your own
-              # probes.
-              PROBES = [
-                  # GPU inventory + driver/CUDA versions.
-                  ("nvidia-smi", "nvidia-smi"),
-                  # PyTorch: confirm CUDA is visible and exercise a real GPU op
-                  # (matmul on device) so we validate the runtime, not just imports.
-                  ("pytorch", "python3 -c '"
-                      "import torch; "
-                      "print(\"torch\", torch.__version__, \"cuda?\", torch.cuda.is_available()); "
-                      "print(\"device_count\", torch.cuda.device_count()); "
-                      "d = \"cuda\" if torch.cuda.is_available() else \"cpu\"; "
-                      "x = torch.rand(1024, 1024, device=d); "
-                      "y = (x @ x).sum().item(); "
-                      "print(\"matmul_ok_on\", d, \"sum\", y)"
-                      "'"),
-              ]
-
-              def run_probes(server, daemon_id):
-                  """Run each probe on one daemon and print its output."""
-                  for label, cmd in PROBES:
-                      # Count every attempt (before it can fail), so the total
-                      # reflects commands executed, not just successes.
-                      exec_counts[label] += 1
-                      exec_counts["<total>"] += 1
-                      n = exec_counts["<total>"]
-                      print(f"controller: [{daemon_id}] running {label} "
-                            f"(exec #{n}, {label} x{exec_counts[label]})", flush=True)
-                      try:
-                          r = server.exec(daemon_id, cmd, timeout=120)
-                      except Exception as e:
-                          print(f"controller: [{daemon_id}] {label} EXEC ERROR: {e}", flush=True)
-                          continue
-                      # exec returns a CommandResult (.stdout/.stderr/.exit_code).
-                      print(f"controller: [{daemon_id}] {label} exit={r.exit_code}", flush=True)
-                      if r.stdout.strip():
-                          print(f"----- {label} stdout -----\n{r.stdout.rstrip()}", flush=True)
-                      if r.stderr.strip():
-                          print(f"----- {label} stderr -----\n{r.stderr.rstrip()}", flush=True)
-
-              cfg = TunnelConfig(
-                  authkey=os.environ["SANDD_TUNNEL_AUTHKEY"],
-                  server=os.environ["SANDD_TUNNEL_SERVER"],
-              )
-              print("controller: joining mesh + starting Server on :8765", flush=True)
-              server = Server(connect="tunnel", tunnel_config=cfg)
+              server = Server(connect="tunnel", tunnel_config=TunnelConfig(
+                  authkey=authkey, server=os.environ["SANDD_TUNNEL_SERVER"]))
               print("controller: ready, waiting for daemons", flush=True)
 
-              # Probe each daemon ONCE, the first time we see it, then keep listing
-              # for liveness. `probed` guards against re-running on every poll.
-              probed = set()
+              # Run one command on each daemon the first time we see it, to show exec
+              # works. `seen` guards against re-running every poll.
+              seen = set()
               while True:
                   try:
-                      ds = server.list_daemons()
-                      ids = [d.id for d in ds]
-                      print(f"controller: {len(ds)} daemon(s):", ids, flush=True)
-                      for did in ids:
-                          if did not in probed:
-                              probed.add(did)
-                              run_probes(server, did)
-                      # Drop ids that have disconnected so a reconnecting daemon is
-                      # re-probed rather than silently skipped.
-                      probed &= set(ids)
-                      # Running tally of commands executed so far, per probe.
-                      per_probe = {k: v for k, v in exec_counts.items() if k != "<total>"}
-                      print(f"controller: exec total={exec_counts['<total>']} {per_probe}", flush=True)
+                      for d in server.list_daemons():
+                          if d.id in seen:
+                              continue
+                          seen.add(d.id)
+                          r = server.exec(d.id, "nvidia-smi -L")
+                          print(f"[{d.id}] exit={r.exit_code}\n{r.stdout.rstrip()}", flush=True)
                   except Exception as e:
                       print("controller: loop error:", e, flush=True)
                   time.sleep(5)
-          # The controller's auth key + headscale URL. Created by hand (README
-          # step 3); this deployment fails to start until it exists.
-          envFrom:
-            - secretRef:
-                name: sandd-controller-auth
+          env:
+            # The headscale URL the controller joins. The SAME hostname as server_url
+            # in config/sandd/headscale.yaml and SANDD_TUNNEL_SERVER in nebula-sandd-config
+            # — all three must be identical. This file is hand-applied (not in the overlay
+            # `make deploy` substitutes), so the literal token below is substituted at
+            # apply time from the SAME SANDD_TUNNEL_SERVER env var — see README step 2.
+            # The controller mints its OWN key from the broker, so no auth key here.
+            - name: SANDD_TUNNEL_SERVER
+              value: __SANDD_TUNNEL_SERVER__
+            # In-cluster key broker: the controller mints its OWN reusable+ephemeral
+            # key at startup from this endpoint (see resolve_authkey above). This is
+            # the nebula-keybroker ClusterIP Service (config/sandd/headscale.yaml).
+            # Required — the controller crash-loops if the broker is unreachable.
+            - name: SANDD_KEYBROKER_URL
+              value: http://nebula-keybroker.nebula-system:8090
           ports:
             # Informational only — the daemons reach this over the mesh, not via a
             # Service. Not exposed cluster-wide.

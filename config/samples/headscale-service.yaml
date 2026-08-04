@@ -1,24 +1,16 @@
-# headscale Service — SEPARATED from the Deployment on purpose, and applied FIRST.
+# headscale Service — hand-applied, NOT in the config/sandd overlay.
 #
-# Why standalone + first: the LoadBalancer address is a chicken-and-egg for
-# headscale's server_url (which MUST equal the address clients dial, or headscale
-# rejects them). AWS provisions the ELB and assigns its hostname the moment this
-# Service exists — independently of whether any headscale pod is running yet. So
-# the workflow is:
-#   1. kubectl apply -f config/samples/headscale-service.yaml   # this file
-#   2. read the ELB hostname from `kubectl get svc nebula-headscale`
-#   3. put it into server_url in config/sandd/headscale.yaml
-#   4. make deploy   # headscale comes up already-correct — NO restart needed
+# It is kept out of the overlay because the overlay adds a `nebula-` name prefix,
+# which would create a SECOND, differently-named Service and thus a second LB. So it
+# lives here and sets its own namespace + `nebula-` name explicitly, matching the
+# prefixed Deployment the overlay generates; its selector matches the pod labels, so
+# it finds the Deployment's pods regardless.
 #
-# It lives here in config/samples/ (hand-applied), NOT in the config/sandd overlay
-# alongside headscale.yaml: everything in that folder is applied together by
-# `make deploy`, whereas this must go up on its own, first. Keeping it in the
-# overlay too would also create a SECOND, differently-named Service (the overlay
-# adds the nebula- prefix) and thus a second ELB. Because it is not
-# kustomize-processed, it sets its own
-# namespace and the nebula- name explicitly, matching the prefixed Deployment/
-# ConfigMap the overlay generates. Its selector matches the pod labels, so it
-# finds the Deployment's pods regardless.
+# server_url (which MUST equal the address clients dial, or headscale rejects them)
+# is this LB's AWS-assigned hostname. That name is only known AFTER the NLB
+# provisions, so the flow is: apply this Service, read the hostname back, bake it into
+# the three server_url/SANDD_TUNNEL_SERVER spots, then deploy headscale. See README
+# step 1.
 apiVersion: v1
 kind: Service
 metadata:
@@ -26,22 +18,47 @@ metadata:
   namespace: nebula-system
   labels:
     app: headscale
-  # On EKS, uncomment to get an internet-facing NLB (L4 — headscale is raw
-  # HTTP/gRPC, so NOT an ALB). Without these you get a legacy Classic LB.
+  # An NLB (L4 — headscale is raw HTTP/gRPC, so NOT an ALB). scheme=internet-facing:
+  # the mesh is CROSS-CLOUD — GPU boxes are provisioned across AWS regions and other
+  # providers (Modal, RunPod), none of which share a private network with the cluster
+  # VPC. A control plane every node must reach therefore has to be publicly routable,
+  # exactly like Tailscale's own control plane. An internal LB only worked for nodes
+  # in the same/peered VPC, which is not the case here.
+  #
+  # SECURITY: this endpoint is now public. It is defensible because the Tailscale
+  # control (Noise/ts2021) handshake is END-TO-END ENCRYPTED regardless of transport,
+  # and pre-auth keys are minted in-cluster by the broker and baked into instance
+  # user-data OUT OF BAND — they never traverse this endpoint. The gRPC admin API
+  # (:50443) that mints users/keys is NOT exposed here (in-pod only). Still, for real
+  # use put this behind TLS + the hardening in "Production notes" (README).
+  #
+  # The NLB's AWS-assigned hostname (k8s-...elb.<region>.amazonaws.com) is what you
+  # bake into server_url / SANDD_TUNNEL_SERVER; internet-facing => it resolves to
+  # PUBLIC IPs reachable from any cloud/region. The name is stable for the life of the
+  # Service (changes only on delete/recreate), which is why the read-back-then-deploy
+  # flow (README step 1) is safe. The LB listens on port 80 (see ports below) so
+  # server_url is a bare http://<host>.
   annotations:
     service.beta.kubernetes.io/aws-load-balancer-type: "external"
     service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
     service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
 spec:
-  # LoadBalancer so out-of-cluster GPU boxes (any provider) can reach the control
-  # server. Swap for NodePort + DNS, or front with an Ingress, if you have no LB.
+  # LoadBalancer so out-of-cluster GPU boxes — in any region or cloud — can reach the
+  # control server over the public internet. Swap for NodePort + DNS, or front with an
+  # Ingress, if you have no LB.
   type: LoadBalancer
   selector:
     app: headscale
   ports:
-    # Only :8080 (the control endpoint) is exposed. The gRPC admin API (:50443)
-    # is deliberately NOT here — it mints users/auth keys, so it must never be
-    # public; run the headscale CLI via `kubectl exec` into the pod instead.
+    # Listen on the DEFAULT HTTP port 80 and forward to headscale's 8080. This is
+    # REQUIRED, not cosmetic: Tailscale's control (Noise/ts2021) handshake dialer
+    # only ever dials the standard ports — 443 for TLS, 80 for the plaintext
+    # fallback — and IGNORES any custom port in server_url. Exposing headscale on
+    # 8080 let the health check and key fetch through but left the Noise dial with
+    # nowhere to land, so registration timed out and no node ever joined the mesh.
+    # Serving on 80 gives that dial its plaintext target, so server_url is a bare
+    # http://<host> (no port). The gRPC admin API (:50443) is deliberately NOT
+    # exposed — it mints users/keys, so it stays in-pod (`kubectl exec`) only.
     - name: http
-      port: 8080
+      port: 80
       targetPort: 8080
