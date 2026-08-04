@@ -98,7 +98,7 @@ func policyFor(kind keyKind) (keyPolicy, bool) {
 		// is reaped on disconnect, freeing the stable MagicDNS name for the fresh pod
 		// to reclaim (the controller has no PVC, so nothing to preserve). Long TTL
 		// (720h) just bounds a key that outlives a brief reap gap.
-		return keyPolicy{reusable: true, ephemeral: true, expiration: "720h"}, true
+		return keyPolicy{reusable: true, ephemeral: true, expiration: "1h"}, true
 	default:
 		return keyPolicy{}, false
 	}
