@@ -24,7 +24,7 @@ it reaches headscale over a local unix socket. There is no static-key path.
    └──────────▲──────────────────▲──────────────────┘
               │ POST /keys        │ POST /keys
               │ ?kind=controller  │ ?kind=daemon
-              │ (reusable)        │ (single-use)
+              │ (reusable)        │ (reusable)
          controller          Nebula manager
          (at startup)        (at Provision, per workload → bakes key into user-data)
 ```
@@ -113,11 +113,14 @@ default port even though it listens on 8080 in-pod (the Service maps 80 → 8080
 
 The broker mints keys under one headscale user (`SANDD_KEYBROKER_USER`, default
 `nebula`) and **creates that user itself on startup** if it's missing — no manual
-bootstrap. Key policies it owns (see `cmd/keybroker`): daemon keys are **single-use**
-(each workload gets its own throwaway credential); the controller key is **reusable**
-(re-registers across restarts). Both are **ephemeral**, so headscale auto-reaps a node
-shortly after it disconnects — torn-down experiments don't pile up as OFFLINE nodes
-squatting MagicDNS names, and the controller reclaims its stable name cleanly on
+bootstrap. Key policies it owns (see `cmd/keybroker`): both daemon and controller keys
+are **reusable** — the controller so it re-registers across restarts, the daemon so a
+node reaped during a mesh blip can re-authenticate and rejoin (a single-use key would
+be spent, wedging the daemon offline forever). Each workload still gets its own
+freshly-minted daemon key, so a leak is scoped to that workload and bounded by the
+key's TTL (daemon 24h, controller 720h). Both are **ephemeral**, so headscale auto-reaps
+a node shortly after it disconnects — torn-down experiments don't pile up as OFFLINE
+nodes squatting MagicDNS names, and the controller reclaims its stable name cleanly on
 restart (the reaped old node frees it).
 
 ### 2. Deploy the controller
@@ -215,9 +218,11 @@ per instance, and a safe shared read-only mount (each container keeps its own wr
 `/var/lib/tailscale` + `/tmp`).
 
 `SANDD_TUNNEL_AUTHKEY` arrives as container env — the per-workload key the manager
-minted (single-use + ephemeral), so even though the container can see it, it's a
-throwaway good for one node and reaped on disconnect. The daemon is single-tenant, so a
-container seeing its own key is fine.
+minted (reusable + ephemeral, 24h TTL), so even though the container can see it, it's a
+short-lived credential scoped to this one workload and its node is reaped on disconnect.
+It is reusable (not single-use) so the daemon can re-authenticate if its node is reaped
+during a mesh blip; the daemon is single-tenant, so a container seeing its own key is
+fine.
 
 Both parts log to stderr with a `[sandd]` prefix, landing in the **EC2 console**
 (`aws ec2 get-console-output --instance-id <id> --latest`) — the place to debug
@@ -243,7 +248,7 @@ reconstructed — set an explicit `command`.
 
 This is a working DEV setup, not hardened: headscale uses SQLite (on a small PVC so its
 state survives pod restarts, but still a single-writer file DB) over plain HTTP. Each workload
-already gets its own single-use ephemeral key, but for real use also: back headscale
+already gets its own freshly-minted ephemeral key, but for real use also: back headscale
 with a PersistentVolume + real database + TLS, and add per-tenant **tags/ACLs** to
 minted keys so daemons are mesh-isolated, not just credential-distinct. See
 https://headscale.net.

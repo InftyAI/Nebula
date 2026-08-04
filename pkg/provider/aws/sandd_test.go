@@ -78,7 +78,7 @@ func TestProvision_MintsPerDaemonKey(t *testing.T) {
 }
 
 // TestProvision_SeparateProvisionsMintSeparateKeys: two DISTINCT workloads => two
-// mints, so each gets its OWN single-use credential (the isolation guarantee).
+// mints, so each gets its OWN freshly-minted credential (the isolation guarantee).
 // Distinct claim names avoid the idempotency short-circuit (which would return the
 // existing instance without launching or minting again).
 func TestProvision_SeparateProvisionsMintSeparateKeys(t *testing.T) {

@@ -64,9 +64,11 @@ type keyResponse struct {
 	Key string `json:"key"`
 }
 
-// MintDaemonKey requests a fresh single-use, ephemeral daemon key from the broker.
-// It satisfies provider.DaemonKeyMinter. The returned key is a secret; callers must
-// not log it.
+// MintDaemonKey requests a fresh reusable, ephemeral daemon key from the broker.
+// Reusable so a reaped daemon can re-register after a mesh blip (a single-use key
+// would be spent and the daemon could never rejoin); ephemeral so its node is still
+// reaped on disconnect. It satisfies provider.DaemonKeyMinter. The returned key is a
+// secret; callers must not log it.
 func (c *BrokerClient) MintDaemonKey(ctx context.Context) (string, error) {
 	return c.mint(ctx, "daemon")
 }

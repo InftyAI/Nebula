@@ -56,14 +56,16 @@ import (
 type keyKind string
 
 const (
-	// kindDaemon is a GPU-workload daemon key: SINGLE-USE + ephemeral + short TTL.
-	// Each workload gets its own throwaway credential (best tenant isolation) that
+	// kindDaemon is a GPU-workload daemon key: REUSABLE + ephemeral + bounded TTL.
+	// Each workload still gets its OWN freshly-minted key (best tenant isolation) that
 	// headscale auto-reaps once the pod disconnects (no orphan node pile-up). It is
-	// single-use so a leaked key can register at most ONE node. On a disconnect the
-	// daemon rejoins by re-running `tailscale up`, which reactivates its EXISTING
-	// headscale node via the persisted node key (no authkey re-use) — so the reap
-	// window (headscale ephemeral_node_inactivity_timeout) must be long enough that a
-	// transient blip doesn't delete the node before the daemon reconnects.
+	// REUSABLE — not single-use — because on a flaky mesh a daemon's node gets reaped
+	// (headscale ephemeral_node_inactivity_timeout) during a transient blip, and after
+	// a reap the ONLY way back in is to re-register with the pre-auth key. A single-use
+	// key is already spent by then, so the daemon wedges forever, unable to rejoin. A
+	// reusable key lets every `tailscale up` retry re-register the node, which is what
+	// makes reconnection actually robust. The blast radius of a leaked reusable key is
+	// bounded by the ephemeral reap (nodes vanish on disconnect) and the TTL below.
 	kindDaemon keyKind = "daemon"
 	// kindController is a SandD controller key: REUSABLE + ephemeral + long TTL.
 	// Reusable so it can re-register across restarts. Ephemeral — the SAME as a
@@ -89,10 +91,12 @@ type keyPolicy struct {
 func policyFor(kind keyKind) (keyPolicy, bool) {
 	switch kind {
 	case kindDaemon:
-		// Single-use: reusable=false. Ephemeral so the node is reaped on disconnect.
-		// Short TTL: the key is consumed at boot, minutes after minting, so it only
-		// needs to outlive the gap between Provision and the daemon's first join.
-		return keyPolicy{reusable: false, ephemeral: true, expiration: "1h"}, true
+		// Reusable so a reaped daemon can re-register: on a flaky mesh the node is
+		// reaped during a blip, and re-auth via the pre-auth key is the only way back
+		// in — a single-use key would already be spent, wedging the daemon forever.
+		// Ephemeral so the node is still reaped on disconnect (no orphan pile-up). TTL
+		// bounds a leaked key; each workload gets its own freshly-minted one anyway.
+		return keyPolicy{reusable: true, ephemeral: true, expiration: "24h"}, true
 	case kindController:
 		// Reusable so it can re-register across restarts; ephemeral so the old node
 		// is reaped on disconnect, freeing the stable MagicDNS name for the fresh pod

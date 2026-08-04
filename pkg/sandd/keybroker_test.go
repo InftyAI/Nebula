@@ -55,7 +55,7 @@ func TestMintDaemonKey_Success(t *testing.T) {
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %s, want POST", gotMethod)
 	}
-	// The daemon path must request the daemon kind (single-use + ephemeral).
+	// The daemon path must request the daemon kind (reusable + ephemeral).
 	if gotKind != "daemon" {
 		t.Errorf("kind = %q, want daemon", gotKind)
 	}
