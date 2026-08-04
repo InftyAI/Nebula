@@ -32,9 +32,9 @@ func TestPolicyFor(t *testing.T) {
 		reusable  bool
 		ephemeral bool
 	}{
-		// Daemon: single-use (NOT reusable) + ephemeral — a throwaway per-workload
-		// credential that auto-reaps on disconnect.
-		{kindDaemon, true, false, true},
+		// Daemon: reusable + ephemeral — a per-workload credential that auto-reaps on
+		// disconnect, but reusable so a reaped daemon can re-register after a blip.
+		{kindDaemon, true, true, true},
 		// Controller: reusable (survives restarts) + ephemeral (same as a daemon) so
 		// the old node is reaped on disconnect, freeing its MagicDNS name to reclaim.
 		{kindController, true, true, true},
@@ -92,15 +92,15 @@ func TestKeysHandler_Daemon(t *testing.T) {
 	if resp.Key != "tskey-daemon-abc" {
 		t.Errorf("key = %q, want tskey-daemon-abc", resp.Key)
 	}
-	if resp.Reusable {
-		t.Errorf("daemon key must not be reusable")
+	if !resp.Reusable {
+		t.Errorf("daemon key must be reusable (so a reaped daemon can re-register)")
 	}
 	if !resp.Ephemeral {
 		t.Errorf("daemon key must be ephemeral")
 	}
-	// The runner must have been asked for the single-use ephemeral policy.
-	if seen.reusable || !seen.ephemeral {
-		t.Errorf("runner policy = %+v, want single-use ephemeral", *seen)
+	// The runner must have been asked for the reusable ephemeral policy.
+	if !seen.reusable || !seen.ephemeral {
+		t.Errorf("runner policy = %+v, want reusable ephemeral", *seen)
 	}
 }
 
