@@ -58,11 +58,11 @@ spec:
         - name: controller
           image: inftyai/sandd-server-tunnel:latest
           # Start the Server in tunnel mode and keep it alive. It joins the mesh, then
-          # loops listing daemons and runs ONE command (nvidia-smi -L) on each workload
-          # the first time it connects, printing the output to the pod log
+          # loops listing daemons and runs a few example commands (COMMANDS below) on
+          # each workload the first time it connects, printing the output to the pod log
           # (`kubectl logs`) — just enough to show exec over the mesh works. Attach with
-          # `kubectl exec` to drive `server` yourself (see README, "Using it"), or
-          # replace this with your own controller logic — this is the point of the example.
+          # `kubectl exec` to drive `server` yourself (see README, "Using it"), or edit
+          # COMMANDS / replace this with your own controller logic — that's the point.
           command: ["python3", "-u", "-c"]
           args:
             - |
@@ -82,8 +82,12 @@ spec:
                   authkey=authkey, server=os.environ["SANDD_TUNNEL_SERVER"]))
               print("controller: ready, waiting for daemons", flush=True)
 
-              # Run one command on each daemon the first time we see it, to show exec
-              # works. `seen` guards against re-running every poll.
+              # Commands run on each workload the first time it connects. Edit freely —
+              # each runs in the user's container over the mesh via server.exec.
+              COMMANDS = ["hostname", "nvidia-smi -L", "ls /"]
+
+              # Run the commands on each daemon once. `seen` guards against re-running
+              # every poll.
               seen = set()
               while True:
                   try:
@@ -91,20 +95,29 @@ spec:
                           if d.id in seen:
                               continue
                           seen.add(d.id)
-                          r = server.exec(d.id, "nvidia-smi -L")
-                          print(f"[{d.id}] exit={r.exit_code}\n{r.stdout.rstrip()}", flush=True)
+                          for cmd in COMMANDS:
+                              r = server.exec(d.id, cmd)
+                              print(f"[{d.id}] $ {cmd} (exit={r.exit_code})\n{r.stdout.rstrip()}", flush=True)
                   except Exception as e:
                       print("controller: loop error:", e, flush=True)
                   time.sleep(5)
           env:
-            # The headscale URL the controller joins. The SAME hostname as server_url
-            # in config/sandd/headscale.yaml and SANDD_TUNNEL_SERVER in nebula-sandd-config
-            # — all three must be identical. This file is hand-applied (not in the overlay
-            # `make deploy` substitutes), so the literal token below is substituted at
-            # apply time from the SAME SANDD_TUNNEL_SERVER env var — see README step 2.
-            # The controller mints its OWN key from the broker, so no auth key here.
+            # The headscale URL the controller joins. UNLIKE the daemons (which are
+            # out-of-cluster and MUST use the public NLB hostname) and headscale's own
+            # server_url, the controller runs IN-cluster, so it reaches headscale by its
+            # internal ClusterIP Service name — no per-cluster substitution, and it never
+            # touches the public NLB. That matters: routing an in-cluster client through
+            # the internet-facing NLB is a needless round-trip AND hairpins (blackholes)
+            # when the controller lands on the same node as the headscale pod, which is
+            # exactly what made /machine/register time out and fall back to a dead :443.
+            # The ClusterIP path is direct and can't hairpin. Port 80 (Service 80 -> 8080)
+            # satisfies Tailscale's Noise dialer (80/443 only). headscale accepts this
+            # even though its server_url is the public name: authkey registration doesn't
+            # require the client's login-server to byte-match server_url. Cross-namespace
+            # is fine — the .nebula-system suffix resolves from any namespace. The
+            # controller mints its OWN key from the broker, so no auth key here.
             - name: SANDD_TUNNEL_SERVER
-              value: __SANDD_TUNNEL_SERVER__
+              value: http://nebula-headscale.nebula-system
             # In-cluster key broker: the controller mints its OWN reusable+ephemeral
             # key at startup from this endpoint (see resolve_authkey above). This is
             # the nebula-keybroker ClusterIP Service (config/sandd/headscale.yaml).

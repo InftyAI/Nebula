@@ -129,25 +129,33 @@ squatting MagicDNS names.
 
 ### 2. Deploy the controller
 
-Self-contained — it reads `SANDD_TUNNEL_SERVER` + `SANDD_KEYBROKER_URL` from inline env
-and mints its own key at startup. It's hand-applied (not in the overlay `make deploy`
-substitutes), so its `SANDD_TUNNEL_SERVER` also carries the `__SANDD_TUNNEL_SERVER__`
-token — substitute the same value from `.env` at apply time:
+Self-contained — it mints its own key at startup and reads its endpoints from inline
+env. No substitution needed: unlike the daemons, the controller runs in-cluster, so it
+dials headscale by its internal ClusterIP name (`SANDD_TUNNEL_SERVER:
+http://nebula-headscale.nebula-system`), not the public NLB. So it's a plain apply:
 
 ```bash
-# Pull SANDD_TUNNEL_SERVER out of .env and substitute the token as we apply.
-HS=$(grep -E '^SANDD_TUNNEL_SERVER=' .env | cut -d= -f2-)
-sed "s|__SANDD_TUNNEL_SERVER__|${HS}|g" config/samples/sandd-controller.yaml | kubectl apply -f -
+kubectl apply -f config/samples/sandd-controller.yaml
 
 # Confirm it joined (any 100.64.x.x — we address it by name, not IP):
 CTRL=$(kubectl -n nebula-system get pod -l app=sandd-controller -o name | head -1)
 kubectl -n nebula-system exec "$CTRL" -c controller -- tailscale ip -4
 ```
 
+Routing the in-cluster controller through the public NLB was a needless round-trip and
+**hairpined** (AWS NLBs with `target-type: ip` blackhole traffic from a client that
+lands on the *same node* as the target pod) — that made `/machine/register` time out and
+fall back to a dead `:443`. The ClusterIP path is direct and can't hairpin. headscale
+accepts it even though its `server_url` is the public name (authkey registration doesn't
+require the client's login-server to byte-match `server_url`).
+
 It pins `hostname: sandd-controller` (stable MagicDNS name) and pairs a PVC on
 `/var/lib/tailscale` with `strategy: Recreate`, so a restart reclaims the *same*
 node/name instead of getting a `-suffix` (which would strand daemons at
-`Active daemons: 0`). Needs a default StorageClass — check `kubectl get sc`.
+`Active daemons: 0`). For that reclaim to work the controller's mesh key is **not**
+ephemeral (see `cmd/keybroker`): an ephemeral node is reaped the instant it disconnects,
+so on restart the PVC's key would be orphaned and the controller would loop
+re-registering. Needs a default StorageClass — check `kubectl get sc`.
 
 That's it — the manager read `nebula-sandd-config` at startup (step 1 applied it
 before the manager pod started), so injection is already on. From now on **every AWS
