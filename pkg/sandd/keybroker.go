@@ -85,7 +85,7 @@ func (c *BrokerClient) mint(ctx context.Context, kind string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("calling key broker: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		// Do not echo the body: on success it is key material, and even on error the

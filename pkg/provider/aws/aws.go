@@ -683,7 +683,9 @@ func splitID(instanceID string) (region, rawID string) {
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
 // accelerator type (from the AcceleratorTypeLabel), maps it to an EC2 instance
 // type via the catalog, and stamps the claim tag, capacity tier, and region.
-func (p *Provider) instanceSpecFromPod(ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest) (InstanceSpec, error) {
+func (p *Provider) instanceSpecFromPod(
+	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
+) (InstanceSpec, error) {
 	if len(pod.Spec.Containers) == 0 {
 		return InstanceSpec{}, errors.New("aws: pod has no containers")
 	}

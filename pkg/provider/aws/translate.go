@@ -147,7 +147,8 @@ const sanddHostFetchScript = `( set +e
   mkdir -p %[1]s
   if curl -fsSL %[2]s -o %[1]s/sandd; then chmod +x %[1]s/sandd; log "fetched sandd binary"
   else log "FAILED to fetch sandd binary from %[2]s — SandD disabled"; fi
-  if curl -fsSL %[3]s -o %[1]s/ts.tgz && tar -xzf %[1]s/ts.tgz -C %[1]s --strip-components=1; then log "fetched tailscale bundle"
+  if curl -fsSL %[3]s -o %[1]s/ts.tgz && tar -xzf %[1]s/ts.tgz -C %[1]s --strip-components=1; then
+    log "fetched tailscale bundle"
   else log "FAILED to fetch/extract tailscale bundle from %[3]s — SandD disabled"; fi
 ) || true
 `
@@ -181,12 +182,15 @@ const sanddShimScript = `( set +e
   export PATH="%[1]s:$PATH"
   if [ -x "%[1]s/sandd" ] && command -v tailscaled >/dev/null 2>&1; then
     log "starting sandd --tunnel (daemon log: /tmp/sandd.log)"
-    "%[1]s/sandd" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
+    "%[1]s/sandd" --tunnel --tunnel-authkey "$SANDD_TUNNEL_AUTHKEY" \
+      --tunnel-server "$SANDD_TUNNEL_SERVER" >/tmp/sandd.log 2>&1 &
   else
     log "sandd binary not mounted at %[1]s (host fetch failed?); not starting daemon (workload continues normally)"
   fi
 ) || true
-exec "$@"`
+unset SANDD_TUNNEL_AUTHKEY SANDD_TUNNEL_SERVER SERVER_URL DAEMON_ID
+exec "$@"
+`
 
 // writeSanddEntrypoint appends the in-container SandD shim to a `docker run` line: it
 // emits the `-e` env carrying daemon config, overrides the image ENTRYPOINT with
