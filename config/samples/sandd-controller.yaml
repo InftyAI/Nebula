@@ -15,12 +15,26 @@
 #   docker build -f hack/docker/Dockerfile.server-tunnel -t inftyai/sandd-server-tunnel:latest.
 #
 # The controller mints its own mesh key at startup from the in-cluster key broker
-# (SANDD_KEYBROKER_URL below), as REUSABLE + EPHEMERAL: reusable so restarts can
-# re-register, ephemeral so headscale reaps the node once you delete the experiment
-# (no orphan offline nodes piling up). The PVC below keeps the node key stable WHILE
-# the experiment runs, so the ephemeral node isn't reaped mid-run under it. The
-# headscale URL it joins (SANDD_TUNNEL_SERVER) is set inline in env below — see
-# README.md, step 2.
+# (SANDD_KEYBROKER_URL below), as REUSABLE + EPHEMERAL — the SAME policy the daemons
+# use, and it holds NO persistent state (no PVC). This is deliberate: every start is
+# a CLEAN start, exactly like a daemon.
+#
+# It still keeps its stable MagicDNS name (sandd-controller.nebula.mesh) across
+# restarts, via two mechanisms that do NOT need a PVC:
+#   - hostname: sandd-controller (below) pins the OS hostname, from which Tailscale
+#     derives the node/MagicDNS name — so the name is requested identically each time.
+#   - the key is EPHEMERAL, so headscale reaps the old node the moment the pod
+#     disconnects, FREEING the name; the fresh pod then reclaims it cleanly (no
+#     -suffix). This is exactly why daemons never collide. strategy: Recreate ensures
+#     the old pod is fully gone (its node reaped) BEFORE the new one registers, so the
+#     two never race for the name.
+#
+# Why no PVC: a PVC on /var/lib/tailscale persisted stale dial state, which tripped
+# Tailscale's control dialer into "forcing port 443" on restart — and headscale is
+# HTTP-only on 80, so that dead-ended and the controller could never re-register
+# ("first start works, restart doesn't"). Daemons never hit this because they have no
+# persisted state. Dropping the PVC removes the wedge entirely. The headscale URL it
+# joins (SANDD_TUNNEL_SERVER) is set inline in env below — see README.md, step 2.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,12 +44,14 @@ metadata:
     app: sandd-controller
 spec:
   replicas: 1
-  # Recreate (not the default RollingUpdate): the controller's identity lives on a
-  # single ReadWriteOnce PVC (tailscale-state below). RollingUpdate starts the new
-  # pod before killing the old one, so both would race for the same RWO volume ->
-  # the new pod hangs on a "Multi-Attach" error. Recreate tears the old pod down
-  # first, so the new one reclaims the same tailscale node key and keeps its
-  # MagicDNS name (sandd-controller.nebula.mesh) across restarts.
+  # Recreate (not the default RollingUpdate): the controller's mesh key is EPHEMERAL,
+  # so headscale reaps its node the moment the pod disconnects, which FREES the
+  # sandd-controller MagicDNS name for the next pod to reclaim. RollingUpdate starts
+  # the new pod BEFORE killing the old one, so the new one would try to register while
+  # the old node is still connected (not yet reaped) — a name collision that lands the
+  # new pod on sandd-controller-1 and strands daemons dialing the clean name. Recreate
+  # tears the old pod down first, so its node is reaped before the new one registers
+  # and the fresh pod reclaims the same name cleanly.
   strategy:
     type: Recreate
   selector:
@@ -139,9 +155,20 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-          volumeMounts:
-            - name: tailscale-state
-              mountPath: /var/lib/tailscale
+          # DON'T drop this if you rewrite the controller: on shutdown we log out of
+          # headscale so the ephemeral node is DEREGISTERED immediately, which frees
+          # the sandd-controller name for the next pod. Without it, headscale holds the
+          # old node as `offline` until its inactivity timeout (~30m) elapses; a restart
+          # inside that window finds the clean name still taken and registers as
+          # sandd-controller-<suffix> — and every daemon dialing the clean MagicDNS name
+          # (sandd-controller.nebula.mesh) then hits a dead node ("Active daemons: 0").
+          # Recreate guarantees this preStop finishes before the new pod starts, so the
+          # name is free in time. `|| true` keeps a failed logout (e.g. control plane
+          # already unreachable) from blocking teardown.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "tailscale logout || true"]
           resources:
             requests:
               cpu: "100m"
@@ -149,38 +176,3 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
-      volumes:
-        - name: tailscale-state
-          persistentVolumeClaim:
-            claimName: sandd-controller-tailscale
----
-# Persists tailscaled's node key across controller restarts. With emptyDir the
-# controller re-registered as a BRAND-NEW headscale node every restart; the old
-# (now offline) node still held the clean MagicDNS name, so the new one got a
-# random -suffix and daemons dialing sandd-controller.nebula.mesh hit a dead node
-# ("Active daemons: 0"). A persistent /var/lib/tailscale means the same node key
-# is presented on restart -> headscale recognizes the same node and keeps the
-# name. Pair with the reusable+ephemeral controller auth key: ephemeral reaps the
-# node after you delete the experiment (no orphan pile-up); the PVC keeps identity
-# stable WHILE the experiment runs.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: sandd-controller-tailscale
-  namespace: nebula-system
-  labels:
-    app: sandd-controller
-spec:
-  # Reuse the cluster's existing EBS SC. gp3 is the default here, so this could be
-  # omitted, but pinning it keeps the sample from silently following whatever the
-  # default becomes later. Swap to gp3-retain if you want the EBS volume (and thus
-  # the controller's identity) to survive `delete pvc`; gp3 is Delete, which is the
-  # right call for disposable experiment controllers.
-  storageClassName: gp3
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      # tailscale state is tiny (node key + a little metadata); 1Gi is the common
-      # minimum granularity for dynamically-provisioned block volumes.
-      storage: 1Gi

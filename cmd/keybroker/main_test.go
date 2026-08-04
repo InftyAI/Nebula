@@ -35,9 +35,9 @@ func TestPolicyFor(t *testing.T) {
 		// Daemon: single-use (NOT reusable) + ephemeral — a throwaway per-workload
 		// credential that auto-reaps on disconnect.
 		{kindDaemon, true, false, true},
-		// Controller: reusable (survives restarts) + PERSISTENT (NOT ephemeral) so
-		// its PVC-backed node/name survives a restart; cleanup via the 720h TTL.
-		{kindController, true, true, false},
+		// Controller: reusable (survives restarts) + ephemeral (same as a daemon) so
+		// the old node is reaped on disconnect, freeing its MagicDNS name to reclaim.
+		{kindController, true, true, true},
 		{keyKind("bogus"), false, false, false},
 		{keyKind(""), false, false, false},
 	}
@@ -115,8 +115,8 @@ func TestKeysHandler_Controller(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if !seen.reusable || seen.ephemeral {
-		t.Errorf("controller policy = %+v, want reusable + persistent (not ephemeral)", *seen)
+	if !seen.reusable || !seen.ephemeral {
+		t.Errorf("controller policy = %+v, want reusable + ephemeral", *seen)
 	}
 }
 

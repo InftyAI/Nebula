@@ -58,18 +58,22 @@ type keyKind string
 const (
 	// kindDaemon is a GPU-workload daemon key: SINGLE-USE + ephemeral + short TTL.
 	// Each workload gets its own throwaway credential (best tenant isolation) that
-	// headscale auto-reaps once the pod disconnects (no orphan node pile-up).
+	// headscale auto-reaps once the pod disconnects (no orphan node pile-up). It is
+	// single-use so a leaked key can register at most ONE node. On a disconnect the
+	// daemon rejoins by re-running `tailscale up`, which reactivates its EXISTING
+	// headscale node via the persisted node key (no authkey re-use) — so the reap
+	// window (headscale ephemeral_node_inactivity_timeout) must be long enough that a
+	// transient blip doesn't delete the node before the daemon reconnects.
 	kindDaemon keyKind = "daemon"
-	// kindController is a SandD controller key: REUSABLE + PERSISTENT + long TTL.
-	// Reusable so it can re-register across restarts. Deliberately NOT ephemeral:
-	// ephemeral reaps a node the instant it disconnects, which contradicts the
-	// controller's PVC on /var/lib/tailscale (kept so its identity — and its stable
-	// sandd-controller MagicDNS name — SURVIVES a restart). With both, a Recreate
-	// restart disconnected the old pod, headscale reaped the node, then the new pod
-	// presented the PVC's now-orphaned key and looped re-registering. Persistent +
-	// PVC means the SAME node is reclaimed on restart (no name collision, no -suffix).
-	// Cleanup is handled by the 720h expiration: a torn-down controller goes OFFLINE
-	// and headscale expires it within 30 days (delete the node by hand to reap sooner).
+	// kindController is a SandD controller key: REUSABLE + ephemeral + long TTL.
+	// Reusable so it can re-register across restarts. Ephemeral — the SAME as a
+	// daemon — because the controller holds NO persistent state (no PVC): headscale
+	// reaps its node the instant the pod disconnects, which FREES the stable
+	// sandd-controller MagicDNS name for the next pod to reclaim (the name is pinned
+	// by the pod hostname, not by a persisted node key). This is what lets a restart
+	// reclaim the same name with no -suffix. It also sidesteps the port-443 dial
+	// wedge that a persisted /var/lib/tailscale caused. Long TTL (720h) just bounds a
+	// key that outlives a brief reap gap; ephemeral reaping is the real cleanup path.
 	kindController keyKind = "controller"
 )
 
@@ -90,10 +94,11 @@ func policyFor(kind keyKind) (keyPolicy, bool) {
 		// needs to outlive the gap between Provision and the daemon's first join.
 		return keyPolicy{reusable: false, ephemeral: true, expiration: "1h"}, true
 	case kindController:
-		// Persistent (ephemeral=false): the node must survive a restart to keep its
-		// PVC-backed identity + stable MagicDNS name. Reusable so it can re-register.
-		// Long TTL (720h) is the cleanup path in lieu of ephemeral reaping.
-		return keyPolicy{reusable: true, ephemeral: false, expiration: "720h"}, true
+		// Reusable so it can re-register across restarts; ephemeral so the old node
+		// is reaped on disconnect, freeing the stable MagicDNS name for the fresh pod
+		// to reclaim (the controller has no PVC, so nothing to preserve). Long TTL
+		// (720h) just bounds a key that outlives a brief reap gap.
+		return keyPolicy{reusable: true, ephemeral: true, expiration: "720h"}, true
 	default:
 		return keyPolicy{}, false
 	}

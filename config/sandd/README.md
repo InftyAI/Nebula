@@ -86,22 +86,14 @@ hostname, which is only known once the LB provisions. So apply the Service first
 read it back:
 
 ```bash
+kubectl create namespace nebula-system   # if not already present
 kubectl apply -f config/samples/headscale-service.yaml
 
 # Poll until populated (NLB takes 1–3 min):
 HS=$(kubectl -n nebula-system get svc nebula-headscale \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'); echo "$HS"
 
-# Sanity-check it resolves to PUBLIC IPs (proves scheme=internet-facing took effect):
-nslookup "$HS"   # expect public IPs, NOT 10.x / 172.16–31.x / 192.168.x
-```
-
-Put `http://$HS` (no port) into **`.env`** as `SANDD_TUNNEL_SERVER` — that one line is
-the single source of truth for the endpoint:
-
-```bash
 echo "SANDD_TUNNEL_SERVER=http://$HS" >> .env   # or edit .env by hand
-
 make deploy-all   # substitutes the hostname into every spot, then deploys
 ```
 
@@ -125,7 +117,8 @@ bootstrap. Key policies it owns (see `cmd/keybroker`): daemon keys are **single-
 (each workload gets its own throwaway credential); the controller key is **reusable**
 (re-registers across restarts). Both are **ephemeral**, so headscale auto-reaps a node
 shortly after it disconnects — torn-down experiments don't pile up as OFFLINE nodes
-squatting MagicDNS names.
+squatting MagicDNS names, and the controller reclaims its stable name cleanly on
+restart (the reaped old node frees it).
 
 ### 2. Deploy the controller
 
@@ -149,13 +142,17 @@ fall back to a dead `:443`. The ClusterIP path is direct and can't hairpin. head
 accepts it even though its `server_url` is the public name (authkey registration doesn't
 require the client's login-server to byte-match `server_url`).
 
-It pins `hostname: sandd-controller` (stable MagicDNS name) and pairs a PVC on
-`/var/lib/tailscale` with `strategy: Recreate`, so a restart reclaims the *same*
-node/name instead of getting a `-suffix` (which would strand daemons at
-`Active daemons: 0`). For that reclaim to work the controller's mesh key is **not**
-ephemeral (see `cmd/keybroker`): an ephemeral node is reaped the instant it disconnects,
-so on restart the PVC's key would be orphaned and the controller would loop
-re-registering. Needs a default StorageClass — check `kubectl get sc`.
+It pins `hostname: sandd-controller` (the stable MagicDNS name) and holds **no
+persistent state** — no PVC, an `emptyDir`-clean start every time, exactly like a
+daemon. A restart still reclaims the *same* name (not a `-suffix` that would strand
+daemons at `Active daemons: 0`) because the key is **ephemeral**: headscale reaps the
+old node the instant the pod disconnects, freeing the name, and `strategy: Recreate`
+guarantees the old pod is gone before the new one registers — so the fresh pod
+reclaims the name with no collision. Deliberately **no PVC**: a persisted
+`/var/lib/tailscale` reloaded stale dial state on restart and wedged Tailscale into
+"forcing port 443" (headscale is HTTP-only on 80), so the controller could never
+re-register — "first start works, restart doesn't". Daemons never hit this precisely
+because they carry no state; the controller now matches them. No StorageClass needed.
 
 That's it — the manager read `nebula-sandd-config` at startup (step 1 applied it
 before the manager pod started), so injection is already on. From now on **every AWS
@@ -244,10 +241,9 @@ reconstructed — set an explicit `command`.
 
 ## Production notes
 
-This is a working DEV setup, not hardened: headscale uses SQLite on an `emptyDir` (its
-state — and every issued key — is lost on pod restart) over plain HTTP. Each workload
+This is a working DEV setup, not hardened: headscale uses SQLite (on a small PVC so its
+state survives pod restarts, but still a single-writer file DB) over plain HTTP. Each workload
 already gets its own single-use ephemeral key, but for real use also: back headscale
 with a PersistentVolume + real database + TLS, and add per-tenant **tags/ACLs** to
-minted keys so daemons are mesh-isolated, not just credential-distinct. (headscale's
-`emptyDir` is separate from the controller's PVC in step 2, which persists the
-*controller's* identity, not headscale's state.) See https://headscale.net.
+minted keys so daemons are mesh-isolated, not just credential-distinct. See
+https://headscale.net.

@@ -1,9 +1,9 @@
 # headscale — the Tailscale control server that coordinates the SandD mesh.
 #
-# ⚠️  DEVELOPMENT / EXAMPLE configuration. It uses SQLite on an emptyDir (state is
-#     LOST on Pod restart, which invalidates every issued auth key) and a plain
+# ⚠️  DEVELOPMENT / EXAMPLE configuration. It uses SQLite on a small PVC (state
+#     survives Pod restarts, but it is still a single-writer file DB) and a plain
 #     HTTP listener. For production see https://headscale.net and back it with a
-#     PersistentVolume + a real database + TLS.
+#     real database + TLS.
 #
 # It MUST be reachable by out-of-cluster GPU boxes (they join the same mesh). The
 # LoadBalancer Service that exposes it is hand-applied FIRST — it lives OUTSIDE this

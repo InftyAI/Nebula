@@ -96,3 +96,9 @@ placement controller owns those.
 - See [config/samples](config/samples) for example NodePools and a runnable workload.
 - See [docs/add-a-provider.md](docs/add-a-provider.md) to add a provider backend.
 - See [docs/architecture.md](docs/architecture.md) for design details.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE). Third-party components (e.g. Tailscale, used by
+the optional SandD channel) are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
