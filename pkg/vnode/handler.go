@@ -67,7 +67,7 @@ const defaultBlocklistTTL = 30 * time.Second
 // would otherwise carry an identical deadline for all of them. A per-record jitter
 // in [0, blocklistJitter) decorrelates those wake-ups so freed capacity is sampled
 // across a spread of moments instead of one thundering retry.
-const blocklistJitter = 1 * time.Minute
+const blocklistJitter = 30 * time.Second
 
 // Blocklister records a failed placement so the placement controller can fail over
 // to the next candidate instead of hot-looping against a provider that just

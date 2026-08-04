@@ -26,4 +26,4 @@ spec:
   # Inner axis: within the active capacity tier.
   strategy: Ordered
   failover:
-    blocklistTTL: 3m
+    blocklistTTL: 30s

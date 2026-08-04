@@ -43,30 +43,56 @@ KUBECTL="${KUBECTL:-kubectl}"
 command -v "${KUBECTL}" >/dev/null 2>&1 || die "kubectl not found on PATH"
 
 # --- load .env (secrets only) ----------------------------------------------
+# We PARSE .env into a private associative array rather than `source`-ing it, so
+# its values never enter this script's ENVIRONMENT. That is what lets .env use the
+# standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY names safely: sourcing them
+# (even without `set -a`, if they are already exported in the caller's shell) would
+# hand the PROVISIONING identity to every child process — including `aws eks
+# get-token`, kubectl's EKS auth plugin — and break cluster auth with a 401. Held
+# in ENV_VARS[], the creds reach the Secret (via create_provider_secret) but not
+# kubectl, so the deployer's own AWS identity keeps talking to the cluster.
+declare -A ENV_VARS=()
 ENV_FILE="${ENV_FILE:-.env}"
 if [[ -f "${ENV_FILE}" ]]; then
   log "loading credentials from ${ENV_FILE}"
-  set -a                # export everything defined while sourcing
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-  set +a
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"                        # tolerate CRLF
+    [[ "${line}" =~ ^[[:space:]]*# ]] && continue   # comment
+    [[ "${line}" =~ ^[[:space:]]*$ ]] && continue   # blank
+    line="${line#export }"                      # allow `export KEY=val`
+    [[ "${line}" != *=* ]] && continue          # not an assignment
+    local_key="${line%%=*}"; local_val="${line#*=}"
+    local_key="${local_key//[[:space:]]/}"      # trim whitespace around the key
+    # strip one layer of matching surrounding quotes from the value
+    if [[ "${local_val}" == \"*\" || "${local_val}" == \'*\' ]]; then
+      local_val="${local_val:1:${#local_val}-2}"
+    fi
+    ENV_VARS["${local_key}"]="${local_val}"
+  done < "${ENV_FILE}"
 else
   warn "${ENV_FILE} not found; no provider credentials will be applied. Copy .env.example to .env."
 fi
 
 # --- per-provider secret table ---------------------------------------------
 # One entry per provider: "<secret-name>|<REQUIRED_KEYS>|<OPTIONAL_KEYS>".
-# Keys are env var names read from .env; the Secret stores each verbatim (the
-# SDKs read them by these exact names). To add a provider, append a row —
-# nothing else in this script needs to change.
+# Each key names both the variable read from .env (ENV_VARS[KEY]) and the field it
+# is stored under in the Secret (the name the provider SDK reads inside the pod) —
+# they are the same because .env is PARSED, not sourced, so a key can match the
+# SDK's standard name without leaking into the deployer's environment (see the
+# loader above). To add a provider, append a row — nothing else needs to change.
 PROVIDER_SECRETS=(
   # Only secrets belong here.
   "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|"
-  # AWS: creds are the only secret. The access key + secret are required together
-  # (a lone key is a misconfig), so a blank pair skips the Secret — the SDK then
-  # relies on IRSA / instance role, which is the preferred path. The region is
-  # NON-SECRET and lives on the manager Deployment, not in this Secret; the adapter
-  # self-configures the rest (GPU AMI + subnets).
+  # AWS: creds are the only secret. CRITICAL — these are the PROVISIONING identity
+  # (the account that launches GPU instances), which is DISTINCT from the identity
+  # that talks to the EKS control plane this deploy runs against. They use the
+  # standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY names — safe ONLY because the
+  # loader parses .env into ENV_VARS[] instead of exporting it, so these never reach
+  # `aws eks get-token` (kubectl's EKS auth plugin, which reads those exact env
+  # vars) and cannot hijack cluster auth. Both required together (a lone key is a
+  # misconfig) → a blank pair skips the Secret and the SDK falls back to IRSA /
+  # instance role (the preferred path). Region is NON-SECRET (on the manager
+  # Deployment); the adapter self-configures the rest (GPU AMI + subnets).
   "nebula-aws-credentials|AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY|"
   # "nebula-runpod-credentials|RUNPOD_API_KEY|"
 )
@@ -77,8 +103,9 @@ create_provider_secret() {
   local name="$1" required="$2" optional="$3"
   local args=() key val missing=0
 
+  # Each key names both the .env variable (ENV_VARS[key]) and the Secret field.
   for key in ${required}; do
-    val="${!key:-}"
+    val="${ENV_VARS[${key}]:-}"
     if [[ -z "${val}" ]]; then
       missing=1
       continue
@@ -92,7 +119,7 @@ create_provider_secret() {
   fi
 
   for key in ${optional}; do
-    val="${!key:-}"
+    val="${ENV_VARS[${key}]:-}"
     [[ -n "${val}" ]] && args+=(--from-literal="${key}=${val}")
   done
 
@@ -104,18 +131,24 @@ create_provider_secret() {
     --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 }
 
-# --- 1. build the image ----------------------------------------------------
-log "building image ${IMG}"
-make docker-build IMG="${IMG}"
-
-# --- 2. make the image reachable by the cluster ----------------------------
+# --- 1. build the image, and make it reachable by the cluster --------------
+# Kind and a real registry differ in BOTH build arch and delivery:
+#   - Kind runs on the host's single architecture, so a plain single-arch
+#     `docker-build` + `kind load` is correct (and multi-arch buildx cannot
+#     `kind load` anyway — buildx only pushes).
+#   - A cloud registry may back nodes of a DIFFERENT arch than this machine
+#     (e.g. building on an arm64 Mac for amd64 EKS nodes), so we MUST build a
+#     multi-arch manifest — otherwise the node finds the image but "no match
+#     for platform in manifest". `docker-buildx` builds AND pushes in one step.
 if [[ -n "${KIND_CLUSTER}" ]]; then
   command -v kind >/dev/null 2>&1 || die "KIND_CLUSTER=${KIND_CLUSTER} set but 'kind' not found on PATH"
+  log "building image ${IMG}"
+  make docker-build IMG="${IMG}"
   log "loading ${IMG} into Kind cluster ${KIND_CLUSTER}"
   kind load docker-image "${IMG}" --name "${KIND_CLUSTER}"
 else
-  log "pushing ${IMG} (set KIND_CLUSTER to load into Kind instead)"
-  make docker-push IMG="${IMG}"
+  log "building + pushing multi-arch ${IMG} (set KIND_CLUSTER to load into Kind instead)"
+  make docker-buildx IMG="${IMG}"
 fi
 
 # --- 3. Secrets FIRST, so the manager mounts them on its very first boot ----
@@ -145,8 +178,20 @@ done
 # --- 4. install CRDs + deploy the manager ----------------------------------
 # The pod mounts the cert Secret and reads provider creds at boot — both already
 # exist, so the manager comes up fully configured with no restart needed.
+#
+# SANDD_TUNNEL_SERVER is the ONE non-secret in .env (the internet-facing headscale
+# NLB hostname). It is read from ENV_VARS[] (parsed, NOT sourced — same safety as the
+# creds) and handed to `make deploy`, which substitutes the __SANDD_TUNNEL_SERVER__
+# token in headscale's server_url and the nebula-sandd-config ConfigMap so both render
+# correct on first apply — no restart. Blank => `make deploy` leaves the token in place
+# (an obviously-broken render, not a silent misconfig); the README's read-back step
+# populates it. An env/flag SANDD_TUNNEL_SERVER overrides .env.
+SANDD_TUNNEL_SERVER="${SANDD_TUNNEL_SERVER:-${ENV_VARS[SANDD_TUNNEL_SERVER]:-}}"
+if [[ -z "${SANDD_TUNNEL_SERVER}" ]]; then
+  warn "SANDD_TUNNEL_SERVER unset (not in .env or env) — headscale server_url + SANDD_TUNNEL_SERVER will keep the __SANDD_TUNNEL_SERVER__ placeholder; set it (README step 1) and re-run."
+fi
 log "installing CRDs and deploying the manager"
-make deploy IMG="${IMG}"
+make deploy IMG="${IMG}" SANDD_TUNNEL_SERVER="${SANDD_TUNNEL_SERVER}"
 
 # --- 5. inject the webhook CA bundle (server-side, no manager restart) ------
 # This edits only the MutatingWebhookConfiguration, which just got created by

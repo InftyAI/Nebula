@@ -142,6 +142,11 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// Sandd, when Enabled, makes the workload's docker run start the SandD daemon
+	// INSIDE the container (via an entrypoint shim) so commands and interactive
+	// shells run in the user's own env/cwd/code over the tunnel. A zero value injects
+	// nothing. See buildUserData/writeSanddEntrypoint and provider.SanddConfig.
+	Sandd provider.SanddConfig
 }
 
 // EC2Instance is the adapter-level view of one EC2 instance as observed.
@@ -211,6 +216,9 @@ type Provider struct {
 	// regionSource reports the NodePool-declared regions to sweep in List/Offerings.
 	// May be nil in tests, in which case sweepRegions uses only the cache keys.
 	regionSource RegionSource
+	// sandd is the optional SandD daemon config stamped onto every InstanceSpec so
+	// buildUserData can bootstrap it. Zero value => disabled (no injection).
+	sandd provider.SanddConfig
 
 	mu      sync.Mutex
 	clients map[string]Client // region -> Client, populated lazily by clientFor
@@ -225,11 +233,16 @@ type Provider struct {
 // (admission requires each aws pool to list ≥1 region, and placement stamps it onto
 // the ProvisionRequest), and observed instances report their region from the
 // region-pinned client — so nothing needs a fallback, and no AWS_REGION env is read.
-func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource) *Provider {
+//
+// sandd is the optional SandD daemon config baked into every instance's user-data;
+// its zero value disables injection, so tests and the non-SandD path pass
+// provider.SanddConfig{}.
+func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource, sandd provider.SanddConfig) *Provider {
 	return &Provider{
 		Base:         catalog.Base{ProviderName: provider.ProviderAWS, Catalog: cat},
 		newClient:    newClient,
 		regionSource: regionSource,
+		sandd:        sandd,
 		clients:      make(map[string]Client),
 	}
 }
@@ -244,6 +257,7 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 		func(context.Context, string) (Client, error) { return client, nil },
 		cat,
 		func() []string { return []string{region} },
+		provider.SanddConfig{}, // single-region test convenience: no SandD injection
 	)
 	// Pre-seed the cache so even a stray region lookup returns the fake rather than
 	// invoking the (constant) factory.
@@ -406,7 +420,7 @@ func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.
 		return existing.ID, nil
 	}
 
-	spec, err := p.instanceSpecFromPod(pod, req)
+	spec, err := p.instanceSpecFromPod(ctx, pod, req)
 	if err != nil {
 		return "", err
 	}
@@ -669,7 +683,9 @@ func splitID(instanceID string) (region, rawID string) {
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
 // accelerator type (from the AcceleratorTypeLabel), maps it to an EC2 instance
 // type via the catalog, and stamps the claim tag, capacity tier, and region.
-func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest) (InstanceSpec, error) {
+func (p *Provider) instanceSpecFromPod(
+	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
+) (InstanceSpec, error) {
 	if len(pod.Spec.Containers) == 0 {
 		return InstanceSpec{}, errors.New("aws: pod has no containers")
 	}
@@ -705,6 +721,15 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 		return InstanceSpec{}, fmt.Errorf("aws: no EC2 instance type for %s x%d", canonical, count)
 	}
 
+	// SandD daemon (opt-in): resolve THIS instance's mesh key by minting a fresh
+	// single-use, ephemeral key per workload (tenant isolation + auto-reaped nodes).
+	// This runs on the Provision path, so a mint failure aborts provisioning rather
+	// than launching a daemon that can never join the mesh.
+	sandd, err := p.resolveSanddConfig(ctx)
+	if err != nil {
+		return InstanceSpec{}, err
+	}
+
 	return InstanceSpec{
 		InstanceTypes: instanceTypes,
 		Image:         c.Image,
@@ -714,7 +739,30 @@ func (p *Provider) instanceSpecFromPod(pod *corev1.Pod, req provider.ProvisionRe
 		Spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:        req.Region,
 		Tags:          map[string]string{ClaimTagKey: req.ClaimName},
+		// SandD daemon (opt-in): keyed by the claim name so a daemon that dials home
+		// correlates 1:1 with this instance's NodeClaim. Zero value => no injection.
+		Sandd: sandd,
 	}, nil
+}
+
+// resolveSanddConfig returns the per-instance SandD config. When SandD is disabled
+// (zero config, no KeyMinter) it returns it unchanged. Otherwise it mints a FRESH
+// per-daemon key and returns a copy with AuthKey set to it (and KeyMinter cleared,
+// so the minted key — not the minter — is what buildUserData bakes in). A mint error
+// is returned so Provision fails loudly rather than injecting a keyless (and thus
+// useless) daemon.
+func (p *Provider) resolveSanddConfig(ctx context.Context) (provider.SanddConfig, error) {
+	if p.sandd.KeyMinter == nil {
+		return p.sandd, nil
+	}
+	key, err := p.sandd.KeyMinter.MintDaemonKey(ctx)
+	if err != nil {
+		return provider.SanddConfig{}, fmt.Errorf("aws: minting SandD daemon key: %w", err)
+	}
+	perInstance := p.sandd
+	perInstance.AuthKey = key
+	perInstance.KeyMinter = nil // the resolved key travels on the spec, not the seam.
+	return perInstance, nil
 }
 
 // toInstance normalizes an observed EC2 instance into the provider-agnostic
