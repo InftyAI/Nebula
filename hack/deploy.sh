@@ -178,20 +178,8 @@ done
 # --- 4. install CRDs + deploy the manager ----------------------------------
 # The pod mounts the cert Secret and reads provider creds at boot — both already
 # exist, so the manager comes up fully configured with no restart needed.
-#
-# SANDD_TUNNEL_SERVER is the ONE non-secret in .env (the internet-facing headscale
-# NLB hostname). It is read from ENV_VARS[] (parsed, NOT sourced — same safety as the
-# creds) and handed to `make deploy`, which substitutes the __SANDD_TUNNEL_SERVER__
-# token in headscale's server_url and the nebula-sandd-config ConfigMap so both render
-# correct on first apply — no restart. Blank => `make deploy` leaves the token in place
-# (an obviously-broken render, not a silent misconfig); the README's read-back step
-# populates it. An env/flag SANDD_TUNNEL_SERVER overrides .env.
-SANDD_TUNNEL_SERVER="${SANDD_TUNNEL_SERVER:-${ENV_VARS[SANDD_TUNNEL_SERVER]:-}}"
-if [[ -z "${SANDD_TUNNEL_SERVER}" ]]; then
-  warn "SANDD_TUNNEL_SERVER unset (not in .env or env) — headscale server_url + SANDD_TUNNEL_SERVER will keep the __SANDD_TUNNEL_SERVER__ placeholder; set it (README step 1) and re-run."
-fi
 log "installing CRDs and deploying the manager"
-make deploy IMG="${IMG}" SANDD_TUNNEL_SERVER="${SANDD_TUNNEL_SERVER}"
+make deploy IMG="${IMG}"
 
 # --- 5. inject the webhook CA bundle (server-side, no manager restart) ------
 # This edits only the MutatingWebhookConfiguration, which just got created by

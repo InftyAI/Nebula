@@ -99,6 +99,4 @@ placement controller owns those.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). Third-party components (e.g. Tailscale, used by
-the optional SandD channel) are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Apache-2.0 — see [LICENSE](LICENSE).
