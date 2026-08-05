@@ -406,7 +406,7 @@ func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.
 		return existing.ID, nil
 	}
 
-	spec, err := p.instanceSpecFromPod(ctx, pod, req)
+	spec, err := p.instanceSpecFromPod(pod, req)
 	if err != nil {
 		return "", err
 	}
@@ -670,7 +670,7 @@ func splitID(instanceID string) (region, rawID string) {
 // accelerator type (from the AcceleratorTypeLabel), maps it to an EC2 instance
 // type via the catalog, and stamps the claim tag, capacity tier, and region.
 func (p *Provider) instanceSpecFromPod(
-	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
+	pod *corev1.Pod, req provider.ProvisionRequest,
 ) (InstanceSpec, error) {
 	if len(pod.Spec.Containers) == 0 {
 		return InstanceSpec{}, errors.New("aws: pod has no containers")
