@@ -96,7 +96,7 @@ func policyFor(kind keyKind) (keyPolicy, bool) {
 		// in — a single-use key would already be spent, wedging the daemon forever.
 		// Ephemeral so the node is still reaped on disconnect (no orphan pile-up). TTL
 		// bounds a leaked key; each workload gets its own freshly-minted one anyway.
-		return keyPolicy{reusable: true, ephemeral: true, expiration: "128h"}, true
+		return keyPolicy{reusable: true, ephemeral: true, expiration: "24h"}, true
 	case kindController:
 		// Reusable so it can re-register across restarts; ephemeral so the old node
 		// is reaped on disconnect, freeing the stable MagicDNS name for the fresh pod
