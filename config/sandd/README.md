@@ -14,7 +14,7 @@ is cross-cloud; only outbound reachability to the public headscale endpoint is n
 ## Architecture
 
 **Minting keys** — the broker is the only component with headscale admin authority;
-it reaches headscale over a local unix socket. There is no static-key path.
+it reaches headscale over a local unix socket. Static keys are supported but discouraged; prefer broker-minted keys.
 
 ```
    headscale pod

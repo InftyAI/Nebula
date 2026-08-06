@@ -1,6 +1,6 @@
 # nebula-sandd-config — flips SandD injection ON for the manager. Deployed by this
 # overlay (namePrefix in config/default turns "sandd-config" into "nebula-sandd-config";
-# the manager's envFrom references the pre-prefix name so kustomize rewrites both).
+# the manager’s envFrom references "nebula-sandd-config" directly).
 #
 # A ConfigMap, not a Secret: it holds only URLs. The mesh keys are minted on demand
 # by the key broker and never stored here.
@@ -19,7 +19,7 @@ metadata:
   namespace: nebula-system
 data:
   # In-cluster key broker (the switch that turns injection ON): the manager mints a
-  # fresh single-use, ephemeral key per workload from here. Stable internal Service
+  # fresh reusable, ephemeral key per workload from here. Stable internal Service
   # DNS — no per-cluster edit needed.
   SANDD_KEYBROKER_URL: "http://nebula-keybroker.nebula-system:8090"
   # headscale control-server URL — the internet-facing NLB's AWS-assigned hostname.

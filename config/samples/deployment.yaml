@@ -28,7 +28,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: nebula
 spec:
-  replicas: 30
+  replicas: 2
   selector:
     matchLabels:
       app: gpu-workload-sample

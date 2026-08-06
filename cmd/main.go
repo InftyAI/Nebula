@@ -356,8 +356,7 @@ func registerProviders(ctx context.Context, c client.Client) {
 	// in-cluster key broker. When set, every AWS workload runs the SandD daemon inside
 	// its container in tunnel mode — commands and interactive shells run in the user's
 	// own environment over the mesh with no inbound access — and the adapter mints a
-	// FRESH single-use, ephemeral key per workload (tenant isolation + auto-reaped
-	// nodes). Unset => nil minter => the zero SanddConfig injects nothing, so this is
+	// FRESH reusable, ephemeral key per workload (tenant isolation + auto-reaped
 	// off by default. Minted keys are secrets and are NEVER logged.
 	sanddCfg := provider.SanddConfig{
 		ControlServer: os.Getenv("SANDD_TUNNEL_SERVER"),

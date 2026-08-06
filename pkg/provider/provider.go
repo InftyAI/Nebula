@@ -336,7 +336,7 @@ type SanddConfig struct {
 	ServerURL string
 	// KeyMinter is what enables SandD: when non-nil it mints a FRESH per-instance
 	// mesh key at provision time (see DaemonKeyMinter), so each workload gets its own
-	// single-use, ephemeral credential (tenant isolation + auto-reaped nodes). It is
+	// reusable, ephemeral credential (tenant isolation + auto-reaped nodes). It is
 	// a seam so the manager can inject an HTTP client to the key broker while this
 	// package stays transport-agnostic and unit-testable. Nil => SandD off.
 	KeyMinter DaemonKeyMinter

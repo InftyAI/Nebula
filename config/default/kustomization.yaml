@@ -34,12 +34,12 @@ resources:
 #- ../prometheus
 # [METRICS] Expose the controller manager metrics service.
 - metrics_service.yaml
-# [SANDD] SandD access channel — deployed by default. Stands up headscale + the
-# SandD controller so operators/agents can exec/shell into a workload container
-# (kubectl exec does NOT work against a Nebula virtual node). This only stands up
-# the in-cluster pieces; the manager starts injecting the daemon once the
-# nebula-sandd-config Secret exists (still opt-in per cluster). To skip deploying
-# these components, comment this line out. See config/sandd/README.md.
+# [SANDD] SandD access channel — deployed by default. Stands up headscale (with the keybroker sidecar)
+# plus the manager SandD ConfigMap; the user-facing SandD controller is a hand-applied sample
+# (config/samples/sandd-controller.yaml).
+# the in-cluster pieces; the manager reads SandD URLs from the nebula-sandd-config ConfigMap.
+# To disable injection, blank SANDD_KEYBROKER_URL there; to skip deploying these components, comment this line out.
+# See config/sandd/README.md.
 - ../sandd
 # [NETWORK POLICY] Protect the /metrics endpoint and Webhook Server with NetworkPolicy.
 # Only Pod(s) running a namespace labeled with 'metrics: enabled' will be able to gather the metrics.

@@ -13,3 +13,8 @@ The optional [SandD](https://github.com/InftyAI/SandD) access channel uses the
 Nebula does not link or vendor it; the provider integration fetches the official
 binary onto the GPU host at provision time. If you build and redistribute an image
 with Tailscale baked in, retain its copyright notice per BSD-3-Clause.
+
+ ## Headscale
+ The optional SandD access channel deploys [headscale](https://github.com/juanfont/headscale)
+ (container image `headscale/headscale`). headscale is licensed separately; see its
+ upstream license at https://github.com/juanfont/headscale/blob/main/LICENSE.

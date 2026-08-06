@@ -722,7 +722,7 @@ func (p *Provider) instanceSpecFromPod(
 	}
 
 	// SandD daemon (opt-in): resolve THIS instance's mesh key by minting a fresh
-	// single-use, ephemeral key per workload (tenant isolation + auto-reaped nodes).
+	// reusable, ephemeral key per workload (tenant isolation + auto-reaped nodes).
 	// This runs on the Provision path, so a mint failure aborts provisioning rather
 	// than launching a daemon that can never join the mesh.
 	sandd, err := p.resolveSanddConfig(ctx)

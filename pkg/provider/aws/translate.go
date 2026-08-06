@@ -60,7 +60,7 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	// the container starts. They are bind-mounted read-only into the container by
 	// writeSanddEntrypoint, so the user's image needs no fetcher. Fail-open: a failed
 	// download just leaves the mount empty and the shim skips the daemon.
-	if spec.Sandd.Enabled() {
+	if spec.Sandd.Enabled() && len(spec.Command) > 0 {
 		fmt.Fprintf(&b, sanddHostFetchScript, sanddHostDir, sanddBinaryURL, tailscaleTarballURL)
 	}
 
