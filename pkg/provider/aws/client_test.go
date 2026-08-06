@@ -347,9 +347,10 @@ func TestBuildUserData_QuotesHostileValues(t *testing.T) {
 	}
 }
 
-// TestBuildUserData_PlainBootstrap: the bootstrap renders only the plain
-// docker-pull + docker-run flow — no sandd/tunnel tokens leak in.
-func TestBuildUserData_PlainBootstrap(t *testing.T) {
+// TestBuildUserData_SanddDisabled: the zero SanddConfig is the default, so a spec
+// that does not opt in must render EXACTLY the plain bootstrap — no sandd/tunnel
+// tokens leak in, so existing clusters are unaffected.
+func TestBuildUserData_SanddDisabled(t *testing.T) {
 	encoded, err := buildUserData(InstanceSpec{Image: "img"})
 	if err != nil {
 		t.Fatalf("buildUserData: %v", err)
@@ -357,7 +358,129 @@ func TestBuildUserData_PlainBootstrap(t *testing.T) {
 	raw, _ := base64.StdEncoding.DecodeString(encoded)
 	script := string(raw)
 	if strings.Contains(script, "sandd") || strings.Contains(script, "tunnel") {
-		t.Fatalf("plain bootstrap must not inject sandd/tunnel:\n%s", script)
+		t.Fatalf("sandd disabled but bootstrap injected it:\n%s", script)
+	}
+}
+
+// TestBuildUserData_SanddEnabled: when opted in, sandd runs INSIDE the container via
+// an entrypoint shim so its shells see the user's env/cwd/code. The shim must
+// override the image ENTRYPOINT with /bin/sh, carry daemon config as container env
+// (incl. the claim-derived DAEMON_ID), start the daemon fail-open + backgrounded,
+// and exec the user's effective command so the workload becomes PID 1.
+func TestBuildUserData_SanddEnabled(t *testing.T) {
+	spec := InstanceSpec{
+		Image:   "img",
+		Command: []string{"python", "train.py"},
+		Args:    []string{"--epochs", "3"},
+		Tags:    map[string]string{ClaimTagKey: "claim-abc"},
+		Sandd: provider.SanddConfig{
+			AuthKey:       "tskey-secret",
+			ControlServer: "http://headscale:8080",
+			ServerURL:     "ws://100.64.0.1:8765/ws",
+		},
+	}
+	encoded, err := buildUserData(spec)
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	// The shim commandeers the container ENTRYPOINT as /bin/sh.
+	if !strings.Contains(script, "--entrypoint '/bin/sh'") {
+		t.Fatalf("sandd shim must override the image entrypoint with /bin/sh:\n%s", script)
+	}
+
+	// Daemon config is delivered as container env (so a process INSIDE the container
+	// sees it), including the claim-derived DAEMON_ID and the tunnel key/server. The
+	// binary URLs are NOT container env anymore — the host fetches them (see below).
+	for _, want := range []string{
+		"-e 'DAEMON_ID=claim-abc'",
+		"-e 'SERVER_URL=ws://100.64.0.1:8765/ws'",
+		"-e 'SANDD_TUNNEL_AUTHKEY=tskey-secret'",
+		"-e 'SANDD_TUNNEL_SERVER=http://headscale:8080'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("sandd shim missing container env %q:\n%s", want, script)
+		}
+	}
+
+	// The binaries are fetched on the HOST (which has curl+tar) before docker run, so
+	// the user image needs no fetcher/package manager. Both URLs must appear in the
+	// host-side fetch, targeting sanddHostDir.
+	for _, want := range []string{sanddBinaryURL, tailscaleTarballURL, "mkdir -p " + sanddHostDir} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("host fetch must download %q into %s:\n%s", want, sanddHostDir, script)
+		}
+	}
+	// The host fetch must precede docker run (binaries exist before the container mounts them).
+	if strings.Index(script, sanddBinaryURL) > strings.Index(script, "docker run") {
+		t.Fatalf("host fetch must run BEFORE docker run:\n%s", script)
+	}
+	// The binaries reach the container via a read-only bind mount, not an in-container fetch.
+	if !strings.Contains(script, "-v '"+sanddHostDir+":"+sanddHostDir+":ro'") {
+		t.Fatalf("sandd binaries must be bind-mounted read-only at %s:\n%s", sanddHostDir, script)
+	}
+	if !strings.Contains(script, `export PATH="`+sanddHostDir) {
+		t.Fatalf("shim must put the mounted binaries on PATH:\n%s", script)
+	}
+	// No in-container fetch/install: the image is not required to have curl/wget or a
+	// package manager. Guard against regressing to the old per-container-install model.
+	for _, absent := range []string{"apt-get", "apk add", "SANDD_BINARY_URL", "curl -fsSL \"$SANDD_BINARY_URL\""} {
+		if strings.Contains(script, absent) {
+			t.Fatalf("shim must NOT fetch/install inside the container (found %q):\n%s", absent, script)
+		}
+	}
+
+	// Bring-up must be observable (not silent): steps log with a [sandd] prefix to
+	// stderr so they reach the EC2 instance console for debugging.
+	if !strings.Contains(script, "[sandd]") {
+		t.Fatalf("sandd bring-up must log steps with a [sandd] prefix:\n%s", script)
+	}
+
+	// Fail-open + backgrounded: both the host fetch and the container bring-up are
+	// `( set +e ... ) || true` subshells; the daemon start ends in `&`.
+	if !strings.Contains(script, "set +e") || !strings.Contains(script, ") || true") {
+		t.Fatalf("sandd bring-up must be fail-open (set +e + || true):\n%s", script)
+	}
+	if !strings.Contains(script, "&\n") {
+		t.Fatalf("sandd daemon must be backgrounded:\n%s", script)
+	}
+
+	// The shim execs the user's effective command so the workload is PID 1, and that
+	// command (image then argv) is rendered after the shim payload in kubelet order:
+	// Command[0]+Command[1:] then Args.
+	if !strings.Contains(script, `exec "$@"`) {
+		t.Fatalf("shim must exec the user command as PID 1:\n%s", script)
+	}
+	if !strings.Contains(script, "'img' '-c'") {
+		t.Fatalf("shim payload must follow the image on the run line:\n%s", script)
+	}
+	if !strings.Contains(script, "'sandd-shim' 'python' 'train.py' '--epochs' '3'\n") {
+		t.Fatalf("user effective command not rendered after the shim in order:\n%s", script)
+	}
+}
+
+// TestBuildUserData_SanddQuotesHostileValues: sandd config values are shell-quoted
+// like every other injected value, so a hostile auth key/URL cannot break out.
+func TestBuildUserData_SanddQuotesHostileValues(t *testing.T) {
+	spec := InstanceSpec{
+		Image: "img",
+		Tags:  map[string]string{ClaimTagKey: "c"},
+		Sandd: provider.SanddConfig{
+			AuthKey:       "k'; rm -rf /; echo '",
+			ControlServer: "http://h:8080",
+			ServerURL:     "ws://s:8765/ws",
+		},
+	}
+	encoded, err := buildUserData(spec)
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+	if strings.Contains(script, "\nrm -rf /") {
+		t.Fatalf("hostile sandd value escaped quoting:\n%s", script)
 	}
 }
 

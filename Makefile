@@ -1,6 +1,12 @@
 # Image URL to use all building/pushing image targets
 IMG ?= inftyai/nebula-controller:latest
 
+# KEYBROKER_IMG is the SandD key-broker sidecar image (cmd/keybroker,
+# Dockerfile.keybroker) that runs alongside headscale — see config/sandd. Built and
+# pushed separately from the manager IMG because it is a distinct, optional image
+# with its own base (FROM headscale, so it carries the headscale CLI).
+KEYBROKER_IMG ?= inftyai/nebula-keybroker:latest
+
 # NAMESPACE is where the manager runs (must match config/manager). Consumed by
 # hack/deploy.sh via the deploy-all target.
 NAMESPACE ?= nebula-system
@@ -155,6 +161,14 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
+.PHONY: docker-build-keybroker
+docker-build-keybroker: ## Build docker image for the SandD key-broker sidecar.
+	$(CONTAINER_TOOL) build -f Dockerfile.keybroker -t ${KEYBROKER_IMG} .
+
+.PHONY: docker-push-keybroker
+docker-push-keybroker: ## Push the SandD key-broker sidecar image.
+	$(CONTAINER_TOOL) push ${KEYBROKER_IMG}
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
@@ -195,7 +209,17 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) config/default | $(KUBECTL) apply -f -
+	# SANDD_TUNNEL_SERVER is the internet-facing headscale NLB hostname, only known
+	# after that Service provisions and different on every recreate — so it can't be
+	# baked into the tracked manifests. The config/sandd overlay carries the literal
+	# token __SANDD_TUNNEL_SERVER__ in headscale's server_url and the nebula-sandd-config
+	# ConfigMap; substitute it here so both render correct on the FIRST apply (no
+	# manager/headscale restart). Driven from .env via deploy-all (make deploy-all),
+	# or pass SANDD_TUNNEL_SERVER=... directly. When unset the token is left as-is (the
+	# render is then obviously broken rather than silently pointing nowhere).
+	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) config/default | \
+		$(if $(SANDD_TUNNEL_SERVER),sed 's|__SANDD_TUNNEL_SERVER__|$(SANDD_TUNNEL_SERVER)|g',cat) | \
+		$(KUBECTL) apply -f -
 
 .PHONY: deploy-e2e
 deploy-e2e: manifests kustomize ## Deploy for e2e: config/default plus the fake-provider env var (baked in at deploy time, not via a post-deploy rollout).

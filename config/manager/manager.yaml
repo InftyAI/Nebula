@@ -97,6 +97,27 @@ spec:
           # - secretRef:
           #     name: nebula-runpod-credentials
           #     optional: true
+          # SandD sandbox daemon (cross-provider — see pkg/provider SanddConfig). Its
+          # SANDD_KEYBROKER_URL / SANDD_TUNNEL_SERVER / SANDD_SERVER_URL are projected
+          # as env and every supporting adapter runs the daemon inside the workload
+          # container, so an operator can exec/shell into the user's own environment
+          # over the mesh (kubectl exec does NOT work against a virtual node).
+          #
+          # optional=false: this ConfigMap is REQUIRED. If it is missing the manager
+          # will NOT start (it sits in CreateContainerConfigError until the ConfigMap
+          # exists) rather than booting with SandD silently off. The overlay applies
+          # the ConfigMap before this Deployment (kustomize orders ConfigMap ahead of
+          # Deployment), so a normal `make deploy-all` satisfies it; a manager without
+          # SandD config is treated as a misconfiguration, not a valid mode.
+          #
+          # It is a ConfigMap, not a Secret: it holds only URLs (public endpoints), no
+          # credentials — the actual mesh keys are minted on demand by the key broker
+          # and never stored here. See config/sandd for the full working deployment
+          # (headscale + controller). To turn injection OFF, blank SANDD_KEYBROKER_URL
+          # in the ConfigMap (nil minter => nothing injected) rather than deleting it.
+          - configMapRef:
+              name: nebula-sandd-config
+              optional: false
         ports: []
         securityContext:
           readOnlyRootFilesystem: true
