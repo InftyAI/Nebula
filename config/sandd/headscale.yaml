@@ -124,6 +124,18 @@ spec:
             # process's local admin socket (unix_socket above).
             - name: socket
               mountPath: /var/run/headscale
+          # Sized for the whole mesh: headscale holds every node's state in-process
+          # and recomputes/pushes the netmap to all peers on each change, so both CPU
+          # and memory scale with node count, not with request rate. requests == limits
+          # keeps the pod Guaranteed — a throttled or OOM-killed control server drops
+          # the mesh for every joined node at once.
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
           readinessProbe:
             httpGet:
               path: /health

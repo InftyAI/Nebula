@@ -7,8 +7,9 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/InftyAI/Nebula.svg)](https://pkg.go.dev/github.com/InftyAI/Nebula)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Go Version](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/7WTUuFqyS6)
 
-Run GPU workloads on any NeoCloud or hyperscaler through one Kubernetes API.
+Run GPU workloads on any NeoCloud or hyperscaler or your own infrastructure through one Kubernetes API.
 
 </div>
 
@@ -20,6 +21,12 @@ per-cloud glue. The API follows a Karpenter-style split:
   (cost / availability), failover behaviour, and the GPU shape.
 - **NodeClaim** — one provisioned instance and its lifecycle, held by a finalizer
   so a paid instance is never leaked.
+
+## Overview
+
+<div align="center">
+  <img src="site/arch.png" alt="Nebula architecture overview" width="900">
+</div>
 
 ## How it works
 
@@ -96,6 +103,12 @@ placement controller owns those.
 - See [config/samples](config/samples) for example NodePools and a runnable workload.
 - See [docs/add-a-provider.md](docs/add-a-provider.md) to add a provider backend.
 - See [docs/architecture.md](docs/architecture.md) for design details.
+
+## Community
+
+Join us on [Discord](https://discord.gg/7WTUuFqyS6) for questions, design
+discussions, and help getting started. Contributions of every kind are welcome —
+see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

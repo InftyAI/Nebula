@@ -82,20 +82,16 @@ spec:
           command: ["python3", "-u", "-c"]
           args:
             - |
-              import os, time, json, urllib.request
-              from sandd import Server, TunnelConfig
+              import time
+              from sandd import Server, tunnel_config_from_env
 
-              # Mint a reusable+ephemeral key for this controller from the in-cluster
-              # broker (crash-loops if unreachable — the broker is required, not optional).
-              # NEVER print the key itself, only that we got one.
-              broker = os.environ["SANDD_KEYBROKER_URL"].rstrip("/")
-              req = urllib.request.Request(f"{broker}/keys?kind=controller", method="POST")
-              with urllib.request.urlopen(req, timeout=10) as resp:
-                  authkey = json.load(resp)["key"]
-              print("controller: minted key, joining mesh", flush=True)
-
-              server = Server(connect="tunnel", tunnel_config=TunnelConfig(
-                  authkey=authkey, server=os.environ["SANDD_TUNNEL_SERVER"]))
+              # tunnel_config_from_env mints a reusable+ephemeral key for this controller
+              # from the in-cluster broker and pairs it with the headscale URL, reading
+              # both SANDD_KEYBROKER_URL and SANDD_TUNNEL_SERVER (set in env below). It
+              # retries the mint a few times — the broker is a headscale sidecar, so its
+              # socket may not be up yet — then raises, crash-looping the pod: the broker
+              # is required, not optional. The key is a secret and is never printed.
+              server = Server(connect="tunnel", tunnel_config=tunnel_config_from_env())
               print("controller: ready, waiting for daemons", flush=True)
 
               # Commands run on each workload the first time it connects. Edit freely —
@@ -135,7 +131,7 @@ spec:
             - name: SANDD_TUNNEL_SERVER
               value: http://nebula-headscale.nebula-system
             # In-cluster key broker: the controller mints its OWN reusable+ephemeral
-            # key at startup from this endpoint (see resolve_authkey above). This is
+            # key at startup from this endpoint (via tunnel_config_from_env above). This is
             # the nebula-keybroker ClusterIP Service (config/sandd/headscale.yaml).
             # Required — the controller crash-loops if the broker is unreachable.
             - name: SANDD_KEYBROKER_URL
