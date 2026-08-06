@@ -14,11 +14,6 @@
 
 Please make sure to read and observe our [Code of Conduct](/CODE_OF_CONDUCT.md) first.
 
-### Community
-
-Say hi on [Discord](https://discord.gg/7WTUuFqyS6) — it's the fastest way to ask a
-question, float a design, or find something to pick up.
-
 ## Getting started
 
 🚀 **All kinds of contributions are welcomed !**
