@@ -1,17 +1,25 @@
-# Remote workloads: one Kubernetes API for sandboxes, inference, and training
+# Nebula Architecture
 
 **Status:** Draft · **Supersedes:** the headscale/mesh design on
 `feat/support-headscale` (see [Migration](#migration-from-featsupport-headscale))
+
+This is the design for where Nebula is going: one Kubernetes API surface over every
+GPU workload class — sandboxes and agents, notebooks and shells, inference and
+services, training and fine-tuning jobs — all running on remote instances across
+NeoClouds and hyperscalers.
 
 Nebula turns external GPU capacity into ordinary Pods. Today that stops at
 *provisioning*: a Pod is placed, an instance is launched, and status flows back —
 but the workload is unreachable. `kubectl logs` and `kubectl exec` return
 `NotFound` (`pkg/vnode/handler.go:686`), nothing in the cluster can call a served
-model, and there is no way to run several instances as one coordinated group.
+model, and there is no way to run several instances as one coordinated group. So
+only one of the four classes is really served, and the pieces the other three need
+are also the pieces that make the first one good.
 
-This document is the design for closing that gap. It is a proposal: nothing here
-is built yet. Once a phase ships, its content moves into
-[docs/architecture.md](../architecture.md) and this stays as the record of *why*.
+This document covers that whole target state and the order to build it in. It is a
+proposal: nothing here is built yet. For the architecture as it exists today, see
+[docs/architecture.md](../architecture.md) — as each phase ships, its content moves
+there and this stays as the record of *why*.
 
 - [Requirement](#requirement)
 - [Goals and non-goals](#goals-and-non-goals)
