@@ -38,10 +38,7 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 - **Gang scheduling and intra-gang connectivity** — multi-instance workloads that
   provision all-or-nothing and can reach each other. Deferred, not abandoned: it is
-  what training and fine-tuning need, and the one genuinely new primitive here. The
-  near-term constraint is only that nothing else deepen `NodeClaim.spec.podRef`'s 1:1
-  relationship with a Pod (`api/v1alpha1/nodeclaim_types.go:18`), so it stays
-  reachable. See [Deferred](#deferred--training-fine-tuning-jobs).
+  what training and fine-tuning need.
 
 **Non-goals**
 
@@ -52,13 +49,11 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 ## Workload classes
 
-Four classes. The distinguishing axes are whether anything must **dial into** the
-instance, and whether the replicas carry **identity** (a specific box you keep
-talking to) or are **fungible** (any replica will serve the request).
+Four classes, three phases.
 
 | Class | CRD | Inbound to instance | Group | Lifetime | Phase |
 |---|---|---|---|---|---|
-| sandbox, agent, shell | `Sandbox` | no | N ordinal (warm pool) | minutes–days | 1 |
+| sandbox, agent, shell | `Sandbox` | no | 1 | minutes–days | 1 |
 | notebook | `Notebook` | no (consumer terminates in-cluster) | 1 | hours–days | 1.5 |
 | inference, services | Deployment + Service | **yes**, from arbitrary clients | N fungible | long | 2 |
 | training, fine-tuning, jobs | (TBD) | **yes**, from peers only | N ordinal, all-or-nothing | bounded | deferred |
@@ -136,75 +131,18 @@ workload as its **child**, owning its stdout/stderr pipes.
 
 ### 4. A Sandbox CRD, above the Pod
 
-**Decision.** Add one namespaced `Sandbox` CRD with **`spec.replicas`**. It
-synthesizes N Pods, each with **stable ordinal identity** — StatefulSet-shaped, not
-Deployment-shaped. No class object, no `type` discriminator. Other shapes (Notebook,
-later a training Job) become their own CRDs when they need their own spec, each
-reusing the same Pod path underneath.
+**Decision.** Add one namespaced `Sandbox` CRD. It **creates one Pod**; it does not
+replace or bypass it. No class object, no `type` discriminator — a Sandbox is a
+sandbox. Other shapes (Notebook, and later a training Job) become their own CRDs
+when they need their own spec, each reusing the same Pod path underneath.
 
 ```
-Sandbox (replicas: 3)
-  ├── creates Pod pool-0, pool-1, pool-2  (ownerRef'd, restartPolicy: Never, NO command)
+Sandbox
+  ├── creates Pod (1, ownerRef'd, restartPolicy: Never, NO command)
   │      └── gate → placement → nodeSelector → virtual node
   │             └── VK CreatePod → NodeClaim → instance
-  └── owns lifecycle: scale, stop/start, TTL, idle-cull, per-replica endpoints
+  └── owns lifecycle: stop/start, TTL, idle-cull, endpoints
 ```
-
-**Why replicas on something with identity.** Two unrelated needs, one field:
-
-- **A warm pool.** A NeoCloud GPU instance takes minutes to become Ready, but an
-  agent-exec call wants sub-second. Keeping N boxes provisioned ahead of demand is
-  the only way to serve that without multi-tenanting a single instance. This closes
-  what was previously an open question in this document.
-- **Fan-out.** One agent task across 20 boxes, without creating 20 objects.
-
-**Ordinal, not fungible.** Each replica is `<sandbox>-<ordinal>`, with its own claim,
-its own volume, and its own live sessions — so `kubectl exec sandbox-3` is
-meaningful and repeatable. This is the whole reason a Deployment is still wrong even
-though Deployments have replicas: its replicas are interchangeable, a rolling update
-would silently swap a user's box out from under them, and its recreate-on-exit fights
-the `Stopped` state.
-
-**Scale subresource.** Implement `/scale` so `kubectl scale sandbox/pool
---replicas=20` works and HPA/KEDA can drive pool size from queue depth. That is the
-whole autoscaling story for a warm pool, for free.
-
-```yaml
-kind: Sandbox
-metadata: {name: pool, namespace: team-ml}
-spec:
-  replicas: 3
-  nodePoolRef: gpu                    # existing placement policy object
-  image: ubuntu:24.04
-  accelerator: nvidia-a100
-  desiredState: Running               # Stopped releases GPUs, keeps volumes
-  ttl: 8h                             # per replica, from its own ready time
-  idleTimeout: 30m                    # omit to disable culling
-  storage: {size: 100Gi, retainOnStop: true}
-status:
-  replicas: 3
-  readyReplicas: 2
-  instances:                          # per replica — the addressable unit
-  - name: pool-0
-    phase: Ready
-    nodeClaimRef: {name: team-ml-pool-0}
-    lastActivityTime: "2026-08-07T09:12:00Z"
-  - name: pool-1
-    phase: Ready
-    lastActivityTime: "2026-08-07T09:40:00Z"
-  - name: pool-2
-    phase: Provisioning
-```
-
-**Why a CRD at all**, rather than labeled Pods. Four things Pods cannot express:
-
-1. **Identity that outlives the instance** — volume and claim name survive a
-   reprovision.
-2. **`desiredState: Running | Stopped`** — release a $3/hr GPU while keeping the
-   volume. A large economic lever, and meaningless on a Pod.
-3. **Per-replica `lastActivityTime`** — the idle signal that drives culling.
-4. **Replica set semantics with identity** — no built-in workload API gives ordinal
-   identity *plus* activity-based scale-in (see the open question below).
 
 **Why a Pod underneath.** The Pod is the carrier of everything already built:
 placement, `pkg/failover`'s blocklist, and — critically — the NodeClaim finalizer
@@ -212,100 +150,20 @@ that guarantees a paid instance is never leaked. It is also what ResourceQuota
 counts, which is how one tenant is stopped from provisioning fifty H100s. Bypassing
 it would mean reimplementing all of that.
 
-**No command, by design.** SandD is PID 1 and there is no user program to wrap. A
-sandbox is a box you talk into, not a program that runs.
-
-**Why no SandboxClass.** An earlier draft had a cluster-scoped class holding image,
-ports, TTL, and storage, on the theory that it avoided a `type:` discriminator. But a
-discriminator was never the alternative — every field above is meaningful on every
-sandbox, so there is nothing mutually exclusive to factor out. And the StorageClass
-analogy does not hold: a PVC author genuinely cannot know the provisioner, whereas
-here `nodePoolRef` is already the admin-owned policy object. A class would be a
-second object to reason about for no present benefit, and it invites a
-`spec.overrides` escape hatch that reproduces the whole spec inline.
-
-Add it later **if** self-service multi-tenancy arrives — where users may create
-Sandboxes but must not choose arbitrary images or GPU types, making an admin-owned
-class a real security boundary. That is additive (`classRef` plus webhook
-defaulting), not a migration.
-
-**Why notebook is a future CRD, not a Sandbox variant.** A notebook needs fields a
-sandbox does not: a served HTTP port, a proxied URL in status, per-user auth, and a
-process to start once the box is ready — the notebook server is launched by a
-post-ready **exec through the control channel**, not as a container command. That
-last point is what makes it a different resource rather than a flag: restart Jupyter
-without recreating the instance, a crash does not kill the box or the session, and a
-second process (TensorBoard) can be added to a running notebook later. A notebook is
-also inherently `replicas: 1` — a second identical notebook is a second Notebook.
-
-Sandbox ships first and proves the machinery — Pod synthesis, scale, stop/start,
-idle-cull, endpoints in status, SandD lifecycle. Notebook then reuses all of it plus
-`PortForward` or the proxy.
-
-**The WS server is the activity oracle.** It sees every exec, session, and proxied
-request, so `lastActivityTime` flows SandD → server → the matching entry in
-`status.instances`, and the controller culls on it. Nothing else can know this — the
-provider only knows the instance is running.
-
-**Open question — scale-in must not be ordinal.** StatefulSet scales in from the
-highest ordinal, which is wrong here: `pool-4` may hold a live session while
-`pool-1` has been idle for an hour. Scale-in has to pick the **least recently
-active** replica, which means ordinals are stable names but not a removal order, and
-`status.instances` is the input to that choice. Two consequences worth settling
-before implementing: a replica that is culled leaves an ordinal gap (accept it —
-reusing names invites confusion with a still-draining box), and an in-flight exec
-must either block scale-in briefly or be terminated with a clear error.
-
-**Open question — how a consumer claims a warm replica.** With a pool of N ready
-boxes, something must hand one out and mark it busy, or two callers will land on the
-same box. Options: a lease/claim subresource on the Sandbox; a label the caller sets;
-or leave it to the consumer, which is fine when the pool has one client and wrong the
-moment it has two. Not needed for phase 1 (a caller can pick by name), but it is the
-next thing agent-exec at scale will ask for.
-
-### 5. Inbound is a provider capability
-
-**Decision.** Inference reachability is resolved per provider in three tiers, all
-converging on one consumer-facing abstraction: a **selector-less Service** plus an
-EndpointSlice that Nebula populates.
-
-| Tier | Mechanism | Providers |
-|---|---|---|
-| **A. Native endpoint** | the provider hands us a URL | Modal (tunnels — already implemented, `pkg/provider/modal/client.go:270`) |
-| **B. Direct L3** | security group opens the port; clients hit the instance IP | AWS |
-| **C. Gateway** | instance dials out; an in-cluster gateway accepts consumers | providers with no inbound path at all |
-
-Prefer A, then B. C is a fallback taken knowingly, per provider, because it puts a
-hop in the token path — it must not be the default, which is exactly what a
-mesh-everywhere design would have locked in.
-
-**Why the Service must have no selector.** A selector-based Service would have its
-EndpointSlices auto-populated with the *virtual node's* notion of pod IP, which is
-useless. The real address lives in the endpoint annotation
-(`persistEndpoint`, `pkg/vnode/handler.go:545`), so Nebula writes the EndpointSlice
-itself with `endpointslice.kubernetes.io/managed-by: nebula`. Then kube-proxy
-load-balances to off-cluster IPs and every existing client — `my-llm.default.svc` —
-works unmodified.
-
-**Readiness is a correctness prerequisite, not a feature.** `applyState` sets
-`Ready=True` as soon as the provider reports *running*
-(`pkg/vnode/status.go:74`), but vLLM needs minutes more to load weights. Routing on
-that blackholes traffic on every rollout. An endpoint must not become `ready` until a
-real probe passes. Modal already enforces the Pod's probe internally
-(`SandboxSpec.ReadinessProbe`); for AWS this means probing in the VK poll loop
-(`reconcileOnce`) and gating the Ready condition on the result.
-
-**Never through the control channel.** One process holding 10k connections must not
-also carry token streams: it would become a throughput bottleneck and a single
-failure point for serving. Control plane and data plane stay separate. The one
-exception is `kubectl port-forward` over the existing WebSocket — correct for
-debugging, a notebook, or an admin API, and explicitly not for model serving.
-
-**Training's inbound is different.** Rank-to-rank connectivity is inbound, but from a
-*closed, known* peer set — so it is a provider-native rule scoped to the placement
-group (same subnet, allow-from-self security group, EFA/RDMA where available), not
-exposure to anything outside. It is a provisioning-time property, which is why it is
-coupled to the gang primitive rather than to this tier system.
+```yaml
+kind: Sandbox
+metadata: {name: alice-1, namespace: team-ml}
+spec:
+  nodePoolRef: gpu                    # existing placement policy object
+  image: ubuntu:24.04
+  accelerator: nvidia-a100
+  storage: {size: 100Gi, retainOnStop: true}
+status:
+  phase: Ready
+  endpoints: {exec: ..., pty: ...}
+  lastActivityTime: "2026-08-07T09:12:00Z"
+  nodeClaimRef: {name: team-ml-alice-1}
+```
 
 ---
 
@@ -397,9 +255,8 @@ Nebula side:
 6. Kubelet serving stack on the VK: `vkapi.PodHandler`, address advertisement,
    serving cert, TokenReview/SubjectAccessReview.
 7. Implement `RunInContainer`, `AttachToContainer`, `GetContainerLogs`.
-8. `Sandbox` CRD and its controller: N-Pod synthesis with stable ordinals, the
-   `/scale` subresource, stop/start, TTL, activity-based idle-cull, per-replica
-   status.
+8. `Sandbox` CRD and its controller: Pod synthesis, stop/start, TTL, idle-cull,
+   endpoints in status.
 9. Delete: `errSanddNeedsCommand`, the shim supervisor loop, the Tailscale fetch,
    the headscale half of `config/sandd`, and the `SANDD_TUNNEL_SERVER` substitution
    dance in `Makefile`/`hack/deploy.sh` (a headscale constraint, not ours).
@@ -431,9 +288,9 @@ A separate `Notebook` CRD reusing everything Phase 1 built. What it adds:
 4. EndpointSlice bridge: selector-less Service + Nebula-managed endpoints.
 5. Per-provider inbound: Modal native (nearly free), AWS security groups.
 
-### Deferred — Training, fine-tuning, jobs
+### Phase 3 — Training, fine-tuning, jobs
 
-*Goal: multi-instance, all-or-nothing, mutually reachable. A [non-goal for now](#goals-and-non-goals); listed so the near-term work does not foreclose it.*
+*Goal: multi-instance, all-or-nothing, mutually reachable.*
 
 1. **Gang scheduling** — N instances all-or-nothing, so a partially provisioned
    8-node job does not bill while waiting. `NodeClaim.spec.podRef` is 1:1
