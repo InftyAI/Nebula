@@ -38,7 +38,10 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 - **Gang scheduling and intra-gang connectivity** — multi-instance workloads that
   provision all-or-nothing and can reach each other. Deferred, not abandoned: it is
-  what training and fine-tuning need.
+  what training and fine-tuning need, and the one genuinely new primitive here. The
+  near-term constraint is only that nothing else deepen `NodeClaim.spec.podRef`'s 1:1
+  relationship with a Pod (`api/v1alpha1/nodeclaim_types.go:18`), so it stays
+  reachable. See [Deferred](#deferred--training-fine-tuning-jobs).
 
 **Non-goals**
 
@@ -51,12 +54,17 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 Four classes, three phases.
 
-| Class | Inbound to instance | Group | Lifetime | Phase |
-|---|---|---|---|---|
-| sandbox, agent | no | 1 | minutes–days | 1 |
-| notebook, shell | no | 1 | hours–days | 1 |
-| inference, services | **yes**, from arbitrary clients | N fungible | long | 2 |
-| training, fine-tuning, jobs | **yes**, from peers only | N ordinal, all-or-nothing | bounded | 3 |
+| Class | CRD | Inbound to instance | Group | Lifetime | Phase |
+|---|---|---|---|---|---|
+| sandbox, agent, shell | `Sandbox` | no | 1 | minutes–days | 1 |
+| notebook | `Notebook` | no (consumer terminates in-cluster) | 1 | hours–days | 1.5 |
+| inference, services | Deployment + Service | **yes**, from arbitrary clients | N fungible | long | 2 |
+| training, fine-tuning, jobs | (TBD) | **yes**, from peers only | N ordinal, all-or-nothing | bounded | deferred |
+
+One CRD per shape, each synthesizing Pods onto the existing placement path. Inference
+needs no CRD at all: a Deployment of labeled Pods already provisions N instances, and
+replicas/rolling-update/HPA are what Deployment does well. What it lacks is
+reachability, which is [Decision 5](#5-inbound-is-a-provider-capability).
 
 ---
 
@@ -89,6 +97,8 @@ runs a command. 10k of them is an ordinary WebSocket server in a single process.
 
 **Why not a mesh (headscale/Tailscale).** A mesh solves the same reachability
 problem and needs less development work since coordinator already exists, but headscale has a performance issue when reaching around 500 nodes, see [headscale#1656](https://github.com/juanfont/headscale/issues/1656).
+
+![tailnet](./tailnet.png)
 
 **Revisit if** dial-in becomes a product feature: operator SSH into any box, a
 pull-based metrics scraper, or instance-to-instance traffic *across* providers.
@@ -124,8 +134,10 @@ workload as its **child**, owning its stdout/stderr pipes.
 
 ### 4. A Sandbox CRD, above the Pod
 
-**Decision.** Add a `Sandbox` CRD (namespaced) plus a `SandboxClass` (cluster-scoped)
-for policy. A Sandbox **creates one Pod**; it does not replace or bypass it.
+**Decision.** Add one namespaced `Sandbox` CRD. It **creates one Pod**; it does not
+replace or bypass it. No class object, no `type` discriminator — a Sandbox is a
+sandbox. Other shapes (Notebook, and later a training Job) become their own CRDs
+when they need their own spec, each reusing the same Pod path underneath.
 
 ```
 Sandbox
@@ -141,38 +153,66 @@ that guarantees a paid instance is never leaked. It is also what ResourceQuota
 counts, which is how one tenant is stopped from provisioning fifty H100s. Bypassing
 it would mean reimplementing all of that.
 
-```yaml
-kind: SandboxClass          # cluster-scoped policy
-metadata: {name: notebook-a100}
-spec:
-  nodePoolRef: gpu
-  image: jupyter/tensorflow-notebook:latest
-  startup: ["start-notebook.sh"]      # post-ready exec, NOT a container command
-  ports: [{name: http, port: 8888, expose: Proxied}]
-  interfaces: [Exec, PTY, Proxy]
-  idleTimeout: 30m
-  storage: {size: 100Gi, retainOnStop: true}
-```
+**Why not a Deployment.** Replicas are *fungible*; a sandbox has identity — its
+disk, its claim name, its live sessions. A rolling update would silently swap a
+user's box out from under them, and the Deployment controller's recreate-on-exit
+fights the `Stopped` state below.
+
+**Why a CRD at all**, rather than a labeled Pod. Three things a Pod cannot express:
+
+1. **Identity that outlives the instance** — the disk and claim name survive a
+   reprovision.
+2. **`desiredState: Running | Stopped`** — release a $3/hr GPU while keeping the
+   volume. A large economic lever, and meaningless on a Pod.
+3. **`status.endpoints` + `lastActivityTime`** — a stable address and the idle
+   signal that drives culling.
 
 ```yaml
-kind: Sandbox               # namespaced instance
-metadata: {name: alice-nb-1, namespace: team-ml}
+kind: Sandbox
+metadata: {name: alice-1, namespace: team-ml}
 spec:
-  classRef: notebook-a100
-  desiredState: Running
-  accelerator: nvidia-a100            # per-instance override
+  nodePoolRef: gpu                    # existing placement policy object
+  image: ubuntu:24.04
+  accelerator: nvidia-a100
+  desiredState: Running               # Stopped releases the GPU, keeps the volume
   ttl: 8h
+  idleTimeout: 30m                    # omit to disable culling
+  storage: {size: 100Gi, retainOnStop: true}
 status:
   phase: Ready
-  endpoints:
-    http: https://nebula-proxy.nebula-system/s/alice-nb-1/
+  endpoints: {exec: ..., pty: ...}
   lastActivityTime: "2026-08-07T09:12:00Z"
-  nodeClaimRef: {name: team-ml-alice-nb-1}
+  nodeClaimRef: {name: team-ml-alice-1}
 ```
 
-So: *agent-exec* = short TTL, no storage, Exec only. *agent* = long-lived, storage,
-no idle cull. *notebook* = as above. *shell* = PTY-primary, short idle. Five
-surfaces, one CRD, zero mutually-exclusive fields.
+**No command, by design.** SandD is PID 1 and there is no user program to wrap. A
+sandbox is a box you talk into, not a program that runs.
+
+**Why no SandboxClass.** An earlier draft had a cluster-scoped class holding image,
+ports, TTL, and storage, on the theory that it avoided a `type:` discriminator. But a
+discriminator was never the alternative — every field above is meaningful on every
+sandbox, so there is nothing mutually exclusive to factor out. And the StorageClass
+analogy does not hold: a PVC author genuinely cannot know the provisioner, whereas
+here `nodePoolRef` is already the admin-owned policy object. A class would be a
+second object to reason about for no present benefit, and it invites a
+`spec.overrides` escape hatch that reproduces the whole spec inline.
+
+Add it later **if** self-service multi-tenancy arrives — where users may create
+Sandboxes but must not choose arbitrary images or GPU types, making an admin-owned
+class a real security boundary. That is additive (`classRef` plus webhook
+defaulting), not a migration.
+
+**Why notebook is a future CRD, not a Sandbox variant.** A notebook needs fields a
+sandbox does not: a served HTTP port, a proxied URL in status, per-user auth, and a
+process to start once the box is ready — the notebook server is launched by a
+post-ready **exec through the control channel**, not as a container command. That
+last point is what makes it a different resource rather than a flag: restart Jupyter
+without recreating the instance, a crash does not kill the box or the session, and a
+second process (TensorBoard) can be added to a running notebook later.
+
+Sandbox ships first and proves the machinery — Pod synthesis, stop/start, idle-cull,
+endpoints in status, SandD lifecycle. Notebook then reuses all of it plus
+`PortForward` or the proxy.
 
 **The WS server is the activity oracle.** It sees every exec, session, and proxied
 request, so `lastActivityTime` flows SandD → server → `Sandbox.status`, and the
@@ -300,14 +340,14 @@ out.
 
 Each phase builds the seam the next one needs. Nothing is built twice.
 
-### Phase 1 — Sandbox, agent, notebook, shell
+### Phase 1 — Sandbox, agent, shell
 
 *Goal: `kubectl exec`/`logs` work against a remote box, driven by a CRD.*
 
-Agent side (gating — these block everything else):
+SandD side (gating — these block everything else):
 
 1. Plain-TLS dial-out with a bearer JWT, alongside the existing `--tunnel` mode.
-2. Agent as PID 1, spawning the workload as a child and owning its pipes.
+2. SandD as PID 1, spawning the workload as a child and owning its pipes.
 3. Registry-based entrypoint resolution, so no `command` is required.
 
 Nebula side:
@@ -322,7 +362,8 @@ Nebula side:
 6. Kubelet serving stack on the VK: `vkapi.PodHandler`, address advertisement,
    serving cert, TokenReview/SubjectAccessReview.
 7. Implement `RunInContainer`, `AttachToContainer`, `GetContainerLogs`.
-8. `Sandbox` + `SandboxClass` CRDs and their controller.
+8. `Sandbox` CRD and its controller: Pod synthesis, stop/start, TTL, idle-cull,
+   endpoints in status.
 9. Delete: `errSanddNeedsCommand`, the shim supervisor loop, the Tailscale fetch,
    the headscale half of `config/sandd`, and the `SANDD_TUNNEL_SERVER` substitution
    dance in `Makefile`/`hack/deploy.sh` (a headscale constraint, not ours).
@@ -330,8 +371,19 @@ Nebula side:
 Pull forward from Phase 2 if convenient: the `Instance.Endpoint` widening (seam
 change 3). Cheap now, annoying once two consumers depend on the string.
 
-Notebook additionally needs `PortForward` or a proxy for its HTTP/WS surface —
-scope it as 1.5 if Phase 1 is getting long.
+### Phase 1.5 — Notebook
+
+*Goal: a browser reaches Jupyter on a remote box.*
+
+A separate `Notebook` CRD reusing everything Phase 1 built. What it adds:
+
+1. `PortForward` on the VK, or the controller-side proxy, for the HTTP/WS surface.
+2. A post-ready **exec** that starts the notebook server — not a container command,
+   so it can be restarted without recreating the instance.
+3. A proxied URL in `status.endpoints`, plus per-user auth on it.
+4. Volume support in the provider seam, so the home directory survives a
+   reprovision. Nothing in the AWS adapter wires block devices today; this is the
+   same gap training's checkpoints hit.
 
 ### Phase 2 — Inference and services
 
@@ -343,9 +395,9 @@ scope it as 1.5 if Phase 1 is getting long.
 4. EndpointSlice bridge: selector-less Service + Nebula-managed endpoints.
 5. Per-provider inbound: Modal native (nearly free), AWS security groups.
 
-### Phase 3 — Training, fine-tuning, jobs
+### Deferred — Training, fine-tuning, jobs
 
-*Goal: multi-instance, all-or-nothing, mutually reachable.*
+*Goal: multi-instance, all-or-nothing, mutually reachable. A [non-goal for now](#goals-and-non-goals); listed so the near-term work does not foreclose it.*
 
 1. **Gang scheduling** — N instances all-or-nothing, so a partially provisioned
    8-node job does not bill while waiting. `NodeClaim.spec.podRef` is 1:1
