@@ -1,8 +1,5 @@
 # Nebula Architecture
 
-**Status:** Draft · **Supersedes:** the headscale/mesh design on
-`feat/support-headscale` (see [Migration](#migration-from-featsupport-headscale))
-
 This is the design for where Nebula is going: one Kubernetes API surface over every
 GPU workload class — sandboxes and agents, notebooks and shells, inference and
 services, training and fine-tuning jobs — all running on remote instances across
@@ -33,7 +30,6 @@ there and this stays as the record of *why*.
 - [Provider seam changes](#provider-seam-changes)
 - [Roadmap](#roadmap)
 - [Risks](#risks)
-- [Migration from feat/support-headscale](#migration-from-featsupport-headscale)
 
 ---
 
@@ -578,33 +574,3 @@ and an extra hop for no benefit. One shared holder, keyed by claim name.
 a long-lived agent outliving its token needs refresh. Simplest for Phase 1: issue a
 token that outlives the class's max TTL and bound exposure with ownerRef GC. Decide
 now — retrofitting refresh into the agent is worse than designing for it.
-
----
-
-## Migration from `feat/support-headscale`
-
-`main` is already mesh-free: commit `2cae49c` ("cleanup: remove headscale") removed
-it, and `feat/support-headscale` re-added it via a revert (`1145eb1`). **Nothing needs
-to be reverted** — that branch simply should not merge. Keep it as a reference and
-build on a fresh branch off `main`; a revert-of-a-revert-of-a-cleanup history would
-be unreadable and would lose the working reference for the parts being ported.
-
-Roughly 40% of the branch survives, and it is the part that took the longest.
-
-**Port forward:**
-
-- `pkg/provider/provider.go` — `SanddConfig`, the `Enabled()`/`KeyMinter` seam, and
-  the injection-point design. Rename `AuthKey` → `Token`, drop `ControlServer`.
-- `pkg/provider/aws/translate.go` — the host-fetch plus read-only bind mount *is* the
-  `InjectFiles` primitive; it just fetches one binary instead of two.
-- `pkg/sandd/keybroker.go`, `cmd/keybroker` — the mint-at-Provision call site and
-  injection plumbing. The signing logic changes; the shape does not.
-- `pkg/provider/aws/sandd_test.go`, `client_test.go` — test scaffolding.
-
-**Leave behind:** `config/sandd/headscale.yaml`, `config/samples/headscale-service.yaml`,
-`config/samples/sandd-controller.yaml` (the per-workload controller is dropped), the
-`SANDD_TUNNEL_SERVER` substitution in `Makefile`/`hack/deploy.sh`, the Tailscale
-tarball fetch, the shim supervisor loop, and `errSanddNeedsCommand`.
-
-**Incidental:** an 8.4 MB `keybroker` binary is committed on that branch. Do not carry
-it forward; add it to `.gitignore`.
