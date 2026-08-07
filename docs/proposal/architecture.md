@@ -52,11 +52,13 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 ## Workload classes
 
-Four classes, three phases.
+Four classes. The distinguishing axes are whether anything must **dial into** the
+instance, and whether the replicas carry **identity** (a specific box you keep
+talking to) or are **fungible** (any replica will serve the request).
 
 | Class | CRD | Inbound to instance | Group | Lifetime | Phase |
 |---|---|---|---|---|---|
-| sandbox, agent, shell | `Sandbox` | no | 1 | minutes–days | 1 |
+| sandbox, agent, shell | `Sandbox` | no | N ordinal (warm pool) | minutes–days | 1 |
 | notebook | `Notebook` | no (consumer terminates in-cluster) | 1 | hours–days | 1.5 |
 | inference, services | Deployment + Service | **yes**, from arbitrary clients | N fungible | long | 2 |
 | training, fine-tuning, jobs | (TBD) | **yes**, from peers only | N ordinal, all-or-nothing | bounded | deferred |
@@ -134,56 +136,81 @@ workload as its **child**, owning its stdout/stderr pipes.
 
 ### 4. A Sandbox CRD, above the Pod
 
-**Decision.** Add one namespaced `Sandbox` CRD. It **creates one Pod**; it does not
-replace or bypass it. No class object, no `type` discriminator — a Sandbox is a
-sandbox. Other shapes (Notebook, and later a training Job) become their own CRDs
-when they need their own spec, each reusing the same Pod path underneath.
+**Decision.** Add one namespaced `Sandbox` CRD with **`spec.replicas`**. It
+synthesizes N Pods, each with **stable ordinal identity** — StatefulSet-shaped, not
+Deployment-shaped. No class object, no `type` discriminator. Other shapes (Notebook,
+later a training Job) become their own CRDs when they need their own spec, each
+reusing the same Pod path underneath.
 
 ```
-Sandbox
-  ├── creates Pod (1, ownerRef'd, restartPolicy: Never, NO command)
+Sandbox (replicas: 3)
+  ├── creates Pod pool-0, pool-1, pool-2  (ownerRef'd, restartPolicy: Never, NO command)
   │      └── gate → placement → nodeSelector → virtual node
   │             └── VK CreatePod → NodeClaim → instance
-  └── owns lifecycle: stop/start, TTL, idle-cull, endpoints
+  └── owns lifecycle: scale, stop/start, TTL, idle-cull, per-replica endpoints
 ```
+
+**Why replicas on something with identity.** Two unrelated needs, one field:
+
+- **A warm pool.** A NeoCloud GPU instance takes minutes to become Ready, but an
+  agent-exec call wants sub-second. Keeping N boxes provisioned ahead of demand is
+  the only way to serve that without multi-tenanting a single instance. This closes
+  what was previously an open question in this document.
+- **Fan-out.** One agent task across 20 boxes, without creating 20 objects.
+
+**Ordinal, not fungible.** Each replica is `<sandbox>-<ordinal>`, with its own claim,
+its own volume, and its own live sessions — so `kubectl exec sandbox-3` is
+meaningful and repeatable. This is the whole reason a Deployment is still wrong even
+though Deployments have replicas: its replicas are interchangeable, a rolling update
+would silently swap a user's box out from under them, and its recreate-on-exit fights
+the `Stopped` state.
+
+**Scale subresource.** Implement `/scale` so `kubectl scale sandbox/pool
+--replicas=20` works and HPA/KEDA can drive pool size from queue depth. That is the
+whole autoscaling story for a warm pool, for free.
+
+```yaml
+kind: Sandbox
+metadata: {name: pool, namespace: team-ml}
+spec:
+  replicas: 3
+  nodePoolRef: gpu                    # existing placement policy object
+  image: ubuntu:24.04
+  accelerator: nvidia-a100
+  desiredState: Running               # Stopped releases GPUs, keeps volumes
+  ttl: 8h                             # per replica, from its own ready time
+  idleTimeout: 30m                    # omit to disable culling
+  storage: {size: 100Gi, retainOnStop: true}
+status:
+  replicas: 3
+  readyReplicas: 2
+  instances:                          # per replica — the addressable unit
+  - name: pool-0
+    phase: Ready
+    nodeClaimRef: {name: team-ml-pool-0}
+    lastActivityTime: "2026-08-07T09:12:00Z"
+  - name: pool-1
+    phase: Ready
+    lastActivityTime: "2026-08-07T09:40:00Z"
+  - name: pool-2
+    phase: Provisioning
+```
+
+**Why a CRD at all**, rather than labeled Pods. Four things Pods cannot express:
+
+1. **Identity that outlives the instance** — volume and claim name survive a
+   reprovision.
+2. **`desiredState: Running | Stopped`** — release a $3/hr GPU while keeping the
+   volume. A large economic lever, and meaningless on a Pod.
+3. **Per-replica `lastActivityTime`** — the idle signal that drives culling.
+4. **Replica set semantics with identity** — no built-in workload API gives ordinal
+   identity *plus* activity-based scale-in (see the open question below).
 
 **Why a Pod underneath.** The Pod is the carrier of everything already built:
 placement, `pkg/failover`'s blocklist, and — critically — the NodeClaim finalizer
 that guarantees a paid instance is never leaked. It is also what ResourceQuota
 counts, which is how one tenant is stopped from provisioning fifty H100s. Bypassing
 it would mean reimplementing all of that.
-
-**Why not a Deployment.** Replicas are *fungible*; a sandbox has identity — its
-disk, its claim name, its live sessions. A rolling update would silently swap a
-user's box out from under them, and the Deployment controller's recreate-on-exit
-fights the `Stopped` state below.
-
-**Why a CRD at all**, rather than a labeled Pod. Three things a Pod cannot express:
-
-1. **Identity that outlives the instance** — the disk and claim name survive a
-   reprovision.
-2. **`desiredState: Running | Stopped`** — release a $3/hr GPU while keeping the
-   volume. A large economic lever, and meaningless on a Pod.
-3. **`status.endpoints` + `lastActivityTime`** — a stable address and the idle
-   signal that drives culling.
-
-```yaml
-kind: Sandbox
-metadata: {name: alice-1, namespace: team-ml}
-spec:
-  nodePoolRef: gpu                    # existing placement policy object
-  image: ubuntu:24.04
-  accelerator: nvidia-a100
-  desiredState: Running               # Stopped releases the GPU, keeps the volume
-  ttl: 8h
-  idleTimeout: 30m                    # omit to disable culling
-  storage: {size: 100Gi, retainOnStop: true}
-status:
-  phase: Ready
-  endpoints: {exec: ..., pty: ...}
-  lastActivityTime: "2026-08-07T09:12:00Z"
-  nodeClaimRef: {name: team-ml-alice-1}
-```
 
 **No command, by design.** SandD is PID 1 and there is no user program to wrap. A
 sandbox is a box you talk into, not a program that runs.
@@ -208,25 +235,33 @@ process to start once the box is ready — the notebook server is launched by a
 post-ready **exec through the control channel**, not as a container command. That
 last point is what makes it a different resource rather than a flag: restart Jupyter
 without recreating the instance, a crash does not kill the box or the session, and a
-second process (TensorBoard) can be added to a running notebook later.
+second process (TensorBoard) can be added to a running notebook later. A notebook is
+also inherently `replicas: 1` — a second identical notebook is a second Notebook.
 
-Sandbox ships first and proves the machinery — Pod synthesis, stop/start, idle-cull,
-endpoints in status, SandD lifecycle. Notebook then reuses all of it plus
+Sandbox ships first and proves the machinery — Pod synthesis, scale, stop/start,
+idle-cull, endpoints in status, SandD lifecycle. Notebook then reuses all of it plus
 `PortForward` or the proxy.
 
 **The WS server is the activity oracle.** It sees every exec, session, and proxied
-request, so `lastActivityTime` flows SandD → server → `Sandbox.status`, and the
-Sandbox controller culls on it. Nothing else can know this — the provider only knows
-the instance is running.
+request, so `lastActivityTime` flows SandD → server → the matching entry in
+`status.instances`, and the controller culls on it. Nothing else can know this — the
+provider only knows the instance is running.
 
-**Open question — cold start for agent-exec.** A NeoCloud GPU instance takes minutes
-to become Ready; a code-interpreter call wants sub-second. Three options: (a) 1:1
-Sandbox↔instance and accept the latency; (b) a warm standby pool, still 1:1, paying
-for idle GPUs; (c) N Sandboxes multiplexed onto one warm instance. Option (c) needs
-a per-instance runtime that can launch containers on demand — a different component
-from a single-tenant SandD — and breaks `NodeClaim.spec.podRef`'s 1:1 relationship
-(`api/v1alpha1/nodeclaim_types.go:18`). Start at (a); do not deepen the 1:1
-assumption elsewhere, so (b) or (c) stays reachable.
+**Open question — scale-in must not be ordinal.** StatefulSet scales in from the
+highest ordinal, which is wrong here: `pool-4` may hold a live session while
+`pool-1` has been idle for an hour. Scale-in has to pick the **least recently
+active** replica, which means ordinals are stable names but not a removal order, and
+`status.instances` is the input to that choice. Two consequences worth settling
+before implementing: a replica that is culled leaves an ordinal gap (accept it —
+reusing names invites confusion with a still-draining box), and an in-flight exec
+must either block scale-in briefly or be terminated with a clear error.
+
+**Open question — how a consumer claims a warm replica.** With a pool of N ready
+boxes, something must hand one out and mark it busy, or two callers will land on the
+same box. Options: a lease/claim subresource on the Sandbox; a label the caller sets;
+or leave it to the consumer, which is fine when the pool has one client and wrong the
+moment it has two. Not needed for phase 1 (a caller can pick by name), but it is the
+next thing agent-exec at scale will ask for.
 
 ### 5. Inbound is a provider capability
 
@@ -362,8 +397,9 @@ Nebula side:
 6. Kubelet serving stack on the VK: `vkapi.PodHandler`, address advertisement,
    serving cert, TokenReview/SubjectAccessReview.
 7. Implement `RunInContainer`, `AttachToContainer`, `GetContainerLogs`.
-8. `Sandbox` CRD and its controller: Pod synthesis, stop/start, TTL, idle-cull,
-   endpoints in status.
+8. `Sandbox` CRD and its controller: N-Pod synthesis with stable ordinals, the
+   `/scale` subresource, stop/start, TTL, activity-based idle-cull, per-replica
+   status.
 9. Delete: `errSanddNeedsCommand`, the shim supervisor loop, the Tailscale fetch,
    the headscale half of `config/sandd`, and the `SANDD_TUNNEL_SERVER` substitution
    dance in `Makefile`/`hack/deploy.sh` (a headscale constraint, not ours).
