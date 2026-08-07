@@ -9,6 +9,8 @@ GPU workload class:
 
 All running on remote instances across NeoClouds and hyperscalers.
 
+Contents:
+
 - [Goals and non-goals](#goals-and-non-goals)
 - [Workload classes](#workload-classes)
 - [Decisions](#decisions)
@@ -17,9 +19,7 @@ All running on remote instances across NeoClouds and hyperscalers.
   - [3. SandD is PID 1](#3-sandd-is-pid-1)
   - [4. A Sandbox CRD, above the Pod](#4-a-sandbox-crd-above-the-pod)
   - [5. Inbound is a provider capability](#5-inbound-is-a-provider-capability)
-- [Provider seam changes](#provider-seam-changes)
 - [Roadmap](#roadmap)
-- [Risks](#risks)
 
 ---
 
@@ -27,10 +27,10 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 **Goals**
 
-- A single API surface for all GPU workloads, across providers.
+- Kubernetes native API surface for every workload class
 - `kubectl logs` / `exec` / `attach` against a remote instance, natively.
   offer no native exec API and no inbound reachability.
-- In-cluster clients reach a remote service like inference or microservice.
+- In-cluster clients can reach inference and services
 - Per-provider code stays small: adding a provider must not mean re-implementing
   logs, exec, or stats.
 
@@ -49,19 +49,13 @@ All running on remote instances across NeoClouds and hyperscalers.
 
 ## Workload classes
 
-Four classes, three phases.
+Three classes, three phases.
 
 | Class | CRD | Inbound to instance | Group | Lifetime | Phase |
 |---|---|---|---|---|---|
 | sandbox, agent, shell | `Sandbox` | no | 1 | minutes–days | 1 |
-| notebook | `Notebook` | no (consumer terminates in-cluster) | 1 | hours–days | 1.5 |
 | inference, services | Deployment + Service | **yes**, from arbitrary clients | N fungible | long | 2 |
-| training, fine-tuning, jobs | (TBD) | **yes**, from peers only | N ordinal, all-or-nothing | bounded | deferred |
-
-One CRD per shape, each synthesizing Pods onto the existing placement path. Inference
-needs no CRD at all: a Deployment of labeled Pods already provisions N instances, and
-replicas/rolling-update/HPA are what Deployment does well. What it lacks is
-reachability, which is [Decision 5](#5-inbound-is-a-provider-capability).
+| training, fine-tuning, jobs | Batch Jobs | **yes**, from peers only | N ordinal, all-or-nothing | bounded | deferred |
 
 ---
 
@@ -82,12 +76,7 @@ audience is the workload identity. No overlay network, for any class.
    └─────────────────────────────┘
 ```
 
-**Why the connection must be persistent.** A real kubelet needs no such thing: the
-apiserver *dials it*, because it has a routable address. A Nebula instance sits
-behind NAT in another cloud, so the apiserver cannot dial it and the direction must
-flip. Once flipped, the connection has to *already exist* when a request arrives —
-`kubectl exec` is synchronous, and there is no other channel over which to ask the
-instance to dial in.
+**Why the connection must be persistent.** The SandD daemon should already have an established connection when a request arrives, ensuring synchronous operations like `kubectl exec` work seamlessly.
 
 Cost: one idle TLS connection per instance, carrying zero traffic until someone
 runs a command. 10k of them is an ordinary WebSocket server in a single process.
@@ -121,7 +110,7 @@ Each subresource is a separate handler:
 |---|---|---|
 | `exec`, `attach` | `RunInContainer`, `AttachToContainer` | 1 |
 | `logs` | `GetContainerLogs` | 1 |
-| `port-forward` | `PortForward` | 2 |
+| `port-forward` | `PortForward` | later |
 | `top` | `GetStatsSummary` | later |
 
 ### 3. SandD is PID 1
@@ -131,18 +120,29 @@ workload as its **child**, owning its stdout/stderr pipes.
 
 ### 4. A Sandbox CRD, above the Pod
 
-**Decision.** Add one namespaced `Sandbox` CRD. It **creates one Pod**; it does not
-replace or bypass it. No class object, no `type` discriminator — a Sandbox is a
-sandbox. Other shapes (Notebook, and later a training Job) become their own CRDs
-when they need their own spec, each reusing the same Pod path underneath.
+**Decision.** Add one namespaced `Sandbox` CRD with `spec.replicas`. It **creates N
+Pods** with stable ordinal identity — StatefulSet-shaped, not Deployment-shaped — and
+does not replace or bypass the Pod. No class object, no `type` discriminator. Other
+shapes (Notebook, and later a training Job) become their own CRDs when they need
+their own spec, each reusing the same Pod path underneath.
 
 ```
-Sandbox
-  ├── creates Pod (1, ownerRef'd, restartPolicy: Never, NO command)
+Sandbox (replicas: 3)
+  ├── creates Pod pool-0, pool-1, pool-2  (ownerRef'd, restartPolicy: Never, NO command)
   │      └── gate → placement → nodeSelector → virtual node
   │             └── VK CreatePod → NodeClaim → instance
-  └── owns lifecycle: stop/start, TTL, idle-cull, endpoints
+  └── owns lifecycle: scale, stop/start, TTL, idle-cull, per-replica endpoints
 ```
+
+**Why replicas.** Two needs, one field: a **warm pool**, because an instance takes
+minutes to become Ready while an agent-exec call wants sub-second; and **fan-out**,
+one task across 20 boxes without 20 objects. Implement `/scale` so `kubectl scale`
+and HPA/KEDA work.
+
+**Ordinal, not fungible.** Each replica is `<sandbox>-<ordinal>` with its own claim
+and sessions, so `kubectl exec pool-3` is repeatable. That is why a Deployment is
+still wrong despite having replicas: its replicas are interchangeable, and a rolling
+update would swap a user's box out mid-session.
 
 **Why a Pod underneath.** The Pod is the carrier of everything already built:
 placement, `pkg/failover`'s blocklist, and — critically — the NodeClaim finalizer
@@ -152,80 +152,55 @@ it would mean reimplementing all of that.
 
 ```yaml
 kind: Sandbox
-metadata: {name: alice-1, namespace: team-ml}
+metadata: {name: pool, namespace: team-ml}
 spec:
+  replicas: 3
   nodePoolRef: gpu                    # existing placement policy object
-  image: ubuntu:24.04
-  accelerator: nvidia-a100
-  storage: {size: 100Gi, retainOnStop: true}
+  template:                           # a PodSpec — the shape of one replica
+    metadata:
+      labels:
+        nebula.inftyai.com/accelerator-type: a100-40gb
+    spec:
+      containers:
+      - name: sandbox
+        image: ubuntu:24.04
+        # no command: SandD is PID 1
+        resources:
+          requests: {cpu: "8", memory: 64Gi}
+          limits:   {nvidia.com/gpu: "1"}
 status:
-  phase: Ready
-  endpoints: {exec: ..., pty: ...}
-  lastActivityTime: "2026-08-07T09:12:00Z"
-  nodeClaimRef: {name: team-ml-alice-1}
+  replicas: 3
+  readyReplicas: 2
+  instances:                          # per replica — the addressable unit
+  - name: pool-0
+    phase: Ready
+    endpoints: {exec: ..., pty: ...}
+    lastActivityTime: "2026-08-07T09:12:00Z"
+  - name: pool-1
+    phase: Ready
+    lastActivityTime: "2026-08-07T09:40:00Z"
+  - name: pool-2
+    phase: Provisioning
 ```
 
----
+**A PodSpec template, not flat fields.** The controller synthesizes Pods, so what it
+accepts must eventually *be* a PodSpec — flat fields would mean re-inventing
+`resources`, `env`, `volumeMounts`, and `securityContext` one at a time. Resources
+matter most: the GPU count is a standard `nvidia.com/gpu` limit, which is already
+where placement and the scheduler's fit check read it from, so a parallel
+`accelerator` count field would fork the source of truth. The accelerator *type*
+stays a label, exactly as on a hand-written Nebula Pod, so both go through identical
+placement.
 
-## Provider seam changes
+Nebula fills in on the synthesized Pod: the opt-in labels, the scheduling gate, the
+virtual-node toleration, `restartPolicy: Never`, and the container command (SandD). A
+webhook rejects a template that sets `command` rather than silently dropping it.
 
-Four changes to `pkg/provider`, all small, all shared by every phase.
-
-**1. One interface for pod access, SandD-backed by default.**
-
-```go
-type PodAccess interface {
-	Logs(ctx context.Context, claim string, opts LogOptions) (io.ReadCloser, error)
-	Exec(ctx context.Context, claim string, cmd []string, io AttachIO) error
-	Stats(ctx context.Context, claim string) (Stats, error)
-}
-```
-
-The SandD-backed implementation works everywhere. A provider *may* supply a native
-one (Modal's SDK exec) as a pure optimization; nothing breaks if it does not. This is
-what keeps "add a provider" from meaning "reimplement logs and exec".
-
-**2. One per-provider primitive for getting SandD in.** This is the only place
-provider difference is irreducible:
-
-```go
-InjectFiles(spec *InstanceSpec, files []File) error
-```
-
-AWS already has this in effect — host fetch plus a read-only bind mount
-(`sanddHostFetchScript`). Modal uses its own file/image mechanism. Anything else
-falls back to a `/bin/sh` bootstrap that curls the binary and execs it. One small
-function per provider, and the whole kubelet surface follows.
-
-**3. `Instance.Endpoint string` becomes named, typed addresses.** Modal is the
-forcing case, not a hypothetical: it creates one tunnel *per port* and `observe`
-collapses them into a single string (`pkg/provider/provider.go:192`).
-
-```go
-type Address struct {
-	Name      string       // "http", "grpc" — matches the containerPort name
-	Host      string
-	Port      int32
-	Reachable Reachability // Native | Direct | Gateway
-}
-```
-
-`Reachable` is what tells the EndpointSlice bridge whether to write the address
-directly or point at a gateway. Do this **before** two consumers hardcode the
-string: sandbox wants a control channel, inference wants `http`.
-
-**4. `Capabilities` gains the access questions** (`pkg/provider/provider.go:151`):
-
-```go
-NativeExec     bool         // Modal: true → no SandD needed for exec
-NativeEndpoint bool         // Modal: true (tunnels)
-InboundMode    Reachability // which tier this provider uses
-```
-
-Also: SandD injection moves from **per-provider** (`KeyMinter != nil`, which injects
-into every workload on that provider) to **per-workload**, carried on
-`InstanceSpec`. Required regardless — inference and training Pods must be able to opt
-out.
+**Open question — scale-in must not be ordinal.** StatefulSet removes the highest
+ordinal; here `pool-4` may hold a live session while `pool-1` has been idle an hour.
+Removal must pick the least recently active replica, with `status.instances` as the
+input. So ordinals are stable names but not a removal order, culling leaves ordinal
+gaps, and an in-flight exec must either block scale-in briefly or fail clearly.
 
 ---
 
@@ -236,47 +211,6 @@ Each phase builds the seam the next one needs. Nothing is built twice.
 ### Phase 1 — Sandbox, agent, shell
 
 *Goal: `kubectl exec`/`logs` work against a remote box, driven by a CRD.*
-
-SandD side (gating — these block everything else):
-
-1. Plain-TLS dial-out with a bearer JWT, alongside the existing `--tunnel` mode.
-2. SandD as PID 1, spawning the workload as a child and owning its pipes.
-3. Registry-based entrypoint resolution, so no `command` is required.
-
-Nebula side:
-
-4. `SanddConfig` → dial-out: drop `ControlServer`, `AuthKey` → `Token`. The
-   keybroker becomes a JWT signer — same call site at Provision, same env-injection
-   seam in `writeSanddEntrypoint`; it loses its headscale admin coupling rather than
-   gaining anything.
-5. WS server holding `map[claim]conn`. **In the manager if SandD has a Go
-   server implementation; otherwise one shared gateway Deployment** that the VK
-   calls over HTTP. Not one per workload — see [Risks](#risks).
-6. Kubelet serving stack on the VK: `vkapi.PodHandler`, address advertisement,
-   serving cert, TokenReview/SubjectAccessReview.
-7. Implement `RunInContainer`, `AttachToContainer`, `GetContainerLogs`.
-8. `Sandbox` CRD and its controller: Pod synthesis, stop/start, TTL, idle-cull,
-   endpoints in status.
-9. Delete: `errSanddNeedsCommand`, the shim supervisor loop, the Tailscale fetch,
-   the headscale half of `config/sandd`, and the `SANDD_TUNNEL_SERVER` substitution
-   dance in `Makefile`/`hack/deploy.sh` (a headscale constraint, not ours).
-
-Pull forward from Phase 2 if convenient: the `Instance.Endpoint` widening (seam
-change 3). Cheap now, annoying once two consumers depend on the string.
-
-### Phase 1.5 — Notebook
-
-*Goal: a browser reaches Jupyter on a remote box.*
-
-A separate `Notebook` CRD reusing everything Phase 1 built. What it adds:
-
-1. `PortForward` on the VK, or the controller-side proxy, for the HTTP/WS surface.
-2. A post-ready **exec** that starts the notebook server — not a container command,
-   so it can be restarted without recreating the instance.
-3. A proxied URL in `status.endpoints`, plus per-user auth on it.
-4. Volume support in the provider seam, so the home directory survives a
-   reprovision. Nothing in the AWS adapter wires block devices today; this is the
-   same gap training's checkpoints hit.
 
 ### Phase 2 — Inference and services
 
@@ -308,34 +242,3 @@ A separate `Notebook` CRD reusing everything Phase 1 built. What it adds:
 Logs and exec come free from Phase 1: same SandD, same connection.
 
 ---
-
-## Risks
-
-**Apiserver → manager reachability.** The apiserver dials the address the virtual
-node advertises, so the manager pod's IP must be routable from the control plane.
-Fine on VPC-CNI (EKS). **Not** guaranteed on overlay CNIs, and konnectivity or
-egress-selector clusters need explicit configuration. This is the one item that
-could invalidate Decision 2, and it is cheap to test — **validate it in a real
-cluster before building the rest of Phase 1.**
-
-**Cross-repo dependency on SandD.** Items 1–3 of Phase 1 are SandD-side. In
-particular, whether SandD has (or will have) a **Go** server implementation
-decides whether the WS server lives in the manager or in a separate gateway
-Deployment. Confirm before starting item 5.
-
-**Connection state is not reconstructible.** Restarting the connection holder kills
-live `exec` sessions and reconnects every SandD instance at once. Real kubelets behave the
-same way on restart, so it is a familiar failure mode — but it means backoff with
-jitter belongs in SandD (not optional), and log streaming should be resumable by
-offset rather than assuming a durable stream.
-
-**The per-workload controller is dropped.** The earlier design gave each workload its
-own controller Deployment so consumers could dial it directly with per-tenant
-isolation. With the apiserver as the front door, isolation comes from
-SubjectAccessReview instead, and a per-workload controller would be 10k Deployments
-and an extra hop for no benefit. One shared holder, keyed by claim name.
-
-**Token lifetime versus workload lifetime.** A 24h token on an 8h notebook is fine;
-a long-lived SandD outliving its token needs refresh. Simplest for Phase 1: issue a
-token that outlives the class's max TTL and bound exposure with ownerRef GC. Decide
-now — retrofitting refresh into SandD is worse than designing for it.
