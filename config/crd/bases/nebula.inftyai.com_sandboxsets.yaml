@@ -260,13 +260,16 @@ spec:
                         description: |-
                           Image is the container image the sandbox runs.
 
-                          It has no command, and setting one is rejected at admission. That is not a
-                          simplification, it is the process model: SandD runs as PID 1 in the container
-                          and spawns the workload as its child so it owns the workload's stdout/stderr
-                          pipes, which is what makes `kubectl logs` possible against an instance in
-                          another cloud. A user-supplied command would displace SandD and take the log
-                          and exec paths with it. An interactive sandbox has nothing to run at boot
-                          anyway — the whole point is that commands arrive later, over exec.
+                          There is deliberately no command field, and one cannot be set. That is not a
+                          simplification, it is the process model: the container's command is always
+                          SandD, which runs as PID 1 and is what makes `kubectl exec` and `kubectl logs`
+                          work against an instance in another cloud. A user-supplied command would
+                          displace it and take both with it.
+
+                          A sandbox has nothing to run at boot anyway — the whole point is that commands
+                          arrive later, over exec — so SandD spawns no child here; it holds the container
+                          open and serves requests. Workload classes that do run something get it spawned
+                          as SandD's child instead, which is how it comes to own their stdout/stderr.
                         minLength: 1
                         type: string
                       nodePoolRef:

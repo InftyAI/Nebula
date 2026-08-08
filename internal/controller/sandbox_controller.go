@@ -194,9 +194,24 @@ func (r *SandboxReconciler) buildPod(sbx *nebulav1alpha1.Sandbox) *corev1.Pod {
 			Containers: []corev1.Container{{
 				Name:  sandboxContainerName,
 				Image: sbx.Spec.Image,
-				// No Command: SandD is PID 1 in the container and spawns the workload as
-				// its child, which is what lets it own the stdout/stderr pipes that
-				// `kubectl logs` reads. A command here would displace it.
+				// SandD is the command, set HERE rather than in each provider's bootstrap,
+				// so the Pod stays the single source of truth for what runs on the instance
+				// — the same rule ProvisionRequest documents for image/env/resources. Every
+				// adapter already reads the command off the Pod, so this needs no
+				// per-provider code and cannot drift between providers.
+				//
+				// SandD is PID 1 in the container. For a sandbox it spawns nothing: the box
+				// exists to receive exec calls, so SandD just holds the container open and
+				// serves them. For workload classes that DO run something, it spawns that as
+				// its child and owns the stdout/stderr pipes, which is what makes
+				// `kubectl logs` work against an instance in another cloud.
+				//
+				// The user's image does not contain this binary (it is an arbitrary image
+				// like ubuntu:24.04), so the provider bootstrap must make it appear at
+				// SanddPath — the contract the shared constant exists to pin down. A
+				// user-supplied command is rejected at admission, since it would displace
+				// SandD and take logs and exec with it.
+				Command:   []string{nebulav1alpha1.SanddPath},
 				Resources: sbx.Spec.Resources,
 				Env:       sbx.Spec.Env,
 			}},

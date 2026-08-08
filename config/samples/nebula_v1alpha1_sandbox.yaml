@@ -3,11 +3,10 @@
 #   kubectl exec -it sample -- bash
 #   kubectl logs sample
 #
-# Note there is no command: SandD runs as PID 1 in the container and spawns the
-# workload as its child, which is what lets it own the stdout/stderr pipes that
-# `kubectl logs` reads. Setting a command would displace it, so admission rejects
-# one. An interactive box has nothing to run at boot anyway — commands arrive
-# later, over exec.
+# There is no command field, by design: the container's command is always SandD,
+# which runs as PID 1 and is what makes exec and logs work against an instance in
+# another cloud. A box has nothing to run at boot anyway — commands arrive later,
+# over exec — so SandD holds the container open and serves them.
 apiVersion: nebula.inftyai.com/v1alpha1
 kind: Sandbox
 metadata:
