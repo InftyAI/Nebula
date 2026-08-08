@@ -34,6 +34,3 @@ spec:
           memory: 64Gi
         limits:
           nvidia.com/gpu: "1"
-      # Per box, from its own ready time. In a set this acts as a RECYCLE interval:
-      # an expired box is pruned and the set creates a fresh one to replace it.
-      ttl: 8h

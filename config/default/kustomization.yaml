@@ -49,9 +49,11 @@ patches:
 - path: manager_metrics_patch.yaml
   target:
     kind: Deployment
-    # Scope to the manager ONLY (matches the pre-prefix name), so the
-    # manager-only --metrics-bind-address flag is not injected into any other
-    # Deployment in the build.
+    # Scope to the manager ONLY (matches the pre-prefix name). The manager is
+    # currently the only Deployment in the build, so this is defensive rather than
+    # load-bearing: without a name, kustomize applies the patch to EVERY Deployment,
+    # so the day an overlay adds a second one it would silently receive the
+    # manager-only --metrics-bind-address flag and fail to start on an unknown flag.
     name: controller-manager
 
 # Uncomment the patches line if you enable Metrics and CertManager
@@ -66,7 +68,8 @@ patches:
 - path: manager_webhook_patch.yaml
   target:
     kind: Deployment
-    # Scope to the manager ONLY (see the metrics patch above).
+    # Scope to the manager ONLY (see the metrics patch above) — otherwise a second
+    # Deployment added later would also get the webhook port, volume and cert mount.
     name: controller-manager
 
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.

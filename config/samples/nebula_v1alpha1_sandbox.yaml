@@ -31,7 +31,3 @@ spec:
       memory: 64Gi
     limits:
       nvidia.com/gpu: "1"
-  # Measured from the moment the box becomes READY, not from creation, so a slow
-  # provision does not eat into the user's time. Omit for an unbounded box —
-  # a deliberate choice, since an abandoned GPU box bills until someone notices.
-  ttl: 8h
