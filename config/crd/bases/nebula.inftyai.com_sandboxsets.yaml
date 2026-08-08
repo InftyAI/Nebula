@@ -270,7 +270,9 @@ spec:
                           which structural-schema defaulting cannot express and which would surprise anyone
                           reading the object back. Ask for a CUDA image explicitly when you want one.
 
-                          There is deliberately no command field, and one cannot be set. That is not a
+                          There is deliberately no command field, and one cannot be set: the CRD is a
+                          structural schema, so `command:` in a Sandbox spec is rejected as an unknown
+                          field by the apiserver itself — no webhook required. That is not a
                           simplification, it is the process model: the container's command is always
                           SandD, which runs as PID 1 and is what makes `kubectl exec` and `kubectl logs`
                           work against an instance in another cloud. A user-supplied command would
@@ -367,6 +369,11 @@ spec:
                     required:
                     - nodePoolRef
                     type: object
+                    x-kubernetes-validations:
+                    - message: nvidia.com/gpu requires acceleratorType to be set
+                      rule: has(self.acceleratorType) || !has(self.resources) || ((!has(self.resources.limits)
+                        || !('nvidia.com/gpu' in self.resources.limits)) && (!has(self.resources.requests)
+                        || !('nvidia.com/gpu' in self.resources.requests)))
                 required:
                 - spec
                 type: object

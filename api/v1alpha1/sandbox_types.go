@@ -49,6 +49,14 @@ import (
 // would fork the vocabulary and, worse, fork the source of truth for the
 // accelerator COUNT — which placement and the scheduler's fit check both read
 // from the container's nvidia.com/gpu limit (see util.AcceleratorRequest).
+//
+// The CEL rule below rejects a GPU count with no accelerator type. That pair is
+// contradictory rather than merely incomplete — util.AcceleratorRequest returns an
+// error for it — so without the rule the object is admitted and then fails at
+// PLACEMENT, minutes later and one object removed from the mistake. Note the
+// inverse is fine and deliberately allowed: a type with no count means one
+// accelerator.
+// +kubebuilder:validation:XValidation:rule="has(self.acceleratorType) || !has(self.resources) || ((!has(self.resources.limits) || !('nvidia.com/gpu' in self.resources.limits)) && (!has(self.resources.requests) || !('nvidia.com/gpu' in self.resources.requests)))",message="nvidia.com/gpu requires acceleratorType to be set"
 type SandboxSpec struct {
 	// NodePoolRef names the NodePool whose policy places this sandbox: which
 	// providers are allowed, which capacity tiers, how to rank them. Required —
@@ -68,7 +76,9 @@ type SandboxSpec struct {
 	// which structural-schema defaulting cannot express and which would surprise anyone
 	// reading the object back. Ask for a CUDA image explicitly when you want one.
 	//
-	// There is deliberately no command field, and one cannot be set. That is not a
+	// There is deliberately no command field, and one cannot be set: the CRD is a
+	// structural schema, so `command:` in a Sandbox spec is rejected as an unknown
+	// field by the apiserver itself — no webhook required. That is not a
 	// simplification, it is the process model: the container's command is always
 	// SandD, which runs as PID 1 and is what makes `kubectl exec` and `kubectl logs`
 	// work against an instance in another cloud. A user-supplied command would

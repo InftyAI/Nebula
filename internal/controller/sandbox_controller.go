@@ -208,9 +208,9 @@ func (r *SandboxReconciler) buildPod(sbx *nebulav1alpha1.Sandbox) *corev1.Pod {
 				//
 				// The user's image does not contain this binary (it is an arbitrary image
 				// like ubuntu:24.04), so the provider bootstrap must make it appear at
-				// SanddPath — the contract the shared constant exists to pin down. A
-				// user-supplied command is rejected at admission, since it would displace
-				// SandD and take logs and exec with it.
+				// SanddPath — the contract the shared constant exists to pin down. This is
+				// never in tension with a user-supplied command: SandboxSpec has no command
+				// field, so the structural schema rejects one outright.
 				Command:   []string{nebulav1alpha1.SanddPath},
 				Resources: sbx.Spec.Resources,
 				Env:       sbx.Spec.Env,
