@@ -77,7 +77,7 @@ It does the three things that have to agree with each other:
 
 1. **Serving cert** — mints a self-signed cert for the webhook Service DNS name
    (`nebula-webhook-service.<namespace>.svc`), stores it in the
-   `webhook-server-cert` Secret, and writes it to
+   `nebula-webhook-server-cert` Secret, and writes it to
    `/tmp/k8s-webhook-server/serving-certs` where the webhook server reads it.
 2. **CA trust** — patches that cert's CA into the `MutatingWebhookConfiguration`
    `caBundle`, so the API server trusts the webhook. It is derived from the cert
@@ -202,7 +202,7 @@ kubectl -n nebula-system logs deploy/nebula-controller-manager | grep -i provide
 kubectl get nodes -l nebula.inftyai.com/provider
 
 # Webhook TLS is wired: the caBundle matches the serving cert Secret.
-diff <(kubectl get secret webhook-server-cert -n nebula-system -o jsonpath='{.data.tls\.crt}') \
+diff <(kubectl get secret nebula-webhook-server-cert -n nebula-system -o jsonpath='{.data.tls\.crt}') \
      <(kubectl get mutatingwebhookconfiguration nebula-mutating-webhook-configuration \
          -o jsonpath='{.webhooks[0].clientConfig.caBundle}') \
   && echo "webhook caBundle matches serving cert"

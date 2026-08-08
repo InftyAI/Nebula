@@ -1,6 +1,9 @@
 resources:
 - manifests.yaml
 - service.yaml
+# The (empty) Secret the rotator populates. Required — the rotator Gets/Updates it
+# but never Creates it, so without this the manager crash-loops. See secret.yaml.
+- secret.yaml
 
 # Narrow the generated Pod webhook to opt-in Pods outside system namespaces.
 patches:

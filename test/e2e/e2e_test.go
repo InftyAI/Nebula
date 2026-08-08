@@ -99,13 +99,10 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
-		// caBundle injection is server-side (only the API server reads it) and
-		// requires the MutatingWebhookConfiguration created by the deploy, so it
-		// runs after the deploy. The manager pod is untouched — no restart needed.
-		By("injecting the webhook CA bundle")
-		cmd = exec.Command("hack/gen-webhook-cert.sh", "cabundle")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to inject the webhook CA bundle")
+		// No caBundle injection step: the manager patches the
+		// MutatingWebhookConfiguration itself once its cert rotator runs (pkg/cert),
+		// from the same cert it just wrote. The "CA injection" spec below asserts that
+		// happened, so this is covered by an Eventually rather than a deploy step.
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
@@ -305,7 +302,7 @@ var _ = Describe("Manager", Ordered, func() {
 			// starts — nothing pre-creates it, so this asserts the rotator ran.
 			By("validating that the webhook serving cert Secret exists")
 			verifyCertSecret := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
+				cmd := exec.Command("kubectl", "get", "secrets", "nebula-webhook-server-cert", "-n", namespace)
 				_, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 			}

@@ -151,13 +151,11 @@ else
   make docker-buildx IMG="${IMG}"
 fi
 
-# --- 3. Secrets FIRST, so the manager mounts them on its very first boot ----
-# Ordering matters and lets us avoid any manager restart:
-#   - the webhook cert Secret is a REQUIRED volume mount, so it must exist
-#     before the pod starts;
-#   - provider credentials are read from the environment at process start.
-# Both are consumed only at pod startup, so creating them before `make deploy`
-# means the manager comes up already correct — no restart, no race.
+# --- 3. Secrets FIRST, so the manager reads them on its very first boot -----
+# Provider credentials are read from the environment at process start, so creating
+# them before `make deploy` means the manager comes up already correct — no restart,
+# no race. (The webhook cert is NOT in this list: the manager mints it itself once
+# running, see below.)
 #
 # Secrets need the namespace, which `make deploy` would create — so create it
 # up front (idempotent; kustomize re-applies it harmlessly during deploy).
@@ -178,8 +176,8 @@ for row in "${PROVIDER_SECRETS[@]}"; do
 done
 
 # --- 4. install CRDs + deploy the manager ----------------------------------
-# The pod mounts the cert Secret and reads provider creds at boot — both already
-# exist, so the manager comes up fully configured with no restart needed.
+# The pod reads provider creds at boot and they already exist, so the manager comes
+# up fully configured with no restart needed.
 log "installing CRDs and deploying the manager"
 make deploy IMG="${IMG}"
 

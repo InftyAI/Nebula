@@ -52,10 +52,17 @@ const (
 	// config/webhook/service.yaml AFTER kustomize applies the nebula- namePrefix.
 	serviceName = "nebula-webhook-service"
 
-	// secretName is the Secret the keypair is stored in. The manager also MOUNTS
-	// this Secret (config/default/manager_webhook_patch.yaml), which is why the
-	// name must match there too.
-	secretName = "webhook-server-cert"
+	// secretName is the Secret the keypair is stored in. Like the two names above it
+	// carries the nebula- prefix, because that is what config/default's namePrefix
+	// actually renders ("webhook-server-cert" here would look for a Secret no overlay
+	// creates).
+	//
+	// The Secret MUST already exist when the manager starts, which is why
+	// config/webhook ships it empty: the rotator Gets this Secret and then Updates it,
+	// but never Creates it, so an absent Secret is a fatal startup error that
+	// crash-loops the manager rather than something it recovers from. Empty is all it
+	// needs — nil Data is exactly the condition that triggers minting.
+	secretName = "nebula-webhook-server-cert"
 
 	// certDir is where the rotator writes the keypair and where controller-runtime's
 	// webhook server reads it from. It is the controller-runtime default, and the
