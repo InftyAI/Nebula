@@ -333,7 +333,7 @@ func removeGate(gates []corev1.PodSchedulingGate, name string) []corev1.PodSched
 // Delete is UID-pinned so a Pod already replaced by a same-name recreate is not
 // clobbered, and a NotFound (already gone) is treated as success.
 func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev1.Pod) (bool, error) {
-	if pod.Labels[nebulav1alpha1.EnabledLabel] != "true" {
+	if pod.Labels[nebulav1alpha1.EnabledLabel] != nebulav1alpha1.EnabledValue {
 		return false, nil
 	}
 	if !pod.DeletionTimestamp.IsZero() {

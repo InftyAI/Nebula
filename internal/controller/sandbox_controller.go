@@ -109,7 +109,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	st := sandboxStatusFromPod(&sbx, pod)
+	st := sandboxStatusFromPod(pod)
 	if err := r.setStatus(ctx, &sbx, st); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -164,7 +164,7 @@ func (r *SandboxReconciler) buildPod(sbx *nebulav1alpha1.Sandbox) *corev1.Pod {
 	labels := map[string]string{
 		// EnabledLabel is the opt-in the mutating webhook selects on: without it the
 		// Pod would be scheduled by vanilla Kubernetes and never reach a provider.
-		nebulav1alpha1.EnabledLabel:   "true",
+		nebulav1alpha1.EnabledLabel:   nebulav1alpha1.EnabledValue,
 		nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
 		nebulav1alpha1.PoolLabel:      sbx.Spec.NodePoolRef,
 		nebulav1alpha1.SandboxLabel:   sbx.Name,
@@ -236,11 +236,15 @@ type sandboxStatus struct {
 // is doing, so this reads it rather than tracking instance state independently —
 // two sources for one fact is how they drift.
 //
+// It deliberately takes only the Pod, not the Sandbox: the projection must depend
+// on nothing but observed Pod state, or a stale value already on Sandbox.Status
+// could feed back into the next projection and latch.
+//
 // The mapping keys off the Pod's status REASON, not just its phase, because the
 // interesting distinction for a user is inside PodPending: "cannot get capacity"
 // (Provisioning) versus "capacity granted, still booting" (Initializing). The
 // vnode stamps those reasons (see pkg/vnode/status.go).
-func sandboxStatusFromPod(sbx *nebulav1alpha1.Sandbox, pod *corev1.Pod) sandboxStatus {
+func sandboxStatusFromPod(pod *corev1.Pod) sandboxStatus {
 	endpoint := pod.Annotations[nebulav1alpha1.EndpointAnnotation]
 
 	switch pod.Status.Phase {

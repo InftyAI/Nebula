@@ -74,7 +74,7 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 		return fmt.Errorf("expected a Pod object but got %T", obj)
 	}
 
-	if pod.Labels[nebulav1alpha1.EnabledLabel] != "true" {
+	if pod.Labels[nebulav1alpha1.EnabledLabel] != nebulav1alpha1.EnabledValue {
 		return nil // not opted in; leave the Pod untouched
 	}
 	if pod.Spec.NodeName != "" {

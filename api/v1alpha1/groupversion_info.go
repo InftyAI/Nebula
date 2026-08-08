@@ -44,6 +44,13 @@ const (
 	// objectSelector so only opted-in Pods ever hit the mutating webhook.
 	EnabledLabel = "nebula.inftyai.com/enabled"
 
+	// EnabledValue is the only value of EnabledLabel that opts a Pod in. The
+	// comparison is exact, so a Pod labelled "True" or "1" is NOT opted in — the
+	// label is the webhook's objectSelector, and the API server matches it
+	// literally, so anything else would make the controllers and the selector
+	// disagree about which Pods are Nebula's.
+	EnabledValue = "true"
+
 	// ProviderSelectionGate is the scheduling gate the webhook injects at Pod
 	// CREATE. The placement controller removes it once it has chosen a
 	// provider (by adding a provider nodeSelector), releasing the Pod to the
