@@ -257,8 +257,18 @@ spec:
                           type: object
                         type: array
                       image:
+                        default: ubuntu:24.04
                         description: |-
-                          Image is the container image the sandbox runs.
+                          Image is the container image the sandbox runs. It defaults to a plain Ubuntu,
+                          because unlike the accelerator the image is not a decision a caller has to make
+                          to get a useful box: `kubectl exec` into a bare distro is exactly the "give me a
+                          remote shell" case, and anything else can be installed from inside it. Defaulting
+                          a paid GPU shape would be guessing at spend; defaulting a shell is not.
+
+                          Note it deliberately does NOT default to a CUDA image even when an accelerator is
+                          requested. A conditional default would make the image depend on another field,
+                          which structural-schema defaulting cannot express and which would surprise anyone
+                          reading the object back. Ask for a CUDA image explicitly when you want one.
 
                           There is deliberately no command field, and one cannot be set. That is not a
                           simplification, it is the process model: the container's command is always
@@ -355,7 +365,6 @@ spec:
                           sandbox, which is a deliberate choice rather than the default.
                         type: string
                     required:
-                    - image
                     - nodePoolRef
                     type: object
                 required:

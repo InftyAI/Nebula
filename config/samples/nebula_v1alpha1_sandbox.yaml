@@ -17,6 +17,9 @@ spec:
   # The placement policy this box is provisioned against: which providers are
   # allowed, which capacity tiers, how to rank them.
   nodePoolRef: sample
+  # Optional — defaults to ubuntu:24.04, which is all a "give me a remote shell" box
+  # needs. Note it does NOT become a CUDA image when you ask for an accelerator; name
+  # one explicitly if you want the toolkit preinstalled.
   image: ubuntu:24.04
   # The accelerator TYPE is a label-shaped field; the COUNT rides on the
   # nvidia.com/gpu resource below, so exactly one number drives both scheduling

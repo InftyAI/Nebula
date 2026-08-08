@@ -57,7 +57,16 @@ type SandboxSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	NodePoolRef string `json:"nodePoolRef"`
 
-	// Image is the container image the sandbox runs.
+	// Image is the container image the sandbox runs. It defaults to a plain Ubuntu,
+	// because unlike the accelerator the image is not a decision a caller has to make
+	// to get a useful box: `kubectl exec` into a bare distro is exactly the "give me a
+	// remote shell" case, and anything else can be installed from inside it. Defaulting
+	// a paid GPU shape would be guessing at spend; defaulting a shell is not.
+	//
+	// Note it deliberately does NOT default to a CUDA image even when an accelerator is
+	// requested. A conditional default would make the image depend on another field,
+	// which structural-schema defaulting cannot express and which would surprise anyone
+	// reading the object back. Ask for a CUDA image explicitly when you want one.
 	//
 	// There is deliberately no command field, and one cannot be set. That is not a
 	// simplification, it is the process model: the container's command is always
@@ -70,7 +79,9 @@ type SandboxSpec struct {
 	// open and serves requests. Workload classes that do run something get it spawned
 	// as SandD's child instead, which is how it comes to own their stdout/stderr.
 	// +kubebuilder:validation:MinLength=1
-	Image string `json:"image"`
+	// +kubebuilder:default="ubuntu:24.04"
+	// +optional
+	Image string `json:"image,omitempty"`
 
 	// AcceleratorType is the requested accelerator TYPE (e.g. "a100-40gb",
 	// "h100"), matched case-insensitively against the provider catalog. The COUNT

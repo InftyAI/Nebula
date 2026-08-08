@@ -232,7 +232,12 @@ func (r *SandboxSetReconciler) scaleDown(ctx context.Context, victims []nebulav1
 		// clobbered; an already-gone box is success.
 		preconditions := metav1.Preconditions{UID: &v.UID}
 		if err := r.Delete(ctx, v, &client.DeleteOptions{Preconditions: &preconditions}); err != nil {
-			return client.IgnoreNotFound(err)
+			// An already-gone box is success, and must NOT end the loop: returning here
+			// would abandon the remaining victims while reporting the scale-in as done,
+			// leaving paid instances running.
+			if err = client.IgnoreNotFound(err); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
