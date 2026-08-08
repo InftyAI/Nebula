@@ -76,9 +76,9 @@ spec:
               caller that wants N boxes creates N Sandboxes, each with its own image,
               lifetime and identity.
 
-              The count lives one level up, in SandboxPool, which keeps N Sandboxes warm and
+              The count lives one level up, in SandboxSet, which maintains N Sandboxes and
               owns /scale so `kubectl scale` and HPA work. That split is what lets this type
-              stay singular: because the pool creates Sandbox OBJECTS rather than replicas
+              stay singular: because the set creates Sandbox OBJECTS rather than replicas
               inside one object, everything that depends on a box being its own object —
               per-box RBAC (grant a user their sandbox and not their neighbour's), a
               per-box image and TTL, and a failure that stays visible instead of being

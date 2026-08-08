@@ -11,10 +11,11 @@
 // On top of that provisioning core sit the workload types, each synthesizing
 // Pods onto the same placement path rather than bypassing it:
 //
-//	Sandbox     - one interactive remote box (agent workspace, shell, scratch GPU),
-//	              reachable with the same kubectl exec/logs as a local Pod.
-//	SandboxPool - keeps N warm Sandboxes ready to hand out, and owns /scale so
-//	              `kubectl scale` and HPA drive the count.
+//	Sandbox    - one interactive remote box (agent workspace, shell, scratch GPU),
+//	             reachable with the same kubectl exec/logs as a local Pod.
+//	SandboxSet - maintains N Sandboxes, and owns /scale so `kubectl scale` and HPA
+//	             drive the count. Keeping boxes ready ahead of demand is a USE of
+//	             this, not its definition — there are no lease semantics here.
 //
 // +kubebuilder:object:generate=true
 // +groupName=nebula.inftyai.com
@@ -73,12 +74,11 @@ const (
 	// nebula.inftyai.com/sandbox=alice` work.
 	SandboxLabel = "nebula.inftyai.com/sandbox"
 
-	// SandboxPoolLabel records which SandboxPool created a Sandbox. Its value is
-	// the pool name. It is the selector the pool's /scale subresource publishes in
-	// status (so HPA can find the pool's members) and how the pool controller
-	// enumerates the boxes it owns — ownerReferences alone would not support a
-	// label-selector query.
-	SandboxPoolLabel = "nebula.inftyai.com/sandboxpool"
+	// SandboxSetLabel records which SandboxSet created a Sandbox. Its value is the
+	// set name. It is the selector the set's /scale subresource publishes in status
+	// (so HPA can find the set's members) and how the set controller enumerates the
+	// boxes it owns — ownerReferences alone would not support a label-selector query.
+	SandboxSetLabel = "nebula.inftyai.com/sandboxset"
 
 	// AcceleratorTypeLabel carries the requested accelerator TYPE only (e.g.
 	// "a100-40gb" or "h100"). The COUNT is expressed separately as a standard

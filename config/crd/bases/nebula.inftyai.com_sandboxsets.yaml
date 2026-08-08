@@ -4,16 +4,16 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-  name: sandboxpools.nebula.inftyai.com
+  name: sandboxsets.nebula.inftyai.com
 spec:
   group: nebula.inftyai.com
   names:
-    kind: SandboxPool
-    listKind: SandboxPoolList
-    plural: sandboxpools
+    kind: SandboxSet
+    listKind: SandboxSetList
+    plural: sandboxsets
     shortNames:
-    - sbxp
-    singular: sandboxpool
+    - sbxs
+    singular: sandboxset
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -24,7 +24,7 @@ spec:
       name: Ready
       type: integer
     - jsonPath: .spec.template.spec.nodePoolRef
-      name: Pool
+      name: NodePool
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -33,8 +33,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          SandboxPool keeps N warm Sandboxes ready to hand out, so a consumer does not
-          wait minutes for an instance to provision.
+          SandboxSet maintains N Sandboxes, so boxes can be kept ready ahead of demand
+          instead of making a consumer wait minutes for an instance to provision.
         properties:
           apiVersion:
             description: |-
@@ -55,41 +55,45 @@ spec:
             type: object
           spec:
             description: |-
-              SandboxPoolSpec keeps N Sandboxes alive. It exists because provisioning a
-              remote instance takes MINUTES while an agent's exec call wants sub-second: the
-              only way to serve that is to hold boxes ready before anyone asks. A pool is
-              also the unit fan-out is expressed on ("twenty boxes for this batch") and the
-              thing an autoscaler can drive.
+              SandboxSetSpec maintains N Sandboxes. That is the whole contract, and the name
+              says exactly that much: it is a SET, not a pool. A pool would imply lease
+              semantics — claim a box, hold it, return it, with the pool tracking who has what
+              — and none of that is implemented here. Keeping N boxes alive is what ENABLES
+              warm pooling (holding instances ready because provisioning takes minutes while
+              an agent's exec call wants sub-second) and fan-out ("twenty boxes for this
+              batch"), but those are uses of a set, not the set's job. "Pool" would also be a
+              third meaning of that word in this API group, where NodePool already means
+              placement policy.
 
-              It creates Sandbox OBJECTS, not replicas inside itself, and that is the whole
-              point of having two types. The count is genuinely a different concern from the
-              box: a pool answers "how many", a Sandbox answers "which one, running what, for
-              whom". Because each box stays its own object underneath the pool, per-box RBAC,
-              per-box status and a failure that stays visible all keep working — none of which
-              survives being flattened into a replica index.
+              It creates Sandbox OBJECTS, not replicas inside itself, and that is the point of
+              having two types. The count is a genuinely different concern from the box: a set
+              answers "how many", a Sandbox answers "which one, running what, for whom".
+              Because each box stays its own object underneath, per-box RBAC, per-box status
+              and a failure that stays visible all keep working — none of which survives being
+              flattened into a replica index.
 
-              Boxes get GENERATED names (pool-a4f2x), not ordinals. Ordinals would imply a
+              Boxes get GENERATED names (myset-a4f2x), not ordinals. Ordinals would imply a
               slot that gets refilled, so a box that died would be replaced by an empty one
               wearing the same name — the same address with a different filesystem, which is
               the most confusing thing this API could do. A generated name means a replacement
-              is visibly a NEW box, and callers that need a stable handle hold the Sandbox
-              name they were given rather than an index into a set.
+              is visibly a NEW box, and callers that need a stable handle hold the Sandbox name
+              they were given rather than an index into a set.
             properties:
               replicas:
                 default: 1
                 description: |-
-                  Replicas is how many Sandboxes to keep. Zero is legal and useful: it releases
-                  every box while keeping the pool's definition, which is how a pool is parked
-                  overnight without being forgotten.
+                  Replicas is how many Sandboxes to maintain. Zero is legal and useful: it
+                  releases every box while keeping the set's definition, which is how a set is
+                  parked overnight without being forgotten.
                 format: int32
                 minimum: 0
                 type: integer
               template:
                 description: |-
-                  Template is the shape of every Sandbox this pool creates. All boxes in one
-                  pool are the same shape by construction — a pool exists to make boxes
+                  Template is the shape of every Sandbox this set creates. All boxes in one set
+                  are the same shape by construction — the set exists to make boxes
                   interchangeable at the point of HANDOUT, so a caller can take any ready box
-                  without inspecting it. Two shapes means two pools.
+                  without inspecting it. Two shapes means two sets.
 
                   A template is right here for the same reason it is wrong on Sandbox itself:
                   this object does not describe a box, it describes how to make them.
@@ -109,12 +113,12 @@ spec:
                         additionalProperties:
                           type: string
                         description: |-
-                          Labels are applied to each created Sandbox, on top of the pool-ownership
+                          Labels are applied to each created Sandbox, on top of the set-ownership
                           labels the controller adds.
                         type: object
                     type: object
                   spec:
-                    description: Spec is the SandboxSpec of every box in the pool.
+                    description: Spec is the SandboxSpec of every box in the set.
                     properties:
                       acceleratorType:
                         description: |-
@@ -358,7 +362,7 @@ spec:
             - template
             type: object
           status:
-            description: SandboxPoolStatus is the observed state of the pool.
+            description: SandboxSetStatus is the observed state of the set.
             properties:
               conditions:
                 description: Conditions follows the standard Kubernetes condition
@@ -420,30 +424,29 @@ spec:
                 type: array
               readyReplicas:
                 description: |-
-                  ReadyReplicas is how many owned Sandboxes are Ready — the number of boxes
-                  that can actually serve an exec right now, which is what "is the pool warm"
-                  really means.
+                  ReadyReplicas is how many owned Sandboxes are Ready — the number of boxes that
+                  can actually serve an exec right now.
                 format: int32
                 type: integer
               replicas:
                 description: |-
-                  Replicas is how many Sandboxes the pool currently owns, ready or not. It is
-                  the /scale subresource's status counterpart.
+                  Replicas is how many Sandboxes the set currently owns, ready or not. It is the
+                  /scale subresource's status counterpart.
                 format: int32
                 type: integer
               sandboxes:
                 description: |-
-                  Sandboxes names the boxes this pool owns, so the pool is a usable handout
-                  list: a caller reads it to find a box to claim without listing and filtering
-                  Sandboxes itself. Ordered by name for a stable diff.
+                  Sandboxes names the boxes this set owns, so the set is a usable handout list: a
+                  caller reads it to find a box to use without listing and filtering Sandboxes
+                  itself. Ordered by name for a stable diff.
                 items:
                   type: string
                 type: array
               selector:
                 description: |-
-                  Selector is the label selector matching this pool's Sandboxes, serialized in
-                  the string form the /scale subresource requires. HPA and KEDA read the target's
-                  selector from here, so autoscaling a pool does not work without it.
+                  Selector is the label selector matching this set's Sandboxes, serialized in the
+                  string form the /scale subresource requires. HPA and KEDA read the target's
+                  selector from there, so autoscaling a set does not work without it.
                 type: string
             type: object
         type: object
