@@ -1,18 +1,22 @@
-# This patch ensures the webhook certificates are properly mounted in the manager container.
-# It configures the necessary arguments, volumes, volume mounts, and container ports.
-
-# Add the --webhook-cert-path argument for configuring the webhook certificate path
-- op: add
-  path: /spec/template/spec/containers/0/args/-
-  value: --webhook-cert-path=/tmp/k8s-webhook-server/serving-certs
-
-# Add the volumeMount for the webhook certificates
-- op: add
-  path: /spec/template/spec/containers/0/volumeMounts/-
-  value:
-    mountPath: /tmp/k8s-webhook-server/serving-certs
-    name: webhook-certs
-    readOnly: true
+# This patch wires up the webhook server: its port, and the directory it serves its
+# TLS keypair from.
+#
+# The keypair is provisioned IN-PROCESS by the cert rotator (pkg/cert), not by
+# cert-manager and not by an out-of-band script. That changes the volume this patch
+# needs in two ways worth spelling out, because the kubebuilder default is wrong here:
+#
+#  1. It is an emptyDir, NOT a Secret projection. The rotator WRITES the keypair to
+#     this path, so a Secret volume — which is read-only, and whose kubelet refresh
+#     would fight the rotator — cannot work. The Secret still exists and is still the
+#     shared source of truth across replicas; the rotator reads it from the API and
+#     writes it here, rather than the kubelet projecting it.
+#
+#  2. There is no --webhook-cert-path argument. Passing it makes main build a
+#     certwatcher over the path, and the watcher fails at STARTUP if the files are not
+#     there yet — which they never are on a first install, because the rotator cannot
+#     mint them until the manager is running. controller-runtime's webhook server
+#     already reads this exact directory by default and picks up rotations, so the
+#     watcher is redundant as well as harmful.
 
 # Add the port configuration for the webhook server
 - op: add
@@ -22,10 +26,18 @@
     name: webhook-server
     protocol: TCP
 
-# Add the volume configuration for the webhook certificates
+# The directory the rotator writes the keypair to and the webhook server serves from.
+# Must match certDir in pkg/cert (controller-runtime's default path).
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    mountPath: /tmp/k8s-webhook-server/serving-certs
+    name: webhook-certs
+
+# emptyDir, because the rotator writes here (see above). The container's root
+# filesystem is read-only, so without this volume the write would fail outright.
 - op: add
   path: /spec/template/spec/volumes/-
   value:
     name: webhook-certs
-    secret:
-      secretName: webhook-server-cert
+    emptyDir: {}

@@ -164,10 +164,12 @@ fi
 log "ensuring namespace ${NAMESPACE}"
 "${KUBECTL}" create namespace "${NAMESPACE}" --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 
-# Webhook serving cert (no cert-manager): generate the self-signed cert into the
-# Secret now. The caBundle is injected later, after the webhook config exists.
-log "provisioning webhook serving certificate Secret (self-signed)"
-NAMESPACE="${NAMESPACE}" KUBECTL="${KUBECTL}" hack/gen-webhook-cert.sh secret
+# No webhook cert step here, deliberately. The manager provisions its own serving
+# cert in-process at startup (pkg/cert) — it mints the keypair, stores it in a Secret,
+# writes it to disk and patches the caBundle into the MutatingWebhookConfiguration,
+# then keeps RENEWING it before expiry. That last part is why it replaced the previous
+# hack/gen-webhook-cert.sh: a script-minted cert never rotates, so its expiry is a
+# time bomb that fires years later when nobody remembers the script exists.
 
 # Provider credential Secrets, one per provider (blank required keys → skipped).
 for row in "${PROVIDER_SECRETS[@]}"; do
@@ -181,11 +183,15 @@ done
 log "installing CRDs and deploying the manager"
 make deploy IMG="${IMG}"
 
-# --- 5. inject the webhook CA bundle (server-side, no manager restart) ------
-# This edits only the MutatingWebhookConfiguration, which just got created by
-# `make deploy`. Only the API server reads caBundle, so the manager is untouched.
-log "injecting webhook CA bundle"
-NAMESPACE="${NAMESPACE}" KUBECTL="${KUBECTL}" hack/gen-webhook-cert.sh cabundle
+# No CA-bundle injection step either: the manager patches its own caBundle once it
+# starts, from the same cert it just wrote — so the served cert and the trusted CA
+# cannot drift, which two separate steps could never fully guarantee.
+#
+# One consequence worth knowing when watching a first install: the manager registers
+# NO controllers or webhook until that cert is ready, so the first few seconds of logs
+# show "waiting for the webhook certificate to be ready" and nothing reconciles yet.
+# That ordering is deliberate — a Pod admitted while the webhook is untrusted would be
+# scheduled by vanilla Kubernetes and silently bypass placement.
 
 log "done. Check status with:"
 printf '    %s -n %s get pods\n' "${KUBECTL}" "${NAMESPACE}"

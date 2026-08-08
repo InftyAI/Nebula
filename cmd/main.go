@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -46,6 +47,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/internal/controller"
 	webhookv1 "github.com/InftyAI/Nebula/internal/webhook/v1"
+	nebulacert "github.com/InftyAI/Nebula/pkg/cert"
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
@@ -54,6 +56,10 @@ import (
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
 )
+
+// defaultNamespace is where the manager is installed by config/default. It is only
+// a fallback for managerNamespace when POD_NAMESPACE is unset.
+const defaultNamespace = "nebula-system"
 
 var (
 	scheme   = runtime.NewScheme()
@@ -216,6 +222,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Provision the webhook serving cert in-process, replacing both cert-manager and
+	// the out-of-band hack/gen-webhook-cert.sh. The rotator mints the keypair into a
+	// Secret, writes it where the webhook server reads it, patches the caBundle into
+	// the MutatingWebhookConfiguration, and keeps renewing it before expiry — the one
+	// thing neither prior approach did (the script's cert simply expired years later).
+	//
+	// certsReady closes once the cert is on disk AND the caBundle is patched. The
+	// webhook must not register before that: with failurePolicy=Fail, serving on a
+	// missing keypair means every Pod CREATE in the cluster fails admission.
+	certsReady := make(chan struct{})
+	if enableWebhooks() {
+		if err := nebulacert.CertsManager(mgr, managerNamespace(), certsReady); err != nil {
+			setupLog.Error(err, "unable to set up cert rotation")
+			os.Exit(1)
+		}
+	} else {
+		// Nothing will close the channel, so close it here or the goroutine below would
+		// block forever and no controller would ever start.
+		close(certsReady)
+	}
+
 	// Register provider backends into the process-wide registry that both
 	// reconcilers resolve through (their Providers field defaults to
 	// provider.Get). Done before SetupWithManager so a pool/claim reconciled at
@@ -231,65 +258,27 @@ func main() {
 	// both sides rather than persisted.
 	blocklist := failover.New()
 
-	if err := (&controller.NodePoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "NodePool")
-		os.Exit(1)
-	}
-	if err := (&controller.NodeClaimReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "NodeClaim")
-		os.Exit(1)
-	}
-	if err := (&controller.PodPlacementReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Blocklist: blocklist,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "PodPlacement")
-		os.Exit(1)
-	}
+	// Controller and webhook registration is deferred until the cert exists, so it
+	// runs in a goroutine: the cert cannot be minted until the manager is STARTED
+	// (the rotator is a Runnable and needs a synced cache), so blocking here would
+	// deadlock. controller-runtime supports Add after Start — a Runnable registered
+	// then is started immediately — which is what makes this safe.
+	//
+	// The controllers wait too, not just the webhook. They create Pods, and every Pod
+	// CREATE goes through the defaulting webhook that injects the provider-selection
+	// gate; a Pod created while that webhook is untrusted would either be rejected
+	// (failurePolicy=Fail) or, worse, admitted ungated and scheduled by vanilla
+	// Kubernetes — silently bypassing placement and never reaching a provider.
+	go func() {
+		setupLog.Info("waiting for the webhook certificate to be ready")
+		<-certsReady
+		setupLog.Info("webhook certificate ready")
 
-	// The workload controllers sit on top of the provisioning core above: each
-	// synthesizes objects onto the same placement path rather than talking to a
-	// provider itself. Sandbox produces the Pod that backs one remote box;
-	// SandboxSet produces Sandboxes.
-	if err := (&controller.SandboxReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
-		os.Exit(1)
-	}
-	if err := (&controller.SandboxSetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "SandboxSet")
-		os.Exit(1)
-	}
-
-	// Start one virtual node per registered provider. The virtual kubelet owns
-	// provisioning: its pod controller calls provider.Provision on CreatePod and
-	// provider.Terminate on DeletePod, so an ungated Pod bound to a provider's
-	// virtual node materializes an external instance. Each Runner is a
-	// manager.Runnable, so it shares the manager's lifecycle and leader election.
-	if err := setupVirtualNodes(mgr, blocklist); err != nil {
-		setupLog.Error(err, "unable to set up virtual nodes")
-		os.Exit(1)
-	}
-	// nolint:goconst
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhookv1.SetupPodWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "Pod")
+		if err := setupControllers(mgr, blocklist); err != nil {
+			setupLog.Error(err, "unable to set up controllers")
 			os.Exit(1)
 		}
-	}
-	// +kubebuilder:scaffold:builder
+	}()
 
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")
@@ -321,6 +310,89 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// enableWebhooks reports whether the Pod defaulting webhook (and therefore the cert
+// rotator that makes it trustable) should run. It is off only when explicitly
+// disabled, which is how the local `make run` and tests avoid needing a cert and a
+// reachable Service.
+func enableWebhooks() bool {
+	// nolint:goconst
+	return os.Getenv("ENABLE_WEBHOOKS") != "false"
+}
+
+// managerNamespace is the namespace the manager runs in, which scopes both the
+// webhook cert Secret and the cert's DNS name. It is read from POD_NAMESPACE
+// (projected via fieldRef in config/manager/manager.yaml) rather than hardcoded, so
+// an install into a non-default namespace still gets a cert the API server accepts.
+// The fallback only matters for an out-of-cluster run, where the webhook is
+// typically disabled anyway.
+func managerNamespace() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	setupLog.Info("POD_NAMESPACE is unset; falling back to the default install namespace",
+		"namespace", defaultNamespace)
+	return defaultNamespace
+}
+
+// setupControllers registers every controller, the virtual nodes and the webhook.
+// It runs only after the webhook serving cert is ready (see main), which is why it
+// is a function rather than inline: everything here depends on Pod admission
+// working, so none of it may be registered before the API server trusts the webhook.
+func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
+	if err := (&controller.NodePoolReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create NodePool controller: %w", err)
+	}
+	if err := (&controller.NodeClaimReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create NodeClaim controller: %w", err)
+	}
+	if err := (&controller.PodPlacementReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Blocklist: blocklist,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create PodPlacement controller: %w", err)
+	}
+
+	// The workload controllers sit on top of the provisioning core above: each
+	// synthesizes objects onto the same placement path rather than talking to a
+	// provider itself. Sandbox produces the Pod that backs one remote box;
+	// SandboxSet produces Sandboxes.
+	if err := (&controller.SandboxReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create Sandbox controller: %w", err)
+	}
+	if err := (&controller.SandboxSetReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create SandboxSet controller: %w", err)
+	}
+
+	// Start one virtual node per registered provider. The virtual kubelet owns
+	// provisioning: its pod controller calls provider.Provision on CreatePod and
+	// provider.Terminate on DeletePod, so an ungated Pod bound to a provider's
+	// virtual node materializes an external instance. Each Runner is a
+	// manager.Runnable, so it shares the manager's lifecycle and leader election.
+	if err := setupVirtualNodes(mgr, blocklist); err != nil {
+		return fmt.Errorf("unable to set up virtual nodes: %w", err)
+	}
+	if enableWebhooks() {
+		if err := webhookv1.SetupPodWebhookWithManager(mgr); err != nil {
+			return fmt.Errorf("unable to create Pod webhook: %w", err)
+		}
+	}
+	// +kubebuilder:scaffold:builder
+	return nil
 }
 
 // setupVirtualNodes adds a vnode.Runner to the manager for every registered

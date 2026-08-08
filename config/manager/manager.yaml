@@ -72,6 +72,15 @@ spec:
           # embedded in the binary.
           - name: NEBULA_CATALOG_DIR
             value: /etc/nebula/catalog
+          # The namespace the manager runs in, needed by the webhook cert rotator
+          # (pkg/cert): it scopes both the cert Secret and the cert's DNS name
+          # (<service>.<namespace>.svc). Projected via fieldRef rather than hardcoded
+          # so an install into a non-default namespace still gets a cert the API
+          # server accepts.
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
         envFrom:
           # Provider credentials live in a per-provider Secret, one secretRef per
           # provider — NOT a single shared secret. This matches the "creds-absent →
