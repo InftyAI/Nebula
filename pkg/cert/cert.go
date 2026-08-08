@@ -32,10 +32,15 @@ limitations under the License.
 //     expiry is a silent time bomb that fires years later, when nobody remembers
 //     the script exists.
 //
-// The rotator does both jobs in-process: it mints the keypair into a Secret, writes
-// it to CertDir for the webhook server to serve, patches the caBundle, and then
-// keeps renewing before expiry. Because the CA is patched from the same cert that
-// was just written, the served cert and the trusted CA cannot drift.
+// The rotator does both jobs in-process: it mints the keypair into a Secret, patches
+// the caBundle, and then keeps renewing before expiry. Because the CA is patched from
+// the same cert that was just written, the served cert and the trusted CA cannot drift.
+//
+// The Secret is the ONLY thing it writes. It never touches the filesystem — the
+// keypair reaches the webhook server's certDir because the manager projects that
+// Secret there as a volume, and the rotator merely polls the path to know when the
+// kubelet has done so. See certDir below; getting this backwards (an emptyDir at
+// certDir) silently prevents the whole manager from starting.
 package cert
 
 import (
@@ -64,9 +69,17 @@ const (
 	// needs — nil Data is exactly the condition that triggers minting.
 	secretName = "nebula-webhook-server-cert"
 
-	// certDir is where the rotator writes the keypair and where controller-runtime's
-	// webhook server reads it from. It is the controller-runtime default, and the
-	// same path the manager mounts the Secret at.
+	// certDir is where the keypair lands on disk and where controller-runtime's
+	// webhook server reads it from. It is the controller-runtime default, and the path
+	// the manager projects the Secret above at.
+	//
+	// The rotator does NOT write here, despite the name: cert-controller performs no
+	// filesystem writes at all, and CertDir is a path it only os.Stat()s to decide
+	// readiness (ensureCertsMounted). The KUBELET puts the files here by projecting the
+	// Secret — so the volume must be that Secret, not an emptyDir. With an emptyDir the
+	// files never appear, IsReady never closes, and since controller and webhook
+	// registration waits on it (see CertsManager), nothing ever starts while the manager
+	// still reports Running.
 	certDir = "/tmp/k8s-webhook-server/serving-certs"
 
 	// mutatingWebhookConfName is the MutatingWebhookConfiguration whose caBundle

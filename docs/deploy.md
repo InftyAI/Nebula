@@ -76,9 +76,11 @@ nothing to install and nothing to run before `make deploy`.
 It does the three things that have to agree with each other:
 
 1. **Serving cert** — mints a self-signed cert for the webhook Service DNS name
-   (`nebula-webhook-service.<namespace>.svc`), stores it in the
-   `nebula-webhook-server-cert` Secret, and writes it to
-   `/tmp/k8s-webhook-server/serving-certs` where the webhook server reads it.
+   (`nebula-webhook-service.<namespace>.svc`) and stores it in the
+   `nebula-webhook-server-cert` Secret. That Secret is projected into the manager at
+   `/tmp/k8s-webhook-server/serving-certs`, where the webhook server reads it — the
+   rotator writes only the Secret, never the filesystem, so the volume at that path
+   must be the Secret rather than an `emptyDir`.
 2. **CA trust** — patches that cert's CA into the `MutatingWebhookConfiguration`
    `caBundle`, so the API server trusts the webhook. It is derived from the cert
    just written, so the served cert and the trusted CA cannot drift.
@@ -87,8 +89,8 @@ It does the three things that have to agree with each other:
    later, when nobody remembers a script was involved.
 
 The Secret is the shared source of truth across replicas — a second replica finds
-the existing cert there and writes it to its own disk rather than minting a
-competing one. Rotation is *not* leader-elected, because webhook serving is not
+the existing cert there rather than minting a competing one, and the kubelet projects
+it into that pod too. Rotation is *not* leader-elected, because webhook serving is not
 either: every replica needs the keypair on its own local disk, and the API server
 will call a non-leader.
 

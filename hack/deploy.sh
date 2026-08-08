@@ -163,11 +163,13 @@ log "ensuring namespace ${NAMESPACE}"
 "${KUBECTL}" create namespace "${NAMESPACE}" --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 
 # No webhook cert step here, deliberately. The manager provisions its own serving
-# cert in-process at startup (pkg/cert) — it mints the keypair, stores it in a Secret,
-# writes it to disk and patches the caBundle into the MutatingWebhookConfiguration,
-# then keeps RENEWING it before expiry. That last part is why it replaced the previous
-# hack/gen-webhook-cert.sh: a script-minted cert never rotates, so its expiry is a
-# time bomb that fires years later when nobody remembers the script exists.
+# cert in-process at startup (pkg/cert) — it mints the keypair into a Secret (which
+# kustomize ships empty, and which the kubelet then projects into the pod for the
+# webhook server to serve) and patches the caBundle into the
+# MutatingWebhookConfiguration, then keeps RENEWING it before expiry. That last part is
+# why it replaced the previous hack/gen-webhook-cert.sh: a script-minted cert never
+# rotates, so its expiry is a time bomb that fires years later when nobody remembers
+# the script exists.
 
 # Provider credential Secrets, one per provider (blank required keys → skipped).
 for row in "${PROVIDER_SECRETS[@]}"; do
