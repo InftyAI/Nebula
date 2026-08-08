@@ -199,7 +199,7 @@ func needsPlacement(pod *corev1.Pod) bool {
 	if !pod.DeletionTimestamp.IsZero() {
 		return false
 	}
-	if pod.Labels[nebulav1alpha1.EnabledLabel] != "true" {
+	if pod.Labels[nebulav1alpha1.EnabledLabel] != nebulav1alpha1.EnabledValue {
 		return false
 	}
 	if pod.Spec.NodeName != "" {

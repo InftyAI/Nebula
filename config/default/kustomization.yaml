@@ -24,11 +24,13 @@ resources:
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 - ../webhook
-# [CERTMANAGER] cert-manager is intentionally NOT used. The webhook serving
-# cert is generated as a self-signed cert by hack/gen-webhook-cert.sh (run via
-# `make deploy-all`), which also injects the CA into the webhook config. To
-# switch back to cert-manager, re-add `- ../certmanager` here and re-enable the
-# CERTMANAGER replacements blocks below. See docs/deploy.md.
+# [CERTMANAGER] cert-manager is intentionally NOT used, and neither is any
+# out-of-band cert step. The manager provisions its own webhook serving cert
+# in-process at startup (pkg/cert): it mints the keypair into a Secret, writes it
+# to disk, patches the caBundle into the webhook config, and RENEWS it before
+# expiry. To switch to cert-manager, re-add `- ../certmanager` here, re-enable the
+# CERTMANAGER replacements blocks below, and drop the CertsManager call from
+# cmd/main.go. See docs/deploy.md.
 #- ../certmanager
 # [PROMETHEUS] To enable prometheus monitor, uncomment all sections with 'PROMETHEUS'.
 #- ../prometheus
@@ -47,9 +49,11 @@ patches:
 - path: manager_metrics_patch.yaml
   target:
     kind: Deployment
-    # Scope to the manager ONLY (matches the pre-prefix name), so the
-    # manager-only --metrics-bind-address flag is not injected into any other
-    # Deployment in the build.
+    # Scope to the manager ONLY (matches the pre-prefix name). The manager is
+    # currently the only Deployment in the build, so this is defensive rather than
+    # load-bearing: without a name, kustomize applies the patch to EVERY Deployment,
+    # so the day an overlay adds a second one it would silently receive the
+    # manager-only --metrics-bind-address flag and fail to start on an unknown flag.
     name: controller-manager
 
 # Uncomment the patches line if you enable Metrics and CertManager
@@ -64,7 +68,8 @@ patches:
 - path: manager_webhook_patch.yaml
   target:
     kind: Deployment
-    # Scope to the manager ONLY (see the metrics patch above).
+    # Scope to the manager ONLY (see the metrics patch above) — otherwise a second
+    # Deployment added later would also get the webhook port, volume and cert mount.
     name: controller-manager
 
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
@@ -130,7 +135,7 @@ replacements:
 #         index: 1
 #         create: true
 
-# [CERTMANAGER] Disabled — self-signed cert via hack/gen-webhook-cert.sh instead.
+# [CERTMANAGER] Disabled — the cert is minted in-process by pkg/cert instead.
 # - source: # Uncomment the following block if you have any webhook
 #     kind: Service
 #     version: v1
@@ -199,8 +204,8 @@ replacements:
 #         index: 1
 #         create: true
 
-# [CERTMANAGER] Disabled — the CA is injected into the MutatingWebhookConfiguration
-# by hack/gen-webhook-cert.sh (kubectl patch caBundle) instead of this annotation.
+# [CERTMANAGER] Disabled — the CA is patched into the MutatingWebhookConfiguration
+# by the in-process cert rotator (pkg/cert) instead of this annotation.
 # - source: # Uncomment the following block if you have a DefaultingWebhook (--defaulting )
 #     kind: Certificate
 #     group: cert-manager.io

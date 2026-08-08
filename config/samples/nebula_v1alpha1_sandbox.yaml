@@ -1,0 +1,33 @@
+# One interactive remote box. Reach it exactly as you would a local Pod:
+#
+#   kubectl exec -it sample -- bash
+#   kubectl logs sample
+#
+# There is no command field, by design: the container's command is always SandD,
+# which runs as PID 1 and is what makes exec and logs work against an instance in
+# another cloud. A box has nothing to run at boot anyway — commands arrive later,
+# over exec — so SandD holds the container open and serves them.
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: Sandbox
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: nebula
+  name: sample
+spec:
+  # The placement policy this box is provisioned against: which providers are
+  # allowed, which capacity tiers, how to rank them.
+  nodePoolRef: sample
+  # Optional — defaults to ubuntu:24.04, which is all a "give me a remote shell" box
+  # needs. Note it does NOT become a CUDA image when you ask for an accelerator; name
+  # one explicitly if you want the toolkit preinstalled.
+  image: ubuntu:24.04
+  # The accelerator TYPE is a label-shaped field; the COUNT rides on the
+  # nvidia.com/gpu resource below, so exactly one number drives both scheduling
+  # fit and provisioning. Omit both for a CPU-only box.
+  acceleratorType: a100-40gb
+  resources:
+    requests:
+      cpu: "8"
+      memory: 64Gi
+    limits:
+      nvidia.com/gpu: "1"

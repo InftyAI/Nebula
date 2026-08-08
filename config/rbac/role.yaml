@@ -8,7 +8,6 @@ rules:
   - ""
   resources:
   - configmaps
-  - secrets
   - services
   verbs:
   - get
@@ -25,6 +24,7 @@ rules:
   - ""
   resources:
   - nodes
+  - pods
   verbs:
   - create
   - delete
@@ -45,12 +45,20 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - secrets
   verbs:
-  - delete
+  - create
   - get
   - list
-  - patch
+  - update
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingwebhookconfigurations
+  verbs:
+  - get
+  - list
   - update
   - watch
 - apiGroups:
@@ -70,6 +78,8 @@ rules:
   resources:
   - nodeclaims
   - nodepools
+  - sandboxes
+  - sandboxsets
   verbs:
   - create
   - delete
@@ -83,6 +93,8 @@ rules:
   resources:
   - nodeclaims/finalizers
   - nodepools/finalizers
+  - sandboxes/finalizers
+  - sandboxsets/finalizers
   verbs:
   - update
 - apiGroups:
@@ -90,6 +102,9 @@ rules:
   resources:
   - nodeclaims/status
   - nodepools/status
+  - sandboxes/status
+  - sandboxsets/scale
+  - sandboxsets/status
   verbs:
   - get
   - patch

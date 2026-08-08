@@ -32,6 +32,12 @@ linters:
       - linters:
           - lll
         path: api/*
+      # kubebuilder markers are single-line BY PROTOCOL — controller-gen parses one
+      # marker per comment line and there is no continuation syntax, so a long
+      # groups/resources/verbs triple simply cannot be wrapped to satisfy lll.
+      - linters:
+          - lll
+        source: '^\s*//\s*\+kubebuilder:'
       - linters:
           - dupl
           - lll

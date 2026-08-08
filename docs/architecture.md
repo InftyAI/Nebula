@@ -614,25 +614,3 @@ manager owns reconciliation and the VK node leases (the VK nodes run inside the
 manager as `Runnable`s — option A).
 
 ---
-
-## Build status
-
-| Component | Package | Status |
-|---|---|---|
-| API types (NodePool, NodeClaim) | `api/v1alpha1` | DONE |
-| Provider interface + registry | `pkg/provider` | DONE |
-| Price catalog (CSV + ConfigMap) | `pkg/provider/catalog` | DONE |
-| Modal adapter | `pkg/provider/modal` | DONE |
-| NodeClaim controller (teardown backstop) | `internal/controller` | DONE |
-| NodePool controller | `internal/controller` | DONE |
-| Scheduling-gate webhook | `internal/webhook/v1` | DONE |
-| Provider wiring in manager | `cmd/main.go` | DONE |
-| Virtual Kubelet node (VK owns provisioning) | `pkg/vnode` | DONE |
-| Placement controller (first-matching-provider) | `internal/controller` | DONE |
-| **Optimizer (price/weighted, capacity fallback, blocklist)** | — | **PLANNED** |
-| Other adapters (RunPod next) | `pkg/provider/*` | PLANNED |
-
-The critical path — gated Pod → placed → bound → provisioned → torn down — is now
-closed end to end. The next milestone is the **optimizer**: replacing the v1
-"first matching provider" policy behind `selectPlacement` with price/weighted
-ranking, capacity-tier fallback, and the failover blocklist.

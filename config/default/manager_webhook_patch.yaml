@@ -1,18 +1,28 @@
-# This patch ensures the webhook certificates are properly mounted in the manager container.
-# It configures the necessary arguments, volumes, volume mounts, and container ports.
-
-# Add the --webhook-cert-path argument for configuring the webhook certificate path
-- op: add
-  path: /spec/template/spec/containers/0/args/-
-  value: --webhook-cert-path=/tmp/k8s-webhook-server/serving-certs
-
-# Add the volumeMount for the webhook certificates
-- op: add
-  path: /spec/template/spec/containers/0/volumeMounts/-
-  value:
-    mountPath: /tmp/k8s-webhook-server/serving-certs
-    name: webhook-certs
-    readOnly: true
+# This patch wires up the webhook server: its port, and the directory it serves its
+# TLS keypair from.
+#
+# The keypair is provisioned IN-PROCESS by the cert rotator (pkg/cert), not by
+# cert-manager and not by an out-of-band script. Two consequences worth spelling out,
+# because they are easy to get backwards:
+#
+#  1. The keypair reaches this directory as a SECRET PROJECTION, not an emptyDir.
+#     The rotator does not write files: it mints the keypair into the Secret and
+#     nothing else — cert-controller has no disk writes at all, and its CertDir is a
+#     path it only ever os.Stat()s to decide readiness (see ensureCertsMounted in
+#     rotator.go). So the kubelet is what puts the keypair on disk. With an emptyDir
+#     the files would never appear, the rotator's IsReady channel would never close,
+#     and — because controller and webhook registration waits on it (cmd/main.go) —
+#     NOTHING would ever start: no reconcilers, no virtual nodes, no webhook. The
+#     manager stays Running and looks healthy, which is what makes that failure mode
+#     nasty. This is also the second reason config/webhook ships the empty Secret:
+#     a non-optional Secret volume blocks the pod from starting until it exists.
+#
+#  2. There is no --webhook-cert-path argument. Passing it makes main build a
+#     certwatcher over the path, and the watcher fails at STARTUP if the files are not
+#     there yet — which they are not on a first install, because the Secret is empty
+#     until the rotator mints into it. controller-runtime's webhook server already
+#     reads this exact directory by default, and it is only registered after the
+#     rotator reports ready, so by then the files are there.
 
 # Add the port configuration for the webhook server
 - op: add
@@ -22,10 +32,22 @@
     name: webhook-server
     protocol: TCP
 
-# Add the volume configuration for the webhook certificates
+# The directory the keypair is projected into and the webhook server serves from.
+# Must match certDir in pkg/cert (controller-runtime's default path), which is also
+# the path the rotator polls to decide readiness.
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    mountPath: /tmp/k8s-webhook-server/serving-certs
+    name: webhook-certs
+    readOnly: true
+
+# The rotator's Secret, projected read-only (see above: the kubelet, not the rotator,
+# writes these files). Name must match secretName in pkg/cert. NOT optional: the pod
+# should refuse to start rather than run with a directory that never fills.
 - op: add
   path: /spec/template/spec/volumes/-
   value:
     name: webhook-certs
     secret:
-      secretName: webhook-server-cert
+      secretName: nebula-webhook-server-cert

@@ -68,40 +68,46 @@ cluster) is passed as `make` variables, never committed to `.env`.
 
 Nebula runs a mutating webhook (it injects the scheduling gate into gated Pods),
 and the API server requires TLS to call it. **cert-manager is intentionally not
-used** — there is no cert-manager prerequisite to install. Instead,
-`hack/gen-webhook-cert.sh` provisions a self-signed certificate. It does the two
-things cert-manager would otherwise automate:
+used**, and neither is any out-of-band setup step: the manager provisions its own
+serving certificate in-process at startup (`pkg/cert`, built on
+[cert-controller](https://github.com/open-policy-agent/cert-controller)). There is
+nothing to install and nothing to run before `make deploy`.
 
-1. **Serving cert** — generates a self-signed cert for the webhook Service DNS
-   name (`nebula-webhook-service.nebula-system.svc`) and stores it in the
-   `webhook-server-cert` TLS Secret the manager mounts.
-2. **CA trust** — injects that cert's CA into the `MutatingWebhookConfiguration`
-   `caBundle`, so the API server trusts the webhook. The caBundle is always read
-   back *from the Secret*, so the served cert and the trusted CA cannot drift.
+It does the three things that have to agree with each other:
 
-**No manager restart is involved.** `deploy-all` orders things so the manager
-boots already-correct: the cert Secret is created *before* `make deploy` (it is a
-required volume mount, and a running pod would otherwise need remounting), while
-the caBundle patch happens *after* (it edits only the webhook config, which only
-the API server reads — the manager never sees it).
+1. **Serving cert** — mints a self-signed cert for the webhook Service DNS name
+   (`nebula-webhook-service.<namespace>.svc`) and stores it in the
+   `nebula-webhook-server-cert` Secret. That Secret is projected into the manager at
+   `/tmp/k8s-webhook-server/serving-certs`, where the webhook server reads it — the
+   rotator writes only the Secret, never the filesystem, so the volume at that path
+   must be the Secret rather than an `emptyDir`.
+2. **CA trust** — patches that cert's CA into the `MutatingWebhookConfiguration`
+   `caBundle`, so the API server trusts the webhook. It is derived from the cert
+   just written, so the served cert and the trusted CA cannot drift.
+3. **Renewal** — rotates the cert before it expires. This is the part neither
+   cert-manager-free alternative had: a script-minted cert simply expires, years
+   later, when nobody remembers a script was involved.
 
-Re-running is safe: an existing cert Secret is kept as-is, and the caBundle is
-re-derived to match.
+The Secret is the shared source of truth across replicas — a second replica finds
+the existing cert there rather than minting a competing one, and the kubelet projects
+it into that pod too. Rotation is *not* leader-elected, because webhook serving is not
+either: every replica needs the keypair on its own local disk, and the API server
+will call a non-leader.
 
-> **No auto-rotation.** This is the one thing cert-manager gives you that the
-> self-signed cert does not. The cert is valid 10 years (`CERT_DAYS`, default
-> `3650`). To rotate/renew, regenerate the cert and re-inject the CA:
-> ```bash
-> FORCE_REGEN=true hack/gen-webhook-cert.sh secret
-> hack/gen-webhook-cert.sh cabundle
-> kubectl rollout restart deployment/nebula-controller-manager -n nebula-system
-> ```
-> The restart here is only because you are *replacing* the cert under a
-> already-running manager — the initial deploy needs none.
+**Startup ordering.** Nothing that depends on Pod admission is registered until the
+cert is ready, so the first seconds of a fresh install log
+`waiting for the webhook certificate to be ready` and reconcile nothing. That is
+deliberate: with `failurePolicy: Fail` a Pod created before the webhook is trusted
+would be rejected, and without the gate it would be scheduled by vanilla Kubernetes
+— silently bypassing placement and never reaching a provider.
 
-To switch back to cert-manager, re-add `- ../certmanager` and re-enable the
+The cert volume is an `emptyDir`, not a Secret projection, because the rotator
+*writes* to that path; a Secret volume is read-only and its kubelet refresh would
+fight the rotator.
+
+To switch to cert-manager instead, re-add `- ../certmanager` and re-enable the
 `CERTMANAGER` replacements blocks in `config/default/kustomization.yaml`, install
-cert-manager, and drop the `gen-webhook-cert.sh` calls from `hack/deploy.sh`.
+cert-manager, and drop the `CertsManager` call from `cmd/main.go`.
 
 ---
 
@@ -151,23 +157,20 @@ Non-secret config, passed as `make` variables:
 
 If you don't want the script (e.g. you manage Secrets via sealed-secrets or a
 GitOps pipeline), do the same steps by hand. Order matters — create the Secrets
-before deploying so the manager boots configured, and inject the CA after:
+before deploying so the manager boots configured:
 
 ```bash
-# 1. Namespace + webhook serving cert Secret (before deploy — it's a volume mount).
+# 1. Namespace.
 kubectl create namespace nebula-system --dry-run=client -o yaml | kubectl apply -f -
-hack/gen-webhook-cert.sh secret
 
 # 2. Modal credential Secret (before deploy — read as env at pod startup).
 kubectl create secret generic nebula-modal-credentials -n nebula-system \
   --from-literal=MODAL_TOKEN_ID=ak-... \
   --from-literal=MODAL_TOKEN_SECRET=as-...
 
-# 3. Deploy CRDs + manager. The pod mounts the cert and reads creds on first boot.
+# 3. Deploy CRDs + manager. The pod reads creds on first boot, and provisions its
+#    own webhook cert + caBundle at startup — no cert step of your own.
 make deploy IMG=<your-registry>/nebula:<tag>
-
-# 4. Inject the webhook CA (server-side; needs the webhook config to exist).
-hack/gen-webhook-cert.sh cabundle
 ```
 
 No restart is needed — everything the manager consumes exists before it boots.
@@ -201,7 +204,7 @@ kubectl -n nebula-system logs deploy/nebula-controller-manager | grep -i provide
 kubectl get nodes -l nebula.inftyai.com/provider
 
 # Webhook TLS is wired: the caBundle matches the serving cert Secret.
-diff <(kubectl get secret webhook-server-cert -n nebula-system -o jsonpath='{.data.tls\.crt}') \
+diff <(kubectl get secret nebula-webhook-server-cert -n nebula-system -o jsonpath='{.data.tls\.crt}') \
      <(kubectl get mutatingwebhookconfiguration nebula-mutating-webhook-configuration \
          -o jsonpath='{.webhooks[0].clientConfig.caBundle}') \
   && echo "webhook caBundle matches serving cert"

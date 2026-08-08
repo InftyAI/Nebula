@@ -81,15 +81,10 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
-		// The manager mounts webhook-server-cert as a REQUIRED volume, so the
-		// self-signed cert Secret must exist before the pod starts, or it wedges
-		// in ContainerCreating (Pending) forever. Nebula does not use cert-manager
-		// (see config/default/kustomization.yaml); hack/gen-webhook-cert.sh is the
-		// source of truth, matching the ordering hack/deploy.sh uses in prod.
-		By("provisioning the webhook serving certificate Secret")
-		cmd = exec.Command("hack/gen-webhook-cert.sh", "secret")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to provision the webhook serving cert Secret")
+		// No cert step here: the manager mints its own webhook serving cert at
+		// startup (pkg/cert) into an emptyDir, so there is nothing to pre-create —
+		// the same ordering hack/deploy.sh uses in prod. The cert only exists once
+		// the manager is RUNNING, so the assertions below must be Eventually.
 
 		// Deploy via the e2e overlay, which bakes NEBULA_ENABLE_FAKE_PROVIDER=true
 		// into the manager env so the in-memory fake provider registers at first
@@ -104,13 +99,10 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
-		// caBundle injection is server-side (only the API server reads it) and
-		// requires the MutatingWebhookConfiguration created by the deploy, so it
-		// runs after the deploy. The manager pod is untouched — no restart needed.
-		By("injecting the webhook CA bundle")
-		cmd = exec.Command("hack/gen-webhook-cert.sh", "cabundle")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to inject the webhook CA bundle")
+		// No caBundle injection step: the manager patches the
+		// MutatingWebhookConfiguration itself once its cert rotator runs (pkg/cert),
+		// from the same cert it just wrote. The "CA injection" spec below asserts that
+		// happened, so this is covered by an Eventually rather than a deploy step.
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
@@ -306,11 +298,11 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		It("should have the self-signed webhook serving cert Secret", func() {
-			// Nebula does not use cert-manager; hack/gen-webhook-cert.sh creates this
-			// self-signed Secret in the e2e BeforeAll (and hack/deploy.sh in prod).
+			// The manager's own cert rotator (pkg/cert) creates this Secret after it
+			// starts — nothing pre-creates it, so this asserts the rotator ran.
 			By("validating that the webhook serving cert Secret exists")
 			verifyCertSecret := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
+				cmd := exec.Command("kubectl", "get", "secrets", "nebula-webhook-server-cert", "-n", namespace)
 				_, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 			}

@@ -151,23 +151,25 @@ else
   make docker-buildx IMG="${IMG}"
 fi
 
-# --- 3. Secrets FIRST, so the manager mounts them on its very first boot ----
-# Ordering matters and lets us avoid any manager restart:
-#   - the webhook cert Secret is a REQUIRED volume mount, so it must exist
-#     before the pod starts;
-#   - provider credentials are read from the environment at process start.
-# Both are consumed only at pod startup, so creating them before `make deploy`
-# means the manager comes up already correct — no restart, no race.
+# --- 3. Secrets FIRST, so the manager reads them on its very first boot -----
+# Provider credentials are read from the environment at process start, so creating
+# them before `make deploy` means the manager comes up already correct — no restart,
+# no race. (The webhook cert is NOT in this list: the manager mints it itself once
+# running, see below.)
 #
 # Secrets need the namespace, which `make deploy` would create — so create it
 # up front (idempotent; kustomize re-applies it harmlessly during deploy).
 log "ensuring namespace ${NAMESPACE}"
 "${KUBECTL}" create namespace "${NAMESPACE}" --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 
-# Webhook serving cert (no cert-manager): generate the self-signed cert into the
-# Secret now. The caBundle is injected later, after the webhook config exists.
-log "provisioning webhook serving certificate Secret (self-signed)"
-NAMESPACE="${NAMESPACE}" KUBECTL="${KUBECTL}" hack/gen-webhook-cert.sh secret
+# No webhook cert step here, deliberately. The manager provisions its own serving
+# cert in-process at startup (pkg/cert) — it mints the keypair into a Secret (which
+# kustomize ships empty, and which the kubelet then projects into the pod for the
+# webhook server to serve) and patches the caBundle into the
+# MutatingWebhookConfiguration, then keeps RENEWING it before expiry. That last part is
+# why it replaced the previous hack/gen-webhook-cert.sh: a script-minted cert never
+# rotates, so its expiry is a time bomb that fires years later when nobody remembers
+# the script exists.
 
 # Provider credential Secrets, one per provider (blank required keys → skipped).
 for row in "${PROVIDER_SECRETS[@]}"; do
@@ -176,16 +178,20 @@ for row in "${PROVIDER_SECRETS[@]}"; do
 done
 
 # --- 4. install CRDs + deploy the manager ----------------------------------
-# The pod mounts the cert Secret and reads provider creds at boot — both already
-# exist, so the manager comes up fully configured with no restart needed.
+# The pod reads provider creds at boot and they already exist, so the manager comes
+# up fully configured with no restart needed.
 log "installing CRDs and deploying the manager"
 make deploy IMG="${IMG}"
 
-# --- 5. inject the webhook CA bundle (server-side, no manager restart) ------
-# This edits only the MutatingWebhookConfiguration, which just got created by
-# `make deploy`. Only the API server reads caBundle, so the manager is untouched.
-log "injecting webhook CA bundle"
-NAMESPACE="${NAMESPACE}" KUBECTL="${KUBECTL}" hack/gen-webhook-cert.sh cabundle
+# No CA-bundle injection step either: the manager patches its own caBundle once it
+# starts, from the same cert it just wrote — so the served cert and the trusted CA
+# cannot drift, which two separate steps could never fully guarantee.
+#
+# One consequence worth knowing when watching a first install: the manager registers
+# NO controllers or webhook until that cert is ready, so the first few seconds of logs
+# show "waiting for the webhook certificate to be ready" and nothing reconciles yet.
+# That ordering is deliberate — a Pod admitted while the webhook is untrusted would be
+# scheduled by vanilla Kubernetes and silently bypass placement.
 
 log "done. Check status with:"
 printf '    %s -n %s get pods\n' "${KUBECTL}" "${NAMESPACE}"

@@ -8,6 +8,15 @@
 //	NodeClaim - one provisioned external instance and its lifecycle. Owns the
 //	            terminate finalizer so a paid instance is never leaked.
 //
+// On top of that provisioning core sit the workload types, each synthesizing
+// Pods onto the same placement path rather than bypassing it:
+//
+//	Sandbox    - one interactive remote box (agent workspace, shell, scratch GPU),
+//	             reachable with the same kubectl exec/logs as a local Pod.
+//	SandboxSet - maintains N Sandboxes, and owns /scale so `kubectl scale` and HPA
+//	             drive the count. Keeping boxes ready ahead of demand is a USE of
+//	             this, not its definition — there are no lease semantics here.
+//
 // +kubebuilder:object:generate=true
 // +groupName=nebula.inftyai.com
 package v1alpha1
@@ -35,6 +44,13 @@ const (
 	// objectSelector so only opted-in Pods ever hit the mutating webhook.
 	EnabledLabel = "nebula.inftyai.com/enabled"
 
+	// EnabledValue is the only value of EnabledLabel that opts a Pod in. The
+	// comparison is exact, so a Pod labelled "True" or "1" is NOT opted in — the
+	// label is the webhook's objectSelector, and the API server matches it
+	// literally, so anything else would make the controllers and the selector
+	// disagree about which Pods are Nebula's.
+	EnabledValue = "true"
+
 	// ProviderSelectionGate is the scheduling gate the webhook injects at Pod
 	// CREATE. The placement controller removes it once it has chosen a
 	// provider (by adding a provider nodeSelector), releasing the Pod to the
@@ -58,6 +74,18 @@ const (
 	// PoolLabel records which NodePool a Pod (and its NodeClaim) belongs to. Its
 	// value is the NodePool name, so the key mirrors the CRD kind.
 	PoolLabel = "nebula.inftyai.com/nodepool"
+
+	// SandboxLabel records which Sandbox a Pod belongs to. Its value is the Sandbox
+	// name, so the key mirrors the CRD kind. The Sandbox controller selects its own
+	// Pod by it, and it is what makes `kubectl get pods -l
+	// nebula.inftyai.com/sandbox=alice` work.
+	SandboxLabel = "nebula.inftyai.com/sandbox"
+
+	// SandboxSetLabel records which SandboxSet created a Sandbox. Its value is the
+	// set name. It is the selector the set's /scale subresource publishes in status
+	// (so HPA can find the set's members) and how the set controller enumerates the
+	// boxes it owns — ownerReferences alone would not support a label-selector query.
+	SandboxSetLabel = "nebula.inftyai.com/sandboxset"
 
 	// AcceleratorTypeLabel carries the requested accelerator TYPE only (e.g.
 	// "a100-40gb" or "h100"). The COUNT is expressed separately as a standard
@@ -110,6 +138,18 @@ const (
 	// annotations above (which the placement controller stamps and VK reads), this
 	// flows the other way — VK writes it for operators/tooling to read.
 	EndpointAnnotation = "nebula.inftyai.com/endpoint"
+
+	// SanddPath is where the SandD binary is found INSIDE a Nebula-provisioned
+	// container, and therefore the command every synthesized workload Pod runs. It
+	// is a shared constant rather than a per-adapter string because it is a contract
+	// with two ends that must agree exactly: the controller writes it as the Pod's
+	// container command, and every provider bootstrap must make the binary appear at
+	// this path (the AWS adapter bind-mounts it from the host into the container).
+	//
+	// The path lives under /nebula rather than /usr/local/bin to avoid colliding with
+	// anything the user's own image ships, since the image is arbitrary and we are
+	// injecting into it.
+	SanddPath = "/nebula/sandd"
 
 	// TerminateInstanceFinalizer is held by every NodeClaim to guarantee teardown.
 	// The virtual kubelet owns the happy path (DeletePod → provider.Terminate,
