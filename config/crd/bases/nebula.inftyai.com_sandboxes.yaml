@@ -1,0 +1,426 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: sandboxes.nebula.inftyai.com
+spec:
+  group: nebula.inftyai.com
+  names:
+    kind: Sandbox
+    listKind: SandboxList
+    plural: sandboxes
+    shortNames:
+    - sbx
+    singular: sandbox
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.nodePoolRef
+      name: Pool
+      type: string
+    - jsonPath: .spec.acceleratorType
+      name: Accelerator
+      type: string
+    - jsonPath: .status.endpoint
+      name: Endpoint
+      type: string
+    - jsonPath: .status.expiryTime
+      name: Expires
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          Sandbox is one interactive remote instance — an agent workspace, a shell, a
+          scratch GPU box — reachable with the same `kubectl exec` / `kubectl logs` a
+          local Pod would be.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              SandboxSpec is one long-lived, interactive remote box: an agent's workspace, a
+              shell, a scratch GPU machine. It is the first workload class Nebula serves
+              beyond a hand-written Pod.
+
+              A Sandbox is SINGULAR — one object, one instance. There is deliberately no
+              replicas field and no pod template, because a sandbox is not fungible: someone
+              is attached to it, it accumulates state in its filesystem, and the object's own
+              name IS its stable identity (`kubectl exec sandbox-alice` always reaches the
+              same box). Set-shaped controllers exist because containers are interchangeable,
+              which is exactly the property a sandbox lacks — a rolling update would evict a
+              live session, and "scale in by one" would have to guess whose box to kill. A
+              caller that wants N boxes creates N Sandboxes, each with its own image,
+              lifetime and identity.
+
+              The count lives one level up, in SandboxPool, which keeps N Sandboxes warm and
+              owns /scale so `kubectl scale` and HPA work. That split is what lets this type
+              stay singular: because the pool creates Sandbox OBJECTS rather than replicas
+              inside one object, everything that depends on a box being its own object —
+              per-box RBAC (grant a user their sandbox and not their neighbour's), a
+              per-box image and TTL, and a failure that stays visible instead of being
+              papered over by a replacement — keeps working underneath a pool.
+
+              The spec deliberately reuses corev1 types (ResourceRequirements, EnvVar) rather
+              than inventing parallel fields. The controller synthesizes a Pod, so anything
+              it accepts must ultimately BE PodSpec-shaped; re-declaring resources or env
+              would fork the vocabulary and, worse, fork the source of truth for the
+              accelerator COUNT — which placement and the scheduler's fit check both read
+              from the container's nvidia.com/gpu limit (see util.AcceleratorRequest).
+            properties:
+              acceleratorType:
+                description: |-
+                  AcceleratorType is the requested accelerator TYPE (e.g. "a100-40gb",
+                  "h100"), matched case-insensitively against the provider catalog. The COUNT
+                  is NOT here: it is a standard nvidia.com/gpu entry in Resources, so exactly
+                  one number drives scheduling fit and provisioning. The controller stamps
+                  this onto the synthesized Pod's AcceleratorTypeLabel, so a Sandbox and a
+                  hand-written Nebula Pod go through identical placement.
+
+                  Empty means a CPU-only sandbox, which is a legitimate (and cheap) thing to
+                  want for a shell or an agent that only needs a filesystem.
+                type: string
+              env:
+                description: |-
+                  Env is passed to the sandbox container verbatim, including valueFrom
+                  references — a sandbox usually needs at least a registry or Hugging Face
+                  token, and re-inventing secret indirection here would be strictly worse than
+                  reusing the field everyone already knows.
+                items:
+                  description: EnvVar represents an environment variable present in
+                    a Container.
+                  properties:
+                    name:
+                      description: Name of the environment variable. Must be a C_IDENTIFIER.
+                      type: string
+                    value:
+                      description: |-
+                        Variable references $(VAR_NAME) are expanded
+                        using the previously defined environment variables in the container and
+                        any service environment variables. If a variable cannot be resolved,
+                        the reference in the input string will be unchanged. Double $$ are reduced
+                        to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
+                        "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
+                        Escaped references will never be expanded, regardless of whether the variable
+                        exists or not.
+                        Defaults to "".
+                      type: string
+                    valueFrom:
+                      description: Source for the environment variable's value. Cannot
+                        be used if value is not empty.
+                      properties:
+                        configMapKeyRef:
+                          description: Selects a key of a ConfigMap.
+                          properties:
+                            key:
+                              description: The key to select.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description: Specify whether the ConfigMap or its key
+                                must be defined
+                              type: boolean
+                          required:
+                          - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        fieldRef:
+                          description: |-
+                            Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
+                            spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
+                          properties:
+                            apiVersion:
+                              description: Version of the schema the FieldPath is
+                                written in terms of, defaults to "v1".
+                              type: string
+                            fieldPath:
+                              description: Path of the field to select in the specified
+                                API version.
+                              type: string
+                          required:
+                          - fieldPath
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        resourceFieldRef:
+                          description: |-
+                            Selects a resource of the container: only resources limits and requests
+                            (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
+                          properties:
+                            containerName:
+                              description: 'Container name: required for volumes,
+                                optional for env vars'
+                              type: string
+                            divisor:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              description: Specifies the output format of the exposed
+                                resources, defaults to "1"
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            resource:
+                              description: 'Required: resource to select'
+                              type: string
+                          required:
+                          - resource
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        secretKeyRef:
+                          description: Selects a key of a secret in the pod's namespace
+                          properties:
+                            key:
+                              description: The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description: Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                          - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              image:
+                description: |-
+                  Image is the container image the sandbox runs.
+
+                  It has no command, and setting one is rejected at admission. That is not a
+                  simplification, it is the process model: SandD runs as PID 1 in the container
+                  and spawns the workload as its child so it owns the workload's stdout/stderr
+                  pipes, which is what makes `kubectl logs` possible against an instance in
+                  another cloud. A user-supplied command would displace SandD and take the log
+                  and exec paths with it. An interactive sandbox has nothing to run at boot
+                  anyway — the whole point is that commands arrive later, over exec.
+                minLength: 1
+                type: string
+              nodePoolRef:
+                description: |-
+                  NodePoolRef names the NodePool whose policy places this sandbox: which
+                  providers are allowed, which capacity tiers, how to rank them. Required —
+                  there is no implicit default pool, because placing a paid GPU instance
+                  against a guessed policy is not a safe default.
+                minLength: 1
+                type: string
+              resources:
+                description: |-
+                  Resources is the standard Kubernetes resource requirements for the sandbox
+                  container, verbatim. The accelerator count rides here as an nvidia.com/gpu
+                  limit (`limits: {nvidia.com/gpu: "1"}`), which is where both the placement
+                  controller and the scheduler already read it from.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This is an alpha field and requires enabling the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              ttl:
+                description: |-
+                  TTL bounds the sandbox's total lifetime, measured from the moment it first
+                  became Ready (NOT from creation, so a slow provision does not eat into the
+                  user's time). On expiry the controller releases the instance and the sandbox
+                  reports phase Expired.
+
+                  This exists because the failure mode of a remote GPU box is financial: an
+                  abandoned sandbox bills until someone notices. Omit it for an unbounded
+                  sandbox, which is a deliberate choice rather than the default.
+                type: string
+            required:
+            - image
+            - nodePoolRef
+            type: object
+          status:
+            description: SandboxStatus is the observed state, projected from the synthesized
+              Pod.
+            properties:
+              conditions:
+                description: Conditions follows the standard Kubernetes condition
+                  convention.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              endpoint:
+                description: |-
+                  Endpoint is the reachable address of the external instance once it is
+                  running, in the provider's own form (a public DNS name or an IP). Mirrored
+                  from the Pod's EndpointAnnotation, which is where the virtual kubelet
+                  publishes it.
+                type: string
+              expiryTime:
+                description: |-
+                  ExpiryTime is when TTL will elapse (ReadyTime + TTL), surfaced so a user can
+                  see the deadline without doing the arithmetic. Absent when no TTL is set or
+                  the sandbox has not become Ready yet.
+                format: date-time
+                type: string
+              phase:
+                description: Phase is the coarse lifecycle state.
+                type: string
+              podName:
+                description: |-
+                  PodName is the synthesized Pod backing this sandbox. It is recorded even
+                  though it currently equals the Sandbox name, so tooling (and `kubectl exec`
+                  wrappers) read the pod identity from status rather than reconstructing it
+                  from a naming convention this controller would then be unable to change.
+                type: string
+              readyTime:
+                description: |-
+                  ReadyTime is when the sandbox first became Ready. It is the anchor TTL is
+                  measured from, so it is durable status rather than a derived value: if it
+                  were recomputed from the Pod, a Pod status blip could silently restart the
+                  user's clock.
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

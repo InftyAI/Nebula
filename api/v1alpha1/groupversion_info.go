@@ -8,6 +8,14 @@
 //	NodeClaim - one provisioned external instance and its lifecycle. Owns the
 //	            terminate finalizer so a paid instance is never leaked.
 //
+// On top of that provisioning core sit the workload types, each synthesizing
+// Pods onto the same placement path rather than bypassing it:
+//
+//	Sandbox     - one interactive remote box (agent workspace, shell, scratch GPU),
+//	              reachable with the same kubectl exec/logs as a local Pod.
+//	SandboxPool - keeps N warm Sandboxes ready to hand out, and owns /scale so
+//	              `kubectl scale` and HPA drive the count.
+//
 // +kubebuilder:object:generate=true
 // +groupName=nebula.inftyai.com
 package v1alpha1
@@ -58,6 +66,19 @@ const (
 	// PoolLabel records which NodePool a Pod (and its NodeClaim) belongs to. Its
 	// value is the NodePool name, so the key mirrors the CRD kind.
 	PoolLabel = "nebula.inftyai.com/nodepool"
+
+	// SandboxLabel records which Sandbox a Pod belongs to. Its value is the Sandbox
+	// name, so the key mirrors the CRD kind. The Sandbox controller selects its own
+	// Pod by it, and it is what makes `kubectl get pods -l
+	// nebula.inftyai.com/sandbox=alice` work.
+	SandboxLabel = "nebula.inftyai.com/sandbox"
+
+	// SandboxPoolLabel records which SandboxPool created a Sandbox. Its value is
+	// the pool name. It is the selector the pool's /scale subresource publishes in
+	// status (so HPA can find the pool's members) and how the pool controller
+	// enumerates the boxes it owns — ownerReferences alone would not support a
+	// label-selector query.
+	SandboxPoolLabel = "nebula.inftyai.com/sandboxpool"
 
 	// AcceleratorTypeLabel carries the requested accelerator TYPE only (e.g.
 	// "a100-40gb" or "h100"). The COUNT is expressed separately as a standard
