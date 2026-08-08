@@ -1,0 +1,39 @@
+# Maintains N Sandboxes. Provisioning an instance takes MINUTES while an agent's
+# exec call wants sub-second, so boxes are kept ready ahead of demand:
+#
+#   kubectl get sandboxes -l nebula.inftyai.com/sandboxset=sample
+#   kubectl scale sandboxset/sample --replicas=5
+#
+# Boxes get generated names (sample-a4f2x), not ordinals, because an ordinal would
+# imply a slot that gets refilled — a replacement box wearing a dead box's name is
+# the same address with a different filesystem. A generated name makes a
+# replacement visibly a new box.
+#
+# A template change does NOT roll existing boxes (this is ReplicaSet-shaped, not
+# Deployment-shaped): rolling would evict live sessions and burn minutes of
+# provisioning per box. New boxes get the new template; existing ones are left alone.
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: SandboxSet
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: nebula
+  name: sample
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        team: ml
+    spec:
+      nodePoolRef: sample
+      image: ubuntu:24.04
+      acceleratorType: a100-40gb
+      resources:
+        requests:
+          cpu: "8"
+          memory: 64Gi
+        limits:
+          nvidia.com/gpu: "1"
+      # Per box, from its own ready time. In a set this acts as a RECYCLE interval:
+      # an expired box is pruned and the set creates a fresh one to replace it.
+      ttl: 8h

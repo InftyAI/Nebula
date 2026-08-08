@@ -4,6 +4,8 @@
 resources:
 - bases/nebula.inftyai.com_nodepools.yaml
 - bases/nebula.inftyai.com_nodeclaims.yaml
+- bases/nebula.inftyai.com_sandboxes.yaml
+- bases/nebula.inftyai.com_sandboxsets.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

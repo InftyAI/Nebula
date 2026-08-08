@@ -254,6 +254,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The workload controllers sit on top of the provisioning core above: each
+	// synthesizes objects onto the same placement path rather than talking to a
+	// provider itself. Sandbox produces the Pod that backs one remote box;
+	// SandboxSet produces Sandboxes.
+	if err := (&controller.SandboxReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
+		os.Exit(1)
+	}
+	if err := (&controller.SandboxSetReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SandboxSet")
+		os.Exit(1)
+	}
+
 	// Start one virtual node per registered provider. The virtual kubelet owns
 	// provisioning: its pod controller calls provider.Provision on CreatePod and
 	// provider.Terminate on DeletePod, so an ungated Pod bound to a provider's

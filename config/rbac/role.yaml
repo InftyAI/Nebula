@@ -61,6 +61,7 @@ rules:
   - nodeclaims
   - nodepools
   - sandboxes
+  - sandboxsets
   verbs:
   - create
   - delete
@@ -75,6 +76,7 @@ rules:
   - nodeclaims/finalizers
   - nodepools/finalizers
   - sandboxes/finalizers
+  - sandboxsets/finalizers
   verbs:
   - update
 - apiGroups:
@@ -83,6 +85,8 @@ rules:
   - nodeclaims/status
   - nodepools/status
   - sandboxes/status
+  - sandboxsets/scale
+  - sandboxsets/status
   verbs:
   - get
   - patch

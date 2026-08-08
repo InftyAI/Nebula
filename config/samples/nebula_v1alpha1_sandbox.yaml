@@ -1,0 +1,35 @@
+# One interactive remote box. Reach it exactly as you would a local Pod:
+#
+#   kubectl exec -it sample -- bash
+#   kubectl logs sample
+#
+# Note there is no command: SandD runs as PID 1 in the container and spawns the
+# workload as its child, which is what lets it own the stdout/stderr pipes that
+# `kubectl logs` reads. Setting a command would displace it, so admission rejects
+# one. An interactive box has nothing to run at boot anyway — commands arrive
+# later, over exec.
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: Sandbox
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: nebula
+  name: sample
+spec:
+  # The placement policy this box is provisioned against: which providers are
+  # allowed, which capacity tiers, how to rank them.
+  nodePoolRef: sample
+  image: ubuntu:24.04
+  # The accelerator TYPE is a label-shaped field; the COUNT rides on the
+  # nvidia.com/gpu resource below, so exactly one number drives both scheduling
+  # fit and provisioning. Omit both for a CPU-only box.
+  acceleratorType: a100-40gb
+  resources:
+    requests:
+      cpu: "8"
+      memory: 64Gi
+    limits:
+      nvidia.com/gpu: "1"
+  # Measured from the moment the box becomes READY, not from creation, so a slow
+  # provision does not eat into the user's time. Omit for an unbounded box —
+  # a deliberate choice, since an abandoned GPU box bills until someone notices.
+  ttl: 8h
