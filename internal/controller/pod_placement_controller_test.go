@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -32,6 +33,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 // fakeBlocklist is a test Blocklister that reports a fixed set of candidates as
@@ -258,6 +260,32 @@ func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
 	}
 	if nc.Spec.Accelerator != "" {
 		t.Fatalf("expected empty accelerator for a CPU-only claim, got %q", nc.Spec.Accelerator)
+	}
+}
+
+func TestPlacement_GPUCountWithoutAcceleratorTypeLeavesPodGated(t *testing.T) {
+	// A Pod that requests nvidia.com/gpu but omits accelerator-type is malformed,
+	// not CPU-only. Placement must not silently route it as a CPU-only workload.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+		util.NvidiaGPUResource: resource.MustParse("1"),
+	}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, modal)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if !hasGateNamed(got) {
+		t.Fatal("expected malformed GPU Pod to stay gated")
+	}
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "" {
+		t.Fatalf("expected no provider nodeSelector for malformed GPU Pod, got %v", got.Spec.NodeSelector)
+	}
+	var nc nebulav1alpha1.NodeClaim
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err == nil {
+		t.Fatal("expected no claim for malformed GPU Pod")
 	}
 }
 
