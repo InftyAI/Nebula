@@ -268,7 +268,16 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 // place stamps the routing decision onto the Pod and removes the gate, atomically
 // from the Pod's perspective (one Update). After this, the scheduler is free to
 // bind the Pod to the chosen provider's virtual node.
-func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, p placement) error {
+//
+// Nothing SandD-related is stamped: the controller lives in the manager process, so a
+// daemon's dial-in endpoint is the same for every Pod and needs no per-Pod carrier.
+// pkg/vnode assembles endpoint + token at provision time.
+func (r *PodPlacementReconciler) place(
+	ctx context.Context,
+	pod *corev1.Pod,
+	pool *nebulav1alpha1.NodePool,
+	p placement,
+) error {
 	// Route to the provider's virtual node.
 	if pod.Spec.NodeSelector == nil {
 		pod.Spec.NodeSelector = map[string]string{}
@@ -289,7 +298,6 @@ func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, poo
 	if pool.Spec.Failover != nil && pool.Spec.Failover.BlocklistTTL.Duration > 0 {
 		setAnnotation(pod, nebulav1alpha1.BlocklistTTLAnnotation, pool.Spec.Failover.BlocklistTTL.Duration.String())
 	}
-
 	// Remove our gate, releasing the Pod to the scheduler. Preserve any other
 	// gates a different controller may hold.
 	pod.Spec.SchedulingGates = removeGate(pod.Spec.SchedulingGates, nebulav1alpha1.ProviderSelectionGate)

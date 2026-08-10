@@ -19,6 +19,7 @@ package vnode
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
@@ -77,23 +78,32 @@ func NodeName(providerName string) string {
 // It deliberately wires the lower-level virtual-kubelet `node` package directly
 // rather than the `nodeutil` convenience wrapper: nodeutil pulls in a kubelet
 // HTTP/auth stack whose apiserver dependency does not compile against the k8s
-// 0.33 line this project pins. Nebula does not serve the kubelet API (logs/exec
-// are unsupported — see handler.go), so none of that surface is needed.
+// 0.33 line this project pins. The one piece of that surface Nebula does need —
+// the exec route, so `kubectl exec` can reach a workload — is served by hand in
+// kubelet.go; everything else (logs/attach/stats/port-forward) stays unsupported.
 type Runner struct {
 	prov      provider.Provider
 	client    kubernetes.Interface
 	blocklist Blocklister
+	sandd     *SandD
 	nodeName  string
 }
 
 // NewRunner builds the virtual-node runner for one provider. blocklist is the
 // shared failover blocklist the handler records Provision failures on (may be
-// nil).
-func NewRunner(prov provider.Provider, client kubernetes.Interface, blocklist Blocklister) *Runner {
+// nil). sandd mints each instance's SandD dial-out token; nil disables SandD
+// injection, and every provider's runner shares the one signer the manager built.
+func NewRunner(
+	prov provider.Provider,
+	client kubernetes.Interface,
+	blocklist Blocklister,
+	sandd *SandD,
+) *Runner {
 	return &Runner{
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
+		sandd:     sandd,
 		nodeName:  NodeName(prov.Name()),
 	}
 }
@@ -105,8 +115,23 @@ var _ manager.Runnable = (*Runner)(nil)
 func (r *Runner) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithValues("virtualNode", r.nodeName, "provider", r.prov.Name())
 
-	handler := NewHandler(r.prov, r.client, r.blocklist)
-	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
+	handler := NewHandler(r.prov, r.client, r.blocklist, r.sandd)
+
+	// Served only when SandD is on: without an exec transport the routes could only
+	// return NotFound, so binding would add an unauthenticated listener (see kubelet.go)
+	// for nothing.
+	var kubeletPort int
+	if handler.exec != nil {
+		port, err := serveKubeletAPI(ctx, handler, r.nodeName)
+		if err != nil {
+			// Non-fatal: losing exec beats failing provisioning for this provider.
+			log.Error(err, "could not serve the kubelet API; kubectl exec will be unavailable on this node")
+		} else {
+			kubeletPort = port
+		}
+	}
+
+	nodeSpec := nodeSpec(r.nodeName, r.prov.Name(), kubeletPort)
 
 	// Pod informer scoped to this node only (spec.nodeName == nodeName), so the
 	// pod controller reacts to exactly the Pods the scheduler bound here.
@@ -214,7 +239,10 @@ func (r *Runner) run(
 // ProviderLabel the placement controller selects on, and a NoSchedule taint so
 // only Nebula-placed Pods (which the placement controller tolerates) ever land
 // here.
-func nodeSpec(nodeName, providerName string) *corev1.Node {
+//
+// kubeletPort is where this node serves the exec route (see kubelet.go); zero
+// advertises no kubelet endpoint.
+func nodeSpec(nodeName, providerName string, kubeletPort int) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: nodeName,
@@ -267,8 +295,32 @@ func nodeSpec(nodeName, providerName string) *corev1.Node {
 			Capacity:    virtualCapacity(),
 			Allocatable: virtualCapacity(),
 			Conditions:  []corev1.NodeCondition{{Type: corev1.NodeReady}},
+			// These two are the only thing telling the API server where to proxy an
+			// exec; a node missing either fails every exec at the dial.
+			Addresses: kubeletAddresses(nodeName),
+			DaemonEndpoints: corev1.NodeDaemonEndpoints{
+				// gosec: an OS-assigned port is always inside int32.
+				KubeletEndpoint: corev1.DaemonEndpoint{Port: int32(kubeletPort)}, //nolint:gosec
+			},
 		},
 	}
+}
+
+// kubeletAddresses is the address the API server dials for this node's kubelet API. Every
+// virtual node here shares it (all served by the one manager Pod); the per-node port is
+// what distinguishes them. POD_IP comes from a fieldRef in config/manager/manager.yaml —
+// a Pod can hold several addresses and only that one is routable.
+//
+// Unset (a `make run` from a laptop) advertises no IP rather than guessing one: the API
+// server can't route to a dev machine anyway, and a guess turns a clear failure into a hang.
+func kubeletAddresses(nodeName string) []corev1.NodeAddress {
+	if ip := os.Getenv("POD_IP"); ip != "" {
+		// InternalIP alone. The API server walks its own preferred-address-TYPES
+		// (Hostname first by default), not this slice's order, so a Hostname entry
+		// would win over the IP — and "nebula-aws" resolves nowhere.
+		return []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}}
+	}
+	return []corev1.NodeAddress{{Type: corev1.NodeHostName, Address: nodeName}}
 }
 
 // markNodeReady flips the node's Ready condition to True. Called once both

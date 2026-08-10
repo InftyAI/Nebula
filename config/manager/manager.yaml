@@ -55,6 +55,11 @@ spec:
         # This ensures that deployments meet the highest security requirements for Kubernetes.
         # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
         runAsNonRoot: true
+        # Matches the image's USER (see Dockerfile). Required for the SandD signing key:
+        # kubelet writes projected Secret files owned by root, and only fsGroup makes it
+        # chown the volume to a group this non-root process is in — without it the key
+        # has to be world-readable inside the container to be readable at all.
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -81,6 +86,54 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+          # The address each virtual node advertises as its kubelet endpoint, which is
+          # what the API server dials to proxy a `kubectl exec` into this process (see
+          # pkg/vnode/kubelet.go). It must be the routable pod IP: a Pod can hold
+          # several addresses and only the cluster network's own is reachable, so this
+          # is taken from the downward API rather than discovered from the interfaces.
+          #
+          # Without it the virtual nodes advertise no usable address and exec fails to
+          # connect — everything else about the manager works unchanged.
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          # SandD is OFF by default, and THIS env var is the single switch that turns
+          # it on: SANDD_SIGNING_KEY_PATH gates daemon-token minting AND starts the
+          # embedded controller daemons dial into (see setupSandD in cmd/main.go).
+          # Uncomment BOTH of these after creating the key Secret with
+          # hack/gen-signing-key.sh and applying the Service (config/sandd):
+          #
+          #   - name: SANDD_SIGNING_KEY_PATH
+          #     value: /etc/nebula/sandd/signing.pem
+          #   - name: SANDD_EXTERNAL_HOST
+          #     value: sandd.example.com
+          #
+          # SANDD_EXTERNAL_HOST is REQUIRED once the key path is set, and the manager
+          # refuses to start without it rather than defaulting. It is the externally
+          # reachable address of THIS manager's dial-in port — the edge in front of it
+          # (see config/sandd/ingress.yaml), which must be the SAME host you put in that
+          # Ingress. It cannot be derived: daemons run on NeoCloud instances that are
+          # not on the cluster network, so the manager's in-cluster Service name is
+          # neither resolvable nor routable from them, and any address this process
+          # could invent would be one no daemon can dial. Accepted as a bare host, a
+          # host:port, or a full wss:// URL; a bare host becomes
+          # wss://<host>/ws (TLS by default — the token is a bearer secret).
+          #
+          # It is the ENV VAR, not the Secret's presence, that flips the feature. The
+          # volume below is optional, so an absent Secret yields an empty directory,
+          # not a scheduling failure — and if the path were set unconditionally the
+          # manager would crashloop on every install that has no key. With the switch
+          # here instead: unset means off and provisioning is untouched, while set means
+          # a missing or malformed key is FATAL at startup (setupSandD) rather than
+          # a per-Provision error, because every instance launched without a token is
+          # one whose daemon can never dial in and which bills until someone notices.
+          # A missing SANDD_EXTERNAL_HOST is fatal for exactly the same reason.
+          #
+          # Optional companions (all defaulted in cmd/main.go): SANDD_SIGNING_KID,
+          # SANDD_TOKEN_ISSUER, SANDD_TOKEN_TTL. The signer and the verifier are now the
+          # same process, so these cannot disagree with each other — they only need to
+          # match any verifier you run OUTSIDE the cluster.
         envFrom:
           # Provider credentials live in a per-provider Secret, one secretRef per
           # provider — NOT a single shared secret. This matches the "creds-absent →
@@ -138,6 +191,13 @@ spec:
           - name: catalog
             mountPath: /etc/nebula/catalog
             readOnly: true
+          # The SandD JWT signing key. Mounted unconditionally (the volume is optional,
+          # so this is an empty dir when the Secret is absent) while the FEATURE is
+          # gated by SANDD_SIGNING_KEY_PATH above — that way enabling SandD is a
+          # one-line env change, not a manifest edit that also has to add a volume.
+          - name: sandd-signing-key
+            mountPath: /etc/nebula/sandd
+            readOnly: true
       volumes:
         - name: catalog
           configMap:
@@ -146,5 +206,30 @@ spec:
             # the manager still starts (embedded-CSV fallback) if it's absent.
             name: catalog
             optional: true
+        - name: sandd-signing-key
+          secret:
+            # NOT rewritten by config/default's namePrefix, unlike the catalog volume
+            # above: kustomize only rewrites references to resources IT manages, and
+            # this Secret is created out-of-band by hack/gen-signing-key.sh. So the
+            # name here must match that script's SECRET default literally — verified by
+            # rendering `kustomize build config/default`, where it stays unprefixed.
+            secretName: sandd-signing-key
+            # optional so the manager starts on an install that never enabled SandD.
+            # A cluster WITH the feature on fails loudly instead: the env var is set,
+            # the file is missing, and setupSandD exits non-zero at startup.
+            optional: true
+            # 0440, GROUP-readable, paired with fsGroup: 65532 on the pod. The key is the
+            # crown jewel — it can mint a token for ANY daemon, so unlike a leaked token
+            # (bounded by sub/aud/exp) its compromise is unbounded — but 0400 does not
+            # work here and is not tighter in practice: kubelet writes projected Secret
+            # files owned by root, the manager runs as 65532 (see Dockerfile), so
+            # owner-only meant the manager could not read its OWN key and exited with
+            # "permission denied" at startup.
+            #
+            # fsGroup makes kubelet chown the volume to that group, so 0440 grants exactly
+            # one reader — uid 65532, the manager — and nothing wider. Raising this to
+            # 0444 would make the key world-readable inside the container instead, which is
+            # the change to avoid.
+            defaultMode: 0440
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

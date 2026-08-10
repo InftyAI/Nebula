@@ -51,11 +51,11 @@ spec:
         image: nvidia/cuda:12.4.1-base-ubuntu22.04
         # Print the GPUs the sandbox sees at startup, then idle.
         #
-        # NOTE: `kubectl logs` and `kubectl exec` do NOT work against a Nebula
-        # virtual node — it does not serve the kubelet API (see pkg/vnode
-        # handler.go: GetContainerLogs/RunInContainer return NotFound). So to see
-        # this output, read it on the PROVIDER side (the Modal dashboard or
-        # `modal app logs`), not via kubectl.
+        # NOTE: `kubectl logs` does NOT work against a Nebula virtual node — only
+        # `exec` is served (see pkg/vnode/kubelet.go), and logs answer 501. So to
+        # read this startup output, look on the PROVIDER side (the Modal dashboard
+        # or `modal app logs`). To see the GPUs interactively instead, `kubectl
+        # exec -it <pod> -- nvidia-smi` works once SandD is installed.
         command: ["sh", "-c", "nvidia-smi --query-gpu=index,name,memory.total --format=csv || echo 'no nvidia-smi'; sleep 3600"]
         resources:
           requests:

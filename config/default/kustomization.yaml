@@ -24,6 +24,18 @@ resources:
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 - ../webhook
+# [SANDD] The Service fronting the manager's SandD dial-in port — opt-in, so it is NOT
+# built by default. The controller itself is embedded in the manager, so there is no
+# Deployment here and nothing to crashloop.
+#
+# Left commented anyway: a Service published for a feature that is switched off points at
+# a port nothing is listening on, and "connection refused behind the edge" is a more
+# confusing thing to debug than an absent Service.
+#
+# Uncomment ONLY after hack/gen-signing-key.sh has created the key, and remember the
+# manager still needs SANDD_SIGNING_KEY_PATH + SANDD_EXTERNAL_HOST to actually mint and
+# deliver tokens. See config/sandd/kustomization.yaml for the full three-step enable.
+#- ../sandd
 # [CERTMANAGER] cert-manager is intentionally NOT used, and neither is any
 # out-of-band cert step. The manager provisions its own webhook serving cert
 # in-process at startup (pkg/cert): it mints the keypair into a Secret, writes it

@@ -7,11 +7,14 @@
 bin/*
 Dockerfile.cross
 
+# SandD sources staged into the docker build context by `make docker-build`. A copy of
+# another repo — never commit it.
+/.sandd-build/
+
 # Locally built command binaries. `go build ./cmd/...` drops these in the repo
 # ROOT, not bin/, so they are not covered above — and they are multi-MB, which is
 # exactly the kind of thing that sneaks into a commit unnoticed.
 /manager
-/keybroker
 
 # Test binary, build with `go test -c`
 *.test

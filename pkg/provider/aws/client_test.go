@@ -31,6 +31,7 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	smithy "github.com/aws/smithy-go"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
@@ -347,8 +348,10 @@ func TestBuildUserData_QuotesHostileValues(t *testing.T) {
 	}
 }
 
-// TestBuildUserData_PlainBootstrap: the bootstrap renders only the plain
-// docker-pull + docker-run flow — no sandd/tunnel tokens leak in.
+// TestBuildUserData_PlainBootstrap: a workload that does not run the daemon renders
+// only the plain docker-pull + docker-run flow. Nothing SandD-related may appear —
+// no host fetch, no bind-mount, no credential env-file — so an ordinary GPU job is
+// launched exactly as it would be with the feature absent.
 func TestBuildUserData_PlainBootstrap(t *testing.T) {
 	encoded, err := buildUserData(InstanceSpec{Image: "img"})
 	if err != nil {
@@ -356,8 +359,259 @@ func TestBuildUserData_PlainBootstrap(t *testing.T) {
 	}
 	raw, _ := base64.StdEncoding.DecodeString(encoded)
 	script := string(raw)
-	if strings.Contains(script, "sandd") || strings.Contains(script, "tunnel") {
-		t.Fatalf("plain bootstrap must not inject sandd/tunnel:\n%s", script)
+	if strings.Contains(script, "sandd") || strings.Contains(script, "SANDD") {
+		t.Fatalf("plain bootstrap must not inject sandd:\n%s", script)
+	}
+}
+
+// TestBuildUserData_StagesSanddBinary: when the Pod's command IS the daemon, the
+// bootstrap must fetch the static binary on the HOST before `docker run` and
+// bind-mount it read-only into the container — the two halves of the SanddPath
+// contract, without which the container exits 127 on a missing binary.
+func TestBuildUserData_StagesSanddBinary(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{
+		Image:   "ubuntu:24.04",
+		Command: []string{nebulav1alpha1.SanddPath},
+	})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if !strings.Contains(script, "curl -fsSL --retry 3 --retry-connrefused "+sanddBinaryURL) {
+		t.Fatalf("host fetch of the sandd binary missing:\n%s", script)
+	}
+	// The URL must resolve to a REAL release asset, whether it tracks `latest` or a tag.
+	// Asserted on the literal rather than through the constant, which would pass for any
+	// value: a typo here is not caught by any other test and does not surface until an
+	// instance is already booting, where it presents as a daemon that never dials in.
+	//
+	// Deliberately NOT asserting a pin: tracking `latest` is the current choice (see
+	// sanddBinaryURL). Whatever it names must understand SANDD_TOKEN — v0.0.7 or later —
+	// or the daemon dials in unauthenticated and is rejected with a 401.
+	if !strings.Contains(sanddBinaryURL, "/releases/latest/download/") &&
+		!strings.Contains(sanddBinaryURL, "/releases/download/v") {
+		t.Errorf("sanddBinaryURL is neither a `latest` nor a tagged release asset: %q", sanddBinaryURL)
+	}
+	if !strings.HasSuffix(sanddBinaryURL, "/sandd-linux-amd64") {
+		t.Errorf("sanddBinaryURL should name the linux-amd64 asset, got %q", sanddBinaryURL)
+	}
+	// No downloader on the instance must be reported as itself, not as a bare
+	// "command not found" under set -e — the console is the only debug channel here.
+	if !strings.Contains(script, "wget -q --tries=3") {
+		t.Fatalf("no wget fallback for a curl-less AMI:\n%s", script)
+	}
+	if !strings.Contains(script, "neither curl nor wget") {
+		t.Fatalf("missing-downloader case not reported:\n%s", script)
+	}
+	// A truncated/0-byte download must be caught before it is mounted, or it fails as
+	// a cryptic exec error inside the container instead.
+	if !strings.Contains(script, "if [ ! -s "+sanddHostDir+"/sandd ]") {
+		t.Fatalf("downloaded binary is not verified non-empty:\n%s", script)
+	}
+	if !strings.Contains(script, "chmod +x "+sanddHostDir+"/sandd") {
+		t.Fatalf("staged binary is not made executable:\n%s", script)
+	}
+	// The DIRECTORY is mounted (identical host and container paths), so the binary
+	// lands exactly where the Pod's command names it.
+	if !strings.Contains(script, " -v '"+sanddHostDir+":"+sanddHostDir+":ro'") {
+		t.Fatalf("sandd dir not bind-mounted read-only:\n%s", script)
+	}
+	if !strings.Contains(script, "--entrypoint '"+nebulav1alpha1.SanddPath+"'") {
+		t.Fatalf("daemon must be the container entrypoint:\n%s", script)
+	}
+	// Fetch must precede the run, or the mount source would not exist yet.
+	if strings.Index(script, "curl -fsSL") > strings.Index(script, "docker run") {
+		t.Fatalf("binary must be fetched BEFORE docker run:\n%s", script)
+	}
+}
+
+// TestBuildUserData_NoSanddMountForUserCommand: a workload running the USER's own
+// command must get no mount even when it carries dial-out credentials. The two
+// signals are independent — staging keys on the command, not the token — so a plain
+// GPU job never has /nebula injected into its image.
+func TestBuildUserData_NoSanddMountForUserCommand(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{
+		Image:     "myrepo/train:v1",
+		Command:   []string{"python", "train.py"},
+		SanddAuth: provider.SanddAuth{Endpoint: "wss://c.ns.svc:8765/ws", Token: "tok"},
+	})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if strings.Contains(script, sanddHostDir+":"+sanddHostDir) {
+		t.Fatalf("user-command workload must not get the sandd bind-mount:\n%s", script)
+	}
+	if strings.Contains(script, "curl -fsSL") {
+		t.Fatalf("user-command workload must not fetch the sandd binary:\n%s", script)
+	}
+}
+
+// TestBuildUserData_StagesBinaryWithoutToken: a sandbox whose token mint was skipped
+// still needs the binary. Staging must not be gated on the credential — otherwise the
+// container would exit 127 instead of starting and retrying its dial.
+func TestBuildUserData_StagesBinaryWithoutToken(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{
+		Image:   "ubuntu:24.04",
+		Command: []string{nebulav1alpha1.SanddPath},
+	})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if !strings.Contains(script, sanddHostDir+"/sandd") {
+		t.Fatalf("binary must be staged even with no token:\n%s", script)
+	}
+	if strings.Contains(script, "--env-file") {
+		t.Fatalf("no token was minted; no env-file may be referenced:\n%s", script)
+	}
+}
+
+// TestBuildUserData_TokenNeverOnCommandLine is the security-critical one: the token
+// is a bearer credential, so it must reach the container through a 0600 env FILE and
+// never as a `docker run` argument. An argument is world-readable via
+// /proc/<pid>/cmdline, so the workload itself could `ps` it out and impersonate this
+// daemon — the exact thing per-instance minting exists to prevent.
+func TestBuildUserData_TokenNeverOnCommandLine(t *testing.T) {
+	const token = "eyJhbGciOiJFZERTQSJ9.payload.sig"
+	encoded, err := buildUserData(InstanceSpec{
+		Image:   "ubuntu:24.04",
+		Command: []string{nebulav1alpha1.SanddPath},
+		SanddAuth: provider.SanddAuth{
+			Endpoint: "wss://sandd-abc.team-ml.svc:8765/ws",
+			Token:    token,
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	// The token appears exactly once, on its env-file line — not after `docker run`.
+	runLine := ""
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(line, "docker run") {
+			runLine = line
+		}
+	}
+	if runLine == "" {
+		t.Fatalf("no docker run line found:\n%s", script)
+	}
+	if strings.Contains(runLine, token) {
+		t.Errorf("token leaked onto the docker run command line (readable via /proc):\n%s", runLine)
+	}
+	if !strings.Contains(runLine, "--env-file "+sanddEnvFile) {
+		t.Errorf("docker run must read credentials from %s:\n%s", sanddEnvFile, runLine)
+	}
+	// The file must be created 0600 BEFORE the secret is written into it. `install -m
+	// 600 /dev/null <file>` is the idiom that does this atomically — creating the file
+	// with its final mode, so the token is never briefly world-readable as it would be
+	// with a redirect-then-chmod.
+	installIdx := strings.Index(script, "install -m 600 /dev/null "+sanddEnvFile)
+	tokenIdx := strings.Index(script, token)
+	if installIdx < 0 {
+		t.Errorf("credentials file must be pre-created 0600:\n%s", script)
+	} else if tokenIdx < installIdx {
+		t.Errorf("token is written before the file is locked to 0600:\n%s", script)
+	}
+	if !strings.Contains(script, "SANDD_TOKEN="+token) {
+		t.Errorf("token must be written to the env file:\n%s", script)
+	}
+	if !strings.Contains(script, "SANDD_CONTROLLER_URL=wss://sandd-abc.team-ml.svc:8765/ws") {
+		t.Errorf("controller URL must be written to the env file:\n%s", script)
+	}
+}
+
+// TestBuildUserData_DoesNotRenderADaemonID: the token IS the identity. The controller
+// registers an authenticated daemon under the `sub` it verified and ignores the id in the
+// Register message, so rendering SANDD_DAEMON_ID would put a second copy of the identity
+// on the instance that nothing reads and that can only disagree with the token beside it.
+// This guards against the id being reintroduced "for clarity".
+func TestBuildUserData_DoesNotRenderADaemonID(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{
+		Image:   "ubuntu:24.04",
+		Command: []string{nebulav1alpha1.SanddPath},
+		SanddAuth: provider.SanddAuth{
+			Endpoint: "wss://sandd.example.com/ws",
+			Token:    "real-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if strings.Contains(script, "SANDD_DAEMON_ID") {
+		t.Errorf("the daemon id is the token's sub, not an env var:\n%s", script)
+	}
+	if !strings.Contains(script, "SANDD_TOKEN=real-token") {
+		t.Errorf("the token must still be delivered:\n%s", script)
+	}
+}
+
+// TestBuildUserData_PodCannotForgeSandDEnv: a Pod that sets SANDD_TOKEN itself must
+// not have it passed through. Otherwise the workload picks its own daemon identity
+// and the per-instance mint is decorative.
+func TestBuildUserData_PodCannotForgeSandDEnv(t *testing.T) {
+	encoded, err := buildUserData(InstanceSpec{
+		Image:   "ubuntu:24.04",
+		Command: []string{nebulav1alpha1.SanddPath},
+		Env: map[string]string{
+			"SANDD_TOKEN":          "forged-token",
+			"SANDD_CONTROLLER_URL": "wss://attacker.example.com/ws",
+			"SANDD_DAEMON_ID":      "victim-daemon",
+			"MY_VAR":               "kept",
+		},
+		SanddAuth: provider.SanddAuth{
+			Endpoint: "wss://sandd-abc.team-ml.svc:8765/ws",
+			Token:    "real-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildUserData: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	script := string(raw)
+
+	if strings.Contains(script, "forged-token") {
+		t.Errorf("Pod-supplied SANDD_TOKEN must be dropped:\n%s", script)
+	}
+	if strings.Contains(script, "attacker.example.com") {
+		t.Errorf("Pod-supplied SANDD_CONTROLLER_URL must be dropped:\n%s", script)
+	}
+	// SANDD_DAEMON_ID is dropped even though Nebula never sets it. The daemon reads that
+	// variable, so a Pod that survived setting it would name itself something other than
+	// its token's sub — harmless against today's controller (which registers by sub
+	// regardless) but a live impersonation attempt against any older one.
+	if strings.Contains(script, "victim-daemon") {
+		t.Errorf("Pod-supplied SANDD_DAEMON_ID must be dropped:\n%s", script)
+	}
+	// Non-reserved env is unaffected — the filter must be narrow.
+	if !strings.Contains(script, "MY_VAR=kept") {
+		t.Errorf("ordinary Pod env must still be passed:\n%s", script)
+	}
+	if !strings.Contains(script, "SANDD_TOKEN=real-token") {
+		t.Errorf("the minted token must still be delivered:\n%s", script)
+	}
+}
+
+// TestSanddHostDirMatchesContract pins the mount directory to the shared SanddPath
+// constant. They are derived, not duplicated — this fails if SanddPath moves and the
+// derivation is ever replaced by a hardcoded string.
+func TestSanddHostDirMatchesContract(t *testing.T) {
+	if want := "/nebula"; sanddHostDir != want {
+		t.Fatalf("sanddHostDir = %q, want %q (dir of %q)", sanddHostDir, want, nebulav1alpha1.SanddPath)
+	}
+	if got := sanddHostDir + "/sandd"; got != nebulav1alpha1.SanddPath {
+		t.Fatalf("staged binary path %q != contract %q", got, nebulav1alpha1.SanddPath)
 	}
 }
 

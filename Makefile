@@ -77,6 +77,31 @@ verify-catalog: kustomize ## Verify the price catalog CSVs parse and the catalog
 	go test ./pkg/provider/catalog/...
 	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) config/catalog >/dev/null && echo "catalog ConfigMap renders OK"
 
+##@ SandD (embedded controller)
+
+# The SandD checkout whose Go binding and Rust archive the manager embeds. It is a
+# SEPARATE REPO, and go.mod currently `replace`s the module with this path, so building
+# Nebula requires it on disk. Override if your checkout lives elsewhere:
+#   make build SANDD_DIR=/path/to/SandD
+SANDD_DIR ?= $(shell dirname $(CURDIR))/SandD
+
+# Where the static archive lands. The cgo link needs -L pointing here.
+SANDD_LIB := $(SANDD_DIR)/target/release/libsandbox_server.a
+
+.PHONY: sandd-archive
+sandd-archive: ## Build the SandD controller static archive the manager links against.
+	@test -d "$(SANDD_DIR)" || { \
+		echo "SANDD_DIR=$(SANDD_DIR) not found. The manager embeds the SandD controller;"; \
+		echo "clone https://github.com/InftyAI/SandD beside this repo or set SANDD_DIR=<path>."; \
+		exit 1; }
+	@command -v cargo >/dev/null || { \
+		echo "cargo not found. The embedded controller is Rust: install https://rustup.rs"; \
+		exit 1; }
+	cd $(SANDD_DIR) && cargo build -p sandbox-server --features ffi --lib --release
+
+# Every Go build and test links the archive, so both need this on CGO_LDFLAGS.
+export CGO_LDFLAGS := -L$(SANDD_DIR)/target/release
+
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	go fmt ./...
@@ -90,7 +115,7 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest ## Run tests.
+test: manifests generate fmt vet setup-envtest sandd-archive ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
@@ -137,19 +162,43 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
+build: manifests generate fmt vet sandd-archive ## Build manager binary.
 	go build -ldflags "$(LDFLAGS)" -o bin/manager cmd/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
+run: manifests generate fmt vet sandd-archive ## Run a controller from your host.
 	go run -ldflags "$(LDFLAGS)" ./cmd/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# SandD's RUST sources are staged INTO the build context because Docker cannot read a path
+# outside it, and the manager embeds the controller as a static archive the image compiles
+# itself. Staged as a copy rather than symlinked (the daemon follows neither).
+#
+# Only the Rust half: the Go binding is a published module as of SandD v0.0.7 and comes
+# from the proxy via go.mod, so it no longer has to be visible here.
+#
+# Excludes target/: it is the host's build output, often gigabytes and wrong-platform, and
+# the image rebuilds the archive for its own target anyway.
+SANDD_STAGE := .sandd-build
+.PHONY: sandd-stage
+sandd-stage: ## Stage SandD sources into the docker build context.
+	@test -d "$(SANDD_DIR)" || { \
+		echo "SANDD_DIR=$(SANDD_DIR) not found. The manager embeds the SandD controller;"; \
+		echo "clone https://github.com/InftyAI/SandD beside this repo or set SANDD_DIR=<path>."; \
+		exit 1; }
+	rm -rf $(SANDD_STAGE)
+	mkdir -p $(SANDD_STAGE)
+	cd $(SANDD_DIR) && tar --exclude=target --exclude=.git -cf - \
+		Cargo.toml Cargo.lock server protocol sandd | tar -xf - -C $(CURDIR)/$(SANDD_STAGE)
+
+# The stage is removed even when the build fails, so a broken build does not leave a copy of
+# another repo sitting in the tree.
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} .
+docker-build: sandd-stage ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} . \
+		; status=$$?; rm -rf $(SANDD_STAGE); exit $$status
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -163,7 +212,7 @@ docker-push: ## Push docker image with the manager.
 # To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
 PLATFORMS ?= linux/arm64,linux/amd64
 .PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
+docker-buildx: sandd-stage ## Build and push docker image for the manager for cross-platform support
 	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name nebula-builder
@@ -171,6 +220,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm nebula-builder
 	rm Dockerfile.cross
+	rm -rf $(SANDD_STAGE)
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.

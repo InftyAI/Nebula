@@ -1,0 +1,37 @@
+# [SANDD] The SandD access channel — OPT-IN, and NOT part of config/default.
+#
+# SandD is how you reach INSIDE a Nebula-provisioned workload container (kubectl
+# exec/logs do not work against a virtual node — see pkg/vnode/handler.go). A daemon
+# runs in the workload and dials OUT, so the GPU box needs no inbound access at all.
+#
+# The controller it dials is EMBEDDED IN THE MANAGER (setupSandD in cmd/main.go), so this
+# overlay is only plumbing: one ClusterIP Service pointing at the manager's SandD port.
+# There is no Deployment, no image to pin, and no public-key ConfigMap — the manager
+# derives the verification key from the signing key it already holds, which removes the
+# drift that used to fail every daemon at once.
+#
+# The EDGE is deliberately not here. ingress.yaml is hand-applied because its hostname
+# and TLS Secret are per-cluster, and a placeholder host in a tracked resource would
+# provision a fleet of instances pointed at an address nobody owns.
+#
+# Enabling SandD is three steps, in this order:
+#
+#   1. hack/gen-signing-key.sh
+#        Creates the private-key Secret the manager mounts.
+#   2. kubectl apply -n nebula-system -f config/sandd/ingress.yaml   # after editing the host
+#   3. Uncomment `- ../sandd` in config/default/kustomization.yaml AND
+#      SANDD_SIGNING_KEY_PATH + SANDD_EXTERNAL_HOST in config/manager/manager.yaml,
+#      then `make deploy`.
+#
+# The KEY must come first: step 3 is the switch, and with it on the manager EXITS at
+# startup if the key is missing (by design — instances whose daemons cannot dial in are
+# worse than instances that never launched). The edge before it is a convenience, not a
+# dependency: an Ingress with no backend yet is admitted and serves 503 until this Service
+# has endpoints, so applying it early lets DNS, LB and cert issuance overlap the install.
+#
+# Go through config/default, NOT `kubectl apply -k config/sandd`: applied on its own this
+# folder renders unprefixed into the current namespace, while config/default's namePrefix
+# makes the name nebula-sandd-controller — which is what the hand-applied Ingress routes
+# to (see the comment there). Mixing the two is a 502 at the edge.
+resources:
+  - service.yaml

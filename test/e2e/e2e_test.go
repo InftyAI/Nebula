@@ -81,10 +81,11 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
-		// No cert step here: the manager mints its own webhook serving cert at
-		// startup (pkg/cert) into an emptyDir, so there is nothing to pre-create —
-		// the same ordering hack/deploy.sh uses in prod. The cert only exists once
-		// the manager is RUNNING, so the assertions below must be Eventually.
+		// No cert step here: the manager mints its own webhook serving cert at startup
+		// (pkg/cert) into the Secret config/webhook ships empty, which the kubelet then
+		// projects into the pod — so there is nothing to pre-create, the same ordering
+		// hack/deploy.sh uses in prod. The cert only exists once the manager is RUNNING,
+		// so the assertions below must be Eventually.
 
 		// Deploy via the e2e overlay, which bakes NEBULA_ENABLE_FAKE_PROVIDER=true
 		// into the manager env so the in-memory fake provider registers at first

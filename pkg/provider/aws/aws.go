@@ -142,6 +142,14 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// SanddAuth carries the daemon's dial-out endpoint and JWT, rendered into the
+	// bootstrap as container env. Zero value means SandD is off.
+	//
+	// It is kept OUT of Env above even though it becomes env in the end, because Env
+	// is the user's environment (copied from the Pod) and this is Nebula's injected
+	// credential. Merging them would let a Pod that sets SANDD_TOKEN itself overwrite
+	// the minted one — the workload choosing its own daemon identity.
+	SanddAuth provider.SanddAuth
 }
 
 // EC2Instance is the adapter-level view of one EC2 instance as observed.
@@ -716,6 +724,7 @@ func (p *Provider) instanceSpecFromPod(
 		Spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:        req.Region,
 		Tags:          map[string]string{ClaimTagKey: req.ClaimName},
+		SanddAuth:     req.SanddAuth,
 	}, nil
 }
 

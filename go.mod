@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.31
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.317.0
 	github.com/aws/smithy-go v1.27.3
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/modal-labs/modal-client/go v0.9.0
 	github.com/onsi/ginkgo/v2 v2.27.2
 	github.com/onsi/gomega v1.38.2
@@ -22,6 +23,7 @@ require (
 
 require (
 	cel.dev/expr v0.24.0 // indirect
+	github.com/InftyAI/SandD/go v0.0.0-20260809224346-3ddaae89603a
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/aristanetworks/gomap v0.0.0-20230726210543-f4e41046dced // indirect
@@ -48,7 +50,7 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/logr v1.4.3
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
@@ -128,3 +130,16 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.6.0 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
+
+// The Go binding for the embedded SandD controller resolves from the module proxy as of
+// SandD v0.0.7. It is a PSEUDO-VERSION, not v0.0.7: the binding is a nested module
+// (github.com/InftyAI/SandD/go), so Go would need a `go/v0.0.7` tag to name it by
+// version, and SandD tags only `v0.0.7` for the repo root. The pseudo-version pins the
+// exact released commit, so it is no less reproducible — just uglier.
+//
+// This is pinned while the DAEMON binary tracks `latest` (see sanddBinaryURL in
+// pkg/provider/aws/translate.go), so the two can drift: the binding here speaks the C ABI
+// in server/src/ffi.rs, and an instance fetches whatever the newest release ships. They
+// are separately versioned on purpose — a daemon speaks the wire protocol, not the ABI —
+// but a SandD release that changes BOTH needs this bumped too, or the manager verifies
+// tokens with one vintage while instances run another.

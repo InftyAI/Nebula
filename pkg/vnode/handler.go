@@ -19,6 +19,7 @@ package vnode
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"sync"
@@ -128,6 +129,63 @@ type Handler struct {
 	// recordBlock). A seam so tests can pin it (e.g. to 0) and assert an exact TTL;
 	// production wires it to a uniform draw in [0, blocklistJitter).
 	jitterFn func() time.Duration
+
+	// sandd is the dial-in credentials feature: where a daemon connects, and the
+	// minter for the token it presents. Nil means SandD is off (or a test), in which
+	// case no token is minted and the adapter injects nothing.
+	sandd *SandD
+
+	// exec reaches a command into a provisioned workload, backing RunInContainer (see
+	// exec.go). Nil means exec answers NotFound.
+	//
+	// SEPARATE from sandd, though both are the same feature, because they are needed at
+	// different times by different halves: sandd is write-side and required at
+	// provision time (mint a token, inject it), while this is read-side and used only
+	// when someone runs kubectl exec. A cluster can legitimately have one without the
+	// other — daemons dialing in with no operator yet reaching back, which is the state
+	// of this build.
+	exec Execer
+}
+
+// SandD is everything this package needs to hand a provisioned instance a working
+// dial-in: the endpoint its daemon connects to, and the minter for the token it
+// presents there.
+//
+// The two travel TOGETHER because either alone is useless — a token with no address
+// cannot be delivered anywhere, and an address with no token is refused by the
+// controller. Bundling them means the feature has one switch (a nil *SandD) instead
+// of two fields that can disagree, which is the same reason setupSandD returns both
+// halves of the auth chain or neither.
+type SandD struct {
+	// Endpoint is the WebSocket URL every daemon dials, e.g.
+	// wss://sandd.example.com/ws. It is the SAME for every instance in the cluster:
+	// the controller runs INSIDE this manager process (see Execer), and its registry is
+	// keyed by daemon id, so the address carries no per-workload information.
+	//
+	// It must be reachable FROM THE PROVIDER'S NETWORK, which is what makes it
+	// operator-supplied rather than derived. The in-cluster Service name that fronts
+	// this process is not resolvable or routable from a NeoCloud instance, so deriving
+	// one would produce an address that cannot be dialed — the failure this
+	// configuration exists to prevent.
+	Endpoint string
+
+	// Minter signs the token each instance authenticates with.
+	Minter SandDMinter
+
+	// Execer is the embedded controller the daemons dial into, and therefore the way
+	// back INTO a workload for kubectl exec. Nil leaves exec answering NotFound while
+	// token minting still works — which is a legitimate state, not a broken one: the
+	// write half (hand every instance a working dial-in) is useful on its own.
+	Execer Execer
+}
+
+// SandDMinter mints the daemon token for one instance. It is the narrow slice of
+// pkg/sandd.Signer this package needs, declared here so vnode does not depend on
+// the signer's construction (key loading, config) and tests can substitute a stub.
+type SandDMinter interface {
+	// MintDaemonToken returns a JWT with sub=daemonID and aud=controllerID. The
+	// result is a SECRET and must never be logged.
+	MintDaemonToken(daemonID, controllerID, tenant string, now time.Time) (string, error)
 }
 
 // trackedPod is the virtual node's local record of one pod it provisioned for.
@@ -151,15 +209,30 @@ type trackedPod struct {
 // failover blocklist a Provision failure is recorded on; it may be nil (no-op).
 // client is used to patch the endpoint annotation onto the Pod metadata (VK only
 // writes status); it may be nil in tests, where the annotation stays in-memory.
-func NewHandler(prov provider.Provider, client kubernetes.Interface, blocklist Blocklister) *Handler {
+// sandd mints each instance's dial-out token; nil disables SandD injection.
+func NewHandler(
+	prov provider.Provider,
+	client kubernetes.Interface,
+	blocklist Blocklister,
+	sandd *SandD,
+) *Handler {
 	poll := prov.Capabilities().PollInterval
 	if poll <= 0 {
 		poll = defaultPollInterval
+	}
+	// The exec transport travels inside *SandD (one feature, one switch) but is stored
+	// flat, so RunInContainer's guard is `h.exec == nil` and cannot accidentally
+	// dereference a nil *SandD.
+	var execer Execer
+	if sandd != nil {
+		execer = sandd.Execer
 	}
 	return &Handler{
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
+		sandd:     sandd,
+		exec:      execer,
 		tracked:   make(map[string]*trackedPod),
 		nowFn:     metav1.Now,
 		pollEvery: poll,
@@ -202,6 +275,25 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "claim", claim)
 
+	// Mint the daemon's dial-out credentials. The claim name is the daemon id (sub),
+	// so a leaked token cannot impersonate a different instance; the controller id
+	// (aud) rides on the Pod from placement, which is the only place that resolved
+	// the workload's root owner.
+	sanddAuth, mintErr := h.mintSanddAuth(pod, claim)
+	if mintErr != nil {
+		// Fail loudly rather than provisioning an instance whose daemon can never
+		// authenticate: that instance would bill indefinitely while unreachable, which
+		// is strictly worse than not launching it. No blocklist entry — a signing
+		// failure is our own misconfiguration, not the provider running out of
+		// capacity, so failing over to another region would not help.
+		log.Error(mintErr, "minting SandD daemon credentials failed; not provisioning")
+		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, mintErr.Error())
+		h.store(pod, claim, "")
+		h.emit(pod)
+		return mintErr
+	}
+	req.SanddAuth = sanddAuth
+
 	// Bound the provision call so a wedged backend cannot pin this worker forever.
 	// The provider may raise the deadline via Capabilities.ProvisionTimeout (AWS
 	// does, to leave room for cross-zone failover); zero means "use the default".
@@ -238,6 +330,48 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	h.store(pod, claim, id)
 	h.emit(pod)
 	return nil
+}
+
+// mintSanddAuth builds the dial-in credentials for one instance: the endpoint its
+// daemon connects to, and a JWT bound to that daemon.
+//
+// It returns the zero value (no error) when SandD is off, so a cluster running with
+// the feature disabled provisions exactly as before.
+//
+// daemonID is the claim name, which is the daemon's identity everywhere else in the
+// system (the provider tag, the NodeClaim). Signing it as `sub` is what makes the
+// instance addressable: the controller registers a daemon under the `sub` it verified,
+// so this token is the only thing that decides which entry the connection becomes —
+// and therefore the boundary that keeps one daemon from taking another's identity now
+// that a single controller serves every workload.
+//
+// The endpoint is configuration, not a derivation. It used to be built from the
+// per-workload controller id plus the Pod's namespace, which produced an in-cluster
+// Service name (<id>.<ns>.svc) that a NeoCloud instance can neither resolve nor
+// route to — so every daemon dialed an address that could not answer. It is now the
+// operator-supplied external address that fronts the manager, identical for every
+// instance.
+func (h *Handler) mintSanddAuth(_ *corev1.Pod, daemonID string) (provider.SanddAuth, error) {
+	if h.sandd == nil {
+		return provider.SanddAuth{}, nil // feature off: inject nothing.
+	}
+
+	// Tenant is left empty: Nebula is single-tenant per cluster today. `aud` no longer
+	// confines a token to one workload's controller (there is one fleet), so what
+	// separates daemons is the sub == registered-id check named above. A multi-tenant
+	// gateway would populate this.
+	token, err := h.sandd.Minter.MintDaemonToken(
+		daemonID, nebulav1alpha1.SanddControllerAudience, "", h.nowFn().Time)
+	if err != nil {
+		// The error may embed nothing sensitive today, but wrap without the token: the
+		// mint result is the secret, and this string reaches logs and Pod status.
+		return provider.SanddAuth{}, fmt.Errorf(
+			"minting SandD token for daemon %q: %w", daemonID, err)
+	}
+	return provider.SanddAuth{
+		Endpoint: h.sandd.Endpoint,
+		Token:    token,
+	}, nil
 }
 
 // UpdatePod is a no-op: the external instance's shape is immutable once
@@ -676,12 +810,17 @@ func blocklistTTL(pod *corev1.Pod) time.Duration {
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }
 
-// --- Unused nodeutil.Provider surface --------------------------------------
+// --- Unserved kubelet-API surface ------------------------------------------
 //
-// The kubelet API (logs/exec/attach/stats/port-forward) is not part of the v1
-// scope: Nebula routes external GPU workloads, it does not proxy their consoles.
-// These satisfy the nodeutil.Provider interface required by nodeutil.NewNode and
-// return a NotFound so the VK core reports them cleanly rather than panicking.
+// Exec is served (see kubelet.go and exec.go); the rest of the kubelet API —
+// logs, attach, stats, port-forward — is not part of the v1 scope, because
+// Nebula routes external GPU workloads rather than proxying their consoles.
+//
+// These methods exist to satisfy the provider interface and are NOT what a
+// caller actually hits: kubelet.go leaves their PodHandlerConfig fields nil, so
+// VK's router answers those routes 501 Not Implemented without reaching here.
+// They return NotFound for the paths that call a provider method directly, so
+// the VK core reports them cleanly rather than panicking on a nil.
 
 func (h *Handler) GetContainerLogs(
 	context.Context, string, string, string, vkapi.ContainerLogOpts,
@@ -689,9 +828,8 @@ func (h *Handler) GetContainerLogs(
 	return nil, errdefs.NotFound("container logs are not supported by the Nebula virtual node")
 }
 
-func (h *Handler) RunInContainer(context.Context, string, string, string, []string, vkapi.AttachIO) error {
-	return errdefs.NotFound("exec is not supported by the Nebula virtual node")
-}
+// RunInContainer is implemented in exec.go — it is the one kubelet-API verb this node
+// actually serves, so it needs the SandD relay rather than a stub.
 
 func (h *Handler) AttachToContainer(context.Context, string, string, string, vkapi.AttachIO) error {
 	return errdefs.NotFound("attach is not supported by the Nebula virtual node")

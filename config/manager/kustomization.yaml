@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: inftyai/nebula-controller
-  newTag: latest
+  newTag: local-b0d6713-68277

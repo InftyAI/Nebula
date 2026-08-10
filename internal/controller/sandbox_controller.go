@@ -147,9 +147,22 @@ func (r *SandboxReconciler) ensurePod(ctx context.Context, sbx *nebulav1alpha1.S
 	}
 	if err := r.Create(ctx, pod); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Lost a race with another reconcile (or with a foreign creator). Re-read on
-			// the next pass rather than guessing which it was.
-			return nil, nil
+			// Lost a race: something created this name between our Get and our Create.
+			// Re-read to find out WHAT, because the two possibilities need opposite
+			// answers — a concurrent reconcile of this same Sandbox created OUR Pod (carry
+			// on as if we had created it), while a foreign creator means a genuine
+			// conflict. Reporting PodConflict for the first case would put a false
+			// condition on a perfectly healthy box, and it would flap: the next reconcile
+			// Gets the Pod, sees it owned, and clears the condition again.
+			if err := r.Get(ctx, client.ObjectKeyFromObject(pod), &existing); err != nil {
+				// Includes NotFound (created then deleted in this window): return the error
+				// so we retry rather than mislabelling a vanished Pod as foreign.
+				return nil, err
+			}
+			if !isOwnedBy(&existing, sbx) {
+				return nil, nil
+			}
+			return &existing, nil
 		}
 		return nil, err
 	}

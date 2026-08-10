@@ -21,8 +21,11 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -44,6 +47,10 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
+	// sanddcontroller, not controller: the name is already taken by Nebula's own
+	// internal/controller below.
+	sanddcontroller "github.com/InftyAI/SandD/go/controller"
+
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/internal/controller"
 	webhookv1 "github.com/InftyAI/Nebula/internal/webhook/v1"
@@ -53,6 +60,7 @@ import (
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
+	"github.com/InftyAI/Nebula/pkg/sandd"
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
 )
@@ -258,6 +266,18 @@ func main() {
 	// both sides rather than persisted.
 	blocklist := failover.New()
 
+	// Both halves of SandD auth, resolved HERE, before the manager starts: a bad or
+	// absent key must be a startup failure rather than a per-Provision error discovered
+	// later (every instance provisioned without a token is one whose daemon can never
+	// dial in, and it bills until someone notices), and setupControllers runs in a
+	// goroutine where the only way to report a failure is os.Exit — a misconfiguration
+	// there would surface as a mid-flight crash instead of a startup error.
+	sanddCfg, err := setupSandD()
+	if err != nil {
+		setupLog.Error(err, "unable to set up SandD daemon authentication")
+		os.Exit(1)
+	}
+
 	// Controller and webhook registration is deferred until the cert exists, so it
 	// runs in a goroutine: the cert cannot be minted until the manager is STARTED
 	// (the rotator is a Runnable and needs a synced cache), so blocking here would
@@ -274,7 +294,7 @@ func main() {
 		<-certsReady
 		setupLog.Info("webhook certificate ready")
 
-		if err := setupControllers(mgr, blocklist); err != nil {
+		if err := setupControllers(mgr, blocklist, sanddCfg); err != nil {
 			setupLog.Error(err, "unable to set up controllers")
 			os.Exit(1)
 		}
@@ -336,11 +356,215 @@ func managerNamespace() string {
 	return defaultNamespace
 }
 
+// SandD signer configuration, all from the environment so the key can be rotated
+// and the TTL tuned without a rebuild:
+//
+//	SANDD_SIGNING_KEY_PATH  PKCS#8 Ed25519 private key (mounted from a Secret).
+//	                        UNSET = SandD token minting is OFF.
+//	SANDD_EXTERNAL_HOST     the externally reachable address of this manager's dial-in
+//	                        port, e.g. "sandd.example.com" or a full
+//	                        "wss://sandd.example.com/ws". REQUIRED when the key path
+//	                        is set; see setupSandD for why it cannot be defaulted.
+//	SANDD_SIGNING_KID       key id stamped in the JWT header, so verifiers can hold
+//	                        several public keys during a rotation (default "default").
+//	SANDD_TOKEN_ISSUER      the `iss` claim (default "nebula").
+//	SANDD_TOKEN_TTL         token lifetime, any time.ParseDuration form (default 24h).
+const (
+	defaultSandDSigningKID = "default"
+	defaultSandDIssuer     = "nebula"
+	defaultSandDTokenTTL   = 24 * time.Hour
+
+	// sanddWebSocketPath is the path the controller serves its dial-in WebSocket on
+	// (axum route "/ws" in the SandD repo's server/). Appended when the operator gives
+	// a bare host, so the common configuration is just a hostname.
+	sanddWebSocketPath = "/ws"
+)
+
+// setupSandD builds what the virtual kubelet needs to hand each provisioned instance
+// a working dial-in: the endpoint its daemon connects to, and the minter that signs
+// the token it presents there.
+//
+// Both travel in one *vnode.SandD because they are ONE feature and must switch as
+// one — a token with no reachable address cannot be used, and an address with no
+// token is refused by the controller. The single switch is SANDD_SIGNING_KEY_PATH:
+// unset returns (nil, nil) and SandD is off, so a cluster with no key Secret
+// provisions as before, its instances simply getting no token.
+//
+// Every OTHER misconfiguration is an error, not a fallback: a key path that is set
+// but unreadable, a TTL that does not parse, a key that cannot be marshalled, or a
+// MISSING EXTERNAL HOST. Each means someone intended SandD to be on and got it
+// wrong, and silently degrading would provision a fleet of instances whose daemons
+// can never dial in — billing with no control surface. That is the failure this
+// fails fast to avoid.
+//
+// SANDD_EXTERNAL_HOST is required for exactly that reason. It cannot be derived: this
+// manager's in-cluster Service name is not resolvable or routable from a provider's
+// network, so any value this process could invent would be an address no daemon can
+// reach. Only the operator knows the ingress/LB name that fronts it.
+//
+// Returning the concrete *vnode.SandD rather than a bare interface also sidesteps a
+// trap worth naming: an interface holding a NIL POINTER is not == nil (an interface
+// value is a (type, value) pair, so assigning a typed nil fills the type half).
+// pkg/vnode decides the feature is off via `h.sandd == nil`, and producing the nil
+// HERE — on the one path where the key is absent — means no caller can reintroduce
+// that trap.
+func setupSandD() (*vnode.SandD, error) {
+	keyPath := os.Getenv("SANDD_SIGNING_KEY_PATH")
+	if keyPath == "" {
+		setupLog.Info("SANDD_SIGNING_KEY_PATH is unset; SandD daemon authentication is disabled")
+		return nil, nil
+	}
+
+	// Required, not defaulted. See the doc comment: a guessed address is worse than
+	// no feature, because it provisions billable instances that can never connect.
+	host := os.Getenv("SANDD_EXTERNAL_HOST")
+	if host == "" {
+		return nil, fmt.Errorf(
+			"SANDD_EXTERNAL_HOST is required when SANDD_SIGNING_KEY_PATH is set: it is the " +
+				"externally reachable address of this manager's SandD dial-in port (e.g. " +
+				"sandd.example.com), which daemons on provider instances dial. It cannot be " +
+				"derived from the cluster because the manager's Service name is not " +
+				"resolvable outside it")
+	}
+
+	kid := os.Getenv("SANDD_SIGNING_KID")
+	if kid == "" {
+		kid = defaultSandDSigningKID
+	}
+	issuer := os.Getenv("SANDD_TOKEN_ISSUER")
+	if issuer == "" {
+		issuer = defaultSandDIssuer
+	}
+	ttl := defaultSandDTokenTTL
+	if raw := os.Getenv("SANDD_TOKEN_TTL"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parsing SANDD_TOKEN_TTL %q: %w", raw, err)
+		}
+		ttl = parsed
+	}
+
+	signer, err := sandd.NewSigner(keyPath, kid, issuer, ttl)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint, err := sanddEndpoint(host)
+	if err != nil {
+		return nil, err
+	}
+
+	// The verification material is DERIVED from the signing key, not configured. Both
+	// halves now live in one process, so the public key, kid and issuer cannot disagree
+	// with what is actually signing — which removes the failure that used to take the
+	// whole fleet down at once (a public key published through a second channel that had
+	// drifted from the private one, so every daemon failed to authenticate together).
+	publicKey, err := signer.PublicKeyPEM()
+	if err != nil {
+		return nil, err
+	}
+
+	// Start the controller daemons dial into, IN THIS PROCESS. There is no Deployment,
+	// Service or public-key ConfigMap: a daemon's connection is a live socket owned by
+	// whichever process accepted it, so hosting it here is what lets the virtual kubelet
+	// reach back into a workload directly instead of asking a second process to relay.
+	//
+	// It binds ALL interfaces on SanddControllerPort — daemons reach it from outside the
+	// cluster through the operator's edge, which terminates TLS and forwards here.
+	srv, err := sanddcontroller.Start(sanddcontroller.Config{
+		Bind:         fmt.Sprintf("0.0.0.0:%d", nebulav1alpha1.SanddControllerPort),
+		PublicKeyPEM: publicKey,
+		ControllerID: nebulav1alpha1.SanddControllerAudience,
+		Issuer:       issuer,
+		KID:          kid,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("starting the embedded SandD controller: %w", err)
+	}
+
+	// Deliberately never closed: it must outlive every exec session and live as long as
+	// the process. Releasing the port at shutdown is the OS's job, and closing it early
+	// would tear down live shells for no gain.
+	//
+	// Log the metadata and the endpoint (public), but NEVER the key or any token it
+	// mints. The endpoint is worth logging: "which address did we tell daemons to
+	// dial" is the first question when none of them connect.
+	setupLog.Info("SandD enabled with an embedded controller",
+		"kid", kid, "issuer", issuer, "ttl", ttl.String(), "endpoint", endpoint,
+		"listenPort", nebulav1alpha1.SanddControllerPort,
+		"audience", nebulav1alpha1.SanddControllerAudience)
+	return &vnode.SandD{
+		Endpoint: endpoint,
+		Minter:   signer,
+		Execer:   vnode.EmbeddedExecer{Server: srv},
+	}, nil
+}
+
+// sanddEndpoint turns the operator's SANDD_EXTERNAL_HOST into the WebSocket URL a
+// daemon dials.
+//
+// The host is accepted in the forms an operator actually types — "sandd.example.com",
+// "sandd.example.com:8765", or a full "wss://sandd.example.com/ws" — and normalized
+// to one URL, because a bare host is the obvious thing to write and silently
+// mishandling a scheme someone added is a miserable way to lose an afternoon.
+//
+// wss:// is the default and http(s) is rejected outright: the daemon dials a
+// WebSocket, TLS terminates at the edge, and ws:// (plaintext, opt-in) exists only
+// for a local/dev edge that does not terminate TLS. A plaintext default would ship
+// bearer tokens in the clear.
+//
+// No port is appended for wss://: the edge listens on 443 and forwards to the
+// fleet's SanddControllerPort in-cluster, so the port the controller binds is not
+// the port a daemon names.
+func sanddEndpoint(host string) (string, error) {
+	h := strings.TrimSpace(host)
+
+	// Already a URL: validate the scheme and keep the operator's path.
+	if i := strings.Index(h, "://"); i >= 0 {
+		scheme := h[:i]
+		switch scheme {
+		case "wss", "ws":
+		default:
+			return "", fmt.Errorf(
+				"SANDD_EXTERNAL_HOST %q has scheme %q: daemons dial a WebSocket, so use wss:// "+
+					"(or ws:// for a local edge that does not terminate TLS)", host, scheme)
+		}
+		u, err := url.Parse(h)
+		if err != nil {
+			return "", fmt.Errorf("parsing SANDD_EXTERNAL_HOST %q: %w", host, err)
+		}
+		if u.Host == "" {
+			return "", fmt.Errorf("SANDD_EXTERNAL_HOST %q names no host", host)
+		}
+		// An explicit path is honoured as-is; only a bare/rooted URL gets /ws, so an
+		// edge that mounts the controller under a prefix can say so.
+		if u.Path == "" || u.Path == "/" {
+			u.Path = sanddWebSocketPath
+		}
+		return u.String(), nil
+	}
+
+	// A bare host (optionally with a port). Reject anything with a path or stray
+	// slashes rather than guessing what was meant.
+	if strings.ContainsAny(h, "/ ") {
+		return "", fmt.Errorf(
+			"SANDD_EXTERNAL_HOST %q is neither a bare host nor a ws(s):// URL", host)
+	}
+	if h == "" {
+		return "", fmt.Errorf("SANDD_EXTERNAL_HOST is empty")
+	}
+	return "wss://" + h + sanddWebSocketPath, nil
+}
+
 // setupControllers registers every controller, the virtual nodes and the webhook.
 // It runs only after the webhook serving cert is ready (see main), which is why it
 // is a function rather than inline: everything here depends on Pod admission
 // working, so none of it may be registered before the API server trusts the webhook.
-func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
+func setupControllers(
+	mgr ctrl.Manager,
+	blocklist *failover.Blocklist,
+	sanddCfg *vnode.SandD,
+) error {
 	if err := (&controller.NodePoolReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -357,6 +581,9 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Blocklist: blocklist,
+		// No SandD field: the controller runs in this process, so placement creates
+		// nothing for it and needs none of its configuration. The dial-in credentials
+		// are assembled per instance by the virtual kubelet below.
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create PodPlacement controller: %w", err)
 	}
@@ -383,7 +610,7 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
 	// provider.Terminate on DeletePod, so an ungated Pod bound to a provider's
 	// virtual node materializes an external instance. Each Runner is a
 	// manager.Runnable, so it shares the manager's lifecycle and leader election.
-	if err := setupVirtualNodes(mgr, blocklist); err != nil {
+	if err := setupVirtualNodes(mgr, blocklist, sanddCfg); err != nil {
 		return fmt.Errorf("unable to set up virtual nodes: %w", err)
 	}
 	if enableWebhooks() {
@@ -399,7 +626,7 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
 // provider. The Runner needs a typed clientset (the virtual kubelet's node/pod
 // controllers use client-go directly, not the controller-runtime client), built
 // from the same rest.Config the manager uses.
-func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister) error {
+func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, sanddCfg *vnode.SandD) error {
 	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		return err
@@ -409,7 +636,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister) error {
 		if !ok {
 			continue
 		}
-		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist)); err != nil {
+		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist, sanddCfg)); err != nil {
 			return err
 		}
 		setupLog.Info("registered virtual node", "provider", name, "node", vnode.NodeName(name))

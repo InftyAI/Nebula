@@ -1,0 +1,75 @@
+# The EDGE: the one address daemons dial, and the only part of this overlay that is
+# genuinely per-cluster.
+#
+# It exists because a NeoCloud instance is not on the cluster network. It cannot resolve
+# or route to sandd-controller.<ns>.svc, so the manager's dial-in port needs an address
+# that is reachable from the public internet — and whatever that address is, it must be
+# handed to the manager as SANDD_EXTERNAL_HOST so the tokens it mints are delivered with a
+# URL that actually answers. Nothing derives it: the manager refuses to start with the
+# feature on and the host unset rather than guessing (see setupSandD).
+#
+# nginx is assumed here because its WebSocket knobs are the ones most likely to be
+# wrong. Any edge works — an ALB Ingress, a Gateway API HTTPRoute, or a LoadBalancer
+# Service straight onto the manager — as long as it does three things:
+#
+#   1. Upgrades to WebSocket (HTTP/1.1 Connection/Upgrade passthrough).
+#   2. Tolerates a connection that is IDLE FOR HOURS. This is the one that bites: a
+#      daemon's control connection is long-lived and mostly silent, and nginx's default
+#      60s proxy-read-timeout severs it. The daemon reconnects, so the symptom is not an
+#      outage but a fleet that churns its connections every minute forever.
+#   3. Terminates TLS. The daemon presents a bearer token on this connection, so
+#      plaintext across the internet would put every token on the wire. wss:// is what
+#      the manager defaults to for a reason.
+#
+# APPLY THIS BY HAND after editing the host. It is commented out of kustomization.yaml
+# because the hostname and TLS Secret are yours, and a tracked placeholder host would
+# either fail to admit or, worse, provision a fleet pointed at an address nobody owns.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sandd-controller
+  labels:
+    app.kubernetes.io/name: sandd-controller
+    app.kubernetes.io/part-of: nebula
+  annotations:
+    # Idle tolerance (see point 2 above). An hour is comfortably longer than the
+    # daemon's own heartbeat interval, so a healthy-but-quiet connection is never cut
+    # by the edge; a genuinely dead one is still caught by the heartbeat, which is the
+    # layer that can actually tell the difference.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # The upgrade itself. ingress-nginx handles WebSocket automatically for a matched
+    # backend, but only over HTTP/1.1 — spelled out so a cluster whose defaults have
+    # been changed does not silently downgrade.
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        # REPLACE. This must be the same host you give the manager as
+        # SANDD_EXTERNAL_HOST.
+        - sandd.example.com
+      # A TLS Secret you provide (cert-manager, or created by hand). Nebula's in-process
+      # cert rotator does NOT cover this — it mints only the webhook serving cert, whose
+      # trust anchor is the API server's caBundle. Daemons are outside the cluster and
+      # trust the public CA set, so this cert must be publicly trusted.
+      secretName: sandd-controller-tls
+  rules:
+    - host: sandd.example.com # REPLACE, as above
+      http:
+        paths:
+          # /ws is the dial-in route (axum's only WebSocket route). Exact, not Prefix:
+          # /stats reports the registry and /health is a probe — neither should be
+          # published to the internet just because they share a port.
+          - path: /ws
+            pathType: Exact
+            backend:
+              service:
+                # Written PREFIXED, unlike every other name in this folder: those go
+                # through kustomize (config/default's namePrefix turns
+                # sandd-controller into nebula-sandd-controller), but this file is
+                # applied by hand with kubectl, which does no rewriting. Apply it into
+                # the manager's namespace: kubectl apply -n nebula-system -f this.
+                name: nebula-sandd-controller
+                port:
+                  name: sandd-ws

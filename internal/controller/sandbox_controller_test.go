@@ -26,10 +26,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -121,8 +124,12 @@ func TestSandboxSynthesizesPod(t *testing.T) {
 	reconcileSandbox(t, r)
 	pod := getSandboxPod(t, c)
 
-	if got := pod.Labels[nebulav1alpha1.EnabledLabel]; got != "true" {
-		t.Errorf("opt-in label = %q, want \"true\" (without it the Pod never reaches a provider)", got)
+	// Compared against the constant, not a literal "true": the webhook's objectSelector
+	// is rendered from this same constant, so a literal here would keep passing if the
+	// value ever changed while the Pod stopped matching the selector.
+	if got := pod.Labels[nebulav1alpha1.EnabledLabel]; got != nebulav1alpha1.EnabledValue {
+		t.Errorf("opt-in label = %q, want %q (without it the Pod never reaches a provider)",
+			got, nebulav1alpha1.EnabledValue)
 	}
 	if got := pod.Labels[nebulav1alpha1.PoolLabel]; got != "gpu" {
 		t.Errorf("pool label = %q, want \"gpu\"", got)
@@ -429,6 +436,101 @@ func TestSandboxRefusesForeignPod(t *testing.T) {
 	}
 	if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Image != "nginx" {
 		t.Error("the foreign Pod's spec was overwritten")
+	}
+}
+
+// newRacingSandboxReconciler builds a reconciler whose first Pod CREATE loses a
+// race: the pod that `winner` returns is written to the store behind our back and
+// the Create then fails AlreadyExists, exactly as the API server would report it
+// when someone else claimed the name between our Get and our Create.
+func newRacingSandboxReconciler(sbx *nebulav1alpha1.Sandbox, winner *corev1.Pod) (*SandboxReconciler, client.Client) {
+	s := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(s)
+	_ = nebulav1alpha1.AddToScheme(s)
+
+	raced := false
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(sbx).
+		WithStatusSubresource(&nebulav1alpha1.Sandbox{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+				opts ...client.CreateOption) error {
+				if _, isPod := obj.(*corev1.Pod); !isPod || raced {
+					return cl.Create(ctx, obj, opts...)
+				}
+				raced = true
+				if err := cl.Create(ctx, winner.DeepCopy()); err != nil {
+					return err
+				}
+				return apierrors.NewAlreadyExists(
+					schema.GroupResource{Resource: "pods"}, winner.Name)
+			},
+		}).
+		Build()
+	return &SandboxReconciler{Client: c, Scheme: s}, c
+}
+
+// TestSandboxAlreadyExistsRaceOnOwnPod: losing the CREATE race to a CONCURRENT
+// RECONCILE OF THIS SAME SANDBOX is not a conflict. The Pod that won is ours, so
+// the box must proceed normally — reporting PodConflict here would put a false
+// condition on a healthy sandbox, and it would flap, since the next reconcile Gets
+// the owned Pod and clears it again.
+func TestSandboxAlreadyExistsRaceOnOwnPod(t *testing.T) {
+	// What the concurrent reconcile created: the very same Pod this reconcile is about
+	// to build, owned by the same Sandbox.
+	sbx := newSandbox()
+	builder, _ := newSandboxReconciler(sbx)
+	ours := builder.buildPod(sbx)
+	if err := controllerutil.SetControllerReference(sbx, ours, builder.Scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+
+	r, c := newRacingSandboxReconciler(newSandbox(), ours)
+	reconcileSandbox(t, r)
+
+	got := getSandbox(t, c)
+	for _, cond := range got.Status.Conditions {
+		if cond.Type == nebulav1alpha1.SandboxConditionReady &&
+			cond.Reason == nebulav1alpha1.ReasonPodConflict {
+			t.Fatal("reported PodConflict for a Pod this Sandbox owns; " +
+				"losing a race with our own concurrent reconcile is not a conflict")
+		}
+	}
+	if pod := getSandboxPod(t, c); !isOwnedBy(pod, got) {
+		t.Error("the winning Pod should be the owned one")
+	}
+}
+
+// TestSandboxAlreadyExistsRaceOnForeignPod: losing the same race to a FOREIGN
+// creator IS a conflict, and must still be reported — the fix for the owned case
+// must not swallow this one.
+func TestSandboxAlreadyExistsRaceOnForeignPod(t *testing.T) {
+	foreign := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testSbxName,
+			Namespace: testNS,
+			Labels:    map[string]string{"app": "someone-elses-thing"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+		},
+	}
+	r, c := newRacingSandboxReconciler(newSandbox(), foreign)
+	reconcileSandbox(t, r)
+
+	sbx := getSandbox(t, c)
+	var reason string
+	for _, cond := range sbx.Status.Conditions {
+		if cond.Type == nebulav1alpha1.SandboxConditionReady {
+			reason = cond.Reason
+		}
+	}
+	if reason != nebulav1alpha1.ReasonPodConflict {
+		t.Errorf("condition reason = %q, want %q", reason, nebulav1alpha1.ReasonPodConflict)
+	}
+	if pod := getSandboxPod(t, c); pod.Labels["app"] != "someone-elses-thing" {
+		t.Error("the foreign Pod was mutated; it must be left alone")
 	}
 }
 

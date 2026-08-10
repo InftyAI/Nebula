@@ -144,6 +144,49 @@ type ProvisionRequest struct {
 	// RunPod) ignore it, and a region-aware adapter falls back to the region its
 	// client was built with (see the AWS adapter's NewSDKClient).
 	Region string
+	// SanddAuth carries the SandD daemon's dial-out credentials: the controller
+	// endpoint to dial and the freshly-minted JWT authenticating this one instance.
+	// Zero value (empty Token) means the feature is off and the adapter injects
+	// nothing.
+	//
+	// This is the one ProvisionRequest field that is NOT merely "a decision absent
+	// from the Pod" — it is a SECRET, and that is precisely why it travels here. The
+	// other provisioning inputs ride annotations on the Pod, but a bearer token must
+	// not: anything on the Pod is in etcd and readable by every actor with pod-read
+	// in the namespace (which includes the workload's own service account). Minting
+	// it per-Provision-call keeps it in memory on the path from signer to instance
+	// user-data and nowhere else, and makes each provisioning attempt get a fresh
+	// token rather than replaying one stored at placement time.
+	SanddAuth SanddAuth
+}
+
+// SanddAuth is what the SandD daemon needs to authenticate to its controller: where
+// to dial, and the token proving which daemon it is.
+//
+// Named for what it IS (the daemon's auth material) rather than for the library that
+// mints it — pkg/sandd is only today's signer implementation, and this seam is
+// deliberately ignorant of it: an adapter renders these two strings into its launch
+// payload and never learns what signed them. Not called bare `Auth` either, because
+// on a ProvisionRequest that would read as the PROVIDER's credentials (AWS keys),
+// which is the opposite of what it holds.
+type SanddAuth struct {
+	// Endpoint is the controller's dial-in URL (wss://host:port/ws form). The daemon
+	// retries until it resolves, so it is safe for this to be handed out before the
+	// controller's Pod is serving.
+	Endpoint string
+	// Token is the Ed25519-signed JWT: `sub` is the daemon's identity (the claim
+	// name), `aud` is the controller id, and it expires on the signer's TTL.
+	//
+	// There is deliberately no DaemonID field beside it. The controller registers an
+	// authenticated daemon under the `sub` it verified and ignores the id the daemon
+	// claims, so the token alone carries the identity; a second copy could only drift
+	// from it, and an adapter that rendered one would be describing an id the
+	// controller does not use.
+	//
+	// SECRET. It must reach the instance's bootstrap and nothing else: never logged
+	// (not even truncated), never written to an annotation, status field, or event.
+	// Empty means SandD is disabled and the adapter injects nothing.
+	Token string
 }
 
 // Capabilities declares provider quirks as data, so the control plane filters

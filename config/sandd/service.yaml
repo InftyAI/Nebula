@@ -1,0 +1,33 @@
+# The in-cluster address the EDGE forwards daemon dial-ins to.
+#
+# It selects the MANAGER pod, not a fleet of its own: the SandD controller runs inside the
+# manager process (see setupSandD in cmd/main.go), because a daemon's connection is a live
+# socket owned by whichever process accepted it — so hosting it there is what lets the
+# virtual kubelet reach into a workload for `kubectl exec` with nothing to relay through.
+# There is no sandd-controller Deployment or image to pin any more.
+#
+# Daemons never use this name: it is not resolvable from a provider's network. That is what
+# SANDD_EXTERNAL_HOST and the Ingress in front of this are for.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandd-controller
+  labels:
+    app.kubernetes.io/name: sandd-controller
+    app.kubernetes.io/part-of: nebula
+spec:
+  type: ClusterIP
+  # The manager's pod labels (config/manager/manager.yaml), matching how
+  # config/default/metrics_service.yaml selects the same pod. Change them there and this
+  # Service silently selects nothing — the symptom is every daemon failing to dial in.
+  selector:
+    control-plane: controller-manager
+    app.kubernetes.io/name: nebula
+  ports:
+    - name: sandd-ws
+      port: 8765
+      # The manager's `ports:` list is empty, so this names a NUMBER, not a port name:
+      # targetPort only resolves names declared on the container. The number must equal
+      # nebulav1alpha1.SanddControllerPort, which is what the embedded controller binds.
+      targetPort: 8765
+      protocol: TCP

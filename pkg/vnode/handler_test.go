@@ -113,7 +113,7 @@ func testPod(ns, name string) *corev1.Pod {
 
 func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 	pod.Annotations = map[string]string{nebulav1alpha1.CapacityTypeAnnotation: string(nebulav1alpha1.CapacitySpot)}
 
@@ -141,7 +141,7 @@ func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 
 func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity")}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
@@ -166,7 +166,7 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	}
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl)
+	h := NewHandler(fp, nil, bl, nil)
 	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base TTL is asserted exactly
 
 	pod := testPod("default", "p1")
@@ -204,7 +204,7 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 	// (which would exclude everything on the provider).
 	fp := &fakeProvider{provisionErr: errors.New("weird"), classifyScope: provider.BlockScope{}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl)
+	h := NewHandler(fp, nil, bl, nil)
 
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 		t.Fatal("expected CreatePod to return the provision error")
@@ -217,7 +217,7 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl)
+	h := NewHandler(fp, nil, bl, nil)
 	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is asserted exactly
 
 	// No BlocklistTTLAnnotation on the Pod => the handler's built-in default.
@@ -234,7 +234,7 @@ func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
 func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl)
+	h := NewHandler(fp, nil, bl, nil)
 	h.jitterFn = func() time.Duration { return 20 * time.Second } // deterministic jitter
 
 	pod := testPod("default", "p1")
@@ -250,7 +250,7 @@ func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
 // The production jitter draw stays within [0, blocklistJitter) — never negative
 // (which would shorten the block below its base) and never at/over the bound.
 func TestProductionJitterInRange(t *testing.T) {
-	h := NewHandler(&fakeProvider{}, nil, nil)
+	h := NewHandler(&fakeProvider{}, nil, nil, nil)
 	for i := 0; i < 1000; i++ {
 		j := h.jitterFn()
 		if j < 0 || j >= blocklistJitter {
@@ -261,7 +261,7 @@ func TestProductionJitterInRange(t *testing.T) {
 
 func TestDeletePod_TerminatesAndUntracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
@@ -283,7 +283,7 @@ func TestDeletePod_TerminatesAndUntracks(t *testing.T) {
 
 func TestDeletePod_Idempotent(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -297,7 +297,7 @@ func TestDeletePod_Idempotent(t *testing.T) {
 
 func TestReconcileOnce_ReportsRunning(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -344,7 +344,7 @@ func TestReconcileOnce_DNSEndpointNotWrittenToPodIP(t *testing.T) {
 	// must be left empty. The reachable address is surfaced on the annotation
 	// instead, which accepts any form.
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -385,7 +385,7 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 	})
 
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, client, nil)
+	h := NewHandler(fp, client, nil, nil)
 	_ = h.CreatePod(context.Background(), pod)
 	// Register the notify wrapper (this is where persistEndpoint is injected).
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
@@ -423,7 +423,7 @@ func TestReconcileOnce_NotifiesOnProvisioningToInitializing(t *testing.T) {
 	// check would swallow this and strand the Pod on the stale "Provisioning"
 	// reason; the reason must move and a notification must fire.
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -466,7 +466,7 @@ func TestReconcileOnce_NotifiesOnProvisioningToInitializing(t *testing.T) {
 
 func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -486,11 +486,11 @@ func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 func TestNewHandler_PollIntervalFromCapabilities(t *testing.T) {
 	// A provider that declares a cadence overrides the default.
 	custom := &fakeProvider{capabilities: provider.Capabilities{PollInterval: 5 * time.Second}}
-	if got := NewHandler(custom, nil, nil).pollEvery; got != 5*time.Second {
+	if got := NewHandler(custom, nil, nil, nil).pollEvery; got != 5*time.Second {
 		t.Fatalf("expected the provider's PollInterval, got %v", got)
 	}
 	// A provider that leaves it zero falls back to the vnode default.
-	if got := NewHandler(&fakeProvider{}, nil, nil).pollEvery; got != defaultPollInterval {
+	if got := NewHandler(&fakeProvider{}, nil, nil, nil).pollEvery; got != defaultPollInterval {
 		t.Fatalf("expected the default cadence, got %v", got)
 	}
 }
@@ -505,7 +505,7 @@ func TestGetPod_ReAdoptsLiveInstanceAfterRestart(t *testing.T) {
 	fp := &fakeProvider{list: []provider.Instance{{
 		ID: "inst-9", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: "1.2.3.4",
 	}}}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 
 	got, err := h.GetPod(context.Background(), "default", "p1")
 	if err != nil {
@@ -531,7 +531,7 @@ func TestGetPod_UnknownClaimStaysNotFound(t *testing.T) {
 	fp := &fakeProvider{list: []provider.Instance{{
 		ID: "inst-1", ClaimName: "default-other", State: provider.InstanceRunning,
 	}}}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 
 	if _, err := h.GetPod(context.Background(), "default", "p1"); !errdefs.IsNotFound(err) {
 		t.Fatalf("expected NotFound for an unknown, unlisted claim, got %v", err)
@@ -540,7 +540,7 @@ func TestGetPod_UnknownClaimStaysNotFound(t *testing.T) {
 
 func TestGetPods_ReturnsTracked(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, nil)
 	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
 	_ = h.CreatePod(context.Background(), testPod("default", "p2"))
 

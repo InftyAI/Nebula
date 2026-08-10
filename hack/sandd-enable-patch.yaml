@@ -1,0 +1,39 @@
+# Local SandD enable patch — NOT for production.
+#
+# Turns SandD on without editing config/manager/manager.yaml, so a tunnel hostname (which
+# is per-developer and short-lived) never lands in a committed manifest.
+#
+# SANDD_EXTERNAL_HOST here is an ngrok URL rather than an Ingress host: an AWS instance
+# dials INWARD to the controller, and a local kind cluster has no public address. Replace
+# it with your own tunnel — the value below is dead the moment that tunnel restarts.
+#
+# Apply with:
+#   kubectl patch deploy nebula-controller-manager -n nebula-system \
+#     --patch-file hack/sandd-enable-patch.yaml
+#
+# The name carries the `nebula-` prefix kustomize adds (namePrefix in
+# config/default/kustomization.yaml); `controller-manager` is the name in the base only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nebula-controller-manager
+  namespace: nebula-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          env:
+            # The single switch: gates token minting AND starts the embedded controller.
+            - name: SANDD_SIGNING_KEY_PATH
+              value: /etc/nebula/sandd/signing.pem
+            # A bare host becomes wss://<host>/ws. ngrok terminates TLS, so the daemon
+            # gets a real certificate and the bearer token is never sent in clear.
+            - name: SANDD_EXTERNAL_HOST
+              value: lone-infundibular-hayes.ngrok-free.dev
+            # Short TTL for a test run: a token only has to survive the dial-in, and a
+            # short life limits the damage if one leaks into a log.
+            - name: SANDD_TOKEN_TTL
+              value: 1h
+            - name: SANDD_SIGNING_KID
+              value: local-dev

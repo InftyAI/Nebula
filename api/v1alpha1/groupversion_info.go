@@ -139,16 +139,54 @@ const (
 	// flows the other way — VK writes it for operators/tooling to read.
 	EndpointAnnotation = "nebula.inftyai.com/endpoint"
 
+	// SanddControllerAudience is the `aud` every daemon token carries, and the id the
+	// embedded SandD controller admits.
+	//
+	// It is a CONSTANT because there is one controller per cluster — it runs inside the
+	// manager process — not one per workload. A per-workload audience bought isolation
+	// only while each workload had its own controller process; once one controller
+	// serves every daemon, a workload-scoped `aud` cannot refuse a token that
+	// controller is itself the audience for, so it would be ceremony, not a boundary.
+	//
+	// What actually separates daemons is the controller's registration check: a
+	// daemon may only register the id in its token's `sub`, so a valid token cannot
+	// be used to claim another daemon's identity. That check is the tenant boundary
+	// now, and it lives in the controller (see the SandD repo's server/).
+	SanddControllerAudience = "sandd"
+
+	// SanddControllerPort is the port the SandD controller serves its dial-in
+	// WebSocket on. The manager binds it directly (setupSandD), and config/sandd's
+	// Service targets it; daemons reach it through the external edge (see
+	// SandDConfig.ExternalHost), which terminates TLS and forwards here.
+	//
+	// It lives here, not in either package that uses it, because it is a contract
+	// between two packages that cannot import each other: cmd opens the listener and
+	// pkg/vnode builds the URL daemons dial. Two constants would compile fine and
+	// fail at runtime as a daemon connecting to a closed port.
+	SanddControllerPort = 8765
+
 	// SanddPath is where the SandD binary is found INSIDE a Nebula-provisioned
 	// container, and therefore the command every synthesized workload Pod runs. It
 	// is a shared constant rather than a per-adapter string because it is a contract
 	// with two ends that must agree exactly: the controller writes it as the Pod's
 	// container command, and every provider bootstrap must make the binary appear at
-	// this path (the AWS adapter bind-mounts it from the host into the container).
+	// this path.
 	//
 	// The path lives under /nebula rather than /usr/local/bin to avoid colliding with
 	// anything the user's own image ships, since the image is arbitrary and we are
-	// injecting into it.
+	// injecting into it. Adapters also key on this exact value to detect "this
+	// instance runs the daemon" (see the AWS adapter's needsSandd), so it is the
+	// TRIGGER for staging the binary, not just the place it lands.
+	//
+	// Each adapter satisfies it however its launch model allows, so the mechanism is
+	// deliberately NOT specified here:
+	//   - AWS fetches the static binary onto the host in user-data and bind-mounts
+	//     /nebula read-only into the container, so the user's image needs no fetcher
+	//     (see buildUserData / sanddHostFetchScript).
+	//   - Modal has no host to mount from — CreateSandbox takes an image plus a
+	//     command — so it CANNOT use that mechanism and does not honour this contract
+	//     yet: a Modal sandbox whose command is this path will fail to start until the
+	//     binary is layered into the image or fetched in-sandbox.
 	SanddPath = "/nebula/sandd"
 
 	// TerminateInstanceFinalizer is held by every NodeClaim to guarantee teardown.

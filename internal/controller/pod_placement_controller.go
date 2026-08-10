@@ -76,6 +76,20 @@ type PodPlacementReconciler struct {
 	Blocklist Blocklister
 }
 
+// NOTE on SandD: this reconciler used to create a SandD controller Deployment and
+// Service per workload, and to stamp the resulting controller id on the Pod. It no
+// longer does, and holds no SandD configuration at all.
+//
+// The controller now runs inside the manager process itself (setupSandD), one per
+// cluster, so there is nothing per-Pod to create and nothing per-workload to
+// resolve. Placement went back to being purely about placement; what a daemon needs
+// to dial in (endpoint + token) is assembled at provision time by pkg/vnode, which
+// is where the token was already minted.
+//
+// Removed with it: the workload root-owner walk (its only purpose was deriving a
+// per-workload controller name that had to stay stable across rollouts), the
+// per-workload ownerReference GC dance, and SanddControllerAnnotation.
+
 // Blocklister is the read side of pkg/failover.Blocklist the placement controller
 // depends on: it asks whether a candidate placement is currently excluded and,
 // when it is, how long until it frees (so a Pod stuck on failover can requeue for
@@ -86,6 +100,12 @@ type Blocklister interface {
 	BlockedUntil(c failover.Candidate) (retryAfter time.Duration, blocked bool)
 }
 
+// Placement reads Pods and NodePools and creates NodeClaims — nothing else. The
+// apps/batch read grants and the deployments/services create grants that used to sit
+// here went with the per-workload SandD controller (see the NOTE above): the owner
+// walk needed to read every workload kind, and the controller itself was a Deployment
+// plus a Service. Both are gone, so holding those verbs would be standing permission
+// the operator never exercises.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodeclaims,verbs=get;list;watch;create
@@ -169,7 +189,10 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: staleClaimRequeue}, nil
 	}
 
-	// Stamp the routing decision and release the Pod to the scheduler.
+	// Stamp the routing decision and release the Pod to the scheduler. No SandD
+	// controller is created here: it lives in the manager process, and its dial-in
+	// address is the same for every workload, so there is nothing per-Pod to
+	// provision before ungating.
 	if err := r.place(ctx, &pod, pool, placement); err != nil {
 		return ctrl.Result{}, err
 	}
