@@ -1,616 +1,558 @@
 # Nebula Architecture
 
-Nebula is a Kubernetes control plane for GPU-as-a-Service: it schedules GPU
-workloads across heterogeneous compute providers ("NeoClouds" — RunPod, Modal,
-CoreWeave, Lambda — and vanilla Kubernetes) as if they were one cluster. A user
-submits an ordinary `Deployment`/`Pod`; Nebula decides *which provider* runs it
-based on cost, availability, and policy, provisions the external instance, and
-reclaims it on teardown so a paid GPU is never leaked.
+Nebula is a Kubernetes control plane for GPU-as-a-Service. It lets users submit
+ordinary Pods or Deployments, then places each opted-in GPU workload onto an
+external compute provider through Kubernetes-native scheduling gates, virtual
+nodes, and durable placement records.
 
-This document is the top-level design. It is descriptive of decisions already
-made and prescriptive for the parts not yet built (marked **PLANNED**). For
-building and deploying the manager (including provider credentials), see
-[docs/deploy.md](deploy.md).
+The current manager attempts to register the Modal and AWS providers, plus an
+in-memory `fake` provider for e2e tests when explicitly enabled. The provider
+seam is meant to support more backends, but this document describes the
+implementation that is in the repository today. Planned or partial work is
+called out in
+[Current implementation status](#current-implementation-status). For deployment
+and credential setup, see [docs/deploy.md](deploy.md).
 
-- [Goals and non-goals](#goals-and-non-goals)
-- [System overview](#system-overview)
-- [The placement flow](#the-placement-flow-end-to-end)
-  - [Status flow — two independent lanes](#status-flow--two-independent-lanes)
+- [Goals and Non-Goals](#goals-and-non-goals)
+- [System Overview](#system-overview)
+- [Placement Flow](#placement-flow)
+  - [Status Flow](#status-flow)
 - [Components](#components)
-  - [Scheduling-gate webhook](#1-scheduling-gate-webhook)
-  - [Placement controller](#2-placement-controller-done)
-  - [Virtual Kubelet node](#3-virtual-kubelet-node-done)
-  - [NodeClaim controller](#4-nodeclaim-controller)
-  - [NodePool controller](#5-nodepool-controller)
-  - [Provider abstraction](#6-provider-abstraction)
-  - [Optimizer & poll loop](#7-optimizer--poll-loop-planned)
+  - [Scheduling-Gate Webhook](#1-scheduling-gate-webhook)
+  - [Placement Controller](#2-placement-controller)
+  - [Virtual Kubelet Node](#3-virtual-kubelet-node)
+  - [NodeClaim Controller](#4-nodeclaim-controller)
+  - [NodePool Controller](#5-nodepool-controller)
+  - [Provider Abstraction](#6-provider-abstraction)
+  - [Placement Optimizer and Poll Loop](#7-placement-optimizer-and-poll-loop)
 - [CRDs](#crds)
-- [Failure domains & HA](#failure-domains--ha)
-- [Build status](#build-status)
+- [Failure Domains and HA](#failure-domains-and-ha)
+- [Current Implementation Status](#current-implementation-status)
 
 ---
 
-## Goals and non-goals
+## Goals and Non-Goals
 
 **Goals**
 
-- One Kubernetes API surface over many GPU clouds. Users write standard Pods;
-  they never call a provider SDK.
-- Cost/availability-aware placement with failover: try the cheapest viable
-  {capacity tier, provider} first, fall back on capacity errors.
-- Never leak a paid instance: teardown is guaranteed by a finalizer even if the
-  node/Pod disappears.
-- Provider quirks stay behind one narrow seam; the control plane is
-  provider-agnostic.
+- One Kubernetes API surface over external GPU clouds. Users describe workload
+  shape with normal Pod fields; they do not call provider SDKs directly.
+- Capacity/provider/region-aware placement with failover. The current placement
+  walk tries capacity tiers first, then providers, then each provider's regions,
+  skipping recently failed candidates through a TTL blocklist.
+- No leaked paid instances. The virtual kubelet handles happy-path teardown and a
+  cluster-scoped NodeClaim finalizer acts as the level-triggered backstop.
+- Provider quirks stay behind a narrow seam: capabilities, offerings,
+  accelerator mapping, provisioning, list, terminate, and error classification.
 
-**Non-goals (v1)**
+**Non-goals in the current implementation**
 
-- Region/zone placement. v1 targets NeoClouds, which are region-simple. Region
-  is a planned additive field, not modeled yet.
-- Bin-packing many pods per instance. One workload → one external instance.
-- In-place migration. Recovery from preemption is delete-and-recreate.
+- Provider-neutral geography. Region is provider-specific (`ProviderSpec.Regions`)
+  and there is no global "us-east" vocabulary across clouds.
+- "All regions" expansion. AWS pool entries must list explicit regions; an
+  all-regions wildcard is reserved for a richer price/availability optimizer.
+- Bin-packing multiple unrelated Pods onto one external instance. The current
+  model is one workload Pod to one external instance.
+- In-place migration. Recovery from reclaim, failure, or spec changes is
+  delete-and-recreate.
 
 ---
 
-## System overview
+## System Overview
 
-Nebula borrows two proven patterns and fuses them:
+Nebula combines three Kubernetes patterns:
 
-- **Virtual Kubelet (VK)** provides the *mechanism*: each provider is a single
-  virtual Node in the cluster. A Pod scheduled to that node is provisioned on
-  the NeoCloud via that provider's API instead of by a container runtime.
-- **Karpenter-style CRDs** provide the *policy + ledger*: `NodePool` (which
-  providers, how to choose) and `NodeClaim` (a durable, cluster-scoped record of
-  one external instance. The virtual kubelet owns provisioning and the happy-path
-  teardown; the claim outlives the Pod and carries a finalizer so it can act as a
-  level-triggered teardown *backstop* when the Pod is force-deleted during a VK
-  outage — a paid GPU is never leaked).
-- **Scheduling gates** are the *placement hook*: a mutating webhook holds an
-  opted-in Pod until Nebula's placement controller picks a provider, then
-  releases it to the native scheduler.
+- **Scheduling gates** hold opted-in Pods until Nebula chooses a placement.
+- **Virtual Kubelet** exposes one virtual Node per provider. When the native
+  scheduler binds a Pod to `nebula-<provider>`, the provider's virtual kubelet
+  provisions an external instance instead of starting a local container runtime.
+- **Karpenter-style CRDs** separate policy from the instance ledger:
+  `NodePool` says where and how to place; `NodeClaim` records the durable
+  identity of one external instance and owns the terminate finalizer.
 
 ```
-                    ┌──────────────────────────────────────────────────────┐
-                    │                    Nebula manager                     │
-   kubectl apply    │  ┌────────────┐  ┌─────────────┐  ┌────────────────┐  │
-   Deployment ──────┼─▶│  webhook   │  │  placement  │  │   NodePool /   │  │
-   (labeled         │  │ (gate Pod) │  │ controller  │  │NodeClaim ctrls │  │
-    enabled=true)   │  └────────────┘  └─────────────┘  └────────────────┘  │
-                    │        │                │                  │          │
-                    └────────┼────────────────┼──────────────────┼──────────┘
-                             │                 │                  │
-                    gate added│      nodeSelector+ungate│  provision/terminate
-                             ▼                 ▼                  ▼
-                    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-                    │ SchedulingGated│  │native scheduler│  │  Provider    │
-                    │      Pod      │──▶│ binds to vnode │──▶│  seam (Get/  │
-                    └──────────────┘   └──────────────┘   │ Provision..) │
-                                              │            └──────┬───────┘
-                                              ▼                   │
-                                     ┌─────────────────┐          ▼
-                                     │ Virtual Kubelet │   ┌──────────────┐
-                                     │ node (1/provider)│──▶│  NeoCloud API│
-                                     │  CreatePod →    │   │ (RunPod/Modal│
-                                     │   provision     │   │  /CoreWeave) │
-                                     └─────────────────┘   └──────────────┘
+kubectl apply Pod/Deployment
+        |
+        v
+  +------------------+       +-----------------------+
+  | mutating webhook | ----> | SchedulingGated Pod   |
+  | adds gate/taint  |       | not yet schedulable   |
+  +------------------+       +-----------------------+
+                                      |
+                                      v
+                           +-----------------------+
+                           | placement controller  |
+                           | NodePool -> candidate |
+                           | NodeClaim first       |
+                           | nodeSelector + ungate |
+                           +-----------------------+
+                                      |
+                                      v
+                           +-----------------------+
+                           | native scheduler      |
+                           | binds to nebula-aws   |
+                           | or nebula-modal       |
+                           +-----------------------+
+                                      |
+                                      v
+                           +-----------------------+
+                           | provider VK handler   |
+                           | CreatePod -> Provision|
+                           | DeletePod -> Terminate|
+                           | List poll -> PodStatus|
+                           +-----------------------+
+                                      |
+                                      v
+                           +-----------------------+
+                           | Modal Sandbox / EC2   |
+                           | instance              |
+                           +-----------------------+
 ```
 
 Everything runs in one controller-runtime manager binary (`cmd/main.go`) today.
-The VK node processes are the one component that may run separately — see
-[Virtual Kubelet node](#3-virtual-kubelet-node-done).
+Virtual nodes are started as manager runnables, one per registered provider. The
+same manager also owns `Sandbox` and `SandboxSet` controllers, which synthesize
+Nebula-managed Pods for long-lived interactive boxes.
 
 ---
 
-## The placement flow (end to end)
+## Placement Flow
 
-Follow a single GPU Pod from `kubectl apply` to a running instance:
+Follow one GPU Pod from creation to teardown:
 
-1. **Opt-in.** User creates a Pod (usually via a Deployment) carrying the label
-   `nebula.inftyai.com/enabled: "true"` and the label
-   `nebula.inftyai.com/accelerator-type: a100-40gb` (accelerator type), with the
-   count expressed as a standard `nvidia.com/gpu` resource on the container
-   (omit it for a single GPU). The Pod is the *source of truth* for the workload
-   shape — image, command, env, resources, the accelerator type (label) and count
-   (`nvidia.com/gpu`); keeping the count on the standard resource means the
-   scheduler's fit check and provisioning read the same number.
+1. **Opt in.** A user creates a Pod, usually through a Deployment, with
+   `nebula.inftyai.com/enabled: "true"` and a
+   `nebula.inftyai.com/nodepool: <pool>` label. GPU type is requested with
+   `nebula.inftyai.com/accelerator-type`; GPU count is the standard
+   `nvidia.com/gpu` resource. The Pod remains the source of truth for image,
+   command, env, ports, CPU, memory, accelerator type, and accelerator count.
 
-2. **Gate (webhook).** The mutating webhook, scoped by an objectSelector to
-   opted-in Pods outside system namespaces, injects the scheduling gate
+2. **Gate at admission.** The mutating webhook adds the scheduling gate
    `nebula.inftyai.com/provider-selection` and a key-only `Exists` toleration for
-   the virtual-node taint `nebula.inftyai.com/provider:NoSchedule`. The Pod is
-   now `SchedulingGated`; the native scheduler will not bind it. `failurePolicy=
-   Fail` — a Pod that should be placed by Nebula must never slip past ungated.
+   the virtual-node taint `nebula.inftyai.com/provider:NoSchedule`. The webhook
+   is scoped by object and namespace selectors so only opted-in non-system Pods
+   are affected.
 
-3. **Place (placement controller).** Watches SchedulingGated Pods with our
-   gate. For each opted-in, gated, not-yet-bound Pod it resolves the Pod's
-   `NodePool` (via the `nebula.inftyai.com/nodepool` label), selects a provider
-   (v1 policy: **first matching provider** — the first in the pool's provider list
-   whose catalog offers the Pod's GPU type; a CPU-only Pod matches any), and then,
-   **in this order**:
-   - creates the `NodeClaim` **first** — named deterministically
-     `<namespace>-<name>`, back-referencing the Pod by UID, recording the chosen
-     provider, capacity tier, and pool. The claim is the durable teardown ledger,
-     so it must exist *before* the Pod can bind and provision. `Create` is
-     idempotent on the fixed name, but idempotency is **UID-scoped**: if a claim
-     of that name already exists, placement ungates only when it pins *this* Pod's
-     UID (a genuine retry after a crash between create and ungate). If it still
-     pins a prior same-named Pod (recreated faster than the backstop reaped the old
-     claim), placement does **not** ungate — it requeues until the NodeClaim
-     backstop sees the old Pod is gone, terminates that instance, and deletes the
-     stale claim, after which the create succeeds with the correct UID. This is
-     what makes "the claim exists before bind/provision" a guarantee that the
-     claim names *this* workload's instance, not a stale one.
-   - then, in one Pod update: adds `nodeSelector:
-     {nebula.inftyai.com/provider: <chosen>}`, writes the chosen tier to
-     `nebula.inftyai.com/capacity-type` (the one provisioning input not otherwise
-     on the Pod), and removes the gate.
+3. **Select placement.** The placement controller watches opted-in Pods that
+   still hold the gate and are not yet bound. It resolves the Pod's NodePool,
+   parses the accelerator request, then walks candidates in this order:
 
-   If no pool resolves, or no provider in the pool can serve the Pod, the Pod is
-   **left gated** (no guessing); a later reconcile — a pool edit that adds a
-   matching provider re-enqueues its gated Pods — can place it.
+   ```text
+   for each capacityType in pool.spec.capacityTypes:     # outer axis
+     for each provider in pool.spec.providers:           # listed order today
+       for each region in provider.regions or [""]:      # provider-local axis
+         skip unregistered providers
+         skip providers that do not offer the accelerator type/count
+         skip candidates blocked by failover blocklist
+         choose the first remaining candidate
+   ```
 
-4. **Bind.** With the gate gone and a provider nodeSelector set, the native
-   scheduler binds the Pod to that provider's virtual Node.
+   `Ordered`, `LowestPrice`, and `Weighted` are API values, but the current inner
+   ranking is still listed order. The placement flow is already structured so
+   price or weight ranking can replace the inner ordering without changing the
+   rest of the controller.
 
-5. **Provision (VK).** Binding writes `spec.nodeName = nebula-<provider>`;
-   that provider's VK node observes the Pod via its node-scoped informer and fires
-   `CreatePod`. It reads the workload off the Pod, builds a
-   `ProvisionRequest{ClaimName, CapacityType}` (ClaimName derived deterministically
-   from the Pod, CapacityType from the annotation), and calls `provider.Provision`.
-   **The virtual kubelet owns provisioning** — the placement controller never
-   calls Provision; it only routes the Pod. The observed instance state is
-   projected onto the Pod's status.
+4. **Create the ledger first.** Before the Pod can bind, the controller creates a
+   deterministic NodeClaim named from the Pod namespace/name. The claim records
+   the Pod UID, provider, capacity type, provider-local region, accelerator pool
+   (`type:count`), and pool name. If a same-named claim exists for an older Pod
+   UID, the new Pod stays gated until the NodeClaim backstop reaps the stale
+   claim.
 
-6. **Observe (poll loop in VK).** The VK handler's poll loop calls
-   `provider.List()` periodically (no NeoCloud pushes preemption events) and
-   pushes observed instance state onto Pod status via VK's `NotifyPods`. The
-   NodeClaim controller does **not** mirror this finer runtime status — the Pod is
-   the source of truth for it. The claim tracks only a coarse guard: once its
-   served Pod is observed, the claim is marked `Bound` (see step 7).
+5. **Ungate atomically.** In one Pod update, the placement controller:
 
-7. **Teardown (VK happy path + NodeClaim backstop — DONE).** Two layers guarantee
-   the paid instance is reclaimed:
-   - **Happy path (VK):** when the Pod/Deployment is deleted, VK calls
-     `DeletePod`, which runs `provider.Terminate(instanceID)`.
-   - **Backstop (NodeClaim):** the claim is cluster-scoped and *outlives* the Pod,
-     and carries the `TerminateInstance` finalizer. The NodeClaim controller is
-     level-triggered: it marks a claim `Bound` once it has seen the served Pod
-     (the durable guard), and when a **Bound** claim's Pod later vanishes it treats
-     that as a real teardown and self-deletes; the finalizer then resolves the
-     provider, finds the instance by **claim name via `List()`** (not
-     `status.InstanceID`, which VK tracks in-memory and loses on a crash), and
-     calls `Terminate` before releasing. On the happy path this is a redundant
-     idempotent no-op (VK already terminated, so `List` finds nothing); its whole
-     reason to exist is the case where the Pod is force-deleted while that
-     provider's VK is down, so `DeletePod` never runs. A claim that was **never**
-     Bound and whose Pod is absent is treated as possible cache lag: it waits a
-     `placementGracePeriod` (2m) before being deleted, so a fresh claim isn't
-     reaped in the window between create and the Pod appearing.
+   - writes `spec.nodeSelector[nebula.inftyai.com/provider] = <provider>`;
+   - writes `nebula.inftyai.com/capacity-type` when the chosen tier is explicit;
+   - writes `nebula.inftyai.com/region` when the chosen region is explicit;
+   - writes `nebula.inftyai.com/blocklist-ttl` when the pool sets one;
+   - removes only Nebula's scheduling gate.
 
-### Status flow — two independent lanes
+   If no candidate can serve the Pod, the Pod is left gated. If candidates are
+   only blocked by failover TTLs, the controller requeues for the soonest expiry.
 
-The single most subtle part of the design: **the Pod and the NodeClaim are
-populated from different sources and never mirror each other.** Runtime status
-lives on the Pod; the claim tracks only a coarse teardown guard.
+6. **Bind through Kubernetes.** Once the gate is gone, the native scheduler sees
+   the provider nodeSelector and binds the Pod to `nebula-<provider>`.
+
+7. **Provision in the virtual kubelet.** The provider's VK handler observes the
+   bound Pod and calls `CreatePod`. It derives the claim name from the Pod, reads
+   `CapacityType` and `Region` from annotations, builds
+   `ProvisionRequest{ClaimName, CapacityType, Region}`, and calls
+   `provider.Provision`. The placement controller never provisions directly.
+
+8. **Observe by polling.** Each virtual node periodically calls `provider.List()`
+   and matches instances back to tracked Pods by claim name. The default cadence
+   is 15 seconds; providers can override it through `Capabilities.PollInterval`.
+   Observed instance state is projected onto Pod status and endpoint metadata.
+
+9. **Fail over on provision errors.** When `Provision` fails, the VK handler asks
+   the provider to classify the error into a `BlockScope`, using the accelerator
+   and region from the failed request. The shared blocklist records that scope for
+   the Pod's blocklist TTL plus jitter. The Pod is marked Failed; the placement
+   controller deletes terminal controller-owned Pods so their owner recreates a
+   fresh gated Pod that skips the blocked candidate.
+
+10. **Teardown.** The happy path is edge-triggered by VK `DeletePod`, which calls
+    `provider.Terminate(instanceID)`. The backstop is level-triggered by the
+    NodeClaim finalizer: once the served Pod is gone, the claim self-deletes, its
+    finalizer resolves the provider, finds the instance by recorded instance ID
+    or by claim name via `List()`, calls `Terminate`, and only then releases.
+
+### Status Flow
+
+Pod status and NodeClaim status come from different sources. The Pod is the
+runtime surface users watch. The NodeClaim is the coarse ledger that protects
+teardown.
 
 ```
-  Pod.status  ◀── (pkg/vnode)      NodeClaim.status ◀── (NodeClaim controller)
-  ═══════════════════════════      ═══════════════════════════════════════════
-  source: the provider instance    source: whether the served Pod EXISTS
-                                    (never the instance's runtime state)
+Pod.status, written by pkg/vnode
+  CreatePod success        -> Pending / Provisioning
+  CreatePod error          -> Failed / ProvisionFailed
+  List sees Pending        -> Pending / Initializing
+  List sees Running        -> Running / Ready=True / endpoint annotation
+  List sees Failed         -> Failed / Failed
+  List misses instance     -> Failed / Terminated
+  DeletePod success        -> Succeeded / Terminated
 
-  edge-triggered (instant):        Reconcile(Pod present/absent):
-    CreatePod → PodPending           Pod present  → phase=Bound   (one-way latch)
-    Provision err → PodFailed        Pod absent + wasBound → self-delete → backstop
-    DeletePod → PodSucceeded         Pod absent + !Bound + grace → self-delete
-                                     Pod absent + !Bound + in grace → requeue
-  level-triggered (poll, §7):
-    List() → match by ClaimName
-      InstanceRunning    → PodRunning, Ready=True, PodIP=endpoint
-      InstancePending    → PodPending, Ready=False
-      InstanceFailed     → PodFailed
-      InstanceTerminated → PodFailed/"Preempted"  (also: absent from List)
+NodeClaim.status, written by NodeClaim controller
+  present Pod, no instance yet       -> Provisioning
+  present Pod, initializing instance -> Initializing
+  present Running Pod                -> Bound
+  present deleting Pod               -> Terminating
+  present terminal Pod               -> Terminated
+  absent after Bound/Terminating      -> delete self -> terminate finalizer
+  absent before Bound                 -> wait placementGracePeriod, then delete
 ```
 
-- **Pod lane (`pkg/vnode`).** The happy-path transitions are pushed
-  synchronously — `CreatePod` emits `Pending` (or `Failed`) the moment
-  `Provision` returns, `DeletePod` emits a terminal phase — so provisioning-start
-  and teardown do **not** wait on any poll. The poll loop's *only* job is the
-  out-of-band transitions nothing pushes: an instance becoming reachable
-  (`Pending→Running`) and, the costly one, a spot reclaim (`Running→Terminated`).
-  `applyState` (`status.go`) is the sole mapping from `provider.InstanceState` to
-  a standard Pod phase/condition, so `kubectl get pod` shows Running/Ready/PodIP.
+Important details:
 
-- **NodeClaim lane (NodeClaim controller).** The claim deliberately does **not**
-  copy the instance's runtime state. Its phase is only `Pending → Bound`, where
-  `Bound` is a one-way latch meaning "I have observed the served Pod at least
-  once." That latch is the *arming signal for the teardown backstop*: a `Bound`
-  claim whose Pod later vanishes is a real teardown (self-delete → finalizer
-  terminates the instance), whereas a claim that never reached `Bound` and has no
-  Pod is treated as possible cache lag and waits out `placementGracePeriod`.
-
-**Why the split.** An earlier design had the claim mirror the instance state
-(the still-present but now-unused `NodeClaimProvisioning/Running/Preempted/
-Terminating` constants are its residue). It was dropped because it put two
-pollers — VK writing the Pod, the claim controller writing the claim — on the
-same fact from different lag windows, so they disagreed during the poll window
-for no benefit: the claim needs only "did the Pod ever exist" + "is it gone now"
-to do its one job. `NodeClaimStatus.InstanceID`/`Endpoint` fields exist but are
-currently unwritten; the backstop re-derives the instance via `List()` +
-`ClaimName` precisely so teardown survives a VK crash that lost the in-memory id.
-
-**Failover (PLANNED).** If `Provision` fails (e.g. RunPod reports no capacity),
-the provider classifies the error into a `BlockScope` (this accelerator+tier, or
-the whole provider for auth/quota). The optimizer will exclude that scope for
-`BlocklistTTL`; the Deployment recreates the Pod (gated again) and the controller
-ungates it toward the next candidate. v1's "first matching provider" selection
-does not yet consult a blocklist — a failed Provision surfaces on the Pod and is
-retried against the same first match until the optimizer lands.
+- `Bound` is the teardown guard. Once a claim has seen a Running Pod, a later Pod
+  disappearance is trusted as real teardown, not cache lag.
+- `Provisioning` and `Initializing` do not earn the guard. If the Pod is absent
+  before `Bound`, the controller waits `placementGracePeriod` (15 seconds) before
+  deleting an orphaned claim.
+- `NodeClaimStatus.InstanceID` is recorded on a best-effort basis. The finalizer
+  prefers it when present, but can still recover by matching provider instances
+  by claim name through `List()`.
+- NodeClaim does not mirror logs, restarts, container state, or fine-grained
+  runtime health. Those belong on the Pod.
 
 ---
 
 ## Components
 
-### 1. Scheduling-gate webhook
+### 1. Scheduling-Gate Webhook
 
-A mutating (defaulting) webhook on the external `core/v1` Pod type. On CREATE it
-injects the `provider-selection` scheduling gate **and** a key-only `Exists`
-toleration for the virtual-node taint (`nebula.inftyai.com/provider:NoSchedule`),
-when and only when:
+The webhook mutates external `core/v1` Pods on CREATE only. When a Pod carries
+`nebula.inftyai.com/enabled: "true"` and is not already scheduled, it adds:
 
-- the Pod carries `nebula.inftyai.com/enabled: "true"`;
-- the Pod is not already scheduled (`spec.nodeName == ""` — the API server
-  rejects adding a gate to a bound Pod).
+- scheduling gate `nebula.inftyai.com/provider-selection`;
+- toleration for key `nebula.inftyai.com/provider` with operator `Exists` and
+  effect `NoSchedule`.
 
-Both mutations are idempotent (the gate is not duplicated; a matching provider
-toleration is not re-added). The toleration is injected here rather than by the
-placement controller because it must be present before the scheduler evaluates
-the Pod, and it is provider-agnostic (Exists matches whichever provider the
-placement controller later selects).
+The toleration must be present before native scheduling starts, while the
+provider value is not known yet. That is why it is a key-only toleration from the
+webhook rather than a provider-specific toleration from the placement controller.
 
-**Scoping is critical** and lives in `config/webhook/selector_patch.yaml` (a
-kustomize patch, since controller-gen markers cannot express selectors):
+The webhook uses `failurePolicy=Fail`, so selector scoping is load-bearing:
+objectSelector limits it to opted-in Pods and namespaceSelector excludes system
+namespaces.
 
-- `objectSelector` on `enabled=true` — only opted-in Pods reach the webhook;
-- `namespaceSelector` excluding `kube-system`, `kube-node-lease`, `kube-public`,
-  `nebula-system`.
+### 2. Placement Controller
 
-This matters because `failurePolicy=Fail`: an over-broad webhook would make
-*every* Pod creation in the cluster depend on the Nebula webhook being healthy.
-The narrow selector + verbs=CREATE-only keeps the blast radius to opted-in Pods.
+The placement controller is the consumer of Nebula's scheduling gate. It is a
+no-op for ordinary Pods and for Pods that have already been bound.
 
-### 2. Placement controller
+Responsibilities:
 
-The consumer of the gate — the middle of the critical path. Reconciles Pods that
-are opted-in, still hold our gate, and are not yet bound (`needsPlacement`
-filters out anything else, so it is a no-op for ordinary Pods). For each:
+- resolve the selected NodePool from the Pod's `nebula.inftyai.com/nodepool`
+  label;
+- parse the accelerator type/count from Pod label plus `nvidia.com/gpu`;
+- select the first currently usable candidate across capacity tier, provider,
+  and provider-local region;
+- consult the shared failover blocklist before selecting a candidate;
+- create or verify the Pod UID-pinned NodeClaim before ungating;
+- stamp provider, capacity type, region, and blocklist TTL onto the Pod;
+- remove Nebula's scheduling gate.
 
-- Resolve the target `NodePool` (Pod label `nebula.inftyai.com/nodepool`). Missing or
-  mislabeled → leave the Pod gated (an operator sees a `SchedulingGated` Pod and a
-  missing pool, rather than a silent mis-placement).
-- **Select a provider.** v1 policy is **first matching provider**: walk the pool's
-  providers in listed order and pick the first whose registered adapter offers the
-  Pod's GPU type (`MapAccelerator`); a CPU-only Pod matches any. `selectPlacement`
-  is the seam the richer optimizer (LowestPrice/Weighted, capacity-tier fallback,
-  blocklist) swaps in behind later — the surrounding flow does not change. No
-  match → leave the Pod gated.
-- **Create the `NodeClaim` first, then ungate** (ordering is load-bearing — see
-  the [placement flow](#the-placement-flow-end-to-end) step 3). The claim carries
-  a fixed, Pod-derived name so `Create` is idempotent across retries; ungating is
-  a single Pod `Update` that sets the provider `nodeSelector`, the `capacity-type`
-  annotation, and removes the gate.
+A NodePool edit re-enqueues still-gated Pods that reference that pool, so adding
+a provider or region can unstick Pods without waiting for a full resync.
 
-A pool edit re-enqueues that pool's still-gated Pods (`podsForPool`), so adding a
-provider that can now serve a stuck Pod retries placement promptly instead of
-waiting for the resync. A "gated too long" alert remains a required operational
-safeguard (see [HA](#failure-domains--ha)).
+### 3. Virtual Kubelet Node
 
-### 3. Virtual Kubelet node
+Nebula uses one static virtual Node per registered provider. The node name is
+`nebula-<provider>` and it carries:
 
-This is the mechanism that turns "a Pod bound to a fake node" into "an instance
-running on a NeoCloud". **Decision: one static virtual Node per provider**, and
-**the virtual kubelet owns provisioning** (CreatePod → Provision, DeletePod →
-Terminate). Implemented in `pkg/vnode` (`handler.go`, `node.go`, `status.go`).
+- label `nebula.inftyai.com/provider: <provider>`;
+- taint `nebula.inftyai.com/provider=<provider>:NoSchedule`;
+- opaque capacity large enough for scheduling, while real capacity is enforced by
+  placement and provider provisioning.
 
-#### Why one node per provider
+`pkg/vnode` implements `node.PodLifecycleHandler` and `PodNotifier`.
 
-VK's native model is one node with many pods. The alternative — a node per
-instance — means building your own node-fleet/lease manager on top of VK
-(registering and deregistering a node per workload, each with its own heartbeat).
-We chose the static per-provider node: far simpler, VK-native, and the natural
-unit for a provider that is really "a pool of capacity we rent from". The
-accepted cost is a single failure domain per provider (if a provider's VK
-process is down, that provider can't take new pods) — acceptable because
-placement can route to other providers. Note the tradeoff of "VK owns
-provisioning": because the happy-path teardown is `DeletePod →
-provider.Terminate`, reclaiming an instance on that path depends on that
-provider's VK being alive to process the Pod deletion. This gap is closed by the
-**NodeClaim teardown backstop** (see [NodeClaim controller](#4-nodeclaim-controller)):
-the cluster-scoped claim outlives the Pod and carries a finalizer, so if the Pod
-is force-deleted while VK is down, the level-triggered claim controller still
-reclaims the instance — found by claim name via `List()` — the next time it runs.
+| VK method | Nebula action |
+| --- | --- |
+| `CreatePod(pod)` | Build `ProvisionRequest{ClaimName, CapacityType, Region}`, call `provider.Provision`, track returned instance ID, mark Pod Pending/Provisioning. |
+| `UpdatePod(pod)` | Treat workload shape as immutable; refresh tracked metadata/spec while preserving computed status. |
+| `DeletePod(pod)` | Call `provider.Terminate(instanceID)`, mark Pod Succeeded/Terminated, drop local tracking. |
+| `GetPod` | Return tracked Pod, or re-adopt a live provider instance by claim name after a VK restart. |
+| `GetPodStatus` / `GetPods` | Return tracked status or tracked Pods. |
+| `NotifyPods(cb)` | Start the provider `List()` poll loop and push status/endpoint changes through VK's callback. |
 
-#### The node object
+The kubelet API surfaces for logs, exec, attach, stats, and port-forward are not
+implemented; Nebula places external workloads but does not proxy their consoles.
 
-Each provider VK registers a Node with:
+#### Interaction with Capacity Types
 
-- name `nebula-<provider>` (e.g. `nebula-runpod`);
-- label `nebula.inftyai.com/provider: <name>` — the key the placement
-  controller writes into a Pod's nodeSelector to route it here;
-- a **taint** `nebula.inftyai.com/provider=<name>:NoSchedule` so that *only*
-  Pods Nebula has explicitly routed land on it. The mutating webhook adds a
-  key-only `Exists` toleration for `nebula.inftyai.com/provider:NoSchedule` at
-  admission (the provider is not chosen yet, so it tolerates any value); the
-  placement controller then routes the Pod with a provider nodeSelector. Without
-  the taint, any unscheduled Pod could drift onto a NeoCloud node.
-- generous/opaque `capacity` (VK convention) — real capacity is enforced by the
-  provider API and the optimizer's availability table, not by node allocatable.
+Capacity type is a per-instance decision, not a node property. The placement
+controller writes `nebula.inftyai.com/capacity-type` onto the Pod, and
+`CreatePod` passes it through `ProvisionRequest`. This lets multiple Pods on the
+same provider virtual node use different purchase models.
 
-#### The handler: VK events → the provider seam
+#### Interaction with Regions
 
-VK asks us to implement `node.PodLifecycleHandler`. Each method is a thin
-adapter onto the existing `provider.Provider` seam — **no provider-specific
-logic lives in the VK layer**; it only translates between Pod events and the
-seam:
+Region is also a per-instance decision. The placement controller writes
+`nebula.inftyai.com/region` when the selected candidate has a region, and the VK
+passes it through `ProvisionRequest.Region`.
 
-VK asks us to implement `node.PodLifecycleHandler` (+ `PodNotifier`). Each method
-is a thin adapter onto the existing `provider.Provider` seam — **no
-provider-specific logic lives in the VK layer**; it only translates between Pod
-events and the seam:
+Region-simple providers use an empty region candidate. AWS is region-aware and
+must be configured with explicit regions in each `NodePool` provider entry. One
+AWS provider registration spans all declared and already-provisioned regions by
+building region clients lazily and sweeping the union during `List()` and
+`Offerings()`.
 
-| `PodLifecycleHandler` method | Nebula action |
-|---|---|
-| `CreatePod(pod)` | Derive `ClaimName` from the Pod (namespace-name); read `CapacityType` from the `capacity-type` annotation; call `provider.Provision(pod, req)`; track the returned `instanceID` and set Pod status Pending. |
-| `UpdatePod(pod)` | No-op for immutable workloads in v1 (a spec change is a new Pod); the tracked copy's metadata is refreshed. |
-| `DeletePod(pod)` | Call `provider.Terminate(instanceID)` (idempotent), report a terminal status, and drop the Pod from tracking. This is the happy-path teardown; the NodeClaim finalizer is the backstop when VK never sees the delete. |
-| `GetPod` / `GetPodStatus` | Return the tracked Pod / its status. |
-| `GetPods` | Return the Pods this node is tracking. |
-| `NotifyPods(cb)` | Start the poll loop; `provider.List()` on the provider's cadence (`Capabilities.PollInterval`, default 30s) matches instances to tracked Pods by claim name and pushes state changes (Running/Failed/Preempted) through `cb`. |
+### 4. NodeClaim Controller
 
-Because Provision is idempotent (keyed on `ClaimName`, derived deterministically
-from the Pod), a `CreatePod` retry after a crash re-attaches to the existing
-instance instead of double-provisioning.
+The NodeClaim controller is the teardown backstop. A NodeClaim is cluster-scoped,
+outlives the namespaced Pod, and carries the
+`nebula.inftyai.com/terminate-instance` finalizer.
 
-The poll cadence is **per-provider** (`Capabilities.PollInterval`, default 30s),
-because the trade-off differs by provider: the poll only exists to catch
-transitions nothing pushes (`Pending→Running`, and preemption
-`Running→Terminated`), so a spot-heavy backend where reclaims are common and
-costly wants a short interval to notice them quickly, while an OnDemand-only
-backend that never preempts (e.g. Modal) can poll lazily. The happy-path
-transitions (provision start, teardown) are emitted synchronously by
-`CreatePod`/`DeletePod` and do not wait on the poll. The cost of a faster
-cadence is `List()` call volume — one API call per provider per tick regardless
-of Pod count — so the real ceiling is the provider's rate limit, not ours.
+Reconcile behavior:
 
-The kubelet API surface (logs/exec/attach/stats/port-forward) is intentionally
-unsupported — Nebula routes external GPU workloads, it does not proxy their
-consoles — so those handler methods return `NotFound`. This also lets us wire the
-lower-level `node` package directly rather than the `nodeutil` convenience
-wrapper, whose kubelet HTTP/auth stack does not compile against the pinned k8s
-0.33 line.
+- add the terminate finalizer before doing anything else;
+- fetch the served Pod by namespace/name and UID;
+- set coarse phase from the served Pod: `Provisioning`, `Initializing`, `Bound`,
+  `Terminating`, or `Terminated`;
+- best-effort record `status.instanceID` by matching the provider instance by
+  claim name;
+- when a previously observed Pod disappears, delete the claim so the finalizer
+  runs teardown;
+- when a never-bound claim's Pod is absent, wait 15 seconds to protect against
+  informer cache lag, then delete the orphan claim.
 
-#### Where VK runs
+Deletion behavior:
 
-VK is a long-running process that registers a node and maintains its lease. Two
-options:
+- resolve the provider from `spec.provider`;
+- prefer `status.instanceID` when available;
+- otherwise call `provider.List()` and find the instance whose `ClaimName`
+  matches the Pod-derived claim name;
+- call idempotent `provider.Terminate`;
+- release the finalizer only after termination succeeds, or immediately if the
+  provider is not registered and the controller cannot make progress.
 
-- **A (chosen):** run the per-provider VK nodes *inside* the existing manager,
-  as `manager.Runnable`s (`vnode.Runner`) the manager starts. One binary, one
-  deployment, simplest ops. They share the manager's lifecycle and, if enabled,
-  leader election, so only the leader owns each node's lease.
-- **B:** a separate Deployment per provider. Stronger isolation (a crash-looping
-  Modal adapter can't take down the RunPod node) at the cost of N deployments
-  and duplicated wiring.
+### 5. NodePool Controller
 
-**Implemented as A.** `setupVirtualNodes` in `cmd/main.go` adds one
-`vnode.Runner` per registered provider. Revisit B if provider isolation becomes
-a real operational need.
+NodePool is policy: allowed providers, allowed provider regions, capacity tier
+order, placement strategy, and failover TTL. The controller supplies health and
+observability rather than doing placement itself.
 
-#### Interaction with capacity types
+Responsibilities:
 
-A provider VK node exists once, but a Pod's capacity tier (Spot/OnDemand) is a
-per-instance decision the optimizer made. Because the VK provisions solely from
-the Pod, the tier rides on the `nebula.inftyai.com/capacity-type` annotation
-(written by the placement controller) — *not* on the node. `CreatePod` reads it
-into the `ProvisionRequest`. This keeps "one node per provider" compatible with
-"different pods on the same provider use different tiers".
+- validate environment-dependent provider availability and surface
+  `Ready=False / UnknownProvider` when a referenced adapter is not registered;
+- compute `status.placed` from Bound NodeClaims per provider;
+- watch NodeClaims so placement counts update as instances come and go.
 
-### 4. NodeClaim controller
+Static spec rules are admission-time CEL validations. Examples: `Weighted`
+requires a weight on every provider entry, and AWS provider entries require at
+least one region.
 
-The VK owns provisioning and the *happy-path* teardown; the NodeClaim controller
-is the **level-triggered backstop** that guarantees no paid instance leaks even
-when the Pod → VK path never fires (Pod force-deleted while that provider's VK is
-down). The claim is cluster-scoped and outlives the Pod, and carries the
-`TerminateInstance` finalizer.
+### 6. Provider Abstraction
 
-Reconcile logic:
+`pkg/provider.Provider` is the only seam between provider-agnostic controllers
+and provider-specific APIs.
 
-- **Add the finalizer first.** A claim with no finalizer gets it (and nothing
-  else) on the first reconcile, so teardown is guaranteed from the moment the
-  claim exists.
-- **Bound guard.** Once the served Pod (matched by UID) is observed, the claim is
-  marked `Bound`. `Bound` is the durable signal "an instance was really serving
-  this workload" — the guard the self-delete trusts.
-- **Self-delete on real teardown.** A `Bound` claim whose Pod has since vanished
-  is a real teardown: the claim deletes itself (the finalizer keeps it alive long
-  enough to run the backstop).
-- **Cache-lag guard.** A claim that was **never** `Bound` and whose Pod is absent
-  might just be racing the Pod's cache appearance. It waits `placementGracePeriod`
-  (2m) from creation before being reaped, so a freshly-placed claim isn't deleted
-  in the window between create and the Pod showing up.
-- **Deletion path (`reconcileDelete`).** Resolve the provider (unknown adapter →
-  release the finalizer rather than wedge deletion forever), find the instance —
-  preferring `status.InstanceID` if set, else matching the **claim name** against
-  `provider.List()` (VK tracks the id in-memory and loses it on a crash, so `List`
-  is the reliable recovery path) — call `Terminate` (idempotent), then release the
-  finalizer. A transient `List` error does **not** release the finalizer: teardown
-  retries so the instance is never abandoned.
+Key contracts:
 
-On the happy path the backstop is a redundant idempotent no-op — VK already
-terminated, so `List` finds nothing and `Terminate("")` does nothing. The claim
-deliberately does **not** mirror the Pod's finer runtime status; the Pod is the
-source of truth for that, and `kubectl get pods` shows it.
+- `Provision(pod, req)` reads workload shape from the Pod and only receives the
+  decisions that are not already on the Pod: claim identity, capacity type, and
+  region.
+- `Terminate(instanceID)` is idempotent, including empty or already-gone IDs.
+- `List()` returns Nebula-owned instances for polling, re-adoption, and teardown
+  recovery.
+- `Offerings()` returns price/availability rows, including provider-specific
+  region where applicable.
+- `MapAccelerator(type, count)` maps a canonical accelerator request to provider
+  capacity pools. Count is part of the key for providers such as AWS where
+  different GPU counts map to different instance types.
+- `ClassifyProvisionError(err, accelerator, region)` returns the provider-owned
+  blocklist scope for failover.
 
-### 5. NodePool controller
+**Modal adapter** (`pkg/provider/modal/`) provisions Modal Sandboxes. It is
+OnDemand-only, supports native tags, and maps Pod image, command, env, ports,
+CPU/memory, accelerator type/count, and lifetime into a Sandbox request.
+`env.valueFrom` projection and live integration coverage are still incomplete.
 
-The NodePool is **pure policy** (which providers, capacity-tier order, ranking
-strategy, failover TTL) — no workload shape. The controller is its health &
-observability loop:
+**AWS adapter** (`pkg/provider/aws/`) provisions EC2 GPU instances. It uses the
+NodePool-declared regions as the fan-out source, lazily builds per-region
+clients, resolves region-local GPU AMIs, uses EC2 fleets for Spot or OnDemand,
+records claim/capacity/region tags, and confines capacity/quota blocklist scopes
+to the failing region when appropriate.
 
-- **validate** — the one *environmental* check: every referenced provider has a
-  registered adapter. Surfaced as `Ready=False / UnknownProvider`, not an
-  admission rejection, so a valid manifest stays appliable while a provider's
-  creds are temporarily absent (self-heals on the next reconcile).
-- **refreshPlaced** — recomputes `status.Placed` (count of `Bound` NodeClaims
-  per provider for this pool — `Bound` being the claim-level signal that an
-  instance is live for the workload) each reconcile; watches NodeClaims via
-  `claimToPool` so the picture tracks instances coming and going.
+**Fake adapter** (`pkg/provider/fake/`) is an in-memory backend used by tests and
+e2e overlays only. It is not registered in the default production deployment.
 
-*Static* spec validation (e.g. "Weighted strategy requires a weight on every
-provider") is enforced at **admission** via a CEL `XValidation` rule on
-`NodePoolSpec`, not in the controller — a spec property is knowable at CREATE and
-belongs there. The split — static→admission, environmental→status condition — is
-deliberate: coupling a fail-closed webhook to the runtime provider registry
-would reject valid pools during creds/rollout windows.
+### 7. Placement Optimizer and Poll Loop
 
-### 6. Provider abstraction
+Implemented today:
 
-The single narrow seam between the provider-agnostic control plane and the
-heterogeneous cloud APIs. Key rules:
+- capacity type is the outer axis;
+- provider list order is the current inner ranking;
+- provider-local region is walked inside each provider entry;
+- provider `Offerings()` and `MapAccelerator()` decide servability;
+- failover blocklist skips recently failed provider/accelerator/tier/region
+  candidates;
+- VK poll loop observes provider instance state and updates Pod status.
 
-- **The Pod is the source of truth.** `Provision(pod, req)` reads
-  image/command/env/ports/resources off the Pod, the accelerator type from its
-  `accelerator-type` label and the count from the `nvidia.com/gpu` resource
-  (parsed together by `util.AcceleratorRequest`). `ProvisionRequest` carries only
-  the two things *not* on the Pod: `ClaimName` (identity) and `CapacityType` (the
-  optimizer's tier choice).
-- **Quirks are data, not branches.** `Capabilities{SupportsStop, SupportsSpot,
-  NativeTags, PreemptionNotice}` lets the control plane behave generically.
-- **Poll-based detection.** `List()` returns all Nebula-owned instances in as
-  few calls as possible — the engine of the poll loop, since no NeoCloud pushes
-  preemption.
-- **Error classification.** `ClassifyProvisionError(err) → BlockScope` maps a
-  failure to its blocklist granularity ({accel, tier} vs whole-provider).
-- Shared catalog machinery (`catalog.Lookup`, embeddable `catalog.Base` for
-  Name/Offerings/identity-MapAccelerator) lives in `pkg/provider/catalog`.
+Planned or partial:
 
-Adapters register into a process-wide registry (`pkg/provider/registry.go`) at
-startup via `registerProviders` in `cmd/main.go`. A creds-absent provider is
-logged and skipped, not fatal.
-
-**Modal adapter** (`pkg/provider/modal/`): serverless Sandboxes, create/terminate
-only (no stop/spot), native tags (claim id in a sandbox tag), OnDemand-only. SDK
-sits behind a `Client` seam so the adapter is unit-testable without network. The
-sandbox is built from the Pod as source of truth: image/command/env, accelerator
-type+count (from the annotation), CPU/memory (from the container's resource
-request), exposed ports (from `containerPorts`, surfaced as the endpoint tunnel),
-and lifetime (from `activeDeadlineSeconds`, defaulting to 24h — Modal treats a
-zero timeout as its 5-minute default, so the adapter always sets one). Credentials
-come from a per-provider Secret (`nebula-modal-credentials`) injected via an
-optional `envFrom` — the SDK reads `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` from the
-environment; see `config/manager/modal-credentials.example.yaml`. Still open:
-`env.valueFrom` (Secret/ConfigMap-backed env) is not yet projected, and there is
-no live integration test.
-
-### 7. Optimizer & poll loop (PLANNED)
-
-- **Catalog table.** `{provider, accelerator, capacityType} → {price, available}`,
-  built from provider `Offerings()` (static CSV catalog + live availability
-  probe), cached and periodically refreshed.
-- **Placement resolution — two orthogonal axes, fixed order.** Capacity type is
-  the *outer* axis (hard tier): try Spot on *all* providers before *any*
-  OnDemand. Strategy (LowestPrice/Ordered/Weighted) is the *inner* axis: it only
-  ranks providers *within* the active tier, never across tiers.
-- **Blocklist.** Derived, high-churn, in-memory (not in any CRD). Keyed on
-  {provider, accelerator, capacityType} with wildcard-on-empty, so a failed H100
-  request doesn't block A100 on the same provider. Entries expire after
-  `FailoverPolicy.BlocklistTTL` (default 10m). Failover is always on.
-- **Poll loop (DONE, in VK).** Each provider's virtual node calls `List()` on the
-  provider's cadence (`Capabilities.PollInterval`, default 30s) and projects
-  observed instance state onto **Pod** status — preemption/termination detected by
-  an instance disappearing or changing state. It does **not** write NodeClaims (an
-  earlier mirror-into-claim design was dropped — see
-  [Status flow](#status-flow--two-independent-lanes)). What remains PLANNED here is
-  the *optimizer's* offerings/availability refresh, not the pod-status poll.
+- `LowestPrice` and `Weighted` ranking are API-visible but not implemented as
+  richer inner ranking yet;
+- no metrics-based scheduler feedback loop exists yet;
+- no all-regions expansion exists yet;
+- no warm pool or reservation controller exists yet;
+- accelerator-family fallback beyond provider-local alternates is not a
+  scheduler feature yet.
 
 ---
 
 ## CRDs
 
-Both are **cluster-scoped**, under `nebula.inftyai.com/v1alpha1`. Karpenter's
-names are kept (not prefixed); disambiguation is via the API group and distinct
-shortnames (`np`, `nc`). See `api/v1alpha1/`.
+All CRDs are under `nebula.inftyai.com/v1alpha1`.
 
-### NodePool (`np`) — policy
+- `NodePool` (`np`) is cluster-scoped placement policy.
+- `NodeClaim` (`nc`) is a cluster-scoped instance ledger.
+- `Sandbox` is a namespaced workload-facing object for one interactive remote
+  box.
+- `SandboxSet` is a namespaced controller object that maintains N Sandboxes.
+
+### NodePool (`np`)
 
 ```yaml
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  name: gpu-pool
 spec:
-  providers:            # ordered; order matters for the Ordered strategy
-    - name: runpod
-      weight: 3         # required iff strategy == Weighted (CEL-enforced)
+  providers:
     - name: modal
-  capacityTypes:        # OUTER axis, fallback order. default {Reserved,OnDemand,Spot}
+      weight: 1
+    - name: aws
+      weight: 3
+      regions:
+        - us-east-1
+        - us-west-2
+  capacityTypes:
     - Spot
     - OnDemand
-  strategy: Ordered     # INNER axis: LowestPrice | Ordered | Weighted
+  strategy: Ordered
   failover:
-    blocklistTTL: 10m
+    blocklistTTL: 30s
 status:
-  placed: {runpod: 2, modal: 1}   # running NodeClaims per provider
-  conditions: [{type: Ready, ...}]
+  placed:
+    modal: 2
+    aws: 1
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: Valid
 ```
 
-A pool is pure policy and applies to whatever Pods select it — an H100 and an
-A100 Deployment can share one pool.
+When `capacityTypes` is omitted, the API defaults it to `{OnDemand, Spot}`. The
+listed order is the fallback order the placement controller walks.
 
-### NodeClaim (`nc`) — instance ledger
+### NodeClaim (`nc`)
 
 ```yaml
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodeClaim
+metadata:
+  name: default-train-a100
 spec:
-  podRef: {namespace, name, uid}   # UID pins the exact Pod
-  provider: runpod                 # immutable; a claim never migrates
-  capacityType: Spot               # tier chosen by the optimizer, recorded for reporting
-                                   # (the VK reads it from the Pod's capacity-type annotation)
+  podRef:
+    namespace: default
+    name: train-a100
+    uid: 5c1c8e4a-...
+  provider: aws
+  capacityType: Spot
+  region: us-east-1
+  accelerator: A100-40GB:1
   poolRef: gpu-pool
 status:
-  phase: Bound                     # Pending (Pod not yet observed) | Bound (Pod observed ≥ once)
-  instanceID: <provider id>        # provider instance id, when VK recorded it (backstop hint)
+  phase: Bound
+  instanceID: i-0123456789abcdef0
 ```
 
-Deliberately does **not** duplicate PodSpec/GPU/tier as workload data, nor mirror
-the Pod's finer runtime status — the Pod is the source of truth for both. The
-claim's own status is just the coarse `Bound` guard the teardown backstop relies
-on. The claim is a durable teardown ledger + backstop, keyed on the Pod-derived
-claim name; happy-path teardown is still the VK's `DeletePod → Terminate`.
+Valid phases are `Provisioning`, `Initializing`, `Bound`, `Terminating`, and
+`Terminated`. The claim deliberately does not duplicate PodSpec and does not
+mirror fine-grained runtime status.
+
+### Sandbox and SandboxSet
+
+`Sandbox` and `SandboxSet` are namespaced user-facing abstractions for
+interactive boxes. The controllers synthesize Nebula-managed Pods, so they reuse
+the same admission, placement, virtual-node provisioning, status, and teardown
+paths as direct Pod/Deployment workloads.
 
 ---
 
-## Failure domains & HA
+## Failure Domains and HA
 
-Two components are on the fail-closed critical path and must run HA:
+Components on the fail-closed path:
 
-- **Webhook** (`failurePolicy=Fail`): if it's down, opted-in Pod creation is
-  blocked. Run ≥2 replicas; the narrow objectSelector keeps non-Nebula Pods
-  unaffected. A gated-Pod path that stays gated is preferable to an ungated Pod
-  bypassing placement.
-- **Placement controller**: if it never ungates, opted-in Pods sit
-  `SchedulingGated` forever. Required safeguard: a **"gated too long" alert** and
-  ideally a fallback (e.g. after a timeout, emit an event / optionally place on a
-  default provider).
+- **Webhook.** If the webhook is down, opted-in Pod creation is blocked because
+  `failurePolicy=Fail`. Run it with multiple replicas; selector scoping keeps
+  non-Nebula Pods out of the blast radius.
+- **Placement controller.** If it cannot reconcile, opted-in Pods remain
+  `SchedulingGated`. Operators should alert on gated Pods older than the
+  expected placement window.
 
-Non-critical by design:
+Components designed to degrade without leaks:
 
-- **VK node down**: that provider can't take *new* pods, and existing instances
-  keep running untouched (the external NeoCloud does not care that VK is down).
-  Placement routes new pods to healthy providers. Happy-path teardown of that
-  provider's instances is deferred until its VK recovers — but a Pod force-deleted
-  during the outage is still reclaimed by the NodeClaim finalizer backstop, so no
-  instance leaks (see [NodeClaim controller](#4-nodeclaim-controller)).
-- **Provider creds absent**: the adapter is skipped at registration (logged);
-  pools referencing it surface `UnknownProvider` and self-heal when creds arrive.
+- **Provider virtual node down.** That provider cannot take new Pods through VK
+  while down. Existing external instances keep running. Happy-path Pod deletion
+  may be delayed, but the NodeClaim finalizer backstop can still reclaim
+  force-deleted Pods by listing provider instances by claim name.
+- **Provider credentials absent.** The adapter is skipped during registration.
+  NodePools that reference it surface `UnknownProvider` and self-heal when the
+  manager restarts with credentials available.
+- **Provider List temporarily failing.** VK skips that poll tick and retries on
+  the next cadence. The NodeClaim finalizer does not release on transient list
+  errors, so teardown retries instead of abandoning the instance.
 
-Leader election (`LeaderElectionID: nebula.inftyai.com`) ensures a single active
-manager owns reconciliation and the VK node leases (the VK nodes run inside the
-manager as `Runnable`s — option A).
+Leader election (`LeaderElectionID: nebula.inftyai.com`) keeps a single active
+manager reconciling controllers and owning virtual-node leases.
 
 ---
+
+## Current Implementation Status
+
+Implemented:
+
+- Pod admission gate and provider taint toleration.
+- Pod placement through NodePool, NodeClaim, provider nodeSelector, and ungate.
+- Capacity-tier, provider, and provider-region candidate walk.
+- Shared TTL failover blocklist keyed by provider, accelerator pool, capacity
+  type, and region.
+- Virtual Kubelet provider nodes with CreatePod/DeletePod/List polling.
+- NodeClaim terminate finalizer and 15-second cache-lag guard.
+- Modal, AWS, and e2e fake providers.
+- Sandbox and SandboxSet controllers layered on the same Pod placement path.
+
+Planned or partial:
+
+- `LowestPrice` and `Weighted` ranking semantics.
+- Metrics-based scheduling.
+- Warm pools and reservation support.
+- Arbitrary GPU-count fitting across larger provider instances.
+- Richer accelerator-family fallback.
+- Modal `env.valueFrom` projection and broader live integration tests.
