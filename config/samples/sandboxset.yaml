@@ -19,7 +19,7 @@ metadata:
     app.kubernetes.io/managed-by: nebula
   name: sample
 spec:
-  replicas: 30
+  replicas: 3
   template:
     metadata:
       labels:
