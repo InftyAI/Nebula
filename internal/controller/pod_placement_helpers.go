@@ -96,10 +96,14 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 	// The (type, count) together select the concrete offering: a provider resolves
 	// them through MapAccelerator to its own id (an EC2 instance type on AWS), which
 	// is what the blocklist keys on so L4x1 and L4x8 (distinct instance types) block
-	// independently. A malformed request is treated as "no accelerator" so placement
-	// stays a no-op rather than erroring the reconcile — provisioning would surface
-	// the real error.
-	accel, count, _ := util.AcceleratorRequest(pod)
+	// independently. A malformed request is left gated rather than silently routed as
+	// CPU-only; the user must fix the Pod spec (or a controller-generated Pod's
+	// source object) before placement can proceed.
+	accel, count, err := util.AcceleratorRequest(pod)
+	if err != nil {
+		log.Info("invalid accelerator request; leaving Pod gated", "error", err.Error())
+		return placement{}, false, 0
+	}
 
 	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
 	for _, tier := range capacityTiers(pool) { // outer: capacity
