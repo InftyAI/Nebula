@@ -81,8 +81,10 @@ type SandboxSpec struct {
 	// field by the apiserver itself — no webhook required. That is not a
 	// simplification, it is the process model: a sandbox has nothing to run at boot,
 	// so the controller supplies a placeholder command whose only job is to keep the
-	// container from exiting. A user-supplied command would displace it and take the
-	// instance down with it.
+	// container from exiting (today this is implemented with a long-running `sleep`,
+	// which must exist in the chosen image). Nebula does not currently support
+	// `kubectl exec`/`kubectl logs` against sandboxes; a user-supplied command would
+	// displace the placeholder and take the instance down with it.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:default="ubuntu:24.04"
 	// +optional
