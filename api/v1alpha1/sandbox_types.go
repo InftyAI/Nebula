@@ -79,15 +79,10 @@ type SandboxSpec struct {
 	// There is deliberately no command field, and one cannot be set: the CRD is a
 	// structural schema, so `command:` in a Sandbox spec is rejected as an unknown
 	// field by the apiserver itself — no webhook required. That is not a
-	// simplification, it is the process model: the container's command is always
-	// SandD, which runs as PID 1 and is what makes `kubectl exec` and `kubectl logs`
-	// work against an instance in another cloud. A user-supplied command would
-	// displace it and take both with it.
-	//
-	// A sandbox has nothing to run at boot anyway — the whole point is that commands
-	// arrive later, over exec — so SandD spawns no child here; it holds the container
-	// open and serves requests. Workload classes that do run something get it spawned
-	// as SandD's child instead, which is how it comes to own their stdout/stderr.
+	// simplification, it is the process model: a sandbox has nothing to run at boot,
+	// so the controller supplies a placeholder command whose only job is to keep the
+	// container from exiting. A user-supplied command would displace it and take the
+	// instance down with it.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:default="ubuntu:24.04"
 	// +optional

@@ -147,14 +147,14 @@ var _ = Describe("Sandbox admission", func() {
 	})
 
 	It("rejects a user-supplied command", func() {
-		// The process model depends on SandD being PID 1 — it is what serves exec and
-		// logs — so a command must never reach the container. SandboxSpec simply has no
+		// The controller owns the container's command — a placeholder that keeps the box
+		// alive — so a user-supplied one must never reach it. SandboxSpec simply has no
 		// command field, and because the CRD is a structural schema the apiserver rejects
 		// the unknown field itself. This spec exists because that guarantee is the reason
 		// no validating webhook was written: if the schema ever stopped rejecting it (a
 		// stray x-kubernetes-preserve-unknown-fields would do it), the command would be
-		// silently pruned instead, and the failure would surface as "exec does not work"
-		// rather than as a rejected object.
+		// silently pruned instead, and the failure would surface as a box that dies on
+		// arrival rather than as a rejected object.
 		sbx := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": nebulav1alpha1.GroupVersion.String(),
 			"kind":       "Sandbox",

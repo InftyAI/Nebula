@@ -139,18 +139,6 @@ const (
 	// flows the other way — VK writes it for operators/tooling to read.
 	EndpointAnnotation = "nebula.inftyai.com/endpoint"
 
-	// SanddPath is where the SandD binary is found INSIDE a Nebula-provisioned
-	// container, and therefore the command every synthesized workload Pod runs. It
-	// is a shared constant rather than a per-adapter string because it is a contract
-	// with two ends that must agree exactly: the controller writes it as the Pod's
-	// container command, and every provider bootstrap must make the binary appear at
-	// this path (the AWS adapter bind-mounts it from the host into the container).
-	//
-	// The path lives under /nebula rather than /usr/local/bin to avoid colliding with
-	// anything the user's own image ships, since the image is arbitrary and we are
-	// injecting into it.
-	SanddPath = "/nebula/sandd"
-
 	// TerminateInstanceFinalizer is held by every NodeClaim to guarantee teardown.
 	// The virtual kubelet owns the happy path (DeletePod → provider.Terminate,
 	// keyed on the Pod-derived claim name), but its teardown is edge-triggered and

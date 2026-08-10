@@ -194,24 +194,28 @@ func (r *SandboxReconciler) buildPod(sbx *nebulav1alpha1.Sandbox) *corev1.Pod {
 			Containers: []corev1.Container{{
 				Name:  sandboxContainerName,
 				Image: sbx.Spec.Image,
-				// SandD is the command, set HERE rather than in each provider's bootstrap,
-				// so the Pod stays the single source of truth for what runs on the instance
-				// — the same rule ProvisionRequest documents for image/env/resources. Every
+				// The command is set HERE rather than in each provider's bootstrap, so the
+				// Pod stays the single source of truth for what runs on the instance — the
+				// same rule ProvisionRequest documents for image/env/resources. Every
 				// adapter already reads the command off the Pod, so this needs no
 				// per-provider code and cannot drift between providers.
 				//
-				// SandD is PID 1 in the container. For a sandbox it spawns nothing: the box
-				// exists to receive exec calls, so SandD just holds the container open and
-				// serves them. For workload classes that DO run something, it spawns that as
-				// its child and owns the stdout/stderr pipes, which is what makes
-				// `kubectl logs` work against an instance in another cloud.
+				// A sandbox has nothing to run at boot: the box exists to be connected to,
+				// so its command's only job is to not exit. Without it the container would
+				// run the image's own entrypoint (`bash` for the default ubuntu:24.04),
+				// which finds no TTY, exits immediately, and takes the instance down with
+				// it — the box would surface as Failed seconds after being provisioned.
 				//
-				// The user's image does not contain this binary (it is an arbitrary image
-				// like ubuntu:24.04), so the provider bootstrap must make it appear at
-				// SanddPath — the contract the shared constant exists to pin down. This is
-				// never in tension with a user-supplied command: SandboxSpec has no command
-				// field, so the structural schema rejects one outright.
-				Command:   []string{nebulav1alpha1.SanddPath},
+				// This is a PLACEHOLDER process, not a control surface. It keeps the
+				// instance alive and nothing more; there is no agent inside the container,
+				// so `kubectl exec`/`logs` against a sandbox do not work today (the virtual
+				// kubelet answers NotFound — see pkg/vnode.Handler.RunInContainer). Whatever
+				// restores them replaces this command, and it is deliberately a bare
+				// `sleep` so no bootstrap has to inject a binary into an arbitrary user image.
+				//
+				// This is never in tension with a user-supplied command: SandboxSpec has no
+				// command field, so the structural schema rejects one outright.
+				Command:   []string{"sleep", "infinity"},
 				Resources: sbx.Spec.Resources,
 				Env:       sbx.Spec.Env,
 			}},
@@ -265,9 +269,9 @@ func sandboxStatusFromPod(pod *corev1.Pod) sandboxStatus {
 			endpoint: endpoint,
 		}
 	case corev1.PodFailed, corev1.PodSucceeded:
-		// Succeeded lands here too: a sandbox has no notion of completing — SandD is
-		// PID 1 and only exits when the box goes away — so a terminal Pod means the
-		// instance is gone either way.
+		// Succeeded lands here too: a sandbox has no notion of completing — its command
+		// only exits when the box goes away — so a terminal Pod means the instance is
+		// gone either way.
 		return sandboxStatus{
 			phase:    nebulav1alpha1.SandboxFailed,
 			reason:   nebulav1alpha1.ReasonSandboxFailed,

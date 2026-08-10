@@ -260,9 +260,9 @@ func (r *SandboxSetReconciler) scaleDown(ctx context.Context, victims []nebulav1
 // while a failed box sits beside it.
 //
 // The rule we actually want for step 3 is least-recently-USED, so an idle box goes
-// before one holding a live session. That needs per-box activity data, which only
-// SandD can report and does not yet; "youngest Ready" is the best available proxy
-// until it does.
+// before one holding a live session. That needs per-box activity data, which nothing
+// inside the box reports today; "youngest Ready" is the best available proxy until
+// something does.
 func selectForRemoval(owned []nebulav1alpha1.Sandbox, n int) []nebulav1alpha1.Sandbox {
 	if n >= len(owned) {
 		return owned
