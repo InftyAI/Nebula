@@ -27,10 +27,14 @@ spec:
     spec:
       nodePoolRef: sample
       image: ubuntu:24.04
-      acceleratorType: a100-40gb
+      # T4 x1 (g4dn.xlarge) — the (type, count) pair must exist in the provider
+      # catalog, since on EC2 the GPU count is part of the instance type rather than a
+      # free knob. See the Sandbox sample for the full explanation. Note this is
+      # multiplied by `replicas` above: three boxes means three billable instances.
+      acceleratorType: t4
       resources:
         requests:
-          cpu: "8"
-          memory: 64Gi
+          cpu: "4"
+          memory: 16Gi
         limits:
           nvidia.com/gpu: "1"

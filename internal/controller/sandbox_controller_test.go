@@ -147,10 +147,11 @@ func TestSandboxSynthesizesPod(t *testing.T) {
 	if ctr.Image != "ubuntu:24.04" {
 		t.Errorf("image = %q, want ubuntu:24.04", ctr.Image)
 	}
-	// SandD must be the command: it is PID 1 and serves exec/logs. A Pod without it
-	// would run the image's own entrypoint and be unreachable.
-	if len(ctr.Command) != 1 || ctr.Command[0] != nebulav1alpha1.SanddPath {
-		t.Errorf("command = %v, want [%s]", ctr.Command, nebulav1alpha1.SanddPath)
+	// A non-exiting command must be set. Without one the container runs the image's
+	// own entrypoint (`bash` for ubuntu:24.04), which exits with no TTY and takes the
+	// instance with it, so the box would fail seconds after being provisioned.
+	if got := ctr.Command; len(got) != 2 || got[0] != "sleep" || got[1] != "infinity" {
+		t.Errorf("command = %v, want [sleep infinity]", got)
 	}
 	// The GPU count must survive as a standard resource: placement and the
 	// scheduler's fit check both read it from here.
@@ -255,7 +256,7 @@ func TestSandboxPhaseFromPod(t *testing.T) {
 			want:   nebulav1alpha1.SandboxFailed,
 		},
 		{
-			// SandD only exits when the box goes away, so a Succeeded Pod still means
+			// The command only exits when the box goes away, so a Succeeded Pod still means
 			// the instance is gone — not that the sandbox completed successfully.
 			name:   "succeeded pod is Failed too",
 			mutate: func(p *corev1.Pod) { p.Status.Phase = corev1.PodSucceeded },

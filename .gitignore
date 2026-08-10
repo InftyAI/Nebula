@@ -11,7 +11,6 @@ Dockerfile.cross
 # ROOT, not bin/, so they are not covered above — and they are multi-MB, which is
 # exactly the kind of thing that sneaks into a commit unnoticed.
 /manager
-/keybroker
 
 # Test binary, build with `go test -c`
 *.test

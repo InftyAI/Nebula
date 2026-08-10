@@ -347,17 +347,33 @@ func TestBuildUserData_QuotesHostileValues(t *testing.T) {
 	}
 }
 
-// TestBuildUserData_PlainBootstrap: the bootstrap renders only the plain
-// docker-pull + docker-run flow — no sandd/tunnel tokens leak in.
+// TestBuildUserData_PlainBootstrap pins the ENTIRE rendered script for the simplest
+// spec, byte for byte. The sibling tests above assert individual fragments are
+// present; this one asserts nothing ELSE is, which no amount of Contains checks can
+// establish. Earlier bootstraps prepended a setup preamble (fetching an agent binary,
+// writing a credentials file) before the docker lines, and a fragment-only suite
+// stayed green through all of it.
+//
+// That is worth pinning exactly because of where this string ends up: it is cloud-init
+// on a paid GPU instance with no kubelet, so anything that appears here runs
+// unsupervised and is visible only through the serial console. An intentional change
+// should update this expectation in the same commit — that edit is the review prompt.
 func TestBuildUserData_PlainBootstrap(t *testing.T) {
 	encoded, err := buildUserData(InstanceSpec{Image: "img"})
 	if err != nil {
 		t.Fatalf("buildUserData: %v", err)
 	}
-	raw, _ := base64.StdEncoding.DecodeString(encoded)
-	script := string(raw)
-	if strings.Contains(script, "sandd") || strings.Contains(script, "tunnel") {
-		t.Fatalf("plain bootstrap must not inject sandd/tunnel:\n%s", script)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("user-data is not valid base64: %v", err)
+	}
+
+	const want = "#!/bin/bash\n" +
+		"set -euo pipefail\n" +
+		"docker pull 'img'\n" +
+		"docker run --rm --gpus all 'img'\n"
+	if got := string(raw); got != want {
+		t.Fatalf("rendered bootstrap changed:\n got: %q\nwant: %q", got, want)
 	}
 }
 
