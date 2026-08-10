@@ -10,6 +10,7 @@ cluster, including wiring provider credentials.
 - [Configuration](#configuration)
 - [Manual deployment](#manual-deployment)
 - [Verifying the deployment](#verifying-the-deployment)
+- [Smoke test](#smoke-test)
 
 ---
 
@@ -38,29 +39,20 @@ every provider whose credentials are present.
 
 ## How credentials are handled
 
-Nebula keeps provider credentials in **one Kubernetes Secret per provider** — not
-a single shared secret. This is deliberate and matches the control plane's
-"creds-absent → skip that provider, not fatal" model:
+Nebula keeps provider credentials in **one Kubernetes Secret per provider**, each
+referenced by the manager Deployment through an **optional** `envFrom.secretRef`
+(see `config/manager/manager.yaml`). So:
 
-- Each provider Secret is referenced by the manager Deployment through an
-  **optional** `envFrom.secretRef` (see `config/manager/manager.yaml`). Optional
-  means the manager still boots when a Secret is missing.
-- A provider whose credentials are absent is **logged and skipped** at
-  registration (`registerProviders` in `cmd/main.go`), not fatal. A `NodePool`
-  that references an unregistered provider surfaces `Ready=False /
-  UnknownProvider`, which self-heals once the creds are applied.
-- Splitting per provider isolates rotation and RBAC, and lets you configure one
-  provider without touching another's Secret. Providers namespace their env vars
-  (`MODAL_TOKEN_ID`, `RUNPOD_API_KEY`, …), so the merged environment never
-  collides.
+- The manager boots even when a Secret is missing.
+- A provider whose credentials are absent is logged and skipped at registration,
+  not fatal. A `NodePool` referencing it surfaces `Ready=False / UnknownProvider`,
+  which self-heals once the creds are applied.
 
 `.env` holds **only secrets**. Non-secret configuration (image, namespace, Kind
-cluster) is passed as `make` variables, never committed to `.env`.
+cluster) is passed as `make` variables.
 
-> **Secret vs. absent looks the same.** Because `envFrom` is `optional: true`, a
-> typo in a Secret name silently yields no credentials — the provider is just
-> skipped. The `NodePool` `UnknownProvider` condition is your signal that a
-> referenced provider did not register.
+> **A typo in a Secret name looks exactly like an absent one** — the provider is
+> silently skipped. `UnknownProvider` on the `NodePool` is your signal.
 
 ---
 
@@ -73,41 +65,24 @@ serving certificate in-process at startup (`pkg/cert`, built on
 [cert-controller](https://github.com/open-policy-agent/cert-controller)). There is
 nothing to install and nothing to run before `make deploy`.
 
-It does the three things that have to agree with each other:
+At startup it mints a serving cert into the `nebula-webhook-server-cert` Secret,
+patches the matching CA into the `MutatingWebhookConfiguration` `caBundle`, and
+rotates the cert before it expires.
 
-1. **Serving cert** — mints a self-signed cert for the webhook Service DNS name
-   (`nebula-webhook-service.<namespace>.svc`) and stores it in the
-   `nebula-webhook-server-cert` Secret. That Secret is projected into the manager at
-   `/tmp/k8s-webhook-server/serving-certs`, where the webhook server reads it — the
-   rotator writes only the Secret, never the filesystem, so the volume at that path
-   must be the Secret rather than an `emptyDir`.
-2. **CA trust** — patches that cert's CA into the `MutatingWebhookConfiguration`
-   `caBundle`, so the API server trusts the webhook. It is derived from the cert
-   just written, so the served cert and the trusted CA cannot drift.
-3. **Renewal** — rotates the cert before it expires. This is the part neither
-   cert-manager-free alternative had: a script-minted cert simply expires, years
-   later, when nobody remembers a script was involved.
+Two things this implies for the deployment:
 
-The Secret is the shared source of truth across replicas — a second replica finds
-the existing cert there rather than minting a competing one, and the kubelet projects
-it into that pod too. Rotation is *not* leader-elected, because webhook serving is not
-either: every replica needs the keypair on its own local disk, and the API server
-will call a non-leader.
+- The volume at `/tmp/k8s-webhook-server/serving-certs` **must be that Secret**, not
+  an `emptyDir` — the rotator writes only the Secret, and the kubelet projects it.
+  With an `emptyDir` the files never appear and nothing starts, while the pod still
+  looks healthy.
+- The first seconds of a fresh install log
+  `waiting for the webhook certificate to be ready` and reconcile nothing. That is
+  expected: controllers wait for the cert so no Pod is admitted before the webhook is
+  trusted.
 
-**Startup ordering.** Nothing that depends on Pod admission is registered until the
-cert is ready, so the first seconds of a fresh install log
-`waiting for the webhook certificate to be ready` and reconcile nothing. That is
-deliberate: with `failurePolicy: Fail` a Pod created before the webhook is trusted
-would be rejected, and without the gate it would be scheduled by vanilla Kubernetes
-— silently bypassing placement and never reaching a provider.
-
-The cert volume is an `emptyDir`, not a Secret projection, because the rotator
-*writes* to that path; a Secret volume is read-only and its kubelet refresh would
-fight the rotator.
-
-To switch to cert-manager instead, re-add `- ../certmanager` and re-enable the
-`CERTMANAGER` replacements blocks in `config/default/kustomization.yaml`, install
-cert-manager, and drop the `CertsManager` call from `cmd/main.go`.
+To use cert-manager instead, re-add `- ../certmanager` and re-enable the `CERTMANAGER`
+replacements blocks in `config/default/kustomization.yaml`, install cert-manager, and
+drop the `CertsManager` call from `cmd/main.go`.
 
 ---
 
@@ -118,16 +93,13 @@ cert-manager, and drop the `CertsManager` call from `cmd/main.go`.
 1. **Builds** the manager image (`make docker-build IMG=…`).
 2. **Publishes** it — `docker push`, or `kind load docker-image` when
    `DEPLOY_KIND_CLUSTER` is set.
-3. **Creates Secrets first**, so the manager boots already-configured:
-   - the **webhook serving cert** Secret (self-signed — see
-     [Webhook TLS](#webhook-tls-no-cert-manager));
-   - **credential Secrets** from `.env`, one per provider. A Secret is created
-     only when *all* its required keys are set, so a partial config never
-     produces a half-populated Secret; a provider with blank keys is skipped.
-4. **Deploys** CRDs + the manager (`make deploy IMG=…`). The pod mounts the cert
-   and reads provider creds on its first and only boot.
-5. **Injects the webhook CA bundle** into the `MutatingWebhookConfiguration`
-   (server-side; the manager is not touched).
+3. **Creates the namespace and credential Secrets** from `.env`, one per provider,
+   before deploying — so the manager boots already-configured. A Secret is created
+   only when *all* its required keys are set; a provider with blank keys is skipped.
+4. **Deploys** CRDs + the manager (`make deploy IMG=…`).
+
+There is no webhook-cert step and no CA-bundle injection step — the manager does both
+itself at startup (see [Webhook TLS](#webhook-tls-no-cert-manager)).
 
 ---
 
@@ -216,3 +188,24 @@ A pool referencing an unregistered provider shows it plainly:
 kubectl get nodepool <name> -o jsonpath='{.status.conditions}'
 # Ready=False / UnknownProvider means that provider's creds are missing or wrong.
 ```
+
+---
+
+## Smoke test
+
+The checks above only prove the manager is healthy. To confirm a provider can
+actually launch — **this starts a real GPU instance and costs money**:
+
+```bash
+kubectl apply -f config/samples/nodepool.yaml
+kubectl apply -f config/samples/sandbox.yaml
+
+kubectl get sandbox sample -w      # Pending → Initializing → Ready
+kubectl describe sandbox sample    # events name the provider, region and instance type
+
+kubectl delete -f config/samples/sandbox.yaml   # terminates the instance
+```
+
+Both samples are commented with what the fields mean and which accelerator shapes
+actually resolve. If the box never reaches Ready, check your provider GPU quota
+(on a new AWS account it is often 0, and On-Demand and Spot are separate limits).
