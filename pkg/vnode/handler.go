@@ -175,24 +175,13 @@ var (
 	_ vknode.PodNotifier         = (*Handler)(nil)
 )
 
-// claimName derives a stable instance identity from the Pod. The Pod is the
-// source of truth, so the claim — which providers encode into the instance
-// name/tag for tag-less recovery — must be a deterministic function of it.
-// namespace/name is stable across reconciles; the instance is always torn down
-// on DeletePod, so name reuse after deletion is not a concern. It delegates to
-// util.ClaimName so the vnode handler and the NodeClaim teardown backstop
-// produce identical tokens.
-func claimName(pod *corev1.Pod) string {
-	return util.ClaimName(pod.Namespace, pod.Name)
-}
-
 func key(namespace, name string) string { return namespace + "/" + name }
 
 // CreatePod provisions an external instance for the Pod through the provider.
 // The Pod carries the whole workload shape; the only out-of-band input, the
 // optimizer's capacity tier, rides on CapacityTypeAnnotation.
 func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
-	claim := claimName(pod)
+	claim := util.ClaimName(pod.Namespace, pod.Name)
 	req := provider.ProvisionRequest{
 		ClaimName:    claim,
 		CapacityType: nebulav1alpha1.CapacityType(pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation]),

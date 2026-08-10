@@ -17,7 +17,7 @@ spec:
     - eu-west-1
     - ca-central-1
     - sa-east-1
-  # - name: modal
+  - name: modal
   # - name: runpod
   # Outer axis: try OnDemand on every provider first, fall back to Spot.
   capacityTypes:
