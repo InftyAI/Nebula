@@ -246,8 +246,9 @@ spec:
                 additionalProperties:
                   format: int32
                   type: integer
-                description: Placed counts running instances per provider, for at-a-glance
-                  balance.
+                description: |-
+                  Placed counts existing instances per provider (booting included), for
+                  at-a-glance balance.
                 type: object
             type: object
         type: object

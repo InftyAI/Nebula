@@ -233,11 +233,14 @@ func TestReconcile_PendingPodDoesNotMarkBound(t *testing.T) {
 	}
 }
 
-func TestReconcile_InitializingPodMarksInitializing(t *testing.T) {
-	// A served Pod that is Pending with reason Initializing (instance exists and is
-	// booting, e.g. EC2 running but <2/2 checks) must move the claim to the distinct
-	// Initializing phase — NOT Provisioning (which means still allocating) and NOT
-	// Bound (the guard is earned only when running).
+func TestReconcile_BootingPodEarnsBound(t *testing.T) {
+	// A served Pod that is Pending with reason Initializing means the instance EXISTS
+	// and is booting (e.g. EC2 running but <2/2 checks, or a Modal sandbox whose
+	// readiness probe has not passed). vnode stamps that reason only for an instance
+	// it observed in the provider's List, so it is positive evidence of existence —
+	// and existence, not readiness, is what the claim tracks. It must earn Bound: the
+	// box is real and billable, so if its Pod later vanishes it has to be reclaimed
+	// immediately rather than waiting out the grace window.
 	pod := newPod("p1", "default", "uid-1", corev1.PodPending)
 	pod.Status.Reason = podReasonInitializing
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
@@ -250,11 +253,35 @@ func TestReconcile_InitializingPodMarksInitializing(t *testing.T) {
 	reconcileClaim(t, r, "c1")
 
 	got := getClaim(t, c, "c1")
-	if got.Status.Phase != nebulav1alpha1.NodeClaimInitializing {
-		t.Fatalf("expected phase Initializing, got %q", got.Status.Phase)
+	if got.Status.Phase != nebulav1alpha1.NodeClaimBound {
+		t.Fatalf("expected phase Bound for a booting instance, got %q", got.Status.Phase)
 	}
 	if got.Status.InstanceID != "inst-1" {
 		t.Fatalf("expected instance id captured, got %q", got.Status.InstanceID)
+	}
+}
+
+func TestReconcile_BootingPodGoneIsTornDownWithoutGrace(t *testing.T) {
+	// The point of the change: a claim whose instance was confirmed to exist while
+	// still BOOTING, and whose Pod then disappears, must self-delete immediately so
+	// the finalizer reclaims the instance. Previously such a claim sat at
+	// Initializing, which did not earn the guard, so a real billable GPU box was left
+	// running behind the cache-lag grace window.
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Status.Phase = nebulav1alpha1.NodeClaimBound // earned while booting
+	prov := &fakeProvider{
+		name: "fake",
+		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
+	}
+	// No Pod object: the served Pod is gone.
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	got := &nebulav1alpha1.NodeClaim{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "c1"}, got)
+	if err == nil && got.DeletionTimestamp.IsZero() {
+		t.Fatal("expected the claim to be deleted (no grace) once its instance was known to exist")
 	}
 }
 

@@ -318,22 +318,116 @@ func TestOfferings(t *testing.T) {
 }
 
 func TestToState(t *testing.T) {
-	// The status→state mapping is load-bearing. observe emits only "running"/
-	// "ready" (live), "terminated" (exited), or "" (Poll errored); everything else,
-	// including the empty string, must map to Pending so the poll loop keeps
-	// watching rather than declaring a premature terminal state.
+	// The status→state mapping is load-bearing. observe emits "running" (live AND
+	// ready), "initializing" (live but the readiness probe has not passed),
+	// "terminated" (exited), or "" (Poll errored); everything else, including the
+	// empty string, must map to Pending so the poll loop keeps watching rather than
+	// declaring a premature terminal state.
 	cases := map[string]provider.InstanceState{
-		"running":    provider.InstanceRunning,
-		"ready":      provider.InstanceRunning,
-		"pending":    provider.InstancePending,
-		"":           provider.InstancePending, // Poll errored, status left unset
-		"terminated": provider.InstanceTerminated,
-		"weird-new":  provider.InstancePending, // unknown => keep watching, not terminal
+		"running": provider.InstanceRunning,
+		// The whole point of the readiness work: a live-but-not-ready sandbox must NOT
+		// reach Running, or the Pod (and its Deployment's ready count) advances while
+		// the box is still queued/pulling/booting.
+		"initializing": provider.InstancePending,
+		"pending":      provider.InstancePending,
+		"":             provider.InstancePending, // Poll errored, status left unset
+		"terminated":   provider.InstanceTerminated,
+		// A sandbox that exited nonzero — crashed, or never came up (INIT_FAILURE).
+		// Must NOT read as terminated: "gone" looks like a clean teardown and hides
+		// the failure.
+		"failed":    provider.InstanceFailed,
+		"weird-new": provider.InstancePending, // unknown => keep watching, not terminal
 	}
 	for in, want := range cases {
 		if got := toState(in); got != want {
 			t.Fatalf("toState(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestExitStatus pins the exit-code classification. Poll collapses eight
+// control-plane statuses into one int (see exitStatus), so this split is inference
+// and its direction matters: only a clean exit and the two codes Modal SUBSTITUTES
+// for a non-exit outcome are "gone"; any other nonzero exit is a real failure.
+func TestExitStatus(t *testing.T) {
+	cases := map[int]string{
+		0:   statusTerminated, // ran to completion
+		137: statusTerminated, // Modal terminated it (our Terminate, or Modal's)
+		124: statusTerminated, // sandbox Timeout elapsed
+		1:   statusFailed,     // the workload crashed
+		2:   statusFailed,
+		127: statusFailed, // command not found
+		// The case this whole split exists for: a sandbox that never started (bad
+		// image, no GPU available, OOM at init) must surface as failed, not gone.
+		139: statusFailed,
+	}
+	for code, want := range cases {
+		if got := exitStatus(code); got != want {
+			t.Fatalf("exitStatus(%d) = %q, want %q", code, got, want)
+		}
+	}
+}
+
+// TestToInstance_ReadinessGatesRunning pins the end-to-end consequence through the
+// public surface: only a "running" sandbox becomes InstanceRunning, which is what
+// applyState turns into PodRunning + Ready=True.
+func TestToInstance_ReadinessGatesRunning(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	cases := []struct {
+		status string
+		want   provider.InstanceState
+	}{
+		{statusRunning, provider.InstanceRunning},
+		{statusInitializing, provider.InstancePending},
+		{statusTerminated, provider.InstanceTerminated},
+	}
+	for _, tc := range cases {
+		got := p.toInstance(Sandbox{ID: "sb-1", Status: tc.status})
+		if got.State != tc.want {
+			t.Errorf("toInstance(status=%q).State = %q, want %q", tc.status, got.State, tc.want)
+		}
+	}
+}
+
+// TestProvision_ProbeTagStampedOnlyWithProbe: the tag is how observe recovers
+// probe-ness after a restart (it cannot be re-derived — see ProbeTagKey), so it
+// must be present exactly when the Pod carries a readinessProbe. Stamping it on a
+// probe-less sandbox would make observe call WaitUntilReady, which errors on one.
+func TestProvision_ProbeTagStampedOnlyWithProbe(t *testing.T) {
+	probe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{Command: []string{"true"}},
+		},
+	}
+	for _, tc := range []struct {
+		name  string
+		probe *corev1.Probe
+		want  bool
+	}{
+		{"with probe", probe, true},
+		{"without probe", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeClient{createID: "sb-1"}
+			p := newTestProvider(f)
+			pod := gpuPod("claim-a", "H100", 1)
+			pod.Spec.Containers[0].ReadinessProbe = tc.probe
+
+			if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			_, present := f.lastSpec.Tags[ProbeTagKey]
+			if present != tc.want {
+				t.Errorf("%s tag present = %v, want %v (tags=%v)", ProbeTagKey, present, tc.want, f.lastSpec.Tags)
+			}
+			if tc.want && f.lastSpec.Tags[ProbeTagKey] != probeTagValue {
+				t.Errorf("%s = %q, want %q", ProbeTagKey, f.lastSpec.Tags[ProbeTagKey], probeTagValue)
+			}
+			// Identity must survive alongside it.
+			if f.lastSpec.Tags[ClaimTagKey] != "claim-a" {
+				t.Errorf("%s = %q, want claim-a", ClaimTagKey, f.lastSpec.Tags[ClaimTagKey])
+			}
+		})
 	}
 }
 

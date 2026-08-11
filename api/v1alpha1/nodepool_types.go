@@ -167,7 +167,8 @@ const (
 
 // NodePoolStatus surfaces the current placement picture for observability.
 type NodePoolStatus struct {
-	// Placed counts running instances per provider, for at-a-glance balance.
+	// Placed counts existing instances per provider (booting included), for
+	// at-a-glance balance.
 	// +optional
 	Placed map[string]int32 `json:"placed,omitempty"`
 

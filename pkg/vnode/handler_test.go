@@ -55,12 +55,21 @@ type fakeProvider struct {
 	classifyScope  provider.BlockScope
 	classifyAccel  string
 	classifyRegion string
+	// provisionHook runs inside Provision, before it returns, so a test can observe
+	// the status the handler published for the window in which the provider call is
+	// still in flight.
+	provisionHook func()
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
 func (f *fakeProvider) Capabilities() provider.Capabilities { return f.capabilities }
 
 func (f *fakeProvider) Provision(_ context.Context, _ *corev1.Pod, req provider.ProvisionRequest) (string, error) {
+	// Outside the lock: the hook reads Handler state, and holding f.mu here would
+	// deadlock a hook that touches the provider.
+	if f.provisionHook != nil {
+		f.provisionHook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.provisionCnt++
@@ -416,21 +425,102 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 	}
 }
 
+// The two reasons at phase Pending mean different things — "no instance exists
+// yet" versus "it exists and is not yet ready" — so each has to be reported in
+// its own window. Provisioning is only true while the provider call is in flight,
+// and Initializing must be published the moment the call returns an id, because
+// the NodeClaim reads that reason as its proof that a billable instance exists.
+func TestCreatePod_ProvisioningWhileInFlightThenInitializing(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil)
+
+	var mu sync.Mutex
+	var emitted []string
+	h.NotifyPods(context.Background(), func(p *corev1.Pod) {
+		mu.Lock()
+		emitted = append(emitted, string(p.Status.Phase)+"/"+p.Status.Reason)
+		mu.Unlock()
+	})
+
+	fp.provisionHook = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(emitted) != 1 || emitted[0] != string(corev1.PodPending)+"/"+reasonProvisioning {
+			t.Errorf("while Provision is in flight, expected a single %q emit, got %v",
+				reasonProvisioning, emitted)
+		}
+	}
+
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	// The instance now exists, so the reason must ALREADY have advanced — waiting for
+	// the first poll tick would hold the claim at Provisioning (and so behind the
+	// placement grace period) while the instance bills.
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodPending {
+		t.Fatalf("expected phase Pending, got %q", got.Status.Phase)
+	}
+	if got.Status.Reason != reasonInitializing {
+		t.Fatalf("after Provision returned, expected reason %q, got %q", reasonInitializing, got.Status.Reason)
+	}
+}
+
+// A Pod must NOT be tracked while its Provision call is still in flight. The poll
+// loop maps a tracked pod that is absent from List() to Terminated, and in that
+// window it is legitimately absent — so tracking it early lets a concurrent tick
+// write Failed/Terminated over a provision that goes on to succeed. Pod phases are
+// terminal-sticky and the claim reclaims on that phase, so the write is
+// unrecoverable: the instance is provisioned and then immediately torn down.
+func TestCreatePod_PollTickDuringProvisionDoesNotTerminate(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil)
+
+	var mu sync.Mutex
+	var emitted []string
+	h.NotifyPods(context.Background(), func(p *corev1.Pod) {
+		mu.Lock()
+		emitted = append(emitted, string(p.Status.Phase)+"/"+p.Status.Reason)
+		mu.Unlock()
+	})
+
+	// A tick lands mid-provision, when the provider genuinely has no instance yet.
+	fp.provisionHook = func() { h.reconcileOnce(context.Background()) }
+
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range emitted {
+		if s == string(corev1.PodFailed)+"/"+reasonTerminated {
+			t.Fatalf("a poll tick during Provision reported the pod Terminated: %v", emitted)
+		}
+	}
+	if got, _ := h.GetPod(context.Background(), "default", "p1"); got.Status.Reason != reasonInitializing {
+		t.Fatalf("expected %q after a successful provision, got %q", reasonInitializing, got.Status.Reason)
+	}
+}
+
 func TestReconcileOnce_NotifiesOnProvisioningToInitializing(t *testing.T) {
-	// The Pod starts at "Provisioning" (phase Pending), and the instance comes up
-	// but has not yet passed its readiness checks => InstancePending, which maps to
-	// the "Initializing" reason at the SAME phase (Pending). A phase-only change
-	// check would swallow this and strand the Pod on the stale "Provisioning"
-	// reason; the reason must move and a notification must fire.
+	// The instance comes up but has not yet passed its readiness checks =>
+	// InstancePending, which maps to the "Initializing" reason at phase Pending. The
+	// Pod is already Initializing when CreatePod returns, so what this pins is the
+	// notification: a phase-only change check would swallow a same-phase reason move
+	// and strand the Pod on a stale reason.
 	fp := &fakeProvider{provisionID: "inst-1"}
 	h := NewHandler(fp, nil, nil)
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
-	// Sanity: CreatePod left it at the Provisioning reason (still Pending).
-	if got, _ := h.GetPod(context.Background(), "default", "p1"); got.Status.Reason != reasonProvisioning {
-		t.Fatalf("precondition: expected %q, got %q", reasonProvisioning, got.Status.Reason)
-	}
+	// Force the stale reason back on, so the tick below has a change to report.
+	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "allocating external instance")
+	h.store(pod, "default-p1", "inst-1")
 
 	var mu sync.Mutex
 	var notified []*corev1.Pod

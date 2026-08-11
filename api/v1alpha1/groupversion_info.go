@@ -150,3 +150,48 @@ const (
 	// VK liveness (see docs/architecture.md §3).
 	TerminateInstanceFinalizer = "nebula.inftyai.com/terminate-instance"
 )
+
+// Pod status reasons the virtual kubelet stamps on the Pods it reports, projecting
+// the external instance's lifecycle onto standard Pod status (pkg/vnode/status.go
+// is the only writer).
+//
+// They live here, not privately in pkg/vnode, for two reasons. They are a CONTRACT
+// between packages: the Pod phase is lossy — Provisioning and "booting" both
+// surface as PodPending — so the reason is the only thing separating "no instance
+// exists yet" from "an instance exists and is coming up", and the NodeClaim
+// controller keys its teardown guard off exactly that distinction (see
+// desiredPhase). A rename on the writing side that the reading side did not follow
+// would still compile, still pass tests, and silently leak paid instances: every
+// booting instance would read as Provisioning, so a Pod that vanished mid-boot
+// would be left running behind the cache-lag grace window. And they are user-facing
+// — operators match on status.reason in jsonpath and alerts — so every value is
+// public API whether or not Nebula's own code currently reads it. That is why the
+// whole set is here rather than the subset with in-tree readers: these are the
+// values status.reason can take, and a reader should find them in one place.
+const (
+	// PodReasonProvisioning: a provider Provision call has been issued but the
+	// instance does not yet exist — we are still allocating it (e.g. EC2
+	// RunInstances in flight). Set on CreatePod, before the first poll observes
+	// the instance.
+	PodReasonProvisioning = "Provisioning"
+	// PodReasonInitializing: the instance EXISTS at the provider but is not yet
+	// reachable — it is booting (EC2 "pending"), running-but-not-yet-passing its
+	// reachability checks (running, <2/2, EC2's own "Initializing" status), or a Modal
+	// sandbox whose readiness probe has not passed. It mirrors that EC2 status-check
+	// term. Provisioning is done; the instance is coming up. Distinct from
+	// Provisioning so a Pod stuck here points at a slow boot / failing status checks,
+	// not a stuck allocation — and so the NodeClaim controller can tell that an
+	// instance exists. The virtual kubelet stamps it only for an instance it observed
+	// in the provider's List, which is what makes it trustworthy as that evidence.
+	PodReasonInitializing = "Initializing"
+	// PodReasonRunning: the provider reports the instance running.
+	PodReasonRunning = "Running"
+	// PodReasonProvisionFailed: the provider rejected or failed the Provision call.
+	PodReasonProvisionFailed = "ProvisionFailed"
+	// PodReasonFailed: the provider reports the instance in a failed state.
+	PodReasonFailed = "Failed"
+	// PodReasonTerminated: the instance is gone from the provider (torn down,
+	// reclaimed, or exited). Disappearance alone does not say WHY, so this is the
+	// neutral term rather than "Preempted".
+	PodReasonTerminated = "Terminated"
+)

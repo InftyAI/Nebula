@@ -22,36 +22,24 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
-// Pod status reasons the virtual node stamps on the Pod it reports. The Pod is
-// the source of truth for the external instance's runtime state (the NodeClaim
-// is a passive ledger and does not mirror this), so these live here in the
-// vnode, not on the API type.
+// Pod status reasons the virtual node stamps on the Pod it reports. The Pod is the
+// source of truth for the external instance's runtime state (the NodeClaim is a
+// passive ledger and does not mirror it), and this package is the only writer — but
+// the reason strings themselves are a shared contract (the NodeClaim controller
+// reads them, and operators match on them), so they are declared once in
+// api/v1alpha1 rather than privately here. See the const block there for what each
+// value means and why the set is public.
 const (
-	// reasonProvisioning: a provider Provision call has been issued but the
-	// instance does not yet exist — we are still allocating it (e.g. EC2
-	// RunInstances in flight). Set on CreatePod, before the first poll observes
-	// the instance.
-	reasonProvisioning = "Provisioning"
-	// reasonInitializing: the instance EXISTS at the provider but is not yet
-	// reachable — it is booting (EC2 "pending") or running-but-not-yet-passing its
-	// reachability checks (running, <2/2, EC2's own "Initializing" status). It
-	// mirrors that EC2 status-check term. Provisioning is done; the instance is
-	// coming up. Distinct from Provisioning so a Pod stuck here points at a slow
-	// boot / failing status checks, not a stuck allocation.
-	reasonInitializing = "Initializing"
-	// reasonRunning: the provider reports the instance running.
-	reasonRunning = "Running"
-	// reasonProvisionFailed: the provider rejected or failed the Provision call.
-	reasonProvisionFailed = "ProvisionFailed"
-	// reasonFailed: the provider reports the instance in a failed state.
-	reasonFailed = "Failed"
-	// reasonTerminated: the instance is gone from the provider (torn down,
-	// reclaimed, or exited). Disappearance alone does not say WHY, so this is the
-	// neutral term rather than "Preempted".
-	reasonTerminated = "Terminated"
+	reasonProvisioning    = nebulav1alpha1.PodReasonProvisioning
+	reasonInitializing    = nebulav1alpha1.PodReasonInitializing
+	reasonRunning         = nebulav1alpha1.PodReasonRunning
+	reasonProvisionFailed = nebulav1alpha1.PodReasonProvisionFailed
+	reasonFailed          = nebulav1alpha1.PodReasonFailed
+	reasonTerminated      = nebulav1alpha1.PodReasonTerminated
 )
 
 // applyState maps a provider Instance state onto the Pod status the virtual node
@@ -64,10 +52,16 @@ const (
 //	Terminated -> PodFailed (instance gone: torn down or reclaimed out-of-band)
 //
 // Running already means "reachable": a provider only reports InstanceRunning once
-// the instance has passed its readiness bar (for AWS, the 2/2 EC2 status checks —
-// see toState), so reaching Running is the point at which the Pod is both Running
-// and Ready. Ready is the condition Kubernetes counts toward a Deployment's ready
-// replicas.
+// the instance has passed its readiness bar — for AWS the 2/2 EC2 status checks,
+// for Modal its readiness probe when the sandbox was created with one (see each
+// adapter's toState). So reaching Running is the point at which the Pod is both
+// Running and Ready. Ready is the condition Kubernetes counts toward a
+// Deployment's ready replicas, which is why holding it back until the instance is
+// genuinely reachable matters.
+//
+// The bar is only as good as the provider's signal: a Modal sandbox created
+// WITHOUT a readiness probe has no observable readiness at all, so it reaches
+// Running as soon as its process is live.
 func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, now metav1.Time) {
 	switch state {
 	case provider.InstanceRunning:
