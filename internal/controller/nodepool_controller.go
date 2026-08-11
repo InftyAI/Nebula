@@ -124,10 +124,12 @@ func (r *NodePoolReconciler) validate(pool *nebulav1alpha1.NodePool) (reason, ms
 // live placement picture — so it is fully recomputed each reconcile rather than
 // incremented, which keeps it correct after missed events.
 //
-// "Placed" is a claim whose served Pod has been observed (phase Bound). The
-// claim no longer mirrors the Pod's finer runtime status (the Pod is the source
-// of truth for that), so Bound is the claim-level signal that an instance is
-// live for the workload.
+// "Placed" is a claim with an instance at the provider (phase Bound). That counts
+// a BOOTING instance as placed, which is the intent: this is a capacity picture,
+// and an instance still coming up already occupies quota and already bills. The
+// claim does not mirror the Pod's finer runtime status (the Pod is the source of
+// truth for readiness), so Bound is the claim-level signal that an instance exists
+// for the workload.
 func (r *NodePoolReconciler) refreshPlaced(ctx context.Context, pool *nebulav1alpha1.NodePool) error {
 	var claims nebulav1alpha1.NodeClaimList
 	if err := r.List(ctx, &claims); err != nil {

@@ -11,7 +11,9 @@ seam is meant to support more backends, but this document describes the
 implementation that is in the repository today. Planned or partial work is
 called out in
 [Current implementation status](#current-implementation-status). For deployment
-and credential setup, see [docs/deploy.md](deploy.md).
+and credential setup, see [docs/deploy.md](deploy.md); for how an instance's
+lifecycle becomes Pod and NodeClaim status (including each provider's own status
+mapping), see [docs/status.md](status.md).
 
 - [Goals and Non-Goals](#goals-and-non-goals)
 - [System Overview](#system-overview)
@@ -236,6 +238,10 @@ Important details:
 - NodeClaim does not mirror logs, restarts, container state, or fine-grained
   runtime health. Those belong on the Pod.
 
+The full mapping — Pod phase/reason and the claim phase each produces, plus each
+provider's own status vocabulary and the limits of what is observable — lives in
+[docs/status.md](status.md).
+
 ---
 
 ## Components
@@ -330,8 +336,8 @@ Reconcile behavior:
 
 - add the terminate finalizer before doing anything else;
 - fetch the served Pod by namespace/name and UID;
-- set coarse phase from the served Pod: `Provisioning`, `Initializing`, `Bound`,
-  `Terminating`, or `Terminated`;
+- set coarse phase from the served Pod: `Provisioning`, `Bound`, `Terminating`, or
+  `Terminated`;
 - best-effort record `status.instanceID` by matching the provider instance by
   claim name;
 - when a previously observed Pod disappears, delete the claim so the finalizer
@@ -496,9 +502,9 @@ status:
   instanceID: i-0123456789abcdef0
 ```
 
-Valid phases are `Provisioning`, `Initializing`, `Bound`, `Terminating`, and
-`Terminated`. The claim deliberately does not duplicate PodSpec and does not
-mirror fine-grained runtime status.
+Valid phases are `Provisioning`, `Bound`, `Terminating`, and `Terminated`. The
+claim deliberately does not duplicate PodSpec and does not mirror fine-grained
+runtime status — `Bound` answers existence, not readiness.
 
 ### Sandbox and SandboxSet
 

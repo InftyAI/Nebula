@@ -48,18 +48,18 @@ import (
 // exists at the API server by the time this claim reconciles — only cache
 // propagation, not Pod creation, is being waited on. A Pod watch re-enqueues the
 // claim the moment the cache catches up, so this is just the backstop for a
-// missed event; seconds are plenty. Once the Pod has been observed running
+// missed event; seconds are plenty. Once an instance has been confirmed to exist
 // (Phase set to Bound) a later disappearance is trusted immediately — no grace —
 // because we KNOW the Pod existed and is now gone.
 const placementGracePeriod = 15 * time.Second
 
 // podReasonInitializing is the Pod status.Reason the virtual node stamps while the
-// external instance exists but is not yet reachable (see pkg/vnode/status.go
-// reasonInitializing). The claim keys off it to distinguish Initializing from
-// Provisioning, since both share the Pending phase. Kept in sync with vnode's
-// value by hand — it is a stable, user-facing reason string, not worth an exported
-// package coupling.
-const podReasonInitializing = "Initializing"
+// external instance EXISTS but is not yet reachable. It is the claim's evidence of
+// existence for a Pod that is still Pending: Provisioning and "booting" share the
+// Pending phase, and only the reason separates them — so this must be the SAME
+// string the virtual node writes, which is why it aliases the shared API constant
+// rather than repeating the literal.
+const podReasonInitializing = nebulav1alpha1.PodReasonInitializing
 
 // NodeClaimReconciler reconciles a NodeClaim object.
 //
@@ -134,10 +134,10 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if pod != nil {
 		// The workload is present. We do not mirror the Pod's fine-grained runtime
 		// status, but we DO reflect the coarse phase that matters to the ledger.
-		// desiredPhase maps the served Pod onto the claim phase (Terminated / Bound /
-		// Initializing / Provisioning); markPhase persists it (and the instance id)
-		// idempotently. An empty desiredPhase means "hold the current phase, just keep
-		// the id fresh" — the Bound-flap guard (see desiredPhase).
+		// desiredPhase maps the served Pod onto the claim phase (Terminated /
+		// Terminating / Bound / Provisioning); markPhase persists it (and the instance
+		// id) idempotently. An empty desiredPhase means "hold the current phase, just
+		// keep the id fresh" — the Bound hold (see desiredPhase).
 		return ctrl.Result{}, r.markPhase(ctx, &nc, r.desiredPhase(&nc, pod))
 	}
 
@@ -286,15 +286,19 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 //     Bound (or Provisioning) Pod that starts deleting is not stranded on its prior
 //     phase. Terminal wins over it: an already-gone instance is Terminated, not
 //     merely terminating.
-//   - Bound already => "" (hold). Bound is the durable teardown guard, and a
-//     transient Running->Pending flap (e.g. a status-check blip) must NOT strip it
-//     — losing it would make a later disappearance read as cache lag and skip
-//     teardown. Returning "" holds the phase while markPhase still refreshes the id.
-//   - Running => Bound. The instance is confirmed up; earn the guard.
-//   - Pending with reason Initializing => Initializing (instance exists, booting).
-//   - Otherwise => Provisioning (still allocating; instance does not exist yet).
-//
-// Neither Initializing nor Provisioning earns the Bound guard.
+//   - Bound already => "" (hold). Bound is the durable teardown guard, and it must
+//     never be stripped: losing it would make a later disappearance read as cache
+//     lag and skip teardown of a live instance. Returning "" holds the phase while
+//     markPhase still refreshes the id.
+//   - An instance EXISTS => Bound. Two Pod shapes prove existence, and the claim
+//     treats them identically because its question is existence, not readiness:
+//     Running (up and past its readiness bar) and Pending/Initializing (created and
+//     booting — vnode stamps that reason only for an instance it observed in the
+//     provider's List). A booting GPU box is just as real, and just as billable, as
+//     a serving one; if its Pod vanishes it must be reclaimed with no grace.
+//   - Otherwise => Provisioning. The instance does not exist yet (the Provision
+//     call may still be in flight), so a vanished Pod may be cache lag and the
+//     grace window applies.
 func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) nebulav1alpha1.NodeClaimPhase {
 	switch {
 	case isTerminal(pod.Status.Phase):
@@ -303,10 +307,9 @@ func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *co
 		return nebulav1alpha1.NodeClaimTerminating
 	case r.wasBound(nc):
 		return "" // hold Bound (or Terminated); never downgrade
-	case pod.Status.Phase == corev1.PodRunning:
+	case pod.Status.Phase == corev1.PodRunning,
+		pod.Status.Reason == podReasonInitializing:
 		return nebulav1alpha1.NodeClaimBound
-	case pod.Status.Reason == podReasonInitializing:
-		return nebulav1alpha1.NodeClaimInitializing
 	default:
 		return nebulav1alpha1.NodeClaimProvisioning
 	}
@@ -355,8 +358,9 @@ func (r *NodeClaimReconciler) recordInstanceID(ctx context.Context, nc *nebulav1
 	return true
 }
 
-// wasBound reports whether the served Pod has ever been observed running for this
-// claim. A Terminated claim was necessarily Bound first, so it also counts.
+// wasBound reports whether an external instance has ever been confirmed to exist
+// for this claim — the fact the teardown backstop keys off. A Terminated claim was
+// necessarily Bound first, so it also counts.
 func (r *NodeClaimReconciler) wasBound(nc *nebulav1alpha1.NodeClaim) bool {
 	return nc.Status.Phase == nebulav1alpha1.NodeClaimBound ||
 		nc.Status.Phase == nebulav1alpha1.NodeClaimTerminated

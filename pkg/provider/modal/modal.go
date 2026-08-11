@@ -111,8 +111,8 @@ type SandboxSpec struct {
 	// ReadinessProbe, when non-nil, is the Pod's first-container readinessProbe
 	// carried through so the Client can configure Modal's own readiness probe at
 	// create time. Modal enforces the probe internally (it gates its own traffic
-	// routing on it); Nebula does not read the result back — observe reports status
-	// from the cheap point-in-time Poll signal and never blocks on WaitUntilReady.
+	// routing on it), and observe reads the result back so a live-but-not-yet-ready
+	// sandbox is reported statusInitializing rather than statusRunning.
 	// We only ever pass a user-supplied probe; the adapter never fabricates one.
 	ReadinessProbe *corev1.Probe
 }
@@ -129,6 +129,31 @@ type Sandbox struct {
 // List/Get can recover Nebula identity. Modal supports native tags, so no
 // name-encoding hack is needed.
 const ClaimTagKey = "nebula.inftyai.com/claim"
+
+// ProbeTagKey records that a sandbox was created WITH a readiness probe;
+// probeTagValue is the only value it is ever set to.
+//
+// Nebula has to carry this fact itself. observe needs it to tell "no probe, so
+// there is nothing to wait for" from "the probe has not passed yet" — and
+// WaitUntilReady errors on the former, so it cannot simply be attempted. The Pod
+// cannot answer it either: the read path (Provider.List) takes no Pod, and the
+// Pod that GetPod synthesizes when re-adopting after a VK restart carries only a
+// namespace and name, hence no spec and no readinessProbe.
+//
+// Modal's control plane does return it (SandboxInfo.ReadinessProbe, next to a
+// ReadyAt stamp), but the Go SDK builds its *Sandbox from a list response with
+// info.GetId() alone and keeps the control-plane client private, so neither field
+// is reachable through the public API. If a future SDK exposes SandboxInfo, this
+// tag and the WaitUntilReady call in observe both become unnecessary.
+//
+// A tag is the right carrier: observe already fetches tags before it reads status
+// (so the gate costs no extra call), and tags live with the sandbox at Modal, so
+// probe-ness is recovered exactly the way identity is — even for a sandbox this
+// process never created.
+const (
+	ProbeTagKey   = "nebula.inftyai.com/readiness-probe"
+	probeTagValue = "true"
+)
 
 // Provider is the Modal implementation of provider.Provider. It embeds
 // catalog.Base for the generic catalog methods (Name, Offerings, and the
@@ -269,6 +294,17 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		}
 	}
 
+	tags := map[string]string{ClaimTagKey: req.ClaimName}
+	// Record probe-ness alongside identity so observe can recover it later; see
+	// ProbeTagKey for why this cannot be re-derived at observation time. The tag
+	// tracks whether Modal will actually RECEIVE a probe, not merely whether the Pod
+	// declares one — planProbe drops shapes Modal cannot express (a named port, an
+	// unsupported handler), and tagging those would claim a readiness signal that
+	// does not exist.
+	if _, ok := planProbe(c.ReadinessProbe); ok {
+		tags[ProbeTagKey] = probeTagValue
+	}
+
 	spec := SandboxSpec{
 		Image:          c.Image,
 		Command:        append(append([]string{}, c.Command...), c.Args...),
@@ -277,7 +313,7 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		MemoryMiB:      memoryMiB(&c),
 		Ports:          containerPorts(&c),
 		Timeout:        sandboxTimeout(pod),
-		Tags:           map[string]string{ClaimTagKey: req.ClaimName},
+		Tags:           tags,
 		ReadinessProbe: c.ReadinessProbe,
 	}
 
@@ -373,26 +409,52 @@ func (p *Provider) toInstance(sb Sandbox) provider.Instance {
 	}
 }
 
-// Sandbox status strings observe produces (and toState consumes). observe
-// derives status from Poll, so it only ever emits statusRunning (live) or
-// statusTerminated (process exited); an unset status ("") means Poll errored.
+// Sandbox status strings observe produces (and toState consumes). An unset
+// status ("") means Poll errored.
 const (
-	statusRunning    = "running"
+	// statusRunning: the sandbox process is live AND, when a readiness probe is
+	// configured, that probe has passed.
+	statusRunning = "running"
+	// statusInitializing: the process is live but its readiness probe has not
+	// passed yet — the sandbox is queued, pulling its image, attaching a GPU, or
+	// booting. Only ever produced for a sandbox carrying ProbeTagKey, since Modal
+	// has no readiness signal without a probe.
+	statusInitializing = "initializing"
+	// statusTerminated: the process exited in a way that is NOT a failure — it ran
+	// to completion (exit 0), or Modal reclaimed it (our own Terminate, a sandbox
+	// timeout). "Gone", with no claim about why.
 	statusTerminated = "terminated"
+	// statusFailed: the process exited nonzero — it crashed, or never came up at
+	// all (a bad image, an unavailable GPU, an OOM at init: Modal's INIT_FAILURE).
+	// Distinct from terminated because "it failed" and "it is gone" are different
+	// facts to put in front of an operator: a sandbox that never started reported as
+	// terminated reads like a clean teardown, which is the opposite of what happened.
+	statusFailed = "failed"
 )
 
 // toState maps the status strings observe produces to the provider-agnostic
-// lifecycle state. observe emits only statusRunning (live) or statusTerminated
-// (process exited); "ready" is also accepted as a live synonym. Anything else —
-// including the empty string observe leaves when Poll itself errors — maps to
-// Pending, so the poll loop keeps watching rather than declaring a premature
-// terminal state.
+// lifecycle state.
+//
+// A live sandbox is only reported Running once its readiness probe has passed.
+// Modal's cheap Poll signal cannot see readiness at all — it answers "has the
+// process exited?", so a sandbox that is still scheduling reads exactly like one
+// that is serving — and reporting Running that early advances the Pod, and the
+// owning Deployment's ready replicas, before the box can be reached. This mirrors
+// the AWS adapter holding a running-but-unchecked instance at Pending until its
+// 2/2 EC2 status checks clear.
+//
+// statusInitializing needs no case of its own: it falls to the default, which is
+// where every unrecognized status — including the empty string observe leaves when
+// Poll errors — maps to Pending, so the poll loop keeps watching rather than
+// declaring a premature terminal state.
 func toState(modalStatus string) provider.InstanceState {
 	switch strings.ToLower(modalStatus) {
-	case statusRunning, "ready":
+	case statusRunning:
 		return provider.InstanceRunning
 	case statusTerminated:
 		return provider.InstanceTerminated
+	case statusFailed:
+		return provider.InstanceFailed
 	default:
 		return provider.InstancePending
 	}

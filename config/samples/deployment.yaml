@@ -28,7 +28,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: nebula
 spec:
-  replicas: 2
+  replicas: 8
   selector:
     matchLabels:
       app: gpu-workload-sample
@@ -38,7 +38,7 @@ spec:
         app: gpu-workload-sample
         nebula.inftyai.com/enabled: "true"
         nebula.inftyai.com/nodepool: sample
-        nebula.inftyai.com/accelerator-type: t4
+        nebula.inftyai.com/accelerator-type: a100-80gb
     spec:
       # Do NOT set nodeName or a provider nodeSelector yourself — the placement
       # controller fills the nodeSelector in when it ungates the Pod. Setting
@@ -57,6 +57,25 @@ spec:
         # this output, read it on the PROVIDER side (the Modal dashboard or
         # `modal app logs`), not via kubectl.
         command: ["sh", "-c", "nvidia-smi --query-gpu=index,name,memory.total --format=csv || echo 'no nvidia-smi'; sleep 3600"]
+        # The readiness bar for the EXTERNAL instance. On Modal this is the only
+        # thing that lets Nebula tell "still coming up" (queued, pulling the image,
+        # attaching the GPU) from "up and serving": the cheap poll signal answers
+        # only "has the process exited?", so WITHOUT a probe the Pod — and its
+        # Deployment's ready count — goes Running the moment the sandbox is created.
+        # With one, it stays Pending/Initializing until the probe passes.
+        #
+        # An EXEC probe, because this sample serves nothing and declares no ports:
+        # tcpSocket/httpGet need a numeric port, and a named or missing one omits
+        # the probe entirely. `nvidia-smi -L` is a real bar here — it passes only
+        # once the GPU is actually attached and the driver answers.
+        #
+        # Only exec and tcpSocket reach Modal (httpGet degrades to tcpSocket on its
+        # port); periodSeconds maps to the probe interval, and the other timing
+        # fields are the kubelet's, which never runs here.
+        readinessProbe:
+          exec:
+            command: ["nvidia-smi", "-L"]
+          periodSeconds: 5
         resources:
           requests:
             cpu: "1"
@@ -65,4 +84,4 @@ spec:
             # GPU count. Standard extended resource, so the scheduler's fit check
             # and provisioning read the same number. 8 => 8x the accelerator-type
             # above.
-            nvidia.com/gpu: "1"
+            nvidia.com/gpu: "8"

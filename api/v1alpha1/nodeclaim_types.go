@@ -72,20 +72,22 @@ type PodReference struct {
 // NodeClaimPhase is the coarse, user-facing lifecycle state.
 //
 // The NodeClaim is a passive teardown ledger, not a status mirror: it does NOT
-// track finer workload runtime status (CPU/logs/restarts) — the Pod is the
-// source of truth for that (see pkg/vnode/status.go). It tracks only the coarse
-// states that matter to its own job as a ledger, keyed off the served Pod's
-// phase/reason: Provisioning (allocating — instance does not exist yet),
-// Initializing (instance exists and is booting but not yet reachable), Bound
-// (instance running — the guard the teardown backstop trusts), and Terminated
-// (instance gone). Finer states (e.g. Preempted) are deliberately absent:
-// preemption cannot be detected — the provider contract's InstanceState has no
-// Preempted value, and an absent instance only tells us it is gone, not why.
-// Reintroduce a phase only when something actually sets it.
+// track finer workload runtime status (CPU/logs/restarts/readiness) — the Pod is
+// the source of truth for that (see pkg/vnode/status.go). It tracks only the
+// coarse states that matter to its own job as a ledger, keyed off the served
+// Pod's phase/reason: Provisioning (instance does not exist yet), Bound (an
+// instance EXISTS at the provider — the guard the teardown backstop trusts), and
+// Terminated (instance gone). Finer states (e.g. Preempted) are deliberately
+// absent: preemption cannot be detected — the provider contract's InstanceState
+// has no Preempted value, and an absent instance only tells us it is gone, not
+// why. Reintroduce a phase only when something actually sets it.
 //
-// Only Bound is a teardown guard: neither Provisioning nor Initializing earns the
-// "trust a later disappearance" trust, because until the instance is confirmed up
-// an absent Pod may be cache lag rather than a real teardown.
+// The ledger's question is EXISTENCE, not readiness: what the backstop must know
+// is whether there is an instance out there to reclaim. A booting instance and a
+// serving one are equally real — equally billable, equally in need of teardown —
+// so both are Bound, and readiness is left entirely to the Pod. (This is why
+// there is no Initializing phase: it would be a readiness distinction on an
+// object that does not track readiness.)
 type NodeClaimPhase string
 
 const (
@@ -93,19 +95,24 @@ const (
 	// instance does not yet exist — provisioning is still allocating it. The claim
 	// does NOT earn the Bound teardown guard here: a Pod that vanishes while still
 	// provisioning is treated as possible cache lag (grace window), not a real
-	// teardown, because we never confirmed the instance was actually up.
+	// teardown, because we never confirmed an instance was actually created.
 	NodeClaimProvisioning NodeClaimPhase = "Provisioning"
-	// NodeClaimInitializing: the external instance EXISTS at the provider but is not
-	// yet reachable (e.g. EC2 is "pending", or "running" but its 2/2 status checks
-	// have not passed). The served Pod is Pending with reason Initializing (see
-	// pkg/vnode/status.go). Like Provisioning it does NOT earn the Bound guard — the
-	// instance is not yet confirmed up — but it is surfaced as a distinct phase so
-	// "allocating" and "booting" are distinguishable on the ledger.
-	NodeClaimInitializing NodeClaimPhase = "Initializing"
-	// NodeClaimBound: the served Pod has been observed running (present and not in
-	// a terminal phase). This is the durable guard the backstop trusts — a Bound
-	// claim whose Pod later disappears is a real teardown, not cache lag. The claim
-	// does not track finer workload status; the Pod is the source of truth for that.
+	// NOTE: there is deliberately no "Initializing" phase. It used to mean "the
+	// instance exists but is not reachable yet" and did NOT earn the teardown guard,
+	// which stranded a real, billable instance behind the grace window whenever its
+	// Pod vanished mid-boot. Existence is what the ledger tracks, so that state is
+	// now Bound; readiness lives on the Pod alone.
+	//
+	// NodeClaimBound: an external instance EXISTS at the provider for this claim.
+	// This is the durable guard the backstop trusts — a Bound claim whose Pod later
+	// disappears is a real teardown, not cache lag, so it is reclaimed immediately
+	// rather than after the grace window.
+	//
+	// Existence, NOT readiness: an instance that is booting (EC2 "pending", or
+	// running with its 2/2 status checks still pending; a Modal sandbox whose
+	// readiness probe has not passed) is Bound, because it is just as real and just
+	// as billable as one that is serving. Whether the workload is actually usable is
+	// the Pod's Ready condition, not this phase.
 	NodeClaimBound NodeClaimPhase = "Bound"
 	// NodeClaimTerminating: the served Pod is being deleted (its DeletionTimestamp
 	// is set) but the external instance may not be reclaimed yet — teardown is in

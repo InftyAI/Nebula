@@ -7,6 +7,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/InftyAI/Nebula.svg)](https://pkg.go.dev/github.com/InftyAI/Nebula)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Go Version](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)
+[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/7WTUuFqyS6)
 
 Run GPU workloads on any NeoCloud or hyperscaler through one Kubernetes API.
 
@@ -96,6 +97,8 @@ placement controller owns those.
 - See [config/samples](config/samples) for example NodePools and a runnable workload.
 - See [docs/add-a-provider.md](docs/add-a-provider.md) to add a provider backend.
 - See [docs/architecture.md](docs/architecture.md) for design details.
+- See [docs/status.md](docs/status.md) for how instance lifecycle becomes Pod and
+  NodeClaim status, per provider.
 
 ## License
 
