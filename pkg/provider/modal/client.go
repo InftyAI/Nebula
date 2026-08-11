@@ -427,7 +427,7 @@ func (c *sdkClient) observeReady(ctx context.Context, id string, tags map[string
 	c.readyMu.Unlock()
 
 	if !ready && !waiting {
-		go c.awaitReady(ctx, id)
+		go c.awaitReady(id)
 	}
 	return ready
 }
@@ -457,8 +457,8 @@ func (c *sdkClient) observeReady(ctx context.Context, id string, tags map[string
 // context.deadlineExceededError, modal.TimeoutError, modal.SandboxTimeoutError —
 // and errors.Is(grpcErr, context.DeadlineExceeded) is FALSE for the first) no
 // longer need telling apart, because none of them can promote a sandbox now.
-func (c *sdkClient) awaitReady(ctx context.Context, id string) {
-	ctx, cancel := context.WithTimeout(ctx, c.readyTimeout)
+func (c *sdkClient) awaitReady(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.readyTimeout)
 	defer cancel()
 
 	confirmed := false
