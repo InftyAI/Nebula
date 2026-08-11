@@ -382,42 +382,51 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 // EC2 id. Terminate/Get do not need the region encoded in it — they locate the
 // instance by sweeping the swept regions (the same set List covers), since a
 // wrong-region lookup is a harmless no-op (see Terminate/Get).
-func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest) (string, error) {
+// Every id this returns is RESERVED. RunInstance launches through a CreateFleet
+// *instant* request, which is synchronous: the response carries either an instance
+// id — meaning EC2 already found capacity in some (type, AZ) cell and the instance
+// is booting on real hardware — or the reason it could not launch, which becomes an
+// error driving AZ/region/tier failover. There is no queued state for an EC2
+// instance to sit in, so the reserved return is unconditionally true on success.
+func (p *Provider) Provision(
+	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
+) (string, bool, error) {
 	if pod == nil {
-		return "", errors.New("aws: nil pod")
+		return "", false, errors.New("aws: nil pod")
 	}
 	if req.ClaimName == "" {
-		return "", errors.New("aws: empty ClaimName in ProvisionRequest")
+		return "", false, errors.New("aws: empty ClaimName in ProvisionRequest")
 	}
 
 	region := req.Region
 	client, err := p.clientFor(ctx, region)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	// Idempotency: if an instance already carries this claim tag IN THIS REGION,
 	// return it rather than launching a second (guards a retry after a partial
 	// create). A claim is placed in exactly one region per attempt, so scanning the
-	// target region's client is sufficient.
+	// target region's client is sufficient. It is reserved for the same reason a
+	// fresh launch is: it only exists because some earlier instant fleet succeeded.
 	if existing, err := findByClaim(ctx, client, req.ClaimName); err != nil {
-		return "", err
+		return "", false, err
 	} else if existing != nil {
-		return existing.ID, nil
+		return existing.ID, true, nil
 	}
 
 	spec, err := p.instanceSpecFromPod(pod, req)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	// The Provision deadline is enforced generically by the vnode handler (from
 	// Capabilities.ProvisionTimeout), so RunInstance simply honors ctx as it fails
 	// over across zones — no adapter-local WithTimeout here.
 	id, err := client.RunInstance(ctx, spec)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return id, nil
+	return id, true, nil
 }
 
 // Terminate implements provider.Provider. Idempotent by the Client contract. The

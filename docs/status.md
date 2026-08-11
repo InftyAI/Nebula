@@ -38,7 +38,9 @@ teardown.
 
 | Pod phase | reason | writer | instance exists? | claim phase |
 |---|---|---|---|---|
-| `Pending` | `Provisioning` | `CreatePod` | no | `Provisioning` (grace applies) |
+| `Pending` | `Provisioning` | `CreatePod`, before `Provision` | no | `Provisioning` (grace applies) |
+| `Pending` | `Provisioning` | held, after an UNRESERVED `Provision` | yes, unreserved | `Provisioning` (grace applies) |
+| `Pending` | `Initializing` | `CreatePod`, after a RESERVED `Provision` | yes | `Bound` |
 | `Pending` | `Initializing` | `applyState` ← `InstancePending` | yes | `Bound` |
 | `Running` | `Running` | `applyState` ← `InstanceRunning` | yes | `Bound` |
 | `Failed` | `ProvisionFailed` | `CreatePod` | no | `Terminated` (via `isTerminal`) |
@@ -52,20 +54,34 @@ served Pod is ABSENT: after `Bound`/`Terminating`, the claim deletes itself and
 the terminate finalizer runs; before `Bound`, it waits `placementGracePeriod`
 first.
 
-Note the two writers. `CreatePod` writes the rows where no instance exists; every
-other non-terminal row comes from `applyState`, driven by the poll loop, and is
-therefore only reachable for an instance the provider actually returned from
-`List()`.
+Note the two writers. `CreatePod` writes the rows around the `Provision` call;
+every other non-terminal row comes from `applyState`, driven by the poll loop, and
+is therefore only reachable for an instance the provider returned from `List()`.
 
-`Provisioning` is written *after* `Provision` returns, so today it is barely
-observable: by the time it lands the instance already exists, and the first poll
-tick (≤15s) replaces it with `Initializing`. That makes the two reasons hard to
-tell apart in practice even though they mean different things — "nothing exists
-yet" versus "it exists and is not yet ready". Fixing this is not simply a matter of
-writing `Provisioning` earlier: a Pod must not be tracked before its instance
-exists, because the poll loop maps a tracked Pod absent from `List()` to
-`Terminated`, which is unrecoverable (Pod phases are terminal-sticky and the claim
-reclaims on that phase).
+`Provisioning` is written *before* `Provision` is called. That call can run for
+minutes (AWS sweeps a region's zones on a capacity error, bounded at 2), and until
+it returns this is the only explanation the Pod carries.
+
+Emitting it early is safe; *tracking* it early is not. The poll loop maps a tracked
+Pod absent from `List()` to `Terminated`, which is unrecoverable (Pod phases are
+terminal-sticky and the claim reclaims on that phase), so a tick landing mid-
+provision would tear down the instance the call is about to return. `CreatePod`
+therefore emits without storing, and stores only once `Provision` returns.
+
+`Provision` returns `(id, reserved, error)`. `reserved` means the provider committed
+capacity, not merely accepted the request: AWS always does (`CreateFleet` with
+`FleetTypeInstant` is synchronous), a fresh Modal sandbox never does (the GPU may
+still be queued). Only a reserved instance advances to `Initializing`; an unreserved
+id holds at `Provisioning`, which is still exactly true — the id is real and must be
+reclaimed, but nothing is allocated. Either way the Pod is now tracked: `reserved`
+constrains what the status may claim, not what is owed, and says nothing about
+readiness — that is `applyState`'s job one tick later.
+
+That hold is short-lived by design. One poll tick later the same queued sandbox
+reads `Initializing`, because a provider that queues cannot tell queued from booting
+(see below). For that window the claim is `Provisioning` rather than `Bound`, so an
+orphan waits the grace period instead of being reclaimed at once — teardown still
+resolves the instance from `List()`, so nothing leaks.
 
 Important details:
 
@@ -78,9 +94,11 @@ Important details:
   "nothing exists yet" from "exists and booting", so the claim keys off
   `status.reason`, which is why the reasons are declared once as `PodReason*` in
   `api/v1alpha1`.
-- Only `Provisioning` fails to earn the guard, because nothing exists yet. If the
-  Pod is absent then, the controller waits `placementGracePeriod` (15 seconds)
-  before deleting an orphaned claim.
+- Only `Provisioning` fails to earn the guard. If the Pod is absent then, the
+  controller waits `placementGracePeriod` (15 seconds) before deleting an orphaned
+  claim. An unreserved instance reads `Provisioning` even though it exists, so it
+  gets the grace window rather than immediate reclaim — safe either way, because
+  teardown resolves the instance from `List()`, not from the reason.
 - `NodeClaimStatus.InstanceID` is recorded on a best-effort basis. The finalizer
   prefers it when present, but can still recover by matching provider instances
   by claim name through `List()`.
@@ -133,7 +151,8 @@ folded in by `List` (`StatusChecksPassed`).
   reason it could not launch. A capacity shortfall is an error
   (`ErrNoCapacity`/`ErrSpotCapacity`) that drives AZ/region/tier failover, not a
   pending instance. So an AWS instance that exists is always allocated; `pending`
-  vs `running`-without-checks are both "booting", and both are `Bound`.
+  vs `running`-without-checks are both "booting", and both are `Bound`. This is why
+  `Provision` always returns `reserved` — the Pod can go straight to `Initializing`.
 - **No `Failed` case.** Impaired status checks and `StateReason` are not consumed,
   so an instance that failed to boot currently reads as `Terminated` (looks like a
   clean teardown) or holds at `Pending`. See
@@ -191,14 +210,16 @@ only two signals and has to record a third fact itself.
   the provider what exists.
 - **Modal DOES queue**, unlike AWS: `Sandboxes.Create` returns an id immediately
   and the sandbox then waits for capacity, potentially for minutes on a large GPU
-  shape. It is `Bound` and billing throughout. See below for why that is not
-  reported distinctly.
+  shape. It is `Bound` and billing throughout. So `Provision` returns
+  `reserved=false` for a fresh sandbox and the Pod holds at `Provisioning` until the
+  first poll tick. An *adopted* sandbox has been observed, so a `running` one is
+  known to be reserved. See below for why queued is not reported distinctly.
 
 ### fake
 
 The in-memory e2e provider reports `InstanceRunning` as soon as an instance is
-created. It exists to exercise the placement and teardown paths without a real
-backend, so it has no boot or readiness phase to model.
+created, and so always reserves. It exists to exercise the placement and teardown
+paths without a real backend, so it has no boot or readiness phase to model.
 
 ---
 
@@ -207,10 +228,10 @@ backend, so it has no boot or readiness phase to model.
 Documented so the coarseness is not mistaken for a bug.
 
 **Modal: queued vs. booting.** A sandbox waiting for capacity and one actively
-starting up are both reported `Pending` / `Initializing`, and the Pod's reason
-flips from `Provisioning` to `Initializing` at the first poll tick (≤15s) whether
-or not anything changed in the sandbox. Every public signal was measured and none
-carries the boundary:
+starting up are both reported `Pending` / `Initializing`: the Pod reads
+`Provisioning` until the first poll tick (≤15s), then `Initializing` for the rest of
+both, so that one reason covers queueing and booting alike. Every public signal was
+measured and none carries the boundary:
 
 | signal | distinguishes queued from booting? |
 |---|---|

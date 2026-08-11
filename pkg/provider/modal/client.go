@@ -264,7 +264,10 @@ func (c *sdkClient) GetSandbox(ctx context.Context, id string) (*Sandbox, error)
 		}
 		return nil, err
 	}
-	out := c.observe(ctx, sb)
+	out, err := c.observe(ctx, sb)
+	if err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -290,28 +293,48 @@ func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, c.observe(ctx, sb))
+		observed, err := c.observe(ctx, sb)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, observed)
 	}
 	return out, nil
 }
 
 // observe normalizes a live SDK *Sandbox into the adapter-level Sandbox view:
 // status (from Poll), tags (from GetTags), and a best-effort endpoint (from
-// Tunnels). Tag/tunnel/poll errors are tolerated so a single flaky sandbox
-// doesn't fail the whole List — the poll loop will re-observe next tick.
+// Tunnels). Poll and tunnel errors are tolerated so a single flaky sandbox doesn't
+// fail the whole read — the poll loop will re-observe next tick. A TAG error is
+// not: see below.
 //
 // observe is a BOUNDED read: every call it makes carries a short deadline, so it
 // returns promptly even for a sandbox that is still coming up. It must be, since
 // it runs once per sandbox inside the List iteration.
-func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) Sandbox {
+func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) (Sandbox, error) {
 	out := Sandbox{ID: sb.SandboxID}
 
 	// Tags carry Nebula identity (ClaimTagKey), recovered by toInstance, and
-	// probe-ness (ProbeTagKey), read by isReady below — so this must precede the
+	// probe-ness (ProbeTagKey), read by observeReady below — so this must precede the
 	// status block.
-	if tags, err := sb.GetTags(ctx, &modal.SandboxGetTagsParams{}); err == nil {
-		out.Tags = tags
+	//
+	// A read failure is NOT "no tags", and it cannot be tolerated like the others:
+	// without ClaimTagKey the sandbox has no recoverable identity, and every way of
+	// reporting it anyway is wrong. An empty ClaimName matches no claim, and dropping
+	// the sandbox is indistinguishable from that — the poll loop reads both as "this
+	// claim's instance is gone" and reports the Pod Terminated, which is terminal-sticky
+	// and makes the NodeClaim reclaim a live sandbox. A missing ProbeTagKey would also
+	// make observeReady report a still-booting sandbox ready.
+	//
+	// So the error propagates and fails the whole read. Callers already treat that as
+	// "do not act on a half-known fleet": the poll loop leaves statuses untouched and
+	// retries next tick, re-adoption falls through to NotFound, and the teardown
+	// backstop requeues. A stalled tick is recoverable; a stuck terminal phase is not.
+	tags, err := sb.GetTags(ctx, &modal.SandboxGetTagsParams{})
+	if err != nil {
+		return out, fmt.Errorf("modal: read tags for sandbox %s: %w", sb.SandboxID, err)
 	}
+	out.Tags = tags
 
 	// Status. Poll (== sandboxWait(0)) reports whether the sandbox PROCESS HAS
 	// EXITED — a non-nil exit code means it is gone (terminated), nil means it is
@@ -344,7 +367,7 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) Sandbox {
 		}
 		cancel()
 	}
-	return out
+	return out, nil
 }
 
 // Exit codes Modal substitutes for a non-exit outcome, since Poll conforms to the

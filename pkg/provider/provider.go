@@ -54,11 +54,32 @@ type Provider interface {
 	// nvidia.com/gpu resource (via util.AcceleratorRequest; the type is then
 	// translated via MapAccelerator). The request carries
 	// only what the Pod cannot express: the optimizer-chosen capacity tier and
-	// the claim identity. It returns the provider instance id on success.
+	// the claim identity.
+	//
+	// It returns the provider instance id plus whether that instance is RESERVED:
+	// whether the provider has committed actual capacity to it, as opposed to
+	// merely accepting the request. The two are genuinely different guarantees and
+	// an id alone cannot express either one:
+	//
+	//   - AWS reserves. CreateFleet with an *instant* request is synchronous, so an
+	//     id means EC2 found capacity and the instance is booting on real hardware;
+	//     a shortfall is an error, never a pending instance.
+	//   - Modal does not. Sandboxes.Create returns as soon as the control plane
+	//     accepts the sandbox; the GPU may still be queued, for minutes on a large
+	//     shape.
+	//
+	// Callers use it to report honest status: an unreserved instance is not yet
+	// initializing, so its Pod stays at the provisioning reason. Note that reserved
+	// says nothing about readiness — a reserved instance is still booting, and
+	// readiness is observed later through List/Get. An id with reserved=false still
+	// carries the full teardown obligation, since the instance exists as far as the
+	// provider is concerned; a provider that cannot distinguish the two should
+	// return true, matching the pre-existing assumption.
+	//
 	// Idempotency: if an instance already exists for req.ClaimName (encoded in
 	// the provider's naming scheme, since most providers lack tags), return that
 	// id instead of creating a second.
-	Provision(ctx context.Context, pod *corev1.Pod, req ProvisionRequest) (instanceID string, err error)
+	Provision(ctx context.Context, pod *corev1.Pod, req ProvisionRequest) (instanceID string, reserved bool, err error)
 
 	// Terminate destroys the instance by id. Must be idempotent: terminating an
 	// already-gone instance returns nil (so the NodeClaim finalizer can retry

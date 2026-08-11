@@ -116,9 +116,18 @@ type Handler struct {
 	// blocklist-less wiring simple.
 	blocklist Blocklister
 
-	mu      sync.Mutex
-	tracked map[string]*trackedPod // key: namespace/name
-	notify  func(*corev1.Pod)
+	mu sync.Mutex
+
+	// tracked is the poll loop's work list and what GetPod/GetPodStatus serve, keyed
+	// by namespace/name.
+	//
+	// INVARIANT: only pods whose instance the provider has acknowledged (Provision
+	// returned an id) or that are already terminal. Never one whose Provision call is
+	// still in flight — reconcileOnce maps a tracked pod absent from List() to
+	// Terminated, which for a live provision is a wrong, unrecoverable write.
+	tracked map[string]*trackedPod
+
+	notify func(*corev1.Pod)
 
 	// nowFn and pollEvery are seams for tests.
 	nowFn     func() metav1.Time
@@ -203,7 +212,14 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 
 	log.Info("provisioning external instance",
 		"capacityType", req.CapacityType, "region", req.Region, "timeout", timeout.String())
-	id, err := h.prov.Provision(ctx, pod, req)
+
+	// Report Provisioning BEFORE the call. It can run for minutes (AWS sweeps the
+	// region's zones on a capacity error), and until it returns this is the only
+	// explanation the Pod carries. Emit but do NOT store — see the tracked invariant.
+	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "allocating external instance")
+	h.emit(pod)
+
+	id, reserved, err := h.prov.Provision(ctx, pod, req)
 	if err != nil {
 		log.Error(err, "provision failed; Pod marked Failed for failover")
 		// Record the failure on the shared blocklist so placement fails over to the
@@ -221,9 +237,20 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 
-	// Record the instance id before reporting success; teardown relies on it.
-	log.Info("external instance provisioned", "instanceID", id)
-	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "provisioning external instance")
+	// Only a RESERVED instance advances: capacity is committed and it is booting. An
+	// unreserved id (a Modal sandbox accepted but still queued for a GPU) is left at
+	// the Provisioning stamped above, which is exactly true — the id is real and must
+	// be reclaimed, but nothing is allocated yet. One poll tick later the queued
+	// sandbox reads Initializing too, since Modal cannot tell queued from booting (see
+	// docs/status.md).
+	//
+	// store runs either way: an id means the instance exists. markStatus precedes it
+	// because store deep-copies — storing first would track a copy without the status
+	// just written.
+	log.Info("external instance provisioned", "instanceID", id, "reserved", reserved)
+	if reserved {
+		h.markStatus(pod, corev1.PodPending, reasonInitializing, "external instance is initializing")
+	}
 	h.store(pod, claim, id)
 	h.emit(pod)
 	return nil

@@ -293,12 +293,15 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 //   - An instance EXISTS => Bound. Two Pod shapes prove existence, and the claim
 //     treats them identically because its question is existence, not readiness:
 //     Running (up and past its readiness bar) and Pending/Initializing (created and
-//     booting — vnode stamps that reason only for an instance it observed in the
-//     provider's List). A booting GPU box is just as real, and just as billable, as
-//     a serving one; if its Pod vanishes it must be reclaimed with no grace.
-//   - Otherwise => Provisioning. The instance does not exist yet (the Provision
-//     call may still be in flight), so a vanished Pod may be cache lag and the
-//     grace window applies.
+//     booting — vnode stamps that reason only on evidence of existence, either an
+//     instance observed in the provider's List or a reserved Provision). A booting
+//     GPU box is just as real, and just as billable, as a serving one; if its Pod
+//     vanishes it must be reclaimed with no grace.
+//   - Otherwise => Provisioning. No capacity has been allocated (the Provision call
+//     may still be in flight, or it returned an unreserved id — a Modal sandbox still
+//     queued for a GPU), so a vanished Pod may be cache lag and the grace window
+//     applies. An unreserved instance does exist, so this understates it for one poll
+//     tick; the grace path still reclaims by asking the provider what exists.
 func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) nebulav1alpha1.NodeClaimPhase {
 	switch {
 	case isTerminal(pod.Status.Phase):
