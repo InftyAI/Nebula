@@ -19,6 +19,8 @@ package vnode
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,17 +39,22 @@ import (
 // fakeProvider records lifecycle calls and returns canned results so each
 // Handler branch can be driven deterministically.
 type fakeProvider struct {
-	mu           sync.Mutex
-	provisionID  string
-	provisionErr error
-	provisionCnt int
-	lastReq      provider.ProvisionRequest
-	terminateCnt int
-	terminateID  string
-	terminateErr error
-	list         []provider.Instance
-	listErr      error
-	capabilities provider.Capabilities
+	mu          sync.Mutex
+	provisionID string
+	// provisionReserved is the reserved return: whether the provider committed
+	// capacity, not merely accepted the request. It defaults to FALSE (the Modal-like
+	// case), so a test that cares about the reserved path must opt in — the zero value
+	// should not silently assert the stronger guarantee.
+	provisionReserved bool
+	provisionErr      error
+	provisionCnt      int
+	lastReq           provider.ProvisionRequest
+	terminateCnt      int
+	terminateID       string
+	terminateErr      error
+	list              []provider.Instance
+	listErr           error
+	capabilities      provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
 	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
 	// record what the handler passed in, so a test can assert it resolved them off the
@@ -55,17 +62,27 @@ type fakeProvider struct {
 	classifyScope  provider.BlockScope
 	classifyAccel  string
 	classifyRegion string
+	// provisionHook runs inside Provision, before it returns, so a test can observe
+	// what the handler published for the window in which the call is still in flight.
+	provisionHook func()
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
 func (f *fakeProvider) Capabilities() provider.Capabilities { return f.capabilities }
 
-func (f *fakeProvider) Provision(_ context.Context, _ *corev1.Pod, req provider.ProvisionRequest) (string, error) {
+func (f *fakeProvider) Provision(
+	_ context.Context, _ *corev1.Pod, req provider.ProvisionRequest,
+) (string, bool, error) {
+	// Outside the lock: the hook reads Handler state, and holding f.mu here would
+	// deadlock a hook that touches the provider.
+	if f.provisionHook != nil {
+		f.provisionHook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.provisionCnt++
 	f.lastReq = req
-	return f.provisionID, f.provisionErr
+	return f.provisionID, f.provisionReserved, f.provisionErr
 }
 
 func (f *fakeProvider) Terminate(_ context.Context, id string) error {
@@ -136,6 +153,145 @@ func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 	}
 	if got.Status.Phase != corev1.PodPending {
 		t.Fatalf("expected Pending after provision, got %q", got.Status.Phase)
+	}
+}
+
+func TestCreatePod_ReservedAdvancesToInitializing(t *testing.T) {
+	// reserved=true (AWS: an instant fleet only returns an id once capacity is
+	// allocated) means the instance is committed and booting, so the Pod may leave
+	// Provisioning immediately instead of waiting a whole poll tick for the same news.
+	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
+	h := NewHandler(fp, nil, nil)
+	pod := testPod("default", "p1")
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if pod.Status.Reason != reasonInitializing {
+		t.Fatalf("reason = %q, want %q for a reserved instance", pod.Status.Reason, reasonInitializing)
+	}
+	if pod.Status.Phase != corev1.PodPending {
+		t.Fatalf("phase = %q, want Pending (Initializing is a Pending reason)", pod.Status.Phase)
+	}
+	// The tracked copy must carry the advanced status: store deep-copies, so a
+	// markStatus after it would be invisible to GetPod and to the poll loop.
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Reason != reasonInitializing {
+		t.Fatalf("tracked reason = %q, want %q (markStatus must precede store)", got.Status.Reason, reasonInitializing)
+	}
+}
+
+func TestCreatePod_UnreservedStaysProvisioning(t *testing.T) {
+	// reserved=false (Modal: Create returns on control-plane acceptance, the GPU may
+	// still be queued) means nothing has been allocated yet, so Provisioning is still
+	// exactly true. Advancing to Initializing here would claim a commitment the
+	// provider has not made.
+	fp := &fakeProvider{provisionID: "sb-1", provisionReserved: false}
+	h := NewHandler(fp, nil, nil)
+	pod := testPod("default", "p1")
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if pod.Status.Reason != reasonProvisioning {
+		t.Fatalf("reason = %q, want %q for an unreserved instance", pod.Status.Reason, reasonProvisioning)
+	}
+	// It is still TRACKED: an id was returned, so the instance exists and carries the
+	// full teardown obligation regardless of whether capacity was committed.
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("an unreserved instance must still be tracked: %v", err)
+	}
+	if got.Status.Reason != reasonProvisioning {
+		t.Fatalf("tracked reason = %q, want %q", got.Status.Reason, reasonProvisioning)
+	}
+}
+
+func TestCreatePod_EmitsProvisioningWhileProvisionInFlight(t *testing.T) {
+	// Provision can run for minutes (AWS sweeps a region's zones on a capacity error),
+	// and until it returns Provisioning is the only explanation the Pod carries — so it
+	// must be emitted BEFORE the call, not after, where it would describe a window that
+	// has already closed.
+	//
+	// Emitting an untracked Pod is what makes this safe: the tracked invariant forbids
+	// storing one mid-provision, not reporting one.
+	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
+	h := NewHandler(fp, nil, nil)
+
+	var mu sync.Mutex
+	var reasons []string
+	h.NotifyPods(context.Background(), func(p *corev1.Pod) {
+		mu.Lock()
+		reasons = append(reasons, p.Status.Reason)
+		mu.Unlock()
+	})
+
+	var inFlight []string
+	fp.provisionHook = func() {
+		mu.Lock()
+		inFlight = slices.Clone(reasons)
+		mu.Unlock()
+	}
+
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(inFlight, []string{reasonProvisioning}) {
+		t.Fatalf("emitted %v while Provision was in flight, want exactly [%s]", inFlight, reasonProvisioning)
+	}
+	if !slices.Equal(reasons, []string{reasonProvisioning, reasonInitializing}) {
+		t.Fatalf("emitted %v, want [%s %s]", reasons, reasonProvisioning, reasonInitializing)
+	}
+}
+
+func TestCreatePod_PollTickDuringProvisionEmitsNoTerminalStatus(t *testing.T) {
+	// The tracked invariant, asserted end to end. reconcileOnce maps a tracked pod
+	// that is absent from List() to Terminated, so tracking a pod whose Provision is
+	// still in flight reports Failed/Terminated over a SUCCEEDING provision.
+	//
+	// The assertion is on what was EMITTED, not on the final tracked status: the store
+	// after a successful Provision overwrites the tracked entry, so the end state looks
+	// correct either way. The damage is the emit — VK writes it to the API server, where
+	// Pod phases are terminal-sticky, and the NodeClaim then reclaims a live instance.
+	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
+	h := NewHandler(fp, nil, nil)
+
+	var mu sync.Mutex
+	var emitted []string
+	h.NotifyPods(context.Background(), func(p *corev1.Pod) {
+		mu.Lock()
+		emitted = append(emitted, string(p.Status.Phase)+"/"+p.Status.Reason)
+		mu.Unlock()
+	})
+
+	// A tick lands mid-provision, when the provider has nothing to list yet.
+	fp.provisionHook = func() { h.reconcileOnce(context.Background()) }
+
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range emitted {
+		if strings.HasPrefix(s, string(corev1.PodFailed)) || strings.HasPrefix(s, string(corev1.PodSucceeded)) {
+			t.Fatalf("emitted %v; a tick during a succeeding Provision must not report a terminal phase", emitted)
+		}
+	}
+	// Exactly CreatePod's own two emits: the mid-provision tick had nothing to report
+	// because the pod was not yet tracked.
+	want := []string{
+		string(corev1.PodPending) + "/" + reasonProvisioning,
+		string(corev1.PodPending) + "/" + reasonInitializing,
+	}
+	if !slices.Equal(emitted, want) {
+		t.Fatalf("emitted %v, want %v", emitted, want)
 	}
 }
 
@@ -480,6 +636,45 @@ func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	}
 	if got.Status.Reason != "Terminated" {
 		t.Fatalf("expected Terminated reason, got %q", got.Status.Reason)
+	}
+}
+
+func TestReconcileOnce_ListErrorLeavesStatusUntouched(t *testing.T) {
+	// A List error must not advance anything. It means the fleet is half-known, and
+	// the only unsafe reading is "absent" — which maps to Terminated, a terminal
+	// phase the Pod can never leave.
+	//
+	// This is load-bearing beyond transport failures: the Modal adapter deliberately
+	// FAILS List when a sandbox's tags are unreadable, because a sandbox with no
+	// recoverable ClaimName cannot be reported at all (an empty claim and an omitted
+	// sandbox both read as absent here). That choice is only safe because of this.
+	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
+	h := NewHandler(fp, nil, nil)
+	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
+
+	var mu sync.Mutex
+	var emitted int
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {
+		mu.Lock()
+		emitted++
+		mu.Unlock()
+	})
+
+	fp.list, fp.listErr = nil, errors.New("tags unreadable")
+	h.reconcileOnce(context.Background())
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodPending || got.Status.Reason != reasonInitializing {
+		t.Fatalf("status = %s/%s after a failed List, want the pre-tick Pending/%s",
+			got.Status.Phase, got.Status.Reason, reasonInitializing)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if emitted != 0 {
+		t.Fatalf("emitted %d notifications on a failed List, want 0", emitted)
 	}
 }
 

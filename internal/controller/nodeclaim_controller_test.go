@@ -50,8 +50,8 @@ type fakeProvider struct {
 
 func (f *fakeProvider) Name() string                        { return f.name }
 func (f *fakeProvider) Capabilities() provider.Capabilities { return provider.Capabilities{} }
-func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (string, error) {
-	return "", nil
+func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (string, bool, error) {
+	return "", false, nil
 }
 func (f *fakeProvider) Terminate(_ context.Context, id string) error {
 	f.terminated = append(f.terminated, id)

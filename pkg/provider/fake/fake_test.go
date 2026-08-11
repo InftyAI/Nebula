@@ -38,7 +38,7 @@ func TestProvisionReportsRunningAndLists(t *testing.T) {
 	p := New()
 	ctx := context.Background()
 
-	id, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{
+	id, reserved, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
@@ -47,6 +47,12 @@ func TestProvisionReportsRunningAndLists(t *testing.T) {
 	}
 	if id == "" {
 		t.Fatal("expected a non-empty instance id")
+	}
+	// The fake has no queueing to model — an instance is Running the moment it is
+	// created — so it always reserves. Reporting false would make the fake exercise
+	// the Modal-shaped path and leave Pods at Provisioning forever.
+	if !reserved {
+		t.Fatal("reserved = false; the fake allocates synchronously and is Running immediately")
 	}
 
 	// Get reports it Running with the claim recovered.
@@ -76,11 +82,11 @@ func TestProvisionIdempotentOnClaim(t *testing.T) {
 	ctx := context.Background()
 	req := provider.ProvisionRequest{ClaimName: "claim-a"}
 
-	id1, err := p.Provision(ctx, testPod(), req)
+	id1, _, err := p.Provision(ctx, testPod(), req)
 	if err != nil {
 		t.Fatalf("Provision #1: %v", err)
 	}
-	id2, err := p.Provision(ctx, testPod(), req)
+	id2, _, err := p.Provision(ctx, testPod(), req)
 	if err != nil {
 		t.Fatalf("Provision #2: %v", err)
 	}
@@ -96,7 +102,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	p := New()
 	ctx := context.Background()
 
-	id, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{ClaimName: "claim-a"})
+	id, _, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{ClaimName: "claim-a"})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

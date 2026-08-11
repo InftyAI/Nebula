@@ -118,7 +118,7 @@ func TestProvision_GPUPod(t *testing.T) {
 	f := &fakeClient{createID: "sb-1"}
 	p := newTestProvider(f)
 
-	id, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 2), provider.ProvisionRequest{
+	id, reserved, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 2), provider.ProvisionRequest{
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
@@ -127,6 +127,12 @@ func TestProvision_GPUPod(t *testing.T) {
 	}
 	if id != "sb-1" {
 		t.Fatalf("id = %q, want sb-1", id)
+	}
+	// Create only means the control plane ACCEPTED the sandbox — the GPU may still be
+	// queued — so a fresh sandbox is never reserved. Claiming otherwise would let the
+	// Pod report Initializing while nothing has been allocated.
+	if reserved {
+		t.Fatal("reserved = true; a freshly created sandbox may still be queued for capacity")
 	}
 	if f.lastSpec.GPU != "H100" || f.lastSpec.GPUCount != 2 {
 		t.Fatalf("spec GPU=%q count=%d, want H100/2", f.lastSpec.GPU, f.lastSpec.GPUCount)
@@ -149,7 +155,7 @@ func TestProvision_LowercaseGPUAnnotation(t *testing.T) {
 	// A user may write the accelerator-type label in any case (e.g. "h100"). It must
 	// resolve to the canonical catalog accelerator ("H100") so the provisioned
 	// sandbox — and any downstream key (blocklist/catalog) — uses one casing.
-	_, err := p.Provision(context.Background(), gpuPod("claim-lc", "h100", 1), provider.ProvisionRequest{
+	_, _, err := p.Provision(context.Background(), gpuPod("claim-lc", "h100", 1), provider.ProvisionRequest{
 		ClaimName:    "claim-lc",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
@@ -177,7 +183,7 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 	deadline := int64(3600)
 	pod.Spec.ActiveDeadlineSeconds = &deadline
 
-	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-res"}); err != nil {
+	if _, _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-res"}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.CPU != 2.5 {
@@ -201,7 +207,7 @@ func TestProvision_DefaultsTimeoutWhenNoDeadline(t *testing.T) {
 	// No activeDeadlineSeconds: the adapter must still set a non-zero timeout, else
 	// Modal applies its 5-minute default and the workload dies almost immediately.
 	req := provider.ProvisionRequest{ClaimName: "claim-dt"}
-	if _, err := p.Provision(context.Background(), gpuPod("claim-dt", "H100", 1), req); err != nil {
+	if _, _, err := p.Provision(context.Background(), gpuPod("claim-dt", "H100", 1), req); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.Timeout != defaultSandboxTimeout {
@@ -213,7 +219,7 @@ func TestProvision_CPUOnly(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
 
-	_, err := p.Provision(context.Background(), gpuPod("claim-cpu", "", 0), provider.ProvisionRequest{
+	_, _, err := p.Provision(context.Background(), gpuPod("claim-cpu", "", 0), provider.ProvisionRequest{
 		ClaimName:    "claim-cpu",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
@@ -236,7 +242,7 @@ func TestProvision_Idempotent(t *testing.T) {
 	p := newTestProvider(f)
 
 	req := provider.ProvisionRequest{ClaimName: "claim-a"}
-	id, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req)
+	id, reserved, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req)
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -246,13 +252,44 @@ func TestProvision_Idempotent(t *testing.T) {
 	if f.createCnt != 0 {
 		t.Fatalf("CreateSandbox called %d times, want 0 (idempotent)", f.createCnt)
 	}
+	// An adopted sandbox has been OBSERVED, unlike a fresh create, so its state is
+	// known: this one is running, which means capacity was necessarily allocated.
+	if !reserved {
+		t.Fatal("reserved = false for an adopted RUNNING sandbox; observed state proves capacity was allocated")
+	}
+}
+
+// A sandbox adopted while still coming up is NOT reserved: "initializing" is what
+// Modal reports for both a queued sandbox and a booting one, so it does not prove
+// capacity was allocated. Only a running sandbox does.
+func TestProvision_IdempotentInitializingIsNotReserved(t *testing.T) {
+	f := &fakeClient{
+		sandboxes: []Sandbox{{
+			ID:     "sb-existing",
+			Tags:   map[string]string{ClaimTagKey: "claim-a"},
+			Status: statusInitializing,
+		}},
+	}
+	p := newTestProvider(f)
+
+	id, reserved, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if id != "sb-existing" {
+		t.Fatalf("id = %q, want sb-existing (idempotent reuse)", id)
+	}
+	if reserved {
+		t.Fatal("reserved = true for an adopted INITIALIZING sandbox; it may still be queued")
+	}
 }
 
 func TestProvision_UnsupportedAccelerator(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
 	req := provider.ProvisionRequest{ClaimName: "claim-x"}
-	_, err := p.Provision(context.Background(), gpuPod("claim-x", "TPU-v4", 1), req)
+	_, _, err := p.Provision(context.Background(), gpuPod("claim-x", "TPU-v4", 1), req)
 	if err == nil {
 		t.Fatal("expected error for unsupported accelerator")
 	}
@@ -413,7 +450,7 @@ func TestProvision_ProbeTagStampedOnlyWithProbe(t *testing.T) {
 			pod := gpuPod("claim-a", "H100", 1)
 			pod.Spec.Containers[0].ReadinessProbe = tc.probe
 
-			if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+			if _, _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
 				t.Fatalf("Provision: %v", err)
 			}
 			_, present := f.lastSpec.Tags[ProbeTagKey]
@@ -443,7 +480,7 @@ func TestProvision_ReadinessProbeCarriedThrough(t *testing.T) {
 	}
 	pod.Spec.Containers[0].ReadinessProbe = probe
 
-	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+	if _, _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	// The probe is carried onto the spec so the Client can configure Modal's own
@@ -458,7 +495,7 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 	p := newTestProvider(f)
 
 	req := provider.ProvisionRequest{ClaimName: "claim-a"}
-	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
+	if _, _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.ReadinessProbe != nil {

@@ -164,7 +164,7 @@ func TestProvision_MapsAcceleratorToInstanceType(t *testing.T) {
 	f := &fakeClient{runID: "i-1"}
 	p := newTestProvider(f)
 
-	id, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
+	id, reserved, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 		Region:       "us-west-2",
@@ -176,6 +176,11 @@ func TestProvision_MapsAcceleratorToInstanceType(t *testing.T) {
 	// it by sweeping regions.
 	if id != "i-1" {
 		t.Fatalf("id = %q, want i-1", id)
+	}
+	// An instant fleet is synchronous, so an id means EC2 already allocated capacity:
+	// AWS never hands back an instance that is still queued.
+	if !reserved {
+		t.Fatal("reserved = false; an instant fleet only returns an id once capacity is allocated")
 	}
 	// AWS requests by instance type: H100 must resolve to its accelerator_id as the
 	// primary (fleet) instance type.
@@ -211,7 +216,7 @@ func TestProvision_LowercaseAcceleratorLabel(t *testing.T) {
 
 	// A user may write the accelerator-type label in any case; it must resolve to
 	// the canonical catalog row (and thus the right instance type).
-	if _, err := p.Provision(context.Background(), gpuPod("h100", 8), provider.ProvisionRequest{
+	if _, _, err := p.Provision(context.Background(), gpuPod("h100", 8), provider.ProvisionRequest{
 		ClaimName: "claim-lc",
 		Region:    testRegion,
 	}); err != nil {
@@ -246,7 +251,7 @@ func TestProvision_CountSelectsInstanceType(t *testing.T) {
 		f := &fakeClient{runID: "i-t4"}
 		p := newTestProvider(f)
 		req := provider.ProvisionRequest{ClaimName: "claim-t4", Region: testRegion}
-		if _, err := p.Provision(context.Background(), gpuPod("T4", tc.count), req); err != nil {
+		if _, _, err := p.Provision(context.Background(), gpuPod("T4", tc.count), req); err != nil {
 			t.Fatalf("Provision(T4 x%d): %v", tc.count, err)
 		}
 		if got := primaryType(f.lastSpec); got != tc.wantType {
@@ -261,7 +266,7 @@ func TestProvision_UnsupportedCountIsError(t *testing.T) {
 	// T4 x2 has no instance type (there is no 2-GPU T4 shape): must error rather
 	// than silently picking the x1 or x8 row.
 	req := provider.ProvisionRequest{ClaimName: "claim-t4x2", Region: testRegion}
-	if _, err := p.Provision(context.Background(), gpuPod("T4", 2), req); err == nil {
+	if _, _, err := p.Provision(context.Background(), gpuPod("T4", 2), req); err == nil {
 		t.Fatal("expected an error for an unsupported (accelerator, count) pair")
 	}
 	if f.runCnt != 0 {
@@ -273,7 +278,7 @@ func TestProvision_SpotSetsMarketOption(t *testing.T) {
 	f := &fakeClient{runID: "i-spot"}
 	p := newTestProvider(f)
 
-	if _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
+	if _, _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName:    "claim-spot",
 		CapacityType: nebulav1alpha1.CapacitySpot,
 		Region:       testRegion,
@@ -293,7 +298,7 @@ func TestProvision_EmptyRegionIsError(t *testing.T) {
 	// Provision errors rather than silently guessing. In production every request
 	// carries a region (admission requires each aws pool to list ≥1; placement stamps
 	// it), so this only guards a malformed request.
-	if _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
+	if _, _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName: "claim-def",
 	}); err == nil {
 		t.Fatal("expected an error for a request with no region")
@@ -310,7 +315,7 @@ func TestProvision_NoAcceleratorIsError(t *testing.T) {
 	// EC2 GPU provisioning is by instance type; a Pod with no accelerator has no
 	// instance type to launch, so it must error rather than silently guessing.
 	req := provider.ProvisionRequest{ClaimName: "claim-cpu", Region: testRegion}
-	if _, err := p.Provision(context.Background(), gpuPod("", 0), req); err == nil {
+	if _, _, err := p.Provision(context.Background(), gpuPod("", 0), req); err == nil {
 		t.Fatal("expected an error for a Pod requesting no accelerator")
 	}
 	if f.runCnt != 0 {
@@ -329,7 +334,7 @@ func TestProvision_Idempotent(t *testing.T) {
 	}
 	p := newTestProvider(f)
 
-	id, err := p.Provision(context.Background(), gpuPod("H100", 8),
+	id, _, err := p.Provision(context.Background(), gpuPod("H100", 8),
 		provider.ProvisionRequest{ClaimName: "claim-a", Region: testRegion})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -347,7 +352,7 @@ func TestProvision_UnsupportedAccelerator(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
 	req := provider.ProvisionRequest{ClaimName: "claim-x", Region: testRegion}
-	if _, err := p.Provision(context.Background(), gpuPod("TPU-v4", 1), req); err == nil {
+	if _, _, err := p.Provision(context.Background(), gpuPod("TPU-v4", 1), req); err == nil {
 		t.Fatal("expected error for unsupported accelerator")
 	}
 }

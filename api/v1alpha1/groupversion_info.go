@@ -169,10 +169,13 @@ const (
 // whole set is here rather than the subset with in-tree readers: these are the
 // values status.reason can take, and a reader should find them in one place.
 const (
-	// PodReasonProvisioning: a provider Provision call has been issued but the
-	// instance does not yet exist — we are still allocating it (e.g. EC2
-	// RunInstances in flight). Set on CreatePod, before the first poll observes
-	// the instance.
+	// PodReasonProvisioning: capacity has not been allocated yet. Stamped by CreatePod
+	// before it calls Provision, and HELD if Provision returns an id without reserving
+	// capacity — a Modal sandbox the control plane accepted but that is still queued
+	// for a GPU. So the instance may exist (and then must be reclaimed) even under this
+	// reason; what has not happened is the allocation. Replaced by Initializing as soon
+	// as capacity is committed: at once for a provider that allocates synchronously
+	// (AWS), otherwise when the first poll observes the instance.
 	PodReasonProvisioning = "Provisioning"
 	// PodReasonInitializing: the instance EXISTS at the provider but is not yet
 	// reachable — it is booting (EC2 "pending"), running-but-not-yet-passing its
@@ -181,8 +184,10 @@ const (
 	// term. Provisioning is done; the instance is coming up. Distinct from
 	// Provisioning so a Pod stuck here points at a slow boot / failing status checks,
 	// not a stuck allocation — and so the NodeClaim controller can tell that an
-	// instance exists. The virtual kubelet stamps it only for an instance it observed
-	// in the provider's List, which is what makes it trustworthy as that evidence.
+	// instance exists. The virtual kubelet stamps it only on EVIDENCE of existence:
+	// either the provider observed the instance in its List, or Provision reported it
+	// reserved (capacity committed, not merely requested). That is what makes it
+	// trustworthy for the claim to key Bound off.
 	PodReasonInitializing = "Initializing"
 	// PodReasonRunning: the provider reports the instance running.
 	PodReasonRunning = "Running"

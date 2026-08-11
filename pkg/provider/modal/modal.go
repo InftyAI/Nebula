@@ -188,27 +188,49 @@ func (p *Provider) Capabilities() provider.Capabilities {
 
 // Provision implements provider.Provider. The Pod is the source of truth for
 // the workload; req carries only the claim identity and capacity tier.
-func (p *Provider) Provision(ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest) (string, error) {
+//
+// A fresh sandbox is NEVER reserved. Sandboxes.Create returns as soon as Modal's
+// control plane accepts the sandbox: the id is real (listable, terminable, and
+// carrying the full teardown obligation), but the GPU may still be queued —
+// potentially for minutes on a large shape. So the id and the capacity are two
+// separate facts here, unlike AWS, and reporting reserved=false is what lets the
+// Pod stay at the provisioning reason instead of claiming to be initializing.
+//
+// The queued→running transition is then observed the same way readiness is, through
+// the poll loop's List: the sandbox reads statusInitializing until it is live.
+func (p *Provider) Provision(
+	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
+) (string, bool, error) {
 	if pod == nil {
-		return "", errors.New("modal: nil pod")
+		return "", false, errors.New("modal: nil pod")
 	}
 	if req.ClaimName == "" {
-		return "", errors.New("modal: empty ClaimName in ProvisionRequest")
+		return "", false, errors.New("modal: empty ClaimName in ProvisionRequest")
 	}
 
 	// Idempotency: if a sandbox already carries this claim tag, return it rather
 	// than creating a second (guards against a retry after a partial create).
+	//
+	// Unlike a fresh create, this one has been OBSERVED, so its state is known: a
+	// sandbox the poll loop reports live (Pending once it is up, or Running once
+	// ready) has necessarily been allocated capacity, whereas one still queued is
+	// not yet reserved. That is strictly more information than a create can return,
+	// so use it rather than flatly reporting false.
 	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
-		return "", err
+		return "", false, err
 	} else if existing != nil {
-		return existing.ID, nil
+		return existing.ID, existing.State == provider.InstanceRunning, nil
 	}
 
 	spec, err := p.sandboxSpecFromPod(pod, req)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return p.client.CreateSandbox(ctx, spec)
+	id, err := p.client.CreateSandbox(ctx, spec)
+	if err != nil {
+		return "", false, err
+	}
+	return id, false, nil
 }
 
 // Terminate implements provider.Provider. Idempotent by the Client contract.
