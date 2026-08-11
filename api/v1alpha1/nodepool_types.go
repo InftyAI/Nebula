@@ -39,8 +39,10 @@ type NodePoolSpec struct {
 	// Providers is the ordered set of NeoClouds this pool is allowed to use.
 	// A Pod bound to this pool can only ever be placed on a provider in this
 	// list. Order is significant only for the Ordered strategy (it is the
-	// inner, provider-ranking axis).
+	// inner, provider-ranking axis). A pool can list at most 8 providers so the
+	// candidate set remains bounded while larger configurations are unproven.
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
 	Providers []ProviderSpec `json:"providers"`
 
 	// CapacityTypes is the OUTER axis: the purchase models to try, in fallback

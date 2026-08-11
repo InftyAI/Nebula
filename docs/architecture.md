@@ -470,6 +470,10 @@ status:
 When `capacityTypes` is omitted, the API defaults it to `{OnDemand, Spot}`. The
 listed order is the fallback order the placement controller walks.
 
+A pool must list between one and eight providers. The upper bound keeps the
+provider-by-region candidate expansion bounded while performance at larger
+provider counts remains unproven.
+
 ### NodeClaim (`nc`)
 
 ```yaml

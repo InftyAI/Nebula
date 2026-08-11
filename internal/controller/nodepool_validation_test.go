@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -25,11 +27,11 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
 
-// These specs exercise the CEL validation rule on NodePoolSpec, which is only
-// enforced by a real apiserver (the fake client used by the unit tests does not
-// run CRD x-kubernetes-validations). They require envtest binaries; when those
+// These specs exercise CRD validation on NodePoolSpec, which is only enforced
+// by a real apiserver (the fake client used by the unit tests does not apply the
+// structural schema or CEL rules). They require envtest binaries; when those
 // are absent the whole suite is skipped in BeforeSuite.
-var _ = Describe("NodePool spec validation (CEL)", func() {
+var _ = Describe("NodePool spec validation", func() {
 	newWeightedPool := func(name string, refs ...nebulav1alpha1.ProviderSpec) *nebulav1alpha1.NodePool {
 		return &nebulav1alpha1.NodePool{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -40,6 +42,26 @@ var _ = Describe("NodePool spec validation (CEL)", func() {
 		}
 	}
 	weight := func(w int32) *int32 { return &w }
+	providerRefs := func(count int) []nebulav1alpha1.ProviderSpec {
+		refs := make([]nebulav1alpha1.ProviderSpec, count)
+		for i := range refs {
+			refs[i].Name = fmt.Sprintf("provider-%d", i)
+		}
+		return refs
+	}
+
+	It("admits a pool with eight providers", func() {
+		pool := newPool("eight-providers", nebulav1alpha1.StrategyOrdered, providerRefs(8)...)
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+	})
+
+	It("rejects a pool with more than eight providers", func() {
+		pool := newPool("nine-providers", nebulav1alpha1.StrategyOrdered, providerRefs(9)...)
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("must have at most 8 items"))
+	})
 
 	It("rejects a Weighted pool with a provider missing a weight", func() {
 		pool := newWeightedPool("weighted-missing",
