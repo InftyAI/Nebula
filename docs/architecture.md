@@ -201,24 +201,46 @@ Follow one GPU Pod from creation to teardown:
 
 ### Status Flow
 
-Once a Pod is placed, its status is driven by the poll loop rather than the
-placement path: the virtual kubelet projects the external instance's lifecycle
-onto standard Pod status, and the NodeClaim controller derives its coarse ledger
-phase from the served Pod.
+Pod status and NodeClaim status come from different sources. The Pod is the
+runtime surface users watch. The NodeClaim is the coarse ledger that protects
+teardown.
+
+```
+Pod.status, written by pkg/vnode
+  CreatePod success        -> Pending / Provisioning
+  CreatePod error          -> Failed / ProvisionFailed
+  List sees Pending        -> Pending / Initializing
+  List sees Running        -> Running / Ready=True / endpoint annotation
+  List sees Failed         -> Failed / Failed
+  List misses instance     -> Failed / Terminated
+  DeletePod success        -> Succeeded / Terminated
+
+NodeClaim.status, written by NodeClaim controller
+  present Pod, no instance yet       -> Provisioning
+  present Pod, initializing instance -> Initializing
+  present Running Pod                -> Bound
+  present deleting Pod               -> Terminating
+  present terminal Pod               -> Terminated
+  absent after Bound/Terminating      -> delete self -> terminate finalizer
+  absent before Bound                 -> wait placementGracePeriod, then delete
+```
+
+Important details:
+
+- `Bound` is the teardown guard. Once a claim has seen a Running Pod, a later Pod
+  disappearance is trusted as real teardown, not cache lag.
+- `Provisioning` and `Initializing` do not earn the guard. If the Pod is absent
+  before `Bound`, the controller waits `placementGracePeriod` (15 seconds) before
+  deleting an orphaned claim.
+- `NodeClaimStatus.InstanceID` is recorded on a best-effort basis. The finalizer
+  prefers it when present, but can still recover by matching provider instances
+  by claim name through `List()`.
+- NodeClaim does not mirror logs, restarts, container state, or fine-grained
+  runtime health. Those belong on the Pod.
 
 The full mapping — Pod phase/reason and the claim phase each produces, plus each
 provider's own status vocabulary and the limits of what is observable — lives in
-[docs/status.md](status.md). Two properties matter for the placement flow
-described above:
-
-- `Bound` means an instance EXISTS at the provider, not that the workload is
-  ready. It is the teardown guard: once a claim is `Bound`, a later Pod
-  disappearance is trusted as real teardown rather than informer cache lag, and is
-  reclaimed with no grace period. Only `Provisioning` (nothing created yet) waits
-  out `placementGracePeriod`.
-- `NodeClaimStatus.InstanceID` is recorded on a best-effort basis. The finalizer
-  prefers it when present, but can still recover by matching provider instances by
-  claim name through `List()`.
+[docs/status.md](status.md).
 
 ---
 
