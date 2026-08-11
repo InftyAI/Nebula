@@ -65,20 +65,6 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
-        # Set EXPLICITLY, not left to API-server defaulting, which derives the
-        # policy from the tag (":latest" or none → Always, else IfNotPresent) and
-        # only at CREATE. Defaulted, the value sticks in the live object and apply
-        # never revisits it — absent from the manifest, it is absent from
-        # last-applied-configuration too, so the three-way merge has nothing to
-        # change. A Deployment first created at :latest therefore keeps Always
-        # forever, and Always breaks the Kind path: `kind load` puts the image in
-        # the node's containerd store and never pushes, so pulling a
-        # locally-built tag 404s at the registry.
-        #
-        # IfNotPresent requires the tag to be UNIQUE per build (a date/commit
-        # stamp, not :latest). It is the tag change that rolls a new ReplicaSet —
-        # re-applying the same tag is a byte-identical template, so apply is a
-        # no-op and the old pod keeps running the old binary.
         imagePullPolicy: IfNotPresent
         env:
           # Point the price catalog at the mounted ConfigMap so prices can be
