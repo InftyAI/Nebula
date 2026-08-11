@@ -65,6 +65,7 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        imagePullPolicy: IfNotPresent
         env:
           # Point the price catalog at the mounted ConfigMap so prices can be
           # edited live (kubectl edit configmap nebula-catalog) without a

@@ -9,7 +9,7 @@
 ![Go Version](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/7WTUuFqyS6)
 
-Run GPU workloads on any NeoCloud or hyperscaler through one Kubernetes API.
+Run GPU workloads on any NeoCloud or hyperscaler or your own infrastructure through one Kubernetes API.
 
 </div>
 
@@ -21,6 +21,10 @@ per-cloud glue. The API follows a Karpenter-style split:
   (cost / availability), failover behaviour, and the GPU shape.
 - **NodeClaim** — one provisioned instance and its lifecycle, held by a finalizer
   so a paid instance is never leaked.
+
+<p align="center">
+  <img src="site/images/arch.png" alt="Nebula architecture: the operator's webhook, virtual kubelet and placement controller drive NodePools and NodeClaims onto hyperscalers, NeoClouds, Kubernetes clusters and on-prem servers" width="90%">
+</p>
 
 ## How it works
 
