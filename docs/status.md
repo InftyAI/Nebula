@@ -52,33 +52,20 @@ served Pod is ABSENT: after `Bound`/`Terminating`, the claim deletes itself and
 the terminate finalizer runs; before `Bound`, it waits `placementGracePeriod`
 first.
 
-Note the two writers. `CreatePod` writes the rows where no instance exists, plus
-the first `Initializing` — it publishes `Provisioning` *before* calling the
-provider and `Initializing` as soon as the call returns an id, so each reason
-covers exactly the window in which it is true: `Provisioning` is the blocking
-allocation call itself, and `Initializing` starts the moment an instance exists.
-Every other non-terminal row comes from `applyState`, driven by the poll loop,
-and is therefore only reachable for an instance the provider actually returned
-from `List()`.
+Note the two writers. `CreatePod` writes the rows where no instance exists; every
+other non-terminal row comes from `applyState`, driven by the poll loop, and is
+therefore only reachable for an instance the provider actually returned from
+`List()`.
 
-The ordering matters in both directions. Writing `Provisioning` after the call
-described a state already over, so it was effectively unobservable, while leaving
-`Initializing` to the first tick would hold the claim at `Provisioning` — and so
-behind the `placementGracePeriod` — for up to 15 seconds after a billable instance
-existed.
-
-The pre-call write is emitted but NOT tracked, and that distinction is load-bearing:
-the poll loop maps a tracked Pod absent from `List()` to `Terminated`, and during
-the provider call the instance is legitimately absent, so tracking it there would
-let a concurrent tick write `Failed`/`Terminated` over a provision that goes on to
-succeed — unrecoverably, since Pod phases are terminal-sticky and the claim
-reclaims on that phase.
-
-`Initializing` asserts EXISTENCE, not boot progress. On AWS the instance is also
-genuinely booting, because an instant fleet allocates capacity synchronously. A
-Modal sandbox may still be queued — but reporting `Provisioning` for it would be
-worse: the id, and with it the reclaim obligation, already exists, and a queued
-sandbox bills.
+`Provisioning` is written *after* `Provision` returns, so today it is barely
+observable: by the time it lands the instance already exists, and the first poll
+tick (≤15s) replaces it with `Initializing`. That makes the two reasons hard to
+tell apart in practice even though they mean different things — "nothing exists
+yet" versus "it exists and is not yet ready". Fixing this is not simply a matter of
+writing `Provisioning` earlier: a Pod must not be tracked before its instance
+exists, because the poll loop maps a tracked Pod absent from `List()` to
+`Terminated`, which is unrecoverable (Pod phases are terminal-sticky and the claim
+reclaims on that phase).
 
 Important details:
 

@@ -203,25 +203,6 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 
 	log.Info("provisioning external instance",
 		"capacityType", req.CapacityType, "region", req.Region, "timeout", timeout.String())
-
-	// Report Provisioning BEFORE the call, not after it. Provision blocks until the
-	// provider has created the instance (seconds for Modal, longer for AWS, which
-	// creates a launch template and runs an instant fleet), and that wait is the only
-	// window in which "no instance exists yet" is actually true. Stamping it
-	// afterwards described a state that was already over, so Provisioning was
-	// effectively unobservable and indistinguishable from Initializing except by
-	// timing.
-	//
-	// Emit WITHOUT store: the pod must NOT be tracked yet. reconcileOnce treats a
-	// tracked pod that is absent from List() as Terminated, and during this window it
-	// is legitimately absent — so tracking it here lets a concurrent poll tick write
-	// Failed/Terminated over a provision that is still succeeding. That write is
-	// unrecoverable (Pod phases are terminal-sticky) and the claim would reclaim on
-	// it. Emitting alone is safe: notify only pushes status, and persistEndpoint
-	// no-ops on an endpoint-less pod, so nothing needs the tracking entry yet.
-	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "allocating external instance")
-	h.emit(pod)
-
 	id, err := h.prov.Provision(ctx, pod, req)
 	if err != nil {
 		log.Error(err, "provision failed; Pod marked Failed for failover")
@@ -240,28 +221,9 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 
-	// The instance now EXISTS at the provider — listable, terminable, and billable —
-	// so report Initializing rather than leaving the Pod at Provisioning until the
-	// first poll tick. That closes a real gap: the claim reads Initializing as its
-	// proof an instance exists, and until that reason lands the claim stays
-	// Provisioning, so a Pod deleted in the window would be reclaimed only after the
-	// placement grace period even though something was already running.
-	//
-	// "Initializing" is deliberately about EXISTENCE, not boot progress. For AWS it is
-	// also literally booting (an instant fleet allocates capacity synchronously), but a
-	// Modal sandbox may still be queued for a GPU. Reporting Provisioning for it would
-	// be worse, not better: it would mean the id — and the reclaim obligation — exists
-	// while the Pod still claims nothing does, and a queued sandbox bills. The
-	// queued/booting split is genuinely unobservable through Modal's public API (see
-	// docs/status.md), so both collapse into the one honest statement available: it
-	// exists and is not yet ready. This matches applyState's InstancePending case, so
-	// the first poll tick confirms this status rather than changing it.
-	//
-	// markStatus precedes store because store deep-copies: storing first would track a
-	// Pod still carrying Provisioning, and GetPodStatus would serve that stale reason
-	// until a poll tick overwrote it.
+	// Record the instance id before reporting success; teardown relies on it.
 	log.Info("external instance provisioned", "instanceID", id)
-	h.markStatus(pod, corev1.PodPending, reasonInitializing, "external instance is initializing")
+	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "provisioning external instance")
 	h.store(pod, claim, id)
 	h.emit(pod)
 	return nil
