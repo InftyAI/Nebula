@@ -325,7 +325,7 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) Sandbox {
 		case code != nil:
 			out.Status = exitStatus(*code)
 			c.forgetReady(sb.SandboxID)
-		case c.observeReady(ctx, sb.SandboxID, out.Tags):
+		case c.observeReady(sb.SandboxID, out.Tags):
 			out.Status = statusRunning
 		default:
 			out.Status = statusInitializing
@@ -412,7 +412,7 @@ func exitStatus(code int) string {
 // budget — whereas a wrong Running is not.
 // It takes no context on purpose: there is nothing here to cancel, which is the
 // property that makes it safe to call once per sandbox inside List.
-func (c *sdkClient) observeReady(ctx context.Context, id string, tags map[string]string) bool {
+func (c *sdkClient) observeReady(id string, tags map[string]string) bool {
 	if tags[ProbeTagKey] != probeTagValue {
 		return true
 	}
