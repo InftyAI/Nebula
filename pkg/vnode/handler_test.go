@@ -30,7 +30,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -70,18 +72,26 @@ type fakeProvider struct {
 	// provisionHook runs inside Provision, before it returns, so a test can observe
 	// what the handler published for the window in which the call is still in flight.
 	provisionHook func()
+	// provisionBlocksUntilDeadline makes Provision consume its whole ctx budget before
+	// returning successfully, the way a real backend that answers just under the
+	// timeout does. It exists to prove the provision deadline does not leak into the
+	// writes that follow.
+	provisionBlocksUntilDeadline bool
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
 func (f *fakeProvider) Capabilities() provider.Capabilities { return f.capabilities }
 
 func (f *fakeProvider) Provision(
-	_ context.Context, _ *corev1.Pod, req provider.ProvisionRequest,
+	ctx context.Context, _ *corev1.Pod, req provider.ProvisionRequest,
 ) (provider.ProvisionResult, error) {
 	// Outside the lock: the hook reads Handler state, and holding f.mu here would
 	// deadlock a hook that touches the provider.
 	if f.provisionHook != nil {
 		f.provisionHook()
+	}
+	if f.provisionBlocksUntilDeadline {
+		<-ctx.Done() // burn the provision budget, then succeed anyway
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -896,6 +906,83 @@ func TestCreatePod_FailedEndpointPatchIsRetriedByPollLoop(t *testing.T) {
 		t.Fatalf("a landed endpoint must not re-patch; got %d patches", patches)
 	}
 }
+
+// ctxRecordingClient wraps a clientset to capture the ctx a Secret create receives.
+// The fake clientset ignores ctx entirely, so asserting the Secret merely EXISTS would
+// pass whether or not the provision deadline leaked; the ctx itself has to be inspected.
+// Embedding keeps this to the one method under test.
+type ctxRecordingClient struct {
+	kubernetes.Interface
+	seen *context.Context
+}
+
+func (c ctxRecordingClient) CoreV1() corev1client.CoreV1Interface {
+	return ctxRecordingCoreV1{c.Interface.CoreV1(), c.seen}
+}
+
+type ctxRecordingCoreV1 struct {
+	corev1client.CoreV1Interface
+	seen *context.Context
+}
+
+func (c ctxRecordingCoreV1) Secrets(ns string) corev1client.SecretInterface {
+	return ctxRecordingSecrets{c.CoreV1Interface.Secrets(ns), c.seen}
+}
+
+type ctxRecordingSecrets struct {
+	corev1client.SecretInterface
+	seen *context.Context
+}
+
+func (s ctxRecordingSecrets) Create(
+	ctx context.Context, secret *corev1.Secret, opts metav1.CreateOptions,
+) (*corev1.Secret, error) {
+	*s.seen = ctx
+	return s.SecretInterface.Create(ctx, secret, opts)
+}
+
+// The provision timeout bounds the Provision CALL, not the writes that follow it. A
+// backend that answers just under the deadline would otherwise hand those writes a ctx
+// with no budget left, so they would fail with DeadlineExceeded on the SUCCESS path —
+// and the Secret is never retried, so the one-shot token would be lost for good.
+//
+// Only the Secret is at risk: the endpoint patch runs on the notify wrapper's own
+// long-lived ctx (see NotifyPods), not on CreatePod's.
+func TestCreatePod_ProvisionDeadlineDoesNotLeakIntoCredentialWrite(t *testing.T) {
+	const url, token = "https://sb-1.modal.host", "tok-abc"
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	var secretCtx context.Context
+	fp := &fakeProvider{
+		provisionID:                  "inst-1",
+		provisionURL:                 url,
+		provisionToken:               token,
+		provisionBlocksUntilDeadline: true,
+		// A tiny budget the call is guaranteed to exhaust.
+		capabilities: provider.Capabilities{ProvisionTimeout: time.Millisecond},
+	}
+	h := NewHandler(fp, ctxRecordingClient{client, &secretCtx}, nil)
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	if secretCtx == nil {
+		t.Fatal("the Secret write never ran")
+	}
+	if err := secretCtx.Err(); err != nil {
+		t.Fatalf("the Secret write got an already-expired ctx (%v): the provision deadline "+
+			"leaked into it, and this token can never be re-minted", err)
+	}
+	if got := connectSecret(t, client, "default", "p1"); got == nil ||
+		secretValue(got, "token") != token {
+		t.Fatalf("connect Secret = %v, want the token %q", got, token)
+	}
+}
+
+// setEndpoint ignores an empty endpoint rather than clearing it. That is what lets the
 
 // setEndpoint ignores an empty endpoint rather than clearing it. That is what lets the
 // create-time and observed paths coexist: Modal publishes its URL at create and then

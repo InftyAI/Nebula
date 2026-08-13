@@ -207,11 +207,17 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Bound the provision call so a wedged backend cannot pin this worker forever.
 	// The provider may raise the deadline via Capabilities.ProvisionTimeout (AWS
 	// does, to leave room for cross-zone failover); zero means "use the default".
+	//
+	// The deadline is scoped to that ONE call and must not be reused for the writes
+	// that follow it. A Provision returning just under the timeout would leave those
+	// writes with no time budget at all, so they would fail with DeadlineExceeded on
+	// success — and the credential write below cannot be retried, so a timeout there
+	// loses the token for good. The follow-up writes stay on the caller's ctx.
 	timeout := h.prov.Capabilities().ProvisionTimeout
 	if timeout <= 0 {
 		timeout = defaultProvisionTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	provisionCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	log.Info("provisioning external instance",
@@ -223,7 +229,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "allocating external instance")
 	h.emit(pod)
 
-	res, err := h.prov.Provision(ctx, pod, req)
+	res, err := h.prov.Provision(provisionCtx, pod, req)
 	if err != nil {
 		log.Error(err, "provision failed; Pod marked Failed for failover")
 		// Record the failure on the shared blocklist so placement fails over to the
