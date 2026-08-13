@@ -453,8 +453,11 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand},
 		"runpod", provider.ProviderModal)
-	runpod := &fakeProvider{name: "runpod", gpus: []string{"H100"}}
-	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	// Both advertise Spot, so the tier is genuinely reachable and the blocklist —
+	// not a capability gap — is what pushes the walk onward (see
+	// TestPlacement_SkipsSpotWhenProviderHasNoSpotTier for that path).
+	runpod := &fakeProvider{name: "runpod", gpus: []string{"H100"}, spot: true}
+	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}, spot: true}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, runpod, modal)
 	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
 		// Both providers' Spot is exhausted (wildcard provider, Spot only).
@@ -473,6 +476,63 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 	}
 }
 
+func TestPlacement_SkipsSpotWhenProviderHasNoSpotTier(t *testing.T) {
+	// Modal has no user-facing preemptible capacity (SupportsSpot=false). The pool
+	// asks for Spot first, but that candidate is unservable, so the walk falls
+	// through to OnDemand — and the Pod is labelled OnDemand, which is what it will
+	// actually be billed as. Placing it as Spot would be a silent downgrade: the
+	// adapter ignores CapacityType, so the user would pay OnDemand rates for a Pod
+	// whose annotation claims Spot.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}} // spot: false
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if hasGateNamed(got) {
+		t.Fatal("expected the Pod placed at the OnDemand tier")
+	}
+	if got.Annotations[nebulav1alpha1.CapacityTypeAnnotation] != string(nebulav1alpha1.CapacityOnDemand) {
+		t.Fatalf("expected the Spot candidate skipped for OnDemand, got %q",
+			got.Annotations[nebulav1alpha1.CapacityTypeAnnotation])
+	}
+}
+
+func TestPlacement_SpotOnlyPoolStaysGatedOnOnDemandOnlyProvider(t *testing.T) {
+	// Spot is the pool's ONLY tier and the sole provider cannot serve it, so there is
+	// no candidate at all. The Pod stays gated — visibly unplaceable — rather than
+	// being quietly provisioned as OnDemand against an explicit Spot-only policy.
+	// Nothing here can be fixed by a lapsing TTL, so there is no requeue hint: the
+	// unblock is a pool edit or a provider gaining a Spot tier, both of which
+	// generate their own event.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot}, provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}} // spot: false
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	res, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "p1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected no requeue hint for a capability gap, got %v", res.RequeueAfter)
+	}
+
+	got := getPod(t, c, "default", "p1")
+	if !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when no provider serves the only tier")
+	}
+	var nc nebulav1alpha1.NodeClaim
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err == nil {
+		t.Fatal("expected no claim for an unplaceable Pod")
+	}
+}
+
 func TestPlacement_AllCandidatesBlockedRequeuesForBlockExpiry(t *testing.T) {
 	// Every (tier, provider, region) candidate is blocked (DenyAll on the provider),
 	// but the candidates are servable — the block is a transient failover exclusion.
@@ -482,7 +542,10 @@ func TestPlacement_AllCandidatesBlockedRequeuesForBlockExpiry(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand},
 		provider.ProviderModal)
-	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	// spot:true so BOTH tiers are servable and every skip is the blocklist's doing —
+	// the point of the test is the requeue hint, which only exists for candidates a
+	// lapsing TTL can free.
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}, spot: true}
 	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
 	r.Blocklist = &fakeBlocklist{
 		blocked: []failover.Candidate{{Provider: provider.ProviderModal}}, // whole-provider block (auth/quota)

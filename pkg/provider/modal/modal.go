@@ -21,9 +21,10 @@ limitations under the License.
 //   - Lifecycle is create/terminate only. A Modal Sandbox is spun up and later
 //     terminated; there is no stop/resume, so Capabilities.SupportsStop=false.
 //   - Modal does not expose a user-facing spot/preemptible tier, so
-//     SupportsSpot=false. The optimizer therefore only ever sends OnDemand
-//     ProvisionRequests here (the NodePool capacity-tier loop skips Spot for
-//     providers that don't advertise it).
+//     SupportsSpot=false. Placement consults that trait (servesCapacity in the
+//     capacity-tier loop) and skips a Spot candidate here rather than downgrading
+//     it silently, so only OnDemand (or default-tier) ProvisionRequests reach this
+//     adapter and it never has to interpret CapacityType.
 //   - Modal Sandboxes carry native tags, so NativeTags=true and the ClaimName
 //     is stored as a tag rather than smuggled into the instance name.
 //   - There is no preemption push; detection is poll-based like every provider.
