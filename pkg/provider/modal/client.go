@@ -45,10 +45,6 @@ type sdkClient struct {
 	mc      *modal.Client
 	appName string
 
-	// endpointTimeout bounds the best-effort tunnel lookup used to report an
-	// instance's reachable address; tunnels only exist once the sandbox is up.
-	endpointTimeout time.Duration
-
 	// readyTimeout is the budget one background readiness waiter gets. It is a real
 	// budget, not a hint: WaitUntilReady BLOCKS and returns early only to say
 	// "ready" — never to say "not ready" — so a budget below the call's own setup
@@ -105,12 +101,11 @@ func NewSDKClient(ctx context.Context, appName string) (*Provider, error) {
 		return nil, fmt.Errorf("modal: load price catalog: %w", err)
 	}
 	return New(&sdkClient{
-		mc:              mc,
-		appName:         appName,
-		endpointTimeout: 5 * time.Second,
-		readyTimeout:    30 * time.Second,
-		ready:           make(map[string]bool),
-		waiting:         make(map[string]struct{}),
+		mc:           mc,
+		appName:      appName,
+		readyTimeout: 30 * time.Second,
+		ready:        make(map[string]bool),
+		waiting:      make(map[string]struct{}),
 	}, cat), nil
 }
 
@@ -120,19 +115,19 @@ func (c *sdkClient) app(ctx context.Context) (*modal.App, error) {
 }
 
 // CreateSandbox implements Client.
-func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string, error) {
+func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string, Credential, error) {
 	app, err := c.app(ctx)
 	if err != nil {
-		return "", fmt.Errorf("modal: resolve app: %w", err)
+		return "", Credential{}, fmt.Errorf("modal: resolve app: %w", err)
 	}
 	if spec.Image == "" {
-		return "", fmt.Errorf("modal: empty image in sandbox spec")
+		return "", Credential{}, fmt.Errorf("modal: empty image in sandbox spec")
 	}
 	image := c.mc.Images.FromRegistry(spec.Image, nil)
 
 	probe, err := modalProbe(spec.ReadinessProbe)
 	if err != nil {
-		return "", fmt.Errorf("modal: readiness probe: %w", err)
+		return "", Credential{}, fmt.Errorf("modal: readiness probe: %w", err)
 	}
 
 	sb, err := c.mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
@@ -147,9 +142,70 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		ReadinessProbe: probe,
 	})
 	if err != nil {
-		return "", err
+		return "", Credential{}, err
 	}
-	return sb.SandboxID, nil
+	return sb.SandboxID, c.mintCredential(ctx, sb, spec), nil
+}
+
+// mintCredential issues the sandbox's connect credential and RETURNS it. Nothing is
+// stored here — not in a tag, not in memory.
+//
+// Not in a tag, because Modal's tags are plaintext and bulk-listable: one
+// ListSandboxes would hand over every workload's token at once, with no revocation
+// and no rotation to fall back on. Not in memory, because memory is not durable. The
+// only place a credential belongs is an access-controlled Secret, which this layer
+// has no cluster access to write — so it hands the pair to the one caller that does:
+// the virtual kubelet, which writes both halves to a Secret in the Pod's namespace
+// and the address to the Pod's endpoint annotation.
+//
+// Returning it is enough, and that is the part worth stating: the credential is
+// minted on the one-shot CREATE path, but its consumers are durable Kubernetes
+// objects, so nothing needs to re-derive it later. The annotation in etcd is the
+// endpoint's record of truth (nothing on the read path ever clears it), which is
+// strictly better than a tag — no provider round trip to recover a value the API
+// server already stores. Modal therefore reports NO observed endpoint at all; see
+// observe.
+//
+// Minting is one-shot: every CreateConnectToken call mints a FRESH token, so there is
+// no read-back and no re-derivation later. A caller that drops the return value has
+// lost the credential for the life of the sandbox. That is also why this cannot move
+// to the read path — observe would hand the user a token that changed every tick.
+//
+// It can run this early because the RPC is keyed on the sandbox id alone
+// (SandboxCreateConnectToken takes sandbox_id + port, and the SDK checks only client
+// liveness): no task id, no running container, no booted GPU. Contrast Tunnels, which
+// resolves only once the container is up. So the credential is in hand the moment
+// Create returns, while the sandbox is still queued.
+//
+// Every workload gets one. An authenticated URL is the only general way to reach
+// something running on a NeoCloud — there is no cluster network to fall back on —
+// so the useful default is that the credential exists, and a workload with nothing
+// to serve simply leaves it unused. The URL routes to the first of spec.Ports — one
+// token routes to one port — and no declared port means Modal's own default (8080)
+// applies.
+//
+// This is scoped to service-shaped workloads (a Deployment/StatefulSet/bare Pod
+// that serves traffic). A Sandbox is reached by identity, not by address —
+// `kubectl exec sbx-alice` — so it should NOT carry a credential; today it still
+// gets one, because it reaches this adapter as an ordinary Pod and nothing here
+// distinguishes the two classes yet.
+//
+// Best-effort by design: a sandbox that exists must be reported (and reclaimed)
+// whether or not it got a credential, so a failure here returns the zero Credential
+// and the instance is simply unreachable. The error is NOT returned, because that
+// would fail a Provision whose sandbox is already running — leaking a paid instance
+// to save an address. The error text is dropped rather than logged for the same
+// reason a token is never logged: it can echo the request.
+func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, spec SandboxSpec) Credential {
+	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
+		// Derived from the exposed set rather than carried separately, so the routed
+		// port cannot name one the sandbox was never told to accept traffic on.
+		Port: firstPort(spec.Ports),
+	})
+	if err != nil || creds == nil || creds.Token == "" {
+		return Credential{}
+	}
+	return Credential{URL: creds.URL, Token: creds.Token}
 }
 
 // modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only
@@ -302,15 +358,15 @@ func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 	return out, nil
 }
 
-// observe normalizes a live SDK *Sandbox into the adapter-level Sandbox view:
-// status (from Poll), tags (from GetTags), and a best-effort endpoint (from
-// Tunnels). Poll and tunnel errors are tolerated so a single flaky sandbox doesn't
-// fail the whole read — the poll loop will re-observe next tick. A TAG error is
-// not: see below.
+// observe normalizes a live SDK *Sandbox into the adapter-level Sandbox view: tags
+// (from GetTags) and status (from Poll). A Poll error is tolerated so a single flaky
+// sandbox doesn't fail the whole read — the poll loop will re-observe next tick. A TAG
+// error is not: see below.
 //
-// observe is a BOUNDED read: every call it makes carries a short deadline, so it
-// returns promptly even for a sandbox that is still coming up. It must be, since
-// it runs once per sandbox inside the List iteration.
+// observe is a CHEAP read, and it must be: it runs once per sandbox inside the List
+// iteration, on every poll tick. That is why it reports no endpoint (see the tail of
+// this function) — an address lookup here would be a per-sandbox round trip on the
+// hot path.
 func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) (Sandbox, error) {
 	out := Sandbox{ID: sb.SandboxID}
 
@@ -355,18 +411,17 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) (Sandbox, er
 		}
 	}
 
-	// Endpoint is only meaningful once running; look it up best-effort.
-	// TODO: why we need the tunnel.
-	if out.Status == statusRunning {
-		tctx, cancel := context.WithTimeout(ctx, c.endpointTimeout)
-		if tunnels, err := sb.Tunnels(tctx, c.endpointTimeout, &modal.SandboxTunnelsParams{}); err == nil {
-			for _, t := range tunnels {
-				out.Endpoint = t.URL()
-				break
-			}
-		}
-		cancel()
-	}
+	// No endpoint is read back. The sandbox's reachable address is its connect URL,
+	// minted at create and already persisted on the Pod's endpoint annotation, so
+	// re-deriving it per tick would be a round trip for a value the API server holds.
+	//
+	// The alternative would be a tunnel URL, and reporting one is worse than reporting
+	// nothing: a tunnel is PUBLIC to whoever learns it, so serving it as a stand-in for
+	// an authenticated URL silently downgrades access to the workload. A sandbox whose
+	// mint failed is therefore reported with no address at all — an honest "unreachable"
+	// rather than an open one — and that stays a FACT, not an error: observe's errors
+	// fail the entire List (see the tags block above), so one credential-less sandbox
+	// would otherwise stall status for every pod on the node.
 	return out, nil
 }
 

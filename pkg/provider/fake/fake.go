@@ -88,12 +88,17 @@ func (p *Provider) Capabilities() provider.Capabilities {
 // It reports the instance RESERVED, which is honest for an in-memory backend: the
 // instance is Running the moment it is recorded, so there is no queueing to model
 // (and none of the capacity the reserved flag exists to describe).
-func (p *Provider) Provision(_ context.Context, pod *corev1.Pod, req provider.ProvisionRequest) (string, bool, error) {
+//
+// No connect credential is minted: there is nothing to authenticate against. The
+// endpoint is reported the level-triggered way, through the recorded instance.
+func (p *Provider) Provision(
+	_ context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
+) (provider.ProvisionResult, error) {
 	if pod == nil {
-		return "", false, fmt.Errorf("fake: nil pod")
+		return provider.ProvisionResult{}, fmt.Errorf("fake: nil pod")
 	}
 	if req.ClaimName == "" {
-		return "", false, fmt.Errorf("fake: empty ClaimName in ProvisionRequest")
+		return provider.ProvisionResult{}, fmt.Errorf("fake: empty ClaimName in ProvisionRequest")
 	}
 
 	p.mu.Lock()
@@ -101,7 +106,8 @@ func (p *Provider) Provision(_ context.Context, pod *corev1.Pod, req provider.Pr
 
 	for _, inst := range p.instances {
 		if inst.ClaimName == req.ClaimName {
-			return inst.ID, true, nil // idempotent reuse
+			// Idempotent reuse.
+			return provider.ProvisionResult{InstanceID: inst.ID, Reserved: true}, nil
 		}
 	}
 
@@ -114,7 +120,7 @@ func (p *Provider) Provision(_ context.Context, pod *corev1.Pod, req provider.Pr
 		Endpoint:     fmt.Sprintf("fake://%s", id),
 		CapacityType: req.CapacityType,
 	}
-	return id, true, nil
+	return provider.ProvisionResult{InstanceID: id, Reserved: true}, nil
 }
 
 // Terminate forgets the instance. Idempotent: terminating an already-gone (or

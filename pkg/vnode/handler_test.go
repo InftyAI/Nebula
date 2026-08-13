@@ -27,9 +27,12 @@ import (
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -46,15 +49,19 @@ type fakeProvider struct {
 	// case), so a test that cares about the reserved path must opt in — the zero value
 	// should not silently assert the stronger guarantee.
 	provisionReserved bool
-	provisionErr      error
-	provisionCnt      int
-	lastReq           provider.ProvisionRequest
-	terminateCnt      int
-	terminateID       string
-	terminateErr      error
-	list              []provider.Instance
-	listErr           error
-	capabilities      provider.Capabilities
+	// provisionURL/provisionToken are the connect credential Provision returns — the
+	// one-shot value the handler must persist, since it can never be re-read.
+	provisionURL   string
+	provisionToken string
+	provisionErr   error
+	provisionCnt   int
+	lastReq        provider.ProvisionRequest
+	terminateCnt   int
+	terminateID    string
+	terminateErr   error
+	list           []provider.Instance
+	listErr        error
+	capabilities   provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
 	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
 	// record what the handler passed in, so a test can assert it resolved them off the
@@ -65,24 +72,40 @@ type fakeProvider struct {
 	// provisionHook runs inside Provision, before it returns, so a test can observe
 	// what the handler published for the window in which the call is still in flight.
 	provisionHook func()
+	// provisionBlocksUntilDeadline makes Provision consume its whole ctx budget before
+	// returning successfully, the way a real backend that answers just under the
+	// timeout does. It exists to prove the provision deadline does not leak into the
+	// writes that follow.
+	provisionBlocksUntilDeadline bool
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
 func (f *fakeProvider) Capabilities() provider.Capabilities { return f.capabilities }
 
 func (f *fakeProvider) Provision(
-	_ context.Context, _ *corev1.Pod, req provider.ProvisionRequest,
-) (string, bool, error) {
+	ctx context.Context, _ *corev1.Pod, req provider.ProvisionRequest,
+) (provider.ProvisionResult, error) {
 	// Outside the lock: the hook reads Handler state, and holding f.mu here would
 	// deadlock a hook that touches the provider.
 	if f.provisionHook != nil {
 		f.provisionHook()
 	}
+	if f.provisionBlocksUntilDeadline {
+		<-ctx.Done() // burn the provision budget, then succeed anyway
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.provisionCnt++
 	f.lastReq = req
-	return f.provisionID, f.provisionReserved, f.provisionErr
+	if f.provisionErr != nil {
+		return provider.ProvisionResult{}, f.provisionErr
+	}
+	return provider.ProvisionResult{
+		InstanceID:   f.provisionID,
+		Reserved:     f.provisionReserved,
+		ConnectURL:   f.provisionURL,
+		ConnectToken: f.provisionToken,
+	}, nil
 }
 
 func (f *fakeProvider) Terminate(_ context.Context, id string) error {
@@ -569,6 +592,409 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 	h.reconcileOnce(context.Background())
 	if patches != 1 {
 		t.Fatalf("an unchanged endpoint must not re-patch; got %d patches", patches)
+	}
+}
+
+// connectSecret fetches the connect Secret for a pod, or nil when absent.
+func connectSecret(t *testing.T, client *fake.Clientset, ns, podName string) *corev1.Secret {
+	t.Helper()
+	s, err := client.CoreV1().Secrets(ns).Get(context.Background(), ConnectSecretName(podName), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("get connect secret: %v", err)
+	}
+	return s
+}
+
+// secretValue reads a key from either half of a Secret. The API server folds
+// StringData into Data on write, but the fake client stores it verbatim, so a test
+// asserting on Data alone would only be exercising the fake.
+func secretValue(s *corev1.Secret, key string) string {
+	if v, ok := s.StringData[key]; ok {
+		return v
+	}
+	return string(s.Data[key])
+}
+
+// The credential must land in a Secret and NOT on the Pod: an annotation is
+// readable by anyone with `get pod` in the namespace and sits unencrypted in etcd.
+// The URL rides along so the pair is usable from one object, and separately goes on
+// the Pod's endpoint annotation, which is not secret.
+func TestCreatePod_WritesConnectSecret(t *testing.T) {
+	const url, token = "https://sb-1.modal.host", "tok-abc"
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: token}
+	h := NewHandler(fp, client, nil)
+	// Register the notifier BEFORE CreatePod, as VK does (it wires NotifyPods before
+	// any pod work starts). The endpoint reaches the API server through it.
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	got := connectSecret(t, client, "default", "p1")
+	if got == nil {
+		t.Fatal("expected a connect Secret from the credential Provision returned")
+	}
+	if v := secretValue(got, "token"); v != token {
+		t.Fatalf("secret token = %q, want %q", v, token)
+	}
+	if v := secretValue(got, "url"); v != url {
+		t.Fatalf("secret url = %q, want %q", v, url)
+	}
+	// ownerReferenced to the Pod BY UID — a name alone is ignored by the GC — so
+	// teardown of the Pod reclaims the Secret on every path, including a force delete.
+	if len(got.OwnerReferences) != 1 {
+		t.Fatalf("ownerReferences = %v, want exactly one (the Pod)", got.OwnerReferences)
+	}
+	if ref := got.OwnerReferences[0]; ref.Kind != "Pod" || ref.Name != "p1" || ref.UID != "uid-1" {
+		t.Fatalf("ownerReference = %+v, want Pod/p1 with the Pod's UID", ref)
+	}
+
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	// The address IS published on the Pod — that is how a consumer finds it, and how
+	// the Sandbox controller reports Status.Endpoint.
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != url {
+		t.Fatalf("endpoint annotation = %q, want the connect URL %q", got, url)
+	}
+	// The token must never reach the Pod itself.
+	for k, v := range live.Annotations {
+		if strings.Contains(v, token) {
+			t.Fatalf("token leaked onto Pod annotation %q", k)
+		}
+	}
+}
+
+// The Secret is written ONCE, on the create path — not per poll tick. This is the
+// difference between one write per workload and one per workload per tick forever
+// (at 10k pods on a 15s cadence, ~666 writes/sec that can only ever say
+// AlreadyExists). It is also the only place it CAN be written: the token is minted
+// once and cannot be re-read, so no later tick has anything to write.
+func TestConnectSecret_WrittenOnceNotPerTick(t *testing.T) {
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	var creates int
+	client.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		creates++
+		return false, nil, nil // fall through to the tracker
+	})
+
+	fp := &fakeProvider{
+		provisionID:    "inst-1",
+		provisionURL:   "https://sb-1.modal.host",
+		provisionToken: "tok-abc",
+	}
+	h := NewHandler(fp, client, nil)
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if creates != 1 {
+		t.Fatalf("CreatePod issued %d secret creates, want exactly 1", creates)
+	}
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}
+	for i := 0; i < 3; i++ {
+		h.reconcileOnce(context.Background())
+	}
+	if creates != 1 {
+		t.Fatalf("the poll loop touched the Secret: %d creates after 3 ticks, want 1", creates)
+	}
+	if got := connectSecret(t, client, "default", "p1"); got == nil ||
+		secretValue(got, "token") != "tok-abc" {
+		t.Fatalf("secret = %v, want the original credential intact", got)
+	}
+}
+
+// An endpoint-less workload (a training job, a batch script) gets no credential from
+// the provider, and so must get no Secret: creating an empty one would imply a
+// reachable surface that does not exist. This is also every AWS instance, whose
+// address is observed later rather than minted here.
+func TestCreatePod_NoSecretWithoutCredential(t *testing.T) {
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	fp := &fakeProvider{provisionID: "inst-1"} // no URL, no token
+	h := NewHandler(fp, client, nil)
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	if got := connectSecret(t, client, "default", "p1"); got != nil {
+		t.Fatalf("expected no connect Secret for a credential-less instance, got %+v", got)
+	}
+}
+
+// A URL with no token still publishes the address: the endpoint is how the workload
+// is found, and a Secret holding only a URL would imply a credential that does not
+// exist.
+func TestCreatePod_URLWithoutTokenPatchesEndpointOnly(t *testing.T) {
+	const url = "https://sb-1.modal.host"
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url}
+	h := NewHandler(fp, client, nil)
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != url {
+		t.Fatalf("endpoint annotation = %q, want %q", got, url)
+	}
+	if got := connectSecret(t, client, "default", "p1"); got != nil {
+		t.Fatalf("expected no Secret without a token, got %+v", got)
+	}
+}
+
+// A UID-less Pod would get an ownerReference the GC cannot resolve, so the Secret
+// would never be collected — leaking a live credential. Skip instead.
+func TestCreateConnectSecret_SkipsUIDLessPod(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	h := NewHandler(&fakeProvider{}, client, nil)
+
+	h.createConnectSecret(context.Background(), testPod("default", "p1"), // no UID
+		"https://sb-9.modal.host", "tok-abc")
+
+	if got := connectSecret(t, client, "default", "p1"); got != nil {
+		t.Fatalf("expected no Secret for a UID-less Pod (it would never be GC'd), got %+v", got)
+	}
+}
+
+// A failed Provision publishes nothing. There is no credential to publish, and an
+// endpoint annotation would advertise an instance that does not exist.
+func TestCreatePod_NoCredentialPersistedOnProvisionFailure(t *testing.T) {
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	fp := &fakeProvider{provisionErr: errors.New("no capacity")}
+	h := NewHandler(fp, client, nil)
+	if err := h.CreatePod(context.Background(), pod); err == nil {
+		t.Fatal("expected CreatePod to fail")
+	}
+
+	if got := connectSecret(t, client, "default", "p1"); got != nil {
+		t.Fatalf("expected no Secret after a failed Provision, got %+v", got)
+	}
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != "" {
+		t.Fatalf("endpoint annotation = %q, want empty after a failed Provision", got)
+	}
+}
+
+// The endpoint annotation is where the address LIVES, so a restart does not lose it:
+// nothing on the read path clears it, and a provider that reports no observed
+// endpoint (Modal, which published at create) leaves the stored value alone.
+func TestReconcileOnce_EmptyObservedEndpointDoesNotClearAnnotation(t *testing.T) {
+	const url = "https://sb-1.modal.host"
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: "tok-abc"}
+	h := NewHandler(fp, client, nil)
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+
+	// The instance is observed with NO endpoint, the way Modal reports it.
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}
+	h.reconcileOnce(context.Background())
+
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != url {
+		t.Fatalf("endpoint annotation = %q, want %q retained across a tick that observed none", got, url)
+	}
+}
+
+// A create-time URL comes from the provider ONCE and is never re-observed (Modal
+// reports no endpoint on the read path), so a failed patch cannot be recovered from the
+// provider. It is recovered from the tracked Pod instead: CreatePod stamps the address
+// there, and every poll tick re-emits it, so persistEndpoint keeps patching until one
+// write lands — then dedups. Without that, one transient 500 at create leaves the
+// workload permanently unreachable.
+func TestCreatePod_FailedEndpointPatchIsRetriedByPollLoop(t *testing.T) {
+	const url = "https://sb-1.modal.host"
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	var patches int
+	failing := true
+	client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		patches++
+		if failing {
+			return true, nil, errors.New("boom")
+		}
+		return false, nil, nil // fall through to the tracker
+	})
+
+	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: "tok-abc"}
+	h := NewHandler(fp, client, nil)
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod must not fail on a failed endpoint patch: %v", err)
+	}
+	if patches != 1 {
+		t.Fatalf("expected CreatePod's emit to attempt one patch, got %d", patches)
+	}
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != "" {
+		t.Fatalf("precondition: the patch was supposed to fail, but the annotation is %q", got)
+	}
+
+	// Modal's read path reports no endpoint, so the retry can only come from what was
+	// stamped at create.
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}
+
+	// Still failing: the tick retries rather than giving up.
+	h.reconcileOnce(context.Background())
+	if patches != 2 {
+		t.Fatalf("expected the poll tick to retry the patch, got %d patches total", patches)
+	}
+
+	failing = false
+	h.reconcileOnce(context.Background())
+	if patches != 3 {
+		t.Fatalf("expected a third patch attempt, got %d", patches)
+	}
+	live, err = client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != url {
+		t.Fatalf("endpoint annotation = %q, want the create-time URL %q recovered", got, url)
+	}
+
+	// And once it lands, it dedups — the retry must not become a per-tick write.
+	h.reconcileOnce(context.Background())
+	if patches != 3 {
+		t.Fatalf("a landed endpoint must not re-patch; got %d patches", patches)
+	}
+}
+
+// ctxRecordingClient wraps a clientset to capture the ctx a Secret create receives.
+// The fake clientset ignores ctx entirely, so asserting the Secret merely EXISTS would
+// pass whether or not the provision deadline leaked; the ctx itself has to be inspected.
+// Embedding keeps this to the one method under test.
+type ctxRecordingClient struct {
+	kubernetes.Interface
+	seen *context.Context
+}
+
+func (c ctxRecordingClient) CoreV1() corev1client.CoreV1Interface {
+	return ctxRecordingCoreV1{c.Interface.CoreV1(), c.seen}
+}
+
+type ctxRecordingCoreV1 struct {
+	corev1client.CoreV1Interface
+	seen *context.Context
+}
+
+func (c ctxRecordingCoreV1) Secrets(ns string) corev1client.SecretInterface {
+	return ctxRecordingSecrets{c.CoreV1Interface.Secrets(ns), c.seen}
+}
+
+type ctxRecordingSecrets struct {
+	corev1client.SecretInterface
+	seen *context.Context
+}
+
+func (s ctxRecordingSecrets) Create(
+	ctx context.Context, secret *corev1.Secret, opts metav1.CreateOptions,
+) (*corev1.Secret, error) {
+	*s.seen = ctx
+	return s.SecretInterface.Create(ctx, secret, opts)
+}
+
+// The provision timeout bounds the Provision CALL, not the writes that follow it. A
+// backend that answers just under the deadline would otherwise hand those writes a ctx
+// with no budget left, so they would fail with DeadlineExceeded on the SUCCESS path —
+// and the Secret is never retried, so the one-shot token would be lost for good.
+//
+// Only the Secret is at risk: the endpoint patch runs on the notify wrapper's own
+// long-lived ctx (see NotifyPods), not on CreatePod's.
+func TestCreatePod_ProvisionDeadlineDoesNotLeakIntoCredentialWrite(t *testing.T) {
+	const url, token = "https://sb-1.modal.host", "tok-abc"
+	pod := testPod("default", "p1")
+	pod.UID = "uid-1"
+	client := fake.NewSimpleClientset(pod)
+
+	var secretCtx context.Context
+	fp := &fakeProvider{
+		provisionID:                  "inst-1",
+		provisionURL:                 url,
+		provisionToken:               token,
+		provisionBlocksUntilDeadline: true,
+		// A tiny budget the call is guaranteed to exhaust.
+		capabilities: provider.Capabilities{ProvisionTimeout: time.Millisecond},
+	}
+	h := NewHandler(fp, ctxRecordingClient{client, &secretCtx}, nil)
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	if secretCtx == nil {
+		t.Fatal("the Secret write never ran")
+	}
+	if err := secretCtx.Err(); err != nil {
+		t.Fatalf("the Secret write got an already-expired ctx (%v): the provision deadline "+
+			"leaked into it, and this token can never be re-minted", err)
+	}
+	if got := connectSecret(t, client, "default", "p1"); got == nil ||
+		secretValue(got, "token") != token {
+		t.Fatalf("connect Secret = %v, want the token %q", got, token)
+	}
+}
+
+// setEndpoint ignores an empty endpoint rather than clearing it. That is what lets the
+
+// setEndpoint ignores an empty endpoint rather than clearing it. That is what lets the
+// create-time and observed paths coexist: Modal publishes its URL at create and then
+// reports no endpoint at all, which must not erase the address.
+func TestSetEndpoint_EmptyValueDoesNotClear(t *testing.T) {
+	pod := testPod("default", "p1")
+	pod.Annotations = map[string]string{nebulav1alpha1.EndpointAnnotation: "https://sb-1.modal.host"}
+
+	setEndpoint(pod, "")
+
+	if got := pod.Annotations[nebulav1alpha1.EndpointAnnotation]; got != "https://sb-1.modal.host" {
+		t.Fatalf("endpoint = %q, want the previous value retained", got)
 	}
 }
 

@@ -388,20 +388,26 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 // is booting on real hardware — or the reason it could not launch, which becomes an
 // error driving AZ/region/tier failover. There is no queued state for an EC2
 // instance to sit in, so the reserved return is unconditionally true on success.
+//
+// No connect credential is returned. EC2 has nothing to mint: an instance is reached
+// at its public DNS name or IP, which EC2 does not know until the instance boots, so
+// the address is reported the level-triggered way — observed by List/Get into
+// Instance.Endpoint — and access is authenticated by the key pair and security group,
+// not a bearer token.
 func (p *Provider) Provision(
 	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
-) (string, bool, error) {
+) (provider.ProvisionResult, error) {
 	if pod == nil {
-		return "", false, errors.New("aws: nil pod")
+		return provider.ProvisionResult{}, errors.New("aws: nil pod")
 	}
 	if req.ClaimName == "" {
-		return "", false, errors.New("aws: empty ClaimName in ProvisionRequest")
+		return provider.ProvisionResult{}, errors.New("aws: empty ClaimName in ProvisionRequest")
 	}
 
 	region := req.Region
 	client, err := p.clientFor(ctx, region)
 	if err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	}
 
 	// Idempotency: if an instance already carries this claim tag IN THIS REGION,
@@ -410,23 +416,23 @@ func (p *Provider) Provision(
 	// target region's client is sufficient. It is reserved for the same reason a
 	// fresh launch is: it only exists because some earlier instant fleet succeeded.
 	if existing, err := findByClaim(ctx, client, req.ClaimName); err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	} else if existing != nil {
-		return existing.ID, true, nil
+		return provider.ProvisionResult{InstanceID: existing.ID, Reserved: true}, nil
 	}
 
 	spec, err := p.instanceSpecFromPod(pod, req)
 	if err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	}
 	// The Provision deadline is enforced generically by the vnode handler (from
 	// Capabilities.ProvisionTimeout), so RunInstance simply honors ctx as it fails
 	// over across zones — no adapter-local WithTimeout here.
 	id, err := client.RunInstance(ctx, spec)
 	if err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	}
-	return id, true, nil
+	return provider.ProvisionResult{InstanceID: id, Reserved: true}, nil
 }
 
 // Terminate implements provider.Provider. Idempotent by the Client contract. The

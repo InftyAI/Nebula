@@ -48,11 +48,19 @@ teardown.
 | `Failed` | `Terminated` | `applyState` ← `InstanceTerminated` | gone | `Terminated` |
 | `Succeeded` | `Terminated` | `DeletePod` | gone | `Terminated` |
 
-`Running` also sets `Ready=True` and the endpoint annotation. A Pod carrying a
-`DeletionTimestamp` maps to `Terminating` from any non-terminal phase. When the
-served Pod is ABSENT: after `Bound`/`Terminating`, the claim deletes itself and
-the terminate finalizer runs; before `Bound`, it waits `placementGracePeriod`
-first.
+`Running` also sets `Ready=True`. A Pod carrying a `DeletionTimestamp` maps to
+`Terminating` from any non-terminal phase. When the served Pod is ABSENT: after
+`Bound`/`Terminating`, the claim deletes itself and the terminate finalizer runs;
+before `Bound`, it waits `placementGracePeriod` first.
+
+The endpoint annotation is written on whichever path first knows the address, which
+differs by provider and is independent of phase. A provider that mints a connect URL
+at create time (Modal) publishes it from `CreatePod`, alongside the Secret holding
+the matching bearer token — so the endpoint is on the Pod before it is `Running`. A
+provider whose address only exists once the instance boots (AWS's public DNS name)
+reports it through `List()`, so the poll loop publishes it. Nothing ever clears the
+annotation: once written it stays for the Pod's life, which is what lets the two
+paths coexist and what makes the address survive a manager restart.
 
 Note the two writers. `CreatePod` writes the rows around the `Provision` call;
 every other non-terminal row comes from `applyState`, driven by the poll loop, and

@@ -72,7 +72,7 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 		// when the endpoint actually is one — an AWS public DNS name (the common
 		// case) would make the whole status UpdateStatus fail with a 422 and strand
 		// the Pod on its prior (Initializing) status forever. The endpoint is always
-		// surfaced on EndpointAnnotation regardless of form (see Handler.applyEndpoint),
+		// surfaced on EndpointAnnotation regardless of form (see Handler.patchEndpoint),
 		// so a DNS-only instance still exposes its reachable address; PodIP just stays
 		// empty in that case.
 		if endpoint != "" && net.ParseIP(endpoint) != nil {

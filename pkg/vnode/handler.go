@@ -147,11 +147,15 @@ type trackedPod struct {
 	pod       *corev1.Pod
 	claimName string
 	instance  string
-	// persistedEndpoint is the endpoint value last written to the Pod's metadata
-	// annotation via persistEndpoint. The notify callback fires every poll tick, so
+	// connectEndpoint is the endpoint value last written to the Pod's metadata
+	// annotation via patchEndpoint. The notify callback fires every poll tick, so
 	// this dedups the metadata patch to the ticks where the reachable address
 	// actually changed (first appearance, or a re-provision) rather than every tick.
-	persistedEndpoint string
+	//
+	// It is a cache, not a record: losing it (a restart) costs one redundant patch,
+	// never a lost value, because the annotation itself lives in etcd. No credential is
+	// held here — see persistCredential.
+	connectEndpoint string
 }
 
 // NewHandler builds a Handler for the given provider backend. The poll cadence
@@ -203,11 +207,17 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Bound the provision call so a wedged backend cannot pin this worker forever.
 	// The provider may raise the deadline via Capabilities.ProvisionTimeout (AWS
 	// does, to leave room for cross-zone failover); zero means "use the default".
+	//
+	// The deadline is scoped to that ONE call and must not be reused for the writes
+	// that follow it. A Provision returning just under the timeout would leave those
+	// writes with no time budget at all, so they would fail with DeadlineExceeded on
+	// success — and the credential write below cannot be retried, so a timeout there
+	// loses the token for good. The follow-up writes stay on the caller's ctx.
 	timeout := h.prov.Capabilities().ProvisionTimeout
 	if timeout <= 0 {
 		timeout = defaultProvisionTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	provisionCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	log.Info("provisioning external instance",
@@ -219,7 +229,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "allocating external instance")
 	h.emit(pod)
 
-	id, reserved, err := h.prov.Provision(ctx, pod, req)
+	res, err := h.prov.Provision(provisionCtx, pod, req)
 	if err != nil {
 		log.Error(err, "provision failed; Pod marked Failed for failover")
 		// Record the failure on the shared blocklist so placement fails over to the
@@ -247,13 +257,61 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// store runs either way: an id means the instance exists. markStatus precedes it
 	// because store deep-copies — storing first would track a copy without the status
 	// just written.
-	log.Info("external instance provisioned", "instanceID", id, "reserved", reserved)
-	if reserved {
+	log.Info("external instance provisioned", "instanceID", res.InstanceID, "reserved", res.Reserved)
+	if res.Reserved {
 		h.markStatus(pod, corev1.PodPending, reasonInitializing, "external instance is initializing")
 	}
-	h.store(pod, claim, id)
+	// Stamp a create-time address BEFORE store, because store deep-copies and the
+	// tracked copy is what the poll loop re-emits. That is the whole publication: the
+	// emit below carries it to the API server through the same notify wrapper the poll
+	// loop uses, and every later tick re-offers it until a write lands. No lock: this
+	// Pod is not shared until store, VK having handed us a copy of its own.
+	setEndpoint(pod, res.ConnectURL)
+	h.store(pod, claim, res.InstanceID)
+
+	// The TOKEN, unlike the address, cannot ride the Pod (it would be readable by
+	// anyone with `get pod` and sit unencrypted in etcd), so it gets its own write
+	// here — the only place it exists, since the provider mints it once and cannot
+	// re-read it (see provider.ProvisionResult). It runs after store and before emit so
+	// a tracked pod is never observable without its credential, and it does not gate
+	// the status: a Pod that provisioned is reported provisioned even if the Secret
+	// write failed.
+	h.persistCredential(ctx, pod, res.ConnectURL, res.ConnectToken)
+
 	h.emit(pod)
 	return nil
+}
+
+// persistCredential writes the bearer token, and a copy of the address it
+// authenticates against, into a Secret.
+//
+// It handles ONLY the secret half. The address is published by stamping it on the Pod
+// (see CreatePod / setEndpoint), which routes it through the one endpoint write path
+// every provider shares; this function exists because the token cannot travel that way.
+// An annotation is readable by anyone with `get pod` and lands unencrypted in etcd,
+// which is fine for an address and unacceptable for a credential, so the token goes to
+// an access-controlled Secret — with the URL alongside it, so the pair is usable from
+// one object.
+//
+// The token is one-shot and unrepeatable: minting is create-only with no read-back, so
+// a failed write cannot be retried, here or later. That is the difference from the
+// address, which the poll loop keeps re-offering until it lands. The Secret is instead
+// written once and never rewritten, so it needs nothing held in memory.
+//
+// An empty url means the provider mints no credential (AWS, whose address is not known
+// until boot and is reported through the observed endpoint instead) or that minting
+// failed; an empty token means an address with nothing to authenticate, so a Secret
+// would imply a credential that does not exist. Either way there is nothing to write
+// and nothing to fail — the poll loop still reports the instance, and an unreachable
+// workload is reported unreachable.
+//
+// Best-effort: a nil client (tests) is a no-op, and a failure is logged, never with the
+// token.
+func (h *Handler) persistCredential(ctx context.Context, pod *corev1.Pod, url, token string) {
+	if h.client == nil || url == "" || token == "" {
+		return
+	}
+	h.createConnectSecret(ctx, pod, url, token)
 }
 
 // UpdatePod is a no-op: the external instance's shape is immutable once
@@ -264,10 +322,17 @@ func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		// Preserve the status we compute from the provider; only adopt spec/meta.
+		// Preserve what WE own and the API server does not yet know: the status we
+		// compute from the provider, and the endpoint — which may be an address minted
+		// at create whose patch has not landed yet, so the incoming Pod would not carry
+		// it. Dropping it would discard the only copy (a minted URL is never
+		// re-observed) and strand the retry with nothing to replay. Everything else is
+		// adopted from the incoming spec/meta.
 		status := tp.pod.Status
+		endpoint := tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation]
 		tp.pod = pod.DeepCopy()
 		tp.pod.Status = status
+		setEndpoint(tp.pod, endpoint)
 	}
 	return nil
 }
@@ -390,10 +455,10 @@ func (h *Handler) GetPods(_ context.Context) ([]*corev1.Pod, error) {
 // (enqueuePodStatusUpdate -> UpdateStatus), which writes only the /status
 // subresource and silently drops any metadata change on the same object. The
 // reachable endpoint must live on the Pod's metadata (PodIP cannot hold a DNS
-// name — see applyState), so the wrapper first persists the endpoint annotation
-// with its own metadata patch, then hands the same Pod to VK for the status
-// write. This folds the two writes onto the one notify signal: every status push
-// also reconciles the endpoint annotation (deduped so only a real change patches).
+// name — see applyState), so the wrapper publishes the instance's access details
+// with their own writes first, then hands the same Pod to VK for the status write.
+// This folds those writes onto the one notify signal: every status push also
+// reconciles how the workload is reached.
 func (h *Handler) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	h.mu.Lock()
 	h.notify = func(pod *corev1.Pod) {
@@ -456,16 +521,9 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		} else {
 			matched++
 			applyState(tp.pod, inst.State, inst.Endpoint, h.nowFn())
-			// Surface the reachable address on the Pod metadata. PodIP can't hold a DNS
-			// name (see applyState), so the endpoint always rides an annotation. Set it
-			// on the tracked Pod here; the notify wrapper persists it to the API server
-			// (deduped against persistedEndpoint so only a real change patches).
-			if inst.Endpoint != "" && tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation] != inst.Endpoint {
-				if tp.pod.Annotations == nil {
-					tp.pod.Annotations = map[string]string{}
-				}
-				tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation] = inst.Endpoint
-			}
+			// The observed address, for a provider that cannot know it before boot.
+			// Empty for one that published at create, which must not clear it.
+			setEndpoint(tp.pod, inst.Endpoint)
 		}
 		// Log the before -> after status every tick. This is the "how does the system
 		// look" signal an operator watches: the lifecycle progression (Provisioning ->
@@ -503,6 +561,38 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			notify(p)
 		}
 	}
+}
+
+// setEndpoint stamps a reachable address onto a Pod's annotation — the single stamp
+// every path uses, so the annotation has one assignment site regardless of where the
+// address came from. The notify wrapper then patches it to the API server (PodIP cannot
+// hold a DNS name — see applyState), and its write half (persistEndpoint) reads the
+// value back off the emitted Pod knowing nothing about its origin.
+//
+// Callers, and what each one knows:
+//
+//   - CreatePod — an address MINTED at create, from ProvisionResult. Modal's connect
+//     URL, which exists before the sandbox does and is never reported again.
+//   - reconcileOnce — an address OBSERVED at boot, from a listed Instance. AWS assigns a
+//     public DNS name only once EC2 has one, so it can only arrive on the read path.
+//   - UpdatePod — nothing new; it re-applies what VK's replacement Pod may have
+//     dropped.
+//
+// An empty address is ignored rather than cleared, which is what lets those coexist: a
+// provider that published at create and then reports no observed endpoint (Modal), or
+// one that momentarily omits the value, never erases a working address. No credential
+// is ever stamped here — a token cannot ride the Pod (see persistCredential), and
+// cannot be observed at all, being minted once on the create path.
+//
+// Callers stamping a tracked pod's own Pod must hold h.mu.
+func setEndpoint(pod *corev1.Pod, endpoint string) {
+	if endpoint == "" || pod.Annotations[nebulav1alpha1.EndpointAnnotation] == endpoint {
+		return
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[nebulav1alpha1.EndpointAnnotation] = endpoint
 }
 
 // statusSignature is a compact rendering of the Pod status fields the poll loop
@@ -543,21 +633,24 @@ func (h *Handler) emit(pod *corev1.Pod) {
 	}
 }
 
-// persistEndpoint patches the endpoint annotation onto the Pod metadata. It runs
-// inside the notify wrapper (see NotifyPods), just before VK's status callback:
-// VK's callback writes only the /status subresource and drops any metadata change
-// on the same object, so the reachable address — which is how anything reaches the
-// workload, and which PodIP cannot hold when it is a DNS name (see applyState) —
-// needs this dedicated metadata write. A merge patch scoped to the single
-// annotation is a no-op for every other field and does not collide with the status
-// write that follows.
+// persistEndpoint writes the reachable address on the emitted Pod to the API server. It
+// is the write half for whichever path stamped it (see setEndpoint): CreatePod for an
+// address minted at create, the poll loop for one observed at boot. It runs inside the
+// notify wrapper (see NotifyPods), just before VK's status callback, because VK's
+// callback writes only the /status subresource and drops everything else on the same
+// object.
 //
-// The notify callback fires every poll tick, so this dedups against the tracked
-// pod's persistedEndpoint and patches only when the value actually changed (first
-// appearance or a re-provision); a steady Running pod is never re-patched. It is
-// best-effort: a nil client (tests) or an endpoint-less Pod is a no-op, and a
-// failed patch is logged and retried next tick (persistedEndpoint is only advanced
-// on success), never fatal to the poll. NotFound is ignored — the Pod is gone.
+// Because the poll loop re-emits every tracked pod each tick, this is also the retry for
+// any patch that failed, including a create-time one: it keeps patching until a write
+// succeeds. It carries no credential — a token is written once on the create path (see
+// persistCredential), never per tick.
+//
+// This runs per pod per tick, so anything it does unconditionally is multiplied by the
+// whole fleet — hence the dedup below, which narrows it to the ticks where the address
+// changed or a previous patch has not yet landed.
+//
+// Best-effort: a nil client (tests) is a no-op, and a failure is logged and retried
+// next tick rather than failing the poll.
 func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
 	if h.client == nil {
 		return
@@ -567,15 +660,38 @@ func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
 		return
 	}
 
-	// Dedup: skip the patch when we have already persisted this exact endpoint.
 	h.mu.Lock()
 	tp, tracked := h.tracked[key(pod.Namespace, pod.Name)]
-	if tracked && tp.persistedEndpoint == endpoint {
-		h.mu.Unlock()
-		return
+	// An untracked pod has nothing to dedup against, so its endpoint is patched
+	// unconditionally: the annotation is the only place that address is published, and
+	// skipping it would strand an unreachable Pod.
+	patched := false
+	if tracked {
+		patched = tp.connectEndpoint == endpoint
 	}
 	h.mu.Unlock()
 
+	if !patched {
+		h.patchEndpoint(ctx, pod, endpoint)
+	}
+}
+
+// patchEndpoint patches the endpoint annotation onto the Pod metadata. The
+// reachable address — which is how anything reaches the workload, and which PodIP
+// cannot hold when it is a DNS name (see applyState) — needs this dedicated
+// metadata write, since VK's status callback drops metadata. A merge patch scoped to
+// the single annotation is a no-op for every other field and so does not collide
+// with the status write that follows.
+//
+// This is the ONLY write of the endpoint annotation, and persistEndpoint its only
+// caller, so every address — minted at create or observed at boot — reaches etcd
+// through this one merge patch. The annotation is then where the address LIVES, and
+// nothing clears it: this is only ever called with a non-empty value, so it survives
+// for the Pod's life without the provider being asked for it again.
+//
+// connectEndpoint advances only on success, so a failed patch is retried on the next
+// tick. NotFound is ignored — the Pod is gone.
+func (h *Handler) patchEndpoint(ctx context.Context, pod *corev1.Pod, endpoint string) {
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]string{nebulav1alpha1.EndpointAnnotation: endpoint},
@@ -584,26 +700,103 @@ func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
 	if err != nil {
 		// A marshal of a fixed-shape map cannot realistically fail; guard anyway so a
 		// future change surfaces rather than panics.
-		logf.FromContext(ctx).WithName("vnode-poll").Error(err,
+		logf.FromContext(ctx).WithName("vnode-handler").Error(err,
 			"marshal endpoint annotation patch", "pod", key(pod.Namespace, pod.Name))
 		return
 	}
 	if _, err := h.client.CoreV1().Pods(pod.Namespace).Patch(
 		ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		if !apierrors.IsNotFound(err) {
-			logf.FromContext(ctx).WithName("vnode-poll").Error(err,
-				"persist endpoint annotation; will retry next tick",
+			logf.FromContext(ctx).WithName("vnode-handler").Error(err,
+				"persist endpoint annotation; the poll loop retries next tick",
 				"pod", key(pod.Namespace, pod.Name), "endpoint", endpoint)
 		}
-		return // leave persistedEndpoint unchanged so the next tick retries
+		return // leave connectEndpoint unchanged so the next tick retries
 	}
 
 	// Record success so subsequent ticks skip the patch until the endpoint changes.
 	h.mu.Lock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		tp.persistedEndpoint = endpoint
+		tp.connectEndpoint = endpoint
 	}
 	h.mu.Unlock()
+}
+
+// ConnectSecretName is the Secret holding a Pod's connect credential.
+func ConnectSecretName(podName string) string { return podName + "-connect" }
+
+// createConnectSecret writes the instance's connect URL and bearer token to a
+// Secret in the Pod's namespace, so a consumer can reach the workload with
+// `curl -H "Authorization: Bearer $token" $url`.
+//
+// A Secret, not an annotation: the token authenticates every request to the
+// endpoint, and an annotation would expose it to anyone with `get pod` in the
+// namespace and store it unencrypted in etcd. The URL is duplicated in here
+// alongside it so the pair is usable from one object.
+//
+// It is ownerReferenced to the Pod, which is what reclaims it: teardown deletes the
+// Pod, and the garbage collector removes the Secret with it. Deleting it on the
+// DeletePod path instead would leak on every path that skips DeletePod (a force
+// delete, a VK outage) — the same reason the NodeClaim finalizer exists.
+//
+// Write-once, and unrepeatable: this runs on the create path, from the one
+// ProvisionResult that ever carries the token (see persistCredential). There is no
+// retry loop behind it, because there is nothing to retry WITH — a later attempt has
+// no credential to write, since minting is one-shot and cannot be re-read. So a
+// failure here means the Secret is missing for this instance's life, and the recovery
+// is to replace the instance (delete the Pod), not to poll.
+//
+// AlreadyExists is therefore treated as success rather than reconciled: it means a
+// Secret under this name already exists, which happens when a Pod name is reused
+// before the GC has collected the previous owner's Secret. Overwriting is not
+// obviously better — the old Secret still belongs to a live-until-collected instance —
+// and the stale copy resolves itself when the ownerReference GC removes it.
+//
+// A failure is logged (never with the token).
+func (h *Handler) createConnectSecret(ctx context.Context, pod *corev1.Pod, url, token string) {
+	// No UID means the Pod is synthesized (GetPod's re-adoption stub), so an
+	// ownerReference would be invalid and the Secret would never be collected. Skip
+	// rather than create an unowned Secret that nothing would ever reclaim. In practice
+	// the create path always has the real Pod, so this is a guard, not a case.
+	if pod.UID == "" {
+		return
+	}
+	k := key(pod.Namespace, pod.Name)
+	log := logf.FromContext(ctx).WithName("vnode-handler")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConnectSecretName(pod.Name),
+			Namespace: pod.Namespace,
+			Labels: map[string]string{
+				nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
+			},
+			// UID is what makes this a real ownerReference; a name alone would be
+			// ignored by the GC. It is set on any Pod that exists at the API server.
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Pod",
+				Name:       pod.Name,
+				UID:        pod.UID,
+			}},
+		},
+		Type: corev1.SecretTypeOpaque,
+		StringData: map[string]string{
+			"token": token,
+			"url":   url,
+		},
+	}
+	_, err := h.client.CoreV1().Secrets(pod.Namespace).Create(ctx, secret, metav1.CreateOptions{})
+	switch {
+	case apierrors.IsAlreadyExists(err):
+		return // a Secret under this name already exists; see above
+	case err != nil:
+		// Loud, because it is not retried: the token cannot be re-minted, so this
+		// instance stays credential-less until it is replaced.
+		log.Error(err, "write connect secret; the workload's credential is LOST (delete the Pod to re-provision)",
+			"pod", k, "secret", ConnectSecretName(pod.Name))
+		return
+	}
+	log.Info("wrote connect secret", "pod", k, "secret", ConnectSecretName(pod.Name))
 }
 
 // markStatus sets a coarse pod phase and a single readiness-style condition on
