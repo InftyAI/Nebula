@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,8 +306,8 @@ func TestProvision_EmptyRegionIsError(t *testing.T) {
 
 	// There is NO default region: a request that omits one cannot build a client, so
 	// Provision errors rather than silently guessing. In production every request
-	// carries a region (admission requires each aws pool to list ≥1; placement stamps
-	// it), so this only guards a malformed request.
+	// carries a region (ExpandRegions never yields an empty one; placement stamps it),
+	// so this only guards a malformed request.
 	if _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName: "claim-def",
 	}); err == nil {
@@ -543,6 +545,113 @@ func TestCapabilities(t *testing.T) {
 	}
 	if p.Name() != provider.ProviderAWS {
 		t.Fatalf("name = %q, want %q", p.Name(), provider.ProviderAWS)
+	}
+}
+
+func TestExpandRegions(t *testing.T) {
+	cases := []struct {
+		name     string
+		declared []string
+		want     []string
+	}{{
+		name:     "nil is unconstrained: every default-enabled region",
+		declared: nil,
+		want: []string{
+			"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+			"ca-central-1",
+			"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3",
+			"sa-east-1",
+			"us-east-1", "us-east-2", "us-west-1", "us-west-2",
+		},
+	}, {
+		name:     "empty behaves as nil",
+		declared: []string{},
+		want: []string{
+			"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+			"ca-central-1",
+			"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3",
+			"sa-east-1",
+			"us-east-1", "us-east-2", "us-west-1", "us-west-2",
+		},
+	}, {
+		name:     "group token expands",
+		declared: []string{"us"},
+		want:     []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
+	}, {
+		name:     "group token is case-insensitive",
+		declared: []string{"EU"},
+		want:     []string{"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3"},
+	}, {
+		name:     "literal region passes through",
+		declared: []string{"us-east-1"},
+		want:     []string{"us-east-1"},
+	}, {
+		// An opt-in region belongs to no group, so naming it explicitly is the only
+		// way to reach it — that escape hatch must keep working.
+		name:     "opt-in region passes through though no group contains it",
+		declared: []string{"me-central-1"},
+		want:     []string{"me-central-1"},
+	}, {
+		// Region names outlive this table, so an unknown value is FORWARDED, not
+		// rejected: it fails later with AWS's own error instead of Nebula refusing a
+		// region that shipped after this code did.
+		name:     "unknown value is forwarded unvalidated",
+		declared: []string{"us-east-9", "not-a-region"},
+		want:     []string{"us-east-9", "not-a-region"},
+	}, {
+		// A group and one of its own members must not yield a duplicate: placement
+		// walks the result, so a repeat would attempt the same region twice.
+		name:     "group plus a member of it dedupes",
+		declared: []string{"us", "us-east-1"},
+		want:     []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
+	}, {
+		name:     "declared order is preserved across groups and literals",
+		declared: []string{"ca", "us-east-1", "sa"},
+		want:     []string{"ca-central-1", "us-east-1", "sa-east-1"},
+	}, {
+		name:     "whitespace is trimmed and empties dropped",
+		declared: []string{" us-east-1 ", "", "  "},
+		want:     []string{"us-east-1"},
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ExpandRegions(tc.declared)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ExpandRegions(%v)\n got %v\nwant %v", tc.declared, got, tc.want)
+			}
+			// The method must agree with the package function: cmd/main.go's region
+			// source calls the function while placement calls the method, and the two
+			// diverging is exactly the bug that reports a live fleet as Terminated.
+			p := newTestProvider(&fakeClient{})
+			if m := p.ExpandRegions(tc.declared); !slices.Equal(m, got) {
+				t.Fatalf("method %v != function %v", m, got)
+			}
+		})
+	}
+}
+
+func TestRegionGroups_ExcludeOptInRegions(t *testing.T) {
+	// Opt-in regions are disabled until an operator enables them. clientFor does not
+	// cache build failures, so one in a group would fail its AMI/subnet resolution and
+	// retry on EVERY poll tick, forever, for a region nobody asked for. Guard the
+	// table against a well-meant future addition.
+	optIn := []string{
+		"af-south-1", "ap-east-1", "ap-east-2", "ap-south-2",
+		"ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+		"ca-west-1", "eu-central-2", "eu-south-1", "eu-south-2",
+		"il-central-1", "me-central-1", "me-south-1", "mx-central-1",
+	}
+	all := ExpandRegions(nil)
+	for _, r := range optIn {
+		if slices.Contains(all, r) {
+			t.Errorf("opt-in region %q must not be in any group (it is disabled by default)", r)
+		}
+	}
+	// Separate IAM partitions: one credential set cannot reach them at all.
+	for _, r := range all {
+		if strings.HasPrefix(r, "us-gov-") || strings.HasPrefix(r, "cn-") {
+			t.Errorf("region %q is in another IAM partition and must not be in a group", r)
+		}
 	}
 }
 

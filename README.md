@@ -53,11 +53,11 @@ metadata:
   name: gpu
 spec:
   providers:
-  - name: modal            # NeoCloud; region-simple, no regions needed
-  - name: aws              # hyperscaler; region-aware, at least one required
+  - name: modal            # NeoCloud; regions omitted = place anywhere (cheapest)
+  - name: aws              # hyperscaler; "us" expands to every US region
     regions:
-    - us-east-1
-    - us-west-1
+    - us
+    - eu-west-1            # or name one region exactly
   capacityTypes:           # prefer cheap Spot, fall back to OnDemand
   - Spot
   - OnDemand

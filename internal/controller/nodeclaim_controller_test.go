@@ -47,6 +47,8 @@ type fakeProvider struct {
 	terminateErr error               // if set, Terminate fails
 	gpus         []string            // accelerators MapAccelerator offers; nil = offer any
 	spot         bool                // Capabilities().SupportsSpot (placement skips Spot without it)
+	// expandRegions overrides ExpandRegions; nil = pass the declaration through.
+	expandRegions func([]string) []string
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -75,6 +77,15 @@ func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool) {
 		}
 	}
 	return nil, false
+}
+
+// ExpandRegions passes the declaration through, matching catalog.Base's default (the
+// region-simple behaviour). Tests that need group expansion set expandRegions.
+func (f *fakeProvider) ExpandRegions(declared []string) []string {
+	if f.expandRegions != nil {
+		return f.expandRegions(declared)
+	}
+	return declared
 }
 func (f *fakeProvider) ClassifyProvisionError(error, string, string) provider.BlockScope {
 	return provider.BlockScope{}

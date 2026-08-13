@@ -6,8 +6,9 @@ drives everything through the `provider.Provider` interface and a price/availabi
 catalog, so a new provider is an adapter package plus a little wiring — no changes
 to the placement controller, virtual kubelet, or NodeClaim controller.
 
-Use `pkg/provider/modal` (region-simple NeoCloud) and `pkg/provider/aws`
-(region-aware hyperscaler) as references.
+Use `pkg/provider/modal` (NeoCloud, coarse regions, all optional) and
+`pkg/provider/aws` (hyperscaler, a region is mandatory on every call) as
+references.
 
 ## 1. Implement the adapter
 
@@ -25,6 +26,7 @@ Create `pkg/provider/<name>/` and implement `provider.Provider`
 | `Offerings(ctx)` | Price/availability rows for the optimizer (see the catalog below). |
 | `MapAccelerator(canonical, count)` | Translate a canonical accelerator (type + count) to the provider's own id; `ok=false` if unsupported. |
 | `ClassifyProvisionError(err, accel, region)` | Map a Provision failure to the `BlockScope` failover should blocklist (a capacity error → that {accel, tier, region}; an auth/quota error → the whole provider). |
+| `ExpandRegions(declared)` | Turn a pool's `regions` into the concrete regions to try. `catalog.Base` passes them through unchanged, which is right whenever the provider's own region names already include the group tokens (`us`, `eu`, `ap`) a pool may write — Modal's do. Override only if they don't, as `pkg/provider/aws` does with a static table. |
 
 The Pod is the single source of truth for the workload shape; `ProvisionRequest`
 carries only what the Pod cannot express (the optimizer's capacity tier and the

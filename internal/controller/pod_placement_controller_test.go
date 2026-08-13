@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -473,6 +475,68 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 	// ...and to the FIRST provider (runpod), since OnDemand is walked provider-first.
 	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "runpod" {
 		t.Fatalf("expected first provider runpod at the OnDemand tier, got %v", got.Spec.NodeSelector)
+	}
+}
+
+func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
+	// The pool declares a GROUP token, not a region. Placement must walk the concrete
+	// regions the provider expands it into — and must stamp a CONCRETE one on the Pod,
+	// never the token: RegionAnnotation feeds ProvisionRequest.Region, which the
+	// adapter turns into a regional API endpoint, and "us" is not one.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, "us")
+	prov := &fakeProvider{
+		name: provider.ProviderModal, gpus: []string{"H100"},
+		expandRegions: func(declared []string) []string {
+			if slices.Equal(declared, []string{"us"}) {
+				return []string{"us-east-1", "us-west-2"}
+			}
+			return declared
+		},
+	}
+	// The first expanded region is blocked, so the walk must reach the second — proving
+	// the group really became multiple candidates rather than one opaque value.
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+	r.Blocklist = &fakeBlocklist{blocked: []failover.Candidate{
+		{Provider: provider.ProviderModal, Accelerator: "H100:1",
+			CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"},
+	}}
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if region := got.Annotations[nebulav1alpha1.RegionAnnotation]; region != "us-west-2" {
+		t.Fatalf("expected the group to expand and fail over to us-west-2, got %q", region)
+	}
+}
+
+func TestRegionsFor_UnconstrainedOnRegionSimpleProviderYieldsOneCandidate(t *testing.T) {
+	// A region-simple provider passes nil through (catalog.Base's default), so
+	// expansion yields nothing. regionsFor must still emit ONE candidate — the empty
+	// region, meaning "send no region" — or `range` would run zero times and the
+	// provider would be silently unplaceable with no error anywhere.
+	prov := &fakeProvider{name: provider.ProviderModal}
+	got := regionsFor(prov, nebulav1alpha1.ProviderSpec{Name: provider.ProviderModal})
+	if !slices.Equal(got, []string{""}) {
+		t.Fatalf("regionsFor(nil) = %v, want one empty candidate", got)
+	}
+}
+
+func TestRegionsFor_AgreesWithAWSSweepExpansion(t *testing.T) {
+	// The two readers of ProviderSpec.Regions — placement's regionsFor and the AWS
+	// RegionSource in cmd/main.go — MUST expand a declaration identically. If the
+	// sweep covers less than placement provisions into, the missing region's instances
+	// are absent from List, and applyState maps absence to Terminated: a live, billing
+	// fleet reported as gone. Both go through ExpandRegions; this pins that they do.
+	for _, declared := range [][]string{nil, {"us"}, {"eu"}, {"us-east-1"}, {"us", "me-central-1"}} {
+		placementSide := regionsFor(awsprovider.New(nil, nil, nil),
+			nebulav1alpha1.ProviderSpec{Name: provider.ProviderAWS, Regions: declared})
+		sweepSide := awsprovider.ExpandRegions(declared)
+		if !slices.Equal(placementSide, sweepSide) {
+			t.Errorf("declared %v: placement walks %v but the sweep covers %v",
+				declared, placementSide, sweepSide)
+		}
 	}
 }
 

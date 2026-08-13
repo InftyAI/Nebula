@@ -3,13 +3,15 @@
 // Nebula's provider-agnostic control plane (placement controller, NodeClaim
 // controller, poll loop) and the heterogeneous cloud APIs underneath.
 //
-// Scope: v1 targets NeoClouds (RunPod, Modal, CoreWeave, Lambda), which are
-// region-simple, so region/zone is intentionally NOT modeled yet. Hyperscalers
-// (AWS/GCP/Azure) are a planned near-term expansion; when they land, Region/Zone
-// become additive fields on the request/Offering/BlockScope structs and the
-// optimizer's candidate key widens to include them — the method signatures here
-// are designed not to change. Do not hard-code NeoCloud-only assumptions into
-// the control plane; keep provider quirks behind Capabilities.
+// Scope: region IS modeled, as one axis of the placement candidate key and of
+// BlockScope, but it stays OPTIONAL — an empty region means "no constraint, let
+// the provider place freely", which is a normal mode (and on Modal the cheapest
+// one), not a degenerate fallback. Zone is not modeled: AWS's CreateFleet already
+// spreads across the AZs of a region on its own, and no NeoCloud exposes zones.
+// Providers differ in how coarse their region vocabulary is, and the pool speaks
+// group tokens ("us") on top of that, so translation lives behind ExpandRegions
+// rather than in the control plane. Do not hard-code any one provider's geography
+// into the control plane; keep provider quirks behind Capabilities/ExpandRegions.
 //
 // Design rules learned from SkyPilot / the Nebula design discussion:
 //   - The Pod is the source of truth for the workload shape. Provision takes the
@@ -131,6 +133,32 @@ type Provider interface {
 	// returns a single-element slice.
 	MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool)
 
+	// ExpandRegions resolves a NodePool's declared region constraint
+	// (ProviderSpec.Regions) into the concrete regions placement may walk, in this
+	// provider's own vocabulary. The pool speaks two levels and this is what tells
+	// them apart, because only the provider knows its own geography:
+	//
+	//   - nil/empty  => unconstrained: every region this provider serves.
+	//   - a GROUP token ("us", "eu", "ap") => that geography's regions.
+	//   - anything else => a literal region name, passed through UNVALIDATED.
+	//
+	// The last case is deliberate: region names are the provider's vocabulary and
+	// change faster than this code, so an unrecognized value is forwarded rather than
+	// rejected. A genuinely bad name fails at provision time with the provider's own
+	// error, which beats Nebula refusing a region that shipped last week.
+	//
+	// Expansion happens HERE, at the pool boundary, so everything downstream keeps
+	// seeing exactly one concrete region: ProvisionRequest.Region, RegionAnnotation,
+	// and the failover blocklist key all stay single-valued, and a capacity failure
+	// blocks the one region that failed rather than the whole group it came from.
+	//
+	// It is a pure function of the declaration (no API calls, no ctx): the result
+	// feeds both placement's candidate walk and the observability fan-out
+	// (List/Offerings), and those two MUST agree — a region provisioned into but not
+	// swept would be absent from List, which reports a live instance as Terminated.
+	// So it must not be able to fail differently between the two callers.
+	ExpandRegions(declared []string) []string
+
 	// ClassifyProvisionError maps a Provision error to the granularity at which
 	// the failing placement should be blocklisted. This keeps failover precise:
 	// a "no H100 capacity" error blocks only {provider, H100, capacityType, region},
@@ -162,12 +190,19 @@ type ProvisionRequest struct {
 	// This is the one workload-independent decision that cannot be expressed on
 	// the Pod, so it must be passed explicitly.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region is the provider region the optimizer chose to provision in, in the
-	// provider's own vocabulary (e.g. AWS "us-east-1"). Like CapacityType it is a
-	// workload-independent decision absent from the Pod. Empty means "use the
-	// provider's configured default region" — region-simple NeoClouds (Modal,
-	// RunPod) ignore it, and a region-aware adapter falls back to the region its
-	// client was built with (see the AWS adapter's NewSDKClient).
+	// Region is the ONE concrete region placement chose for this attempt, in the
+	// provider's own vocabulary (AWS "us-east-1", Modal "us-east"). Like CapacityType
+	// it is a workload-independent decision absent from the Pod. It is always a single
+	// resolved region, never a group token or a list: the pool's constraint was already
+	// expanded by ExpandRegions and walked one candidate at a time, which is what lets
+	// a capacity failure blocklist exactly the region that failed.
+	//
+	// Empty means "no region constraint — let the provider place freely". That is a
+	// real, common mode, not a fallback: a pool that declares no regions leaves it
+	// empty, and on Modal that is the widest and cheapest option (a pinned region
+	// carries a 1.5-1.75x multiplier there). The AWS adapter cannot honour it — EC2
+	// endpoints are regional, so it has no "anywhere" call and returns ErrConfig — but
+	// its ExpandRegions never produces an empty region, so the case does not arise.
 	Region string
 }
 

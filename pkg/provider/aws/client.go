@@ -188,8 +188,9 @@ var _ Client = (*sdkClient)(nil)
 // and default-VPC subnets on demand.
 //
 // There is NO default region and NO region env (AWS_REGION is not read): every
-// request carries its own region (admission requires each aws pool to list ≥1 region;
-// placement stamps it), so a fallback would be dead config. This constructor fails
+// request carries its own region (ExpandRegions resolves the pool's declaration —
+// omitted, a group token, or literal names — into concrete regions, and placement
+// stamps one), so a fallback would be dead config. This constructor fails
 // ONLY if the catalog cannot load — never on region config.
 //
 // Security contract (and why ONE credential set spans all regions):

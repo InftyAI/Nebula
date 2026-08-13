@@ -49,10 +49,16 @@ mapping), see [docs/status.md](status.md).
 
 **Non-goals in the current implementation**
 
-- Provider-neutral geography. Region is provider-specific (`ProviderSpec.Regions`)
-  and there is no global "us-east" vocabulary across clouds.
-- "All regions" expansion. AWS pool entries must list explicit regions; an
-  all-regions wildcard is reserved for a richer price/availability optimizer.
+- Provider-neutral geography. `ProviderSpec.Regions` accepts shared *group* tokens
+  (`us`, `eu`, `ap`), but the regions behind them are per-provider and the narrower
+  names are each cloud's own vocabulary — there is no global region namespace. Which
+  level a value is, is resolved by the provider (`ExpandRegions`); an omitted list
+  means every region it serves.
+- Price-ranked region choice. Within a capacity tier the expanded regions are walked
+  in order, not ranked: the catalog carries no per-region prices, so a wide
+  declaration cannot yet prefer the cheapest region. Modal is the sharper case — a
+  pinned region there costs 1.5x (group) or 1.75x (narrow) over its unconstrained
+  default, which the catalog does not model.
 - Bin-packing multiple unrelated Pods onto one external instance. The current
   model is one workload Pod to one external instance.
 - In-place migration. Recovery from reclaim, failure, or spec changes is

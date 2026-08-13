@@ -34,7 +34,10 @@ import (
 // static property of the spec, so it is enforced at admission by the CEL rule
 // below rather than surfaced as a status condition after the fact.
 // +kubebuilder:validation:XValidation:rule="self.strategy != 'Weighted' || self.providers.all(p, has(p.weight))",message="strategy Weighted requires a weight on every provider"
-// +kubebuilder:validation:XValidation:rule="self.providers.all(p, p.name != 'aws' || (has(p.regions) && size(p.regions) > 0))",message="provider aws requires at least one region"
+// (AWS once required at least one region here, because an omitted list meant "the
+// client's default region" and its client has none. Omitted now means "every region
+// the provider serves", which is a valid — if broad — AWS policy, so the rule is gone.
+// See ProviderSpec.Regions.)
 type NodePoolSpec struct {
 	// Providers is the ordered set of NeoClouds this pool is allowed to use.
 	// A Pod bound to this pool can only ever be placed on a provider in this
@@ -79,26 +82,37 @@ type ProviderSpec struct {
 	// +optional
 	Weight *int32 `json:"weight,omitempty"`
 
-	// Regions constrains this provider to a subset of its regions, in the
-	// provider's OWN vocabulary (e.g. ["us-east-1","eu-west-2"] for AWS). Region
-	// is provider-namespaced — there is no cross-provider region vocabulary — so
-	// it lives here per provider, not on the pool. Two cases:
-	//   - omitted/empty => the provider's configured default region (the region
-	//     its client resolved from env/config/instance metadata at startup). This
-	//     is the no-surprise default for region-simple providers (Modal, RunPod),
-	//     which have a single region and ignore this field.
-	//   - explicit list => exactly those regions.
-	// AWS is the exception: it is region-aware with no meaningful single default,
-	// so a `- name: aws` entry MUST list at least one region. That is enforced at
-	// admission by the CEL rule on NodePoolSpec (a per-provider requirement, so it
-	// belongs on the spec where all provider entries are visible, not as a blanket
-	// MinItems that would burden region-simple providers). An "all regions"
-	// wildcard is intentionally NOT supported yet: it only makes sense once the
-	// price-ranking optimizer can expand it against the provider's catalog and
-	// choose among the results, so it is reserved for then. At most 8 regions;
-	// maxLength bounds each entry.
+	// Regions constrains where this provider may place, in the provider's OWN
+	// vocabulary. Region is provider-namespaced — there is no cross-provider region
+	// vocabulary — so it lives here per provider, not on the pool. It is a
+	// CONSTRAINT, not a list of regions to use, and it has three levels:
+	//   - omitted/empty => unconstrained: every region the provider serves. For a
+	//     region-simple provider (Modal) this means "send no region and let the
+	//     provider place freely", which is also its widest and cheapest mode.
+	//   - a geography GROUP token ("us", "eu", "ap", ...) => that geography's
+	//     regions. This is the recommended way to ask for breadth with a data
+	//     residency boundary.
+	//   - a literal region name ("us-east-1" on AWS, "us-east" on Modal) => exactly
+	//     that region.
+	// The provider resolves which level a value is, since only it knows its own
+	// geography (see provider.Provider's ExpandRegions). Group tokens are shared
+	// across providers but the regions behind them are not: "eu" is eu-west-1 and
+	// friends on AWS, while London is eu-west-2 there and there is no "uk" group.
+	//
+	// A value that is not a group token is passed to the provider UNVALIDATED.
+	// Region names change faster than Nebula ships, so an unrecognized one is
+	// forwarded rather than rejected: a genuinely bad name fails at provision time
+	// with the provider's own error, which is better than refusing a region that
+	// launched last week. It is also the escape hatch for AWS opt-in regions, which
+	// no group contains.
+	//
+	// Unconstrained on a region-aware provider is the widest setting and costs
+	// something: every region becomes a placement candidate to walk on failover, and
+	// every region is swept by the observability poll loop. Prefer a group unless the
+	// workload genuinely needs global reach. There is no cap on the number of entries
+	// (a group already expands to many, so capping the declaration would be
+	// arbitrary); maxLength bounds each entry.
 	// +optional
-	// +kubebuilder:validation:MaxItems=8
 	// +kubebuilder:validation:items:MaxLength=32
 	Regions []string `json:"regions,omitempty"`
 }

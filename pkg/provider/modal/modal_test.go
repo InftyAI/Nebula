@@ -513,6 +513,75 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 // client derives it, so the routed port can never name one outside the set). No
 // declared port is not "no endpoint" — every workload is credentialed — it means Modal
 // picks, defaulting to 8080.
+func TestProvision_CarriesRegion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		region string
+		want   []string
+	}{{
+		// The unconstrained case, and the one that must NOT become []string{""}: an
+		// empty region means "no placement constraint", which is Modal's widest pool
+		// and its un-multiplied price. A one-element slice holding "" would instead ask
+		// Modal to place in a region named "".
+		name:   "no region leaves placement unconstrained",
+		region: "",
+		want:   nil,
+	}, {
+		name:   "broad region is forwarded",
+		region: "us",
+		want:   []string{"us"},
+	}, {
+		// Modal owns this vocabulary and gains regions faster than the adapter ships,
+		// so a value it does not recognize is forwarded rather than rejected here.
+		name:   "narrow region is forwarded verbatim",
+		region: "us-east",
+		want:   []string{"us-east"},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeClient{createID: "sb-1"}
+			p := newTestProvider(f)
+			req := provider.ProvisionRequest{ClaimName: "claim-a", Region: tc.region}
+			if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if !slices.Equal(f.lastSpec.Regions, tc.want) {
+				t.Fatalf("spec.Regions = %v, want %v", f.lastSpec.Regions, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	// A capacity shortage in one region must not disqualify the others: Modal's
+	// regions are independent pools, so without this the first regional failure would
+	// block every region the pool lists.
+	got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", "us-east")
+	if got.Region == nil || *got.Region != "us-east" {
+		t.Fatalf("expected the block confined to us-east, got Region=%v", got.Region)
+	}
+
+	// Unconstrained: no region axis was used, so Region stays nil — which per
+	// BlockScope's three-state rule matches only an empty-region candidate, and so
+	// cannot leak onto region-pinned ones.
+	if got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", ""); got.Region != nil {
+		t.Fatalf("expected nil Region for an unconstrained request, got %q", *got.Region)
+	}
+
+	// Auth fails in every region, so DenyAll must not be narrowed to one.
+	if got := p.ClassifyProvisionError(provider.ErrAuth, "H100:1", "us-east"); got.Region != nil {
+		t.Fatalf("DenyAll must not be confined to a region, got %q", *got.Region)
+	}
+
+	// No error, no block. recordBlock installs any non-empty scope it is handed, so
+	// decorating the zero scope with a region would turn "nothing failed" into a live
+	// block on that region.
+	if got := p.ClassifyProvisionError(nil, "H100:1", "us-east"); got != (provider.BlockScope{}) {
+		t.Fatalf("a nil error must classify to the zero scope, got %+v", got)
+	}
+}
+
 func TestProvision_CarriesDeclaredPorts(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
