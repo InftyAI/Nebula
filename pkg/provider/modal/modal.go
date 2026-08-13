@@ -64,8 +64,12 @@ var _ provider.Provider = (*Provider)(nil)
 // the operations the adapter needs, expressed in provider-agnostic terms, so a
 // real implementation (Modal SDK/HTTP) and a fake (tests) are interchangeable.
 type Client interface {
-	// CreateSandbox launches one sandbox from spec and returns its Modal id.
-	CreateSandbox(ctx context.Context, spec SandboxSpec) (id string, err error)
+	// CreateSandbox launches one sandbox from spec and returns its Modal id plus the
+	// connect credential minted for it. The credential is returned HERE and nowhere
+	// else — minting is one-shot and there is no read-back, so a caller that drops it
+	// has lost it for the sandbox's life. Zero when none could be minted; see
+	// sdkClient.mintCredential.
+	CreateSandbox(ctx context.Context, spec SandboxSpec) (id string, cred Credential, err error)
 	// TerminateSandbox terminates a sandbox by id. Must be idempotent:
 	// terminating an already-gone sandbox returns nil.
 	TerminateSandbox(ctx context.Context, id string) error
@@ -97,9 +101,9 @@ type SandboxSpec struct {
 	// MemoryMiB is the requested memory in MiB, from the Pod's request. Zero lets
 	// Modal apply its own default.
 	MemoryMiB int
-	// Ports are the container ports to expose as encrypted tunnels, from the Pod's
-	// containerPorts. The reachable endpoint (reported as the Pod's address) is a
-	// tunnel to one of these, so a Pod that declares no port has no endpoint.
+	// Ports are the container ports to expose, from the Pod's containerPorts. They
+	// declare to Modal which ports may receive traffic at all; the connect URL then
+	// routes to ConnectPort among them.
 	Ports []int
 	// Timeout is the sandbox's maximum lifetime. It MUST be non-zero: Modal treats
 	// a zero timeout as its 5-minute default, which would terminate a real
@@ -108,6 +112,11 @@ type SandboxSpec struct {
 	Timeout time.Duration
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// ConnectPort is the container port the connect URL routes to, taken from the
+	// Pod's first declared port. Zero does NOT mean "no credential" — every workload
+	// is credentialed — it means the Pod declared no port, so Modal's own default
+	// port applies.
+	ConnectPort int
 	// ReadinessProbe, when non-nil, is the Pod's first-container readinessProbe
 	// carried through so the Client can configure Modal's own readiness probe at
 	// create time. Modal enforces the probe internally (it gates its own traffic
@@ -118,11 +127,32 @@ type SandboxSpec struct {
 }
 
 // Sandbox is the adapter-level view of a Modal sandbox as observed.
+//
+// There is no endpoint here, deliberately. Modal's reachable address is the connect
+// URL, which is minted at CREATE time (see Credential) and published straight to the
+// Pod's endpoint annotation, where it persists in etcd for the sandbox's whole life.
+// Re-deriving it on every read would be a Modal round trip for a value the API server
+// already holds — and there is no other address to report: a tunnel URL would be one,
+// but it is PUBLIC to anyone who learns it, so serving it as a substitute for an
+// authenticated URL would silently downgrade access.
 type Sandbox struct {
-	ID       string
-	Tags     map[string]string
-	Status   string // Modal's own status string, normalized by toState.
-	Endpoint string
+	ID     string
+	Tags   map[string]string
+	Status string // Modal's own status string, normalized by toState.
+}
+
+// Credential is the connect pair CreateSandbox mints for a new sandbox: the URL a
+// consumer calls and the bearer token that authenticates against it —
+//
+//	curl -H "Authorization: Bearer $token" $url
+//
+// Token is a SECRET. It is never tagged (Modal's tags are plaintext and
+// bulk-listable), never annotated onto the Pod, and never logged; the virtual kubelet
+// writes the pair to a Secret in the Pod's namespace. It exists on the create path
+// only — see provider.ProvisionResult, which this maps onto.
+type Credential struct {
+	URL   string
+	Token string
 }
 
 // ClaimTagKey is the sandbox tag under which the NodeClaim name is stored, so
@@ -198,14 +228,18 @@ func (p *Provider) Capabilities() provider.Capabilities {
 //
 // The queued→running transition is then observed the same way readiness is, through
 // the poll loop's List: the sandbox reads statusInitializing until it is live.
+//
+// The connect credential comes back on this call and only this call, because Modal
+// mints it once and cannot re-read it. The caller must persist it (the virtual kubelet
+// writes it to a Secret) or it is lost; see mintCredential.
 func (p *Provider) Provision(
 	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
-) (string, bool, error) {
+) (provider.ProvisionResult, error) {
 	if pod == nil {
-		return "", false, errors.New("modal: nil pod")
+		return provider.ProvisionResult{}, errors.New("modal: nil pod")
 	}
 	if req.ClaimName == "" {
-		return "", false, errors.New("modal: empty ClaimName in ProvisionRequest")
+		return provider.ProvisionResult{}, errors.New("modal: empty ClaimName in ProvisionRequest")
 	}
 
 	// Idempotency: if a sandbox already carries this claim tag, return it rather
@@ -216,21 +250,36 @@ func (p *Provider) Provision(
 	// ready) has necessarily been allocated capacity, whereas one still queued is
 	// not yet reserved. That is strictly more information than a create can return,
 	// so use it rather than flatly reporting false.
+	//
+	// It carries NO credential, per the interface contract: the original was minted at
+	// the first create and cannot be re-read, and minting a second one here would hand
+	// the consumer a token that changes on every retry. The consequence is a real gap —
+	// if the first create succeeded but its credential never reached a Secret, nothing
+	// recovers it. Closing that means re-minting for a sandbox with no Secret yet, which
+	// needs cluster access this layer does not have.
 	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	} else if existing != nil {
-		return existing.ID, existing.State == provider.InstanceRunning, nil
+		return provider.ProvisionResult{
+			InstanceID: existing.ID,
+			Reserved:   existing.State == provider.InstanceRunning,
+		}, nil
 	}
 
 	spec, err := p.sandboxSpecFromPod(pod, req)
 	if err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	}
-	id, err := p.client.CreateSandbox(ctx, spec)
+	id, cred, err := p.client.CreateSandbox(ctx, spec)
 	if err != nil {
-		return "", false, err
+		return provider.ProvisionResult{}, err
 	}
-	return id, false, nil
+	return provider.ProvisionResult{
+		InstanceID:   id,
+		Reserved:     false,
+		ConnectURL:   cred.URL,
+		ConnectToken: cred.Token,
+	}, nil
 }
 
 // Terminate implements provider.Provider. Idempotent by the Client contract.
@@ -285,6 +334,7 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, _ string) prov
 
 // findByClaim returns the sandbox tagged with claimName, or nil if none.
 func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider.Instance, error) {
+	// TODO: do we have performance issue here?
 	sandboxes, err := p.client.ListSandboxes(ctx)
 	if err != nil {
 		return nil, err
@@ -327,13 +377,17 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		tags[ProbeTagKey] = probeTagValue
 	}
 
+	ports := containerPorts(&c)
 	spec := SandboxSpec{
-		Image:          c.Image,
-		Command:        append(append([]string{}, c.Command...), c.Args...),
-		Env:            env,
-		CPU:            cpuCores(&c),
-		MemoryMiB:      memoryMiB(&c),
-		Ports:          containerPorts(&c),
+		Image:     c.Image,
+		Command:   append(append([]string{}, c.Command...), c.Args...),
+		Env:       env,
+		CPU:       cpuCores(&c),
+		MemoryMiB: memoryMiB(&c),
+		Ports:     ports,
+		// Route the connect URL at the Pod's first declared port. Only one port can back
+		// a token; 0 (no declared port) leaves the choice to Modal's default.
+		ConnectPort:    firstPort(ports),
 		Timeout:        sandboxTimeout(pod),
 		Tags:           tags,
 		ReadinessProbe: c.ReadinessProbe,
@@ -394,9 +448,9 @@ func resourceQty(c *corev1.Container, name corev1.ResourceName) *resource.Quanti
 	return nil
 }
 
-// containerPorts collects the container's declared ports so the Client can open a
-// tunnel per port. The observed tunnel URL becomes the Pod's endpoint, so a Pod
-// that declares no port is reachable-less by design.
+// containerPorts collects the container's declared ports, which is what tells Modal
+// which ports may receive traffic at all. The connect URL then routes to one of them
+// (see firstPort).
 func containerPorts(c *corev1.Container) []int {
 	if len(c.Ports) == 0 {
 		return nil
@@ -406,6 +460,17 @@ func containerPorts(c *corev1.Container) []int {
 		ports = append(ports, int(p.ContainerPort))
 	}
 	return ports
+}
+
+// firstPort returns the port the connect URL should route to, or 0 when the
+// container declares none, which leaves the port to Modal's own default. Modal
+// routes one port per token, so the first declared port wins; a workload serving on a
+// second port has no address of its own today.
+func firstPort(ports []int) int {
+	if len(ports) == 0 {
+		return 0
+	}
+	return ports[0]
 }
 
 // sandboxTimeout maps the Pod's activeDeadlineSeconds (Kubernetes' own "maximum
@@ -420,12 +485,15 @@ func sandboxTimeout(pod *corev1.Pod) time.Duration {
 }
 
 // toInstance normalizes a Modal sandbox into the provider-agnostic Instance.
+//
+// Endpoint is left empty: Modal's address is published from the create path (see
+// Credential), and an observed empty endpoint never clears the annotation already on
+// the Pod — the write paths all skip "".
 func (p *Provider) toInstance(sb Sandbox) provider.Instance {
 	return provider.Instance{
 		ID:        sb.ID,
 		ClaimName: sb.Tags[ClaimTagKey],
 		State:     toState(sb.Status),
-		Endpoint:  sb.Endpoint,
 		// Modal is OnDemand-only; reflect that on observed instances.
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	}

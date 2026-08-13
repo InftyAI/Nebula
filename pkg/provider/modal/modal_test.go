@@ -40,21 +40,22 @@ type fakeClient struct {
 	createCnt  int
 	createErr  error
 	createID   string
+	cred       Credential // credential CreateSandbox returns; zero = none minted
 	terminated []string
 }
 
-func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string, error) {
+func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string, Credential, error) {
 	f.createCnt++
 	f.lastSpec = spec
 	if f.createErr != nil {
-		return "", f.createErr
+		return "", Credential{}, f.createErr
 	}
 	id := f.createID
 	if id == "" {
 		id = "sb-new"
 	}
 	f.sandboxes = append(f.sandboxes, Sandbox{ID: id, Tags: spec.Tags, Status: "pending"})
-	return id, nil
+	return id, f.cred, nil
 }
 
 func (f *fakeClient) TerminateSandbox(_ context.Context, id string) error {
@@ -118,13 +119,14 @@ func TestProvision_GPUPod(t *testing.T) {
 	f := &fakeClient{createID: "sb-1"}
 	p := newTestProvider(f)
 
-	id, reserved, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 2), provider.ProvisionRequest{
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 2), provider.ProvisionRequest{
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	id, reserved := res.InstanceID, res.Reserved
 	if id != "sb-1" {
 		t.Fatalf("id = %q, want sb-1", id)
 	}
@@ -155,7 +157,7 @@ func TestProvision_LowercaseGPUAnnotation(t *testing.T) {
 	// A user may write the accelerator-type label in any case (e.g. "h100"). It must
 	// resolve to the canonical catalog accelerator ("H100") so the provisioned
 	// sandbox — and any downstream key (blocklist/catalog) — uses one casing.
-	_, _, err := p.Provision(context.Background(), gpuPod("claim-lc", "h100", 1), provider.ProvisionRequest{
+	_, err := p.Provision(context.Background(), gpuPod("claim-lc", "h100", 1), provider.ProvisionRequest{
 		ClaimName:    "claim-lc",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
@@ -183,7 +185,7 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 	deadline := int64(3600)
 	pod.Spec.ActiveDeadlineSeconds = &deadline
 
-	if _, _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-res"}); err != nil {
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-res"}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.CPU != 2.5 {
@@ -207,7 +209,7 @@ func TestProvision_DefaultsTimeoutWhenNoDeadline(t *testing.T) {
 	// No activeDeadlineSeconds: the adapter must still set a non-zero timeout, else
 	// Modal applies its 5-minute default and the workload dies almost immediately.
 	req := provider.ProvisionRequest{ClaimName: "claim-dt"}
-	if _, _, err := p.Provision(context.Background(), gpuPod("claim-dt", "H100", 1), req); err != nil {
+	if _, err := p.Provision(context.Background(), gpuPod("claim-dt", "H100", 1), req); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.Timeout != defaultSandboxTimeout {
@@ -219,7 +221,7 @@ func TestProvision_CPUOnly(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
 
-	_, _, err := p.Provision(context.Background(), gpuPod("claim-cpu", "", 0), provider.ProvisionRequest{
+	_, err := p.Provision(context.Background(), gpuPod("claim-cpu", "", 0), provider.ProvisionRequest{
 		ClaimName:    "claim-cpu",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
@@ -242,10 +244,11 @@ func TestProvision_Idempotent(t *testing.T) {
 	p := newTestProvider(f)
 
 	req := provider.ProvisionRequest{ClaimName: "claim-a"}
-	id, reserved, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req)
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req)
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	id, reserved := res.InstanceID, res.Reserved
 	if id != "sb-existing" {
 		t.Fatalf("id = %q, want sb-existing (idempotent reuse)", id)
 	}
@@ -272,11 +275,12 @@ func TestProvision_IdempotentInitializingIsNotReserved(t *testing.T) {
 	}
 	p := newTestProvider(f)
 
-	id, reserved, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
 		provider.ProvisionRequest{ClaimName: "claim-a"})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	id, reserved := res.InstanceID, res.Reserved
 	if id != "sb-existing" {
 		t.Fatalf("id = %q, want sb-existing (idempotent reuse)", id)
 	}
@@ -289,7 +293,7 @@ func TestProvision_UnsupportedAccelerator(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
 	req := provider.ProvisionRequest{ClaimName: "claim-x"}
-	_, _, err := p.Provision(context.Background(), gpuPod("claim-x", "TPU-v4", 1), req)
+	_, err := p.Provision(context.Background(), gpuPod("claim-x", "TPU-v4", 1), req)
 	if err == nil {
 		t.Fatal("expected error for unsupported accelerator")
 	}
@@ -450,7 +454,7 @@ func TestProvision_ProbeTagStampedOnlyWithProbe(t *testing.T) {
 			pod := gpuPod("claim-a", "H100", 1)
 			pod.Spec.Containers[0].ReadinessProbe = tc.probe
 
-			if _, _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+			if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
 				t.Fatalf("Provision: %v", err)
 			}
 			_, present := f.lastSpec.Tags[ProbeTagKey]
@@ -480,7 +484,7 @@ func TestProvision_ReadinessProbeCarriedThrough(t *testing.T) {
 	}
 	pod.Spec.Containers[0].ReadinessProbe = probe
 
-	if _, _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	// The probe is carried onto the spec so the Client can configure Modal's own
@@ -495,11 +499,148 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 	p := newTestProvider(f)
 
 	req := provider.ProvisionRequest{ClaimName: "claim-a"}
-	if _, _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
+	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if f.lastSpec.ReadinessProbe != nil {
 		t.Fatalf("ReadinessProbe should be nil when the Pod declares none, got %v", f.lastSpec.ReadinessProbe)
+	}
+}
+
+// TestProvision_ConnectPortFromFirstDeclaredPort: ConnectPort selects which port the
+// connect URL routes to. Every workload is credentialed, so 0 is not "no endpoint"
+// but "let Modal pick" (it defaults to 8080).
+func TestProvision_ConnectPortFromFirstDeclaredPort(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ports []corev1.ContainerPort
+		want  int
+	}{
+		{"no ports leaves the port to Modal", nil, 0},
+		{"single port", []corev1.ContainerPort{{ContainerPort: 8000}}, 8000},
+		// Modal routes one port per token, so the first declared port wins.
+		{"first of several wins", []corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}}, 8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeClient{createID: "sb-1"}
+			p := newTestProvider(f)
+			pod := gpuPod("claim-a", "H100", 1)
+			pod.Spec.Containers[0].Ports = tc.ports
+
+			req := provider.ProvisionRequest{ClaimName: "claim-a"}
+			if _, err := p.Provision(context.Background(), pod, req); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if f.lastSpec.ConnectPort != tc.want {
+				t.Fatalf("ConnectPort = %d, want %d", f.lastSpec.ConnectPort, tc.want)
+			}
+		})
+	}
+}
+
+func TestFirstPort(t *testing.T) {
+	if got := firstPort(nil); got != 0 {
+		t.Fatalf("firstPort(nil) = %d, want 0 (leave the port to Modal)", got)
+	}
+	if got := firstPort([]int{9090, 8000}); got != 9090 {
+		t.Fatalf("firstPort = %d, want the first declared port 9090", got)
+	}
+}
+
+// The credential reaches the caller through Provision and NOWHERE else: minting is
+// one-shot, so this return value is the only copy that will ever exist.
+func TestProvision_ReturnsMintedCredential(t *testing.T) {
+	f := &fakeClient{
+		createID: "sb-1",
+		cred:     Credential{URL: "https://x.modal.host", Token: "tok-abc"},
+	}
+	p := newTestProvider(f)
+
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if res.ConnectURL != "https://x.modal.host" {
+		t.Fatalf("ConnectURL = %q, want the minted URL", res.ConnectURL)
+	}
+	if res.ConnectToken != "tok-abc" {
+		t.Fatalf("ConnectToken = %q, want the minted token", res.ConnectToken)
+	}
+	// The token must never be written where a reader of the sandbox could find it: the
+	// tags are plaintext and one ListSandboxes dumps them all.
+	for k, v := range f.lastSpec.Tags {
+		if v == "tok-abc" {
+			t.Fatalf("token leaked into sandbox tag %q", k)
+		}
+	}
+}
+
+// A sandbox that minted nothing yields no credential rather than an error: it still
+// exists, still costs money, and must still be reported and reclaimed.
+func TestProvision_NoCredentialWhenNoneMinted(t *testing.T) {
+	f := &fakeClient{createID: "sb-1"} // zero cred
+	p := newTestProvider(f)
+
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if res.InstanceID != "sb-1" {
+		t.Fatalf("InstanceID = %q, want sb-1 even with no credential", res.InstanceID)
+	}
+	if res.ConnectURL != "" || res.ConnectToken != "" {
+		t.Fatalf("expected no credential, got url=%q token set=%t", res.ConnectURL, res.ConnectToken != "")
+	}
+}
+
+// An idempotent re-Provision carries NO credential. The original was minted once and
+// cannot be re-read, and minting a second one here would hand the consumer a token
+// that changes on every retry.
+func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
+	f := &fakeClient{
+		sandboxes: []Sandbox{{
+			ID:     "sb-existing",
+			Tags:   map[string]string{ClaimTagKey: "claim-a"},
+			Status: statusRunning,
+		}},
+		cred: Credential{URL: "https://x.modal.host", Token: "tok-abc"},
+	}
+	p := newTestProvider(f)
+
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if res.InstanceID != "sb-existing" {
+		t.Fatalf("InstanceID = %q, want sb-existing", res.InstanceID)
+	}
+	if res.ConnectURL != "" || res.ConnectToken != "" {
+		t.Fatalf("an adopted sandbox must carry no credential, got url=%q token set=%t",
+			res.ConnectURL, res.ConnectToken != "")
+	}
+}
+
+// Modal reports NO observed endpoint. Its address is the connect URL, published from
+// the create path onto the Pod's annotation, where it persists; re-deriving it per tick
+// would be a round trip for a value the API server already holds. The alternative —
+// falling back to a tunnel URL — is worse than nothing, since a tunnel is public to
+// whoever learns it.
+func TestToInstance_ReportsNoEndpoint(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	got := p.toInstance(Sandbox{
+		ID:     "sb-1",
+		Status: statusRunning,
+		Tags:   map[string]string{ClaimTagKey: "claim-a"},
+	})
+	if got.Endpoint != "" {
+		t.Fatalf("Endpoint = %q, want empty; the address comes from the create path", got.Endpoint)
+	}
+	if got.ClaimName != "claim-a" || got.State != provider.InstanceRunning {
+		t.Fatalf("claim/state = %q/%q, want claim-a/Running", got.ClaimName, got.State)
 	}
 }
 

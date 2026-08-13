@@ -38,20 +38,27 @@ func TestProvisionReportsRunningAndLists(t *testing.T) {
 	p := New()
 	ctx := context.Background()
 
-	id, reserved, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{
+	res, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	id := res.InstanceID
 	if id == "" {
 		t.Fatal("expected a non-empty instance id")
+	}
+	// The fake authenticates nothing, so it mints no credential; its address is
+	// reported the level-triggered way, through the observed instance.
+	if res.ConnectURL != "" || res.ConnectToken != "" {
+		t.Fatalf("expected no credential from the fake, got url=%q token set=%t",
+			res.ConnectURL, res.ConnectToken != "")
 	}
 	// The fake has no queueing to model — an instance is Running the moment it is
 	// created — so it always reserves. Reporting false would make the fake exercise
 	// the Modal-shaped path and leave Pods at Provisioning forever.
-	if !reserved {
+	if !res.Reserved {
 		t.Fatal("reserved = false; the fake allocates synchronously and is Running immediately")
 	}
 
@@ -82,14 +89,15 @@ func TestProvisionIdempotentOnClaim(t *testing.T) {
 	ctx := context.Background()
 	req := provider.ProvisionRequest{ClaimName: "claim-a"}
 
-	id1, _, err := p.Provision(ctx, testPod(), req)
+	res1, err := p.Provision(ctx, testPod(), req)
 	if err != nil {
 		t.Fatalf("Provision #1: %v", err)
 	}
-	id2, _, err := p.Provision(ctx, testPod(), req)
+	res2, err := p.Provision(ctx, testPod(), req)
 	if err != nil {
 		t.Fatalf("Provision #2: %v", err)
 	}
+	id1, id2 := res1.InstanceID, res2.InstanceID
 	if id1 != id2 {
 		t.Fatalf("ids differ (%q vs %q); Provision must be idempotent on ClaimName", id1, id2)
 	}
@@ -102,10 +110,11 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	p := New()
 	ctx := context.Background()
 
-	id, _, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{ClaimName: "claim-a"})
+	res, err := p.Provision(ctx, testPod(), provider.ProvisionRequest{ClaimName: "claim-a"})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
+	id := res.InstanceID
 	if err := p.Terminate(ctx, id); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}

@@ -27,6 +27,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -56,10 +57,11 @@ type Provider interface {
 	// only what the Pod cannot express: the optimizer-chosen capacity tier and
 	// the claim identity.
 	//
-	// It returns the provider instance id plus whether that instance is RESERVED:
-	// whether the provider has committed actual capacity to it, as opposed to
-	// merely accepting the request. The two are genuinely different guarantees and
-	// an id alone cannot express either one:
+	// It returns a ProvisionResult: the instance id, whether capacity is RESERVED,
+	// and any connect credential minted for the instance. Reserved is whether the
+	// provider has committed actual capacity, as opposed to merely accepting the
+	// request. The two are genuinely different guarantees and an id alone cannot
+	// express either one:
 	//
 	//   - AWS reserves. CreateFleet with an *instant* request is synchronous, so an
 	//     id means EC2 found capacity and the instance is booting on real hardware;
@@ -78,8 +80,10 @@ type Provider interface {
 	//
 	// Idempotency: if an instance already exists for req.ClaimName (encoded in
 	// the provider's naming scheme, since most providers lack tags), return that
-	// id instead of creating a second.
-	Provision(ctx context.Context, pod *corev1.Pod, req ProvisionRequest) (instanceID string, reserved bool, err error)
+	// id instead of creating a second. Such a call returns NO credential — the
+	// original one was already published and cannot be re-read (see
+	// ProvisionResult.ConnectURL).
+	Provision(ctx context.Context, pod *corev1.Pod, req ProvisionRequest) (ProvisionResult, error)
 
 	// Terminate destroys the instance by id. Must be idempotent: terminating an
 	// already-gone instance returns nil (so the NodeClaim finalizer can retry
@@ -167,6 +171,57 @@ type ProvisionRequest struct {
 	Region string
 }
 
+// ProvisionResult is what one Provision call produced. It is a struct rather than
+// more positional returns because the credential below is delivered ONCE, and a
+// value that can only ever be observed here deserves to be named.
+type ProvisionResult struct {
+	// InstanceID is the provider's id for the instance. Non-empty on success, and
+	// carrying the full teardown obligation from that moment on.
+	InstanceID string
+	// Reserved is whether the provider committed actual capacity, as opposed to
+	// merely accepting the request. See Provision.
+	Reserved bool
+	// ConnectURL and ConnectToken are the credential for reaching the instance: an
+	// address plus the bearer token that authenticates against it. Together they are
+	// what a consumer needs and all they need:
+	//
+	//	curl -H "Authorization: Bearer $token" $url
+	//
+	// They are returned HERE, and only here, because minting is one-shot: providers
+	// issue a credential at create and offer no way to read it back (Modal's
+	// CreateConnectToken returns a DIFFERENT token on a second call, so there is not
+	// even a stable value to re-read). This is therefore the single moment the pair
+	// exists in Nebula's hands, and the caller must persist it durably — the virtual
+	// kubelet writes both to a Secret in the Pod's namespace — or it is gone. Empty
+	// when the instance needs no credential, and empty on an idempotent re-Provision
+	// of an existing instance, whose credential was published already.
+	//
+	// The TOKEN is a SECRET: never log it, never put it on the Pod (an annotation is
+	// readable by anyone with `get pod` and lands unencrypted in etcd), never in an
+	// error string. Neither field is on Instance: List/Get are the level-triggered
+	// read path, and a credential that cannot be re-read has no business there.
+	//
+	// ConnectURL is not itself secret, and it is NOT the same value as
+	// Instance.Endpoint even when they agree. This is the one-shot create path; the
+	// endpoint is the observed read path, which is what reports an address that does
+	// not exist until the instance boots (AWS's public DNS name) and what still
+	// reports one after a restart, when no Provision call happens at all.
+	ConnectURL   string
+	ConnectToken string
+}
+
+// String redacts ConnectToken so a ProvisionResult can be logged safely. The
+// compiler cannot stop a future log.Info("...", "result", res) from leaking it;
+// %v/%s go through here instead. GoString covers %#v for the same reason. The URL
+// is not secret and is printed as-is.
+func (r ProvisionResult) String() string {
+	return fmt.Sprintf("ProvisionResult{InstanceID:%s Reserved:%t ConnectURL:%s ConnectToken:%s}",
+		r.InstanceID, r.Reserved, r.ConnectURL, redacted(r.ConnectToken))
+}
+
+// GoString implements fmt.GoStringer so %#v is redacted too.
+func (r ProvisionResult) GoString() string { return r.String() }
+
 // Capabilities declares provider quirks as data, so the control plane filters
 // and behaves generically rather than branching on provider name.
 type Capabilities struct {
@@ -209,13 +264,23 @@ type Instance struct {
 	ID        string
 	ClaimName string // recovered from the naming scheme (for tag-less providers)
 	State     InstanceState
-	// Endpoint is the reachable address once ready (e.g. SSH host:port).
-	Endpoint string
 	// CapacityType reflects how the instance was provisioned, when known.
 	CapacityType nebulav1alpha1.CapacityType
 	// Region is where the instance actually lives, in the provider's own
 	// vocabulary. Empty for region-simple providers that do not report one.
 	Region string
+	// Endpoint is the reachable address once ready (e.g. SSH host:port). It is not
+	// secret, so unlike the connect credential it rides the level-triggered read path
+	// and is re-reported on every tick.
+	Endpoint string
+}
+
+// redacted renders a secret's presence without its value.
+func redacted(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "[REDACTED]"
 }
 
 // InstanceState is the provider-agnostic lifecycle state, normalized from each
