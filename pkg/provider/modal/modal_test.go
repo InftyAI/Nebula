@@ -19,6 +19,7 @@ package modal
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -507,19 +508,30 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 	}
 }
 
-// TestProvision_ConnectPortFromFirstDeclaredPort: ConnectPort selects which port the
-// connect URL routes to. Every workload is credentialed, so 0 is not "no endpoint"
-// but "let Modal pick" (it defaults to 8080).
-func TestProvision_ConnectPortFromFirstDeclaredPort(t *testing.T) {
+// The spec carries the container's declared ports verbatim: they are the set Modal is
+// told to accept traffic on, and the connect URL routes to the first of them (the
+// client derives it, so the routed port can never name one outside the set). No
+// declared port is not "no endpoint" — every workload is credentialed — it means Modal
+// picks, defaulting to 8080.
+func TestProvision_CarriesDeclaredPorts(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		ports []corev1.ContainerPort
-		want  int
+		want  []int
+		// wantRouted is the port the connect URL ends up on, which the client derives
+		// from want; 0 leaves it to Modal.
+		wantRouted int
 	}{
-		{"no ports leaves the port to Modal", nil, 0},
-		{"single port", []corev1.ContainerPort{{ContainerPort: 8000}}, 8000},
-		// Modal routes one port per token, so the first declared port wins.
-		{"first of several wins", []corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}}, 8000},
+		{"no ports leaves the port to Modal", nil, nil, 0},
+		{"single port", []corev1.ContainerPort{{ContainerPort: 8000}}, []int{8000}, 8000},
+		// Modal routes one port per token, so the first declared port wins — but the
+		// whole set is still exposed.
+		{
+			"all exposed, first routed",
+			[]corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}},
+			[]int{8000, 9090},
+			8000,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeClient{createID: "sb-1"}
@@ -531,8 +543,11 @@ func TestProvision_ConnectPortFromFirstDeclaredPort(t *testing.T) {
 			if _, err := p.Provision(context.Background(), pod, req); err != nil {
 				t.Fatalf("Provision: %v", err)
 			}
-			if f.lastSpec.ConnectPort != tc.want {
-				t.Fatalf("ConnectPort = %d, want %d", f.lastSpec.ConnectPort, tc.want)
+			if !slices.Equal(f.lastSpec.Ports, tc.want) {
+				t.Fatalf("Ports = %v, want %v", f.lastSpec.Ports, tc.want)
+			}
+			if got := firstPort(f.lastSpec.Ports); got != tc.wantRouted {
+				t.Fatalf("routed port = %d, want %d", got, tc.wantRouted)
 			}
 		})
 	}

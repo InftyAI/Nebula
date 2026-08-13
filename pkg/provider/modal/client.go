@@ -180,8 +180,9 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 // Every workload gets one. An authenticated URL is the only general way to reach
 // something running on a NeoCloud — there is no cluster network to fall back on —
 // so the useful default is that the credential exists, and a workload with nothing
-// to serve simply leaves it unused. ConnectPort selects which port the URL routes
-// to; 0 means the Pod declared none and Modal's own default (8080) applies.
+// to serve simply leaves it unused. The URL routes to the first of spec.Ports — one
+// token routes to one port — and no declared port means Modal's own default (8080)
+// applies.
 //
 // This is scoped to service-shaped workloads (a Deployment/StatefulSet/bare Pod
 // that serves traffic). A Sandbox is reached by identity, not by address —
@@ -197,7 +198,9 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 // reason a token is never logged: it can echo the request.
 func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, spec SandboxSpec) Credential {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
-		Port: spec.ConnectPort,
+		// Derived from the exposed set rather than carried separately, so the routed
+		// port cannot name one the sandbox was never told to accept traffic on.
+		Port: firstPort(spec.Ports),
 	})
 	if err != nil || creds == nil || creds.Token == "" {
 		return Credential{}

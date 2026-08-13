@@ -102,8 +102,9 @@ type SandboxSpec struct {
 	// Modal apply its own default.
 	MemoryMiB int
 	// Ports are the container ports to expose, from the Pod's containerPorts. They
-	// declare to Modal which ports may receive traffic at all; the connect URL then
-	// routes to ConnectPort among them.
+	// declare to Modal which ports may receive traffic at all, and the connect URL
+	// routes to the first of them (see firstPort) — one token routes to one port.
+	// Empty leaves both the exposed set and the routed port to Modal's own default.
 	Ports []int
 	// Timeout is the sandbox's maximum lifetime. It MUST be non-zero: Modal treats
 	// a zero timeout as its 5-minute default, which would terminate a real
@@ -112,11 +113,6 @@ type SandboxSpec struct {
 	Timeout time.Duration
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
-	// ConnectPort is the container port the connect URL routes to, taken from the
-	// Pod's first declared port. Zero does NOT mean "no credential" — every workload
-	// is credentialed — it means the Pod declared no port, so Modal's own default
-	// port applies.
-	ConnectPort int
 	// ReadinessProbe, when non-nil, is the Pod's first-container readinessProbe
 	// carried through so the Client can configure Modal's own readiness probe at
 	// create time. Modal enforces the probe internally (it gates its own traffic
@@ -377,17 +373,13 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		tags[ProbeTagKey] = probeTagValue
 	}
 
-	ports := containerPorts(&c)
 	spec := SandboxSpec{
-		Image:     c.Image,
-		Command:   append(append([]string{}, c.Command...), c.Args...),
-		Env:       env,
-		CPU:       cpuCores(&c),
-		MemoryMiB: memoryMiB(&c),
-		Ports:     ports,
-		// Route the connect URL at the Pod's first declared port. Only one port can back
-		// a token; 0 (no declared port) leaves the choice to Modal's default.
-		ConnectPort:    firstPort(ports),
+		Image:          c.Image,
+		Command:        append(append([]string{}, c.Command...), c.Args...),
+		Env:            env,
+		CPU:            cpuCores(&c),
+		MemoryMiB:      memoryMiB(&c),
+		Ports:          containerPorts(&c),
 		Timeout:        sandboxTimeout(pod),
 		Tags:           tags,
 		ReadinessProbe: c.ReadinessProbe,
