@@ -46,10 +46,13 @@ type fakeProvider struct {
 	terminated   []string            // instance ids passed to Terminate, in order
 	terminateErr error               // if set, Terminate fails
 	gpus         []string            // accelerators MapAccelerator offers; nil = offer any
+	spot         bool                // Capabilities().SupportsSpot (placement skips Spot without it)
 }
 
-func (f *fakeProvider) Name() string                        { return f.name }
-func (f *fakeProvider) Capabilities() provider.Capabilities { return provider.Capabilities{} }
+func (f *fakeProvider) Name() string { return f.name }
+func (f *fakeProvider) Capabilities() provider.Capabilities {
+	return provider.Capabilities{SupportsSpot: f.spot}
+}
 func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (provider.ProvisionResult, error) {
 	return provider.ProvisionResult{}, nil
 }

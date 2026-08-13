@@ -33,6 +33,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/failover"
+	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -72,15 +73,15 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 // failure ever reached the blocklist, so this loop only walks regions, not zones.
 //
 // Returns ok=false when every (tier, provider, region) candidate is either
-// unservable (provider unregistered or does not offer the accelerator) or blocked;
-// the caller then leaves the Pod gated for a later retry (a pool edit, a provider
-// registering, or a block expiring). Provider quirks (e.g. Modal being
-// OnDemand-only) are still handled at Provision time, not here.
+// unservable (provider unregistered, does not offer the accelerator, or cannot
+// serve the tier — see servesCapacity) or blocked; the caller then leaves the Pod
+// gated for a later retry (a pool edit, a provider registering, or a block
+// expiring).
 //
 // On ok=false it also returns retryAfter: the time until the SOONEST currently-
 // servable candidate (one skipped ONLY because it is blocklisted) frees, or 0 when
 // no candidate can ever be unblocked by a lapsing TTL (every candidate is
-// unregistered or does not offer the accelerator). The caller requeues on a
+// unservable for a reason no TTL can lapse). The caller requeues on a
 // positive hint so a Pod stuck purely on failover retries the moment a block
 // expires, rather than idling until the periodic resync — blocklist TTL expiry
 // emits no event of its own.
@@ -113,6 +114,11 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				log.V(1).Info("skipping candidate: provider not registered",
 					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
+			}
+			if !servesCapacity(prov, tier) {
+				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
+					"provider", ref.Name, "capacityType", tier)
+				continue
 			}
 			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
 			// Pod only matches a provider whose catalog serves that (type, count).
@@ -163,6 +169,27 @@ func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType 
 		return []nebulav1alpha1.CapacityType{""}
 	}
 	return pool.Spec.CapacityTypes
+}
+
+// servesCapacity reports whether prov can actually deliver the candidate's
+// capacity tier. Only Spot is ever refused: an OnDemand-only provider (Modal) has
+// no user-facing interruptible tier, so a Spot candidate there is unservable in
+// exactly the sense a missing accelerator is — the request cannot be honoured, and
+// pretending otherwise is worse than skipping. Placing it would stamp
+// CapacityType=Spot on the Pod, hand it to an adapter that drops the field, and
+// bill the user at OnDemand rates for capacity they explicitly asked to be cheap
+// and interruptible, with no error, event or status to reveal the substitution.
+// Skipping instead lets the pool's next tier take over ([Spot, OnDemand] still
+// lands on Modal as OnDemand, now truthfully labelled), and a Spot-only pool leaves
+// the Pod gated — visibly unplaceable rather than quietly overcharged.
+//
+// The empty tier is "the provider's default", which every provider serves by
+// definition, so it passes.
+func servesCapacity(prov provider.Provider, tier nebulav1alpha1.CapacityType) bool {
+	if tier != nebulav1alpha1.CapacitySpot {
+		return true
+	}
+	return prov.Capabilities().SupportsSpot
 }
 
 // regionsFor is the inner axis for one provider ref: the regions to try, in listed
