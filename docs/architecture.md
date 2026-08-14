@@ -174,10 +174,12 @@ Follow one GPU Pod from creation to teardown:
    joined token rather than one region name). An empty expansion still yields one
    unconstrained `""` candidate so the walk runs.
 
-   `Ordered`, `LowestPrice`, and `Weighted` are API values, but the current inner
-   ranking is still listed order. The placement flow is already structured so
-   price or weight ranking can replace the inner ordering without changing the
-   rest of the controller.
+   `Ordered` is the only strategy the API accepts, and the inner ranking is listed
+   order. `LowestPrice` and `Weighted` exist as constants but are deliberately kept
+   out of the enum until the ranking is implemented — admitting a strategy the walk
+   ignores would let a pool claim a policy it does not get. The placement flow is
+   already structured so price or weight ranking can replace the inner ordering
+   without changing the rest of the controller; widening the enum is the switch.
 
 4. **Create the ledger first.** Before the Pod can bind, the controller creates a
    deterministic NodeClaim named from the Pod namespace/name. The claim records

@@ -63,26 +63,31 @@ var _ = Describe("NodePool spec validation", func() {
 		Expect(err.Error()).To(ContainSubstring("must have at most 8 items"))
 	})
 
-	It("rejects a Weighted pool with a provider missing a weight", func() {
-		pool := newWeightedPool("weighted-missing",
-			nebulav1alpha1.ProviderSpec{Name: "modal", Weight: weight(3)},
-			nebulav1alpha1.ProviderSpec{Name: "runpod"}, // no weight
-		)
-		err := k8sClient.Create(ctx, pool)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("strategy Weighted requires a weight on every provider"))
-	})
-
-	It("admits a Weighted pool with a weight on every provider", func() {
+	// Strategy admits only Ordered today (see NodePoolSpec.Strategy). These assert
+	// the restriction itself, because it is the enum — not the Weighted weight CEL
+	// rule — that now rejects the other two. The weight rule is retained but
+	// unreachable, so it has no admission behaviour left to test: a Weighted pool
+	// WITH weights on every provider is rejected just the same, which is what the
+	// second spec below pins.
+	It("rejects a Weighted pool even with a weight on every provider", func() {
 		pool := newWeightedPool("weighted-ok",
 			nebulav1alpha1.ProviderSpec{Name: "modal", Weight: weight(3)},
 			nebulav1alpha1.ProviderSpec{Name: "runpod", Weight: weight(1)},
 		)
-		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`Unsupported value: "Weighted"`))
 	})
 
-	It("admits a non-Weighted pool regardless of weights", func() {
+	It("rejects a LowestPrice pool", func() {
+		pool := newPool("lowest-price", nebulav1alpha1.StrategyLowestPrice,
+			nebulav1alpha1.ProviderSpec{Name: "modal"})
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`Unsupported value: "LowestPrice"`))
+	})
+
+	It("admits an Ordered pool regardless of weights", func() {
 		pool := &nebulav1alpha1.NodePool{
 			ObjectMeta: metav1.ObjectMeta{Name: "ordered-noweights"},
 			Spec: nebulav1alpha1.NodePoolSpec{

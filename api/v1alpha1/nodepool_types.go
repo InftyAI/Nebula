@@ -15,7 +15,7 @@ import (
 //	    candidates = Providers x (each provider's Regions) x {this capacityType},
 //	                 available now, minus blocklist                // region nests per provider
 //	    IF candidates non-empty:
-//	        pick one via Strategy (LowestPrice | Ordered | Weighted) // inner: rank candidates
+//	        pick one via Strategy (Ordered today; see Strategy)      // inner: rank candidates
 //	        DONE
 //	    // else fall through to the next capacity tier
 //
@@ -33,6 +33,11 @@ import (
 // The Weighted strategy requires a weight on every provider ref. This is a
 // static property of the spec, so it is enforced at admission by the CEL rule
 // below rather than surfaced as a status condition after the fact.
+//
+// The rule is currently UNREACHABLE — Strategy's enum admits only Ordered, so no
+// object can carry Weighted for it to check. It is retained rather than deleted so
+// that widening the enum is a one-line change that cannot silently ship without its
+// weight validation; the cost is one always-true CEL evaluation per admission.
 // +kubebuilder:validation:XValidation:rule="self.strategy != 'Weighted' || self.providers.all(p, has(p.weight))",message="strategy Weighted requires a weight on every provider"
 // (AWS once required at least one region here, because an omitted list meant "the
 // client's default region" and its client has none. Omitted now means "every region
@@ -58,7 +63,14 @@ type NodePoolSpec struct {
 
 	// Strategy is the INNER axis: how to rank providers within the active
 	// capacity tier. It never overrides the capacity tier ordering.
-	// +kubebuilder:validation:Enum=LowestPrice;Ordered;Weighted
+	//
+	// Only Ordered is accepted today. LowestPrice and Weighted are defined as
+	// constants (and the Weighted weight rule is already enforced above) but are
+	// deliberately kept OUT of the enum until the ranking is implemented: admitting
+	// a value the placement walk silently ignores would let a pool claim a policy it
+	// does not get, which is worse than rejecting it at admission. Widening the enum
+	// is the one change needed to enable them once selectPlacement ranks.
+	// +kubebuilder:validation:Enum=Ordered
 	// +kubebuilder:default=Ordered
 	Strategy PlacementStrategy `json:"strategy,omitempty"`
 
@@ -77,7 +89,8 @@ type ProviderSpec struct {
 	Name string `json:"name"`
 
 	// Weight is the relative share of new placements for the Weighted strategy.
-	// Ignored by other strategies.
+	// Ignored by other strategies, which today means ignored entirely: Strategy
+	// accepts only Ordered, so setting this has no effect until Weighted is enabled.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Weight *int32 `json:"weight,omitempty"`
@@ -118,14 +131,21 @@ type ProviderSpec struct {
 }
 
 // PlacementStrategy ranks providers WITHIN a capacity tier (the inner axis).
+//
+// Only StrategyOrdered is admitted by NodePoolSpec.Strategy's enum today. The other
+// two are declared here so the vocabulary is stable and testable ahead of the
+// ranking implementation, NOT because they can be requested — see Strategy.
 type PlacementStrategy string
 
 const (
 	// StrategyLowestPrice picks the lowest $/hr provider in the active tier.
+	// NOT YET ACCEPTED by the Strategy enum.
 	StrategyLowestPrice PlacementStrategy = "LowestPrice"
-	// StrategyOrdered uses the Providers list order as strict priority.
+	// StrategyOrdered uses the Providers list order as strict priority. The only
+	// strategy accepted today, and the default.
 	StrategyOrdered PlacementStrategy = "Ordered"
 	// StrategyWeighted spreads placements to match per-provider weights.
+	// NOT YET ACCEPTED by the Strategy enum.
 	StrategyWeighted PlacementStrategy = "Weighted"
 )
 

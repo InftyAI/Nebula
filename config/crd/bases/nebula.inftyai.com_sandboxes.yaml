@@ -13,7 +13,6 @@ spec:
     plural: sandboxes
     shortNames:
     - sb
-    - sbx
     singular: sandbox
   scope: Namespaced
   versions:

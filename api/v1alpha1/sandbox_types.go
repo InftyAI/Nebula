@@ -230,7 +230,7 @@ type SandboxStatus struct {
 }
 
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:scope=Namespaced,shortName={sb,sbx}
+// +kubebuilder:resource:scope=Namespaced,shortName=sb
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.nodePoolRef`

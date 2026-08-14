@@ -141,7 +141,7 @@ type SandboxSetStatus struct {
 }
 
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:scope=Namespaced,shortName={sbs,sbxs}
+// +kubebuilder:resource:scope=Namespaced,shortName=sbs
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
