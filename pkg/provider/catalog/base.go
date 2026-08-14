@@ -76,6 +76,25 @@ func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 	return b.Catalog.Offerings(b.ProviderName), nil
 }
 
+// ExpandRegions passes the pool's declared regions through unchanged: one candidate
+// per declared region, and the declaration's tokens used verbatim as region names.
+// This is the right default for a provider whose OWN vocabulary already spans both
+// levels the pool speaks (so there is nothing to expand — the token IS the region
+// name, which stays future-proof as the provider adds regions) AND whose provision
+// call reports a capacity failure synchronously, so walking candidates one at a time
+// actually buys a retry in the next region.
+//
+// nil stays nil, which every adapter must read as "unconstrained": send no region
+// and let the provider place freely.
+//
+// Both halves have real overriders, in opposite directions. AWS expands a group
+// token into many candidates, because "us" is not an EC2 region name you can call.
+// Modal collapses the whole declaration into ONE candidate holding every region,
+// because its create cannot fail over — splitting would strand the workload in
+// whichever region was walked first. Check which of those a new provider resembles
+// before inheriting this.
+func (b Base) ExpandRegions(declared []string) []string { return declared }
+
 // MapAccelerator translates a canonical accelerator request (type + count) into
 // this provider's own accelerator ids using the catalog as the mapping table. It
 // finds the offering rows whose AcceleratorType matches (case-insensitively) and

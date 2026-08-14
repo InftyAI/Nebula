@@ -122,6 +122,7 @@ func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 }
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool)      { return []string{c}, true }
+func (f *fakeProvider) ExpandRegions(declared []string) []string               { return declared }
 func (f *fakeProvider) ClassifyProvisionError(_ error, accel, region string) provider.BlockScope {
 	f.classifyAccel = accel
 	f.classifyRegion = region

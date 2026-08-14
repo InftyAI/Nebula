@@ -40,6 +40,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,37 @@ const spotPollInterval = 10 * time.Second
 // bounds the launch attempts, not "the container became healthy" (that is the
 // poll loop's job).
 const provisionTimeout = 2 * time.Minute
+
+// regionGroups maps a NodePool geography token to the EC2 regions it covers. A
+// group token is NOT an EC2 region name and cannot be derived from one by string
+// surgery ("us" is not a callable endpoint, and London is eu-west-2, not uk-*), so
+// the mapping is data. Every value here is a DEFAULT-enabled region: opt-in regions
+// (launched after 2019-03-20 and disabled until an operator enables them — af-south-1,
+// ap-east-1/2, ap-south-2, ap-southeast-3/4/5/6/7, ca-west-1, eu-central-2,
+// eu-south-1/2, il-central-1, me-central-1, me-south-1, mx-central-1) are
+// deliberately EXCLUDED, so a group or an unconstrained pool can only ever expand to
+// regions the account can actually use.
+//
+// That exclusion is what keeps the wide cases cheap. clientFor resolves a GPU AMI and
+// the default VPC's subnets on first use and deliberately does not cache failures, so
+// a region the account has not enabled would fail that resolution and retry on every
+// poll tick (every spotPollInterval), logging forever, for a region nobody asked for.
+// An operator who HAS enabled one names it explicitly — a literal region name is
+// passed through untouched, so nothing here restricts them.
+//
+// GovCloud (us-gov-*) and China (cn-*) are absent for a stronger reason: they are
+// separate IAM partitions, so one credential set cannot reach them at all (see
+// NewSDKClient's security contract). They are not a group member under any token.
+//
+// Kept sorted so expansion order — and therefore the failover walk order within a
+// group — is stable and reviewable rather than an accident of map iteration.
+var regionGroups = map[string][]string{
+	"us": {"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
+	"eu": {"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3"},
+	"ap": {"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1", "ap-southeast-2"},
+	"ca": {"ca-central-1"},
+	"sa": {"sa-east-1"},
+}
 
 // ErrSpotCapacity is a marker the Client wraps onto a Spot-tier capacity failure
 // (alongside provider.ErrNoCapacity) so ClassifyProvisionError — which the
@@ -222,9 +254,10 @@ type Provider struct {
 // provisioned into). cat is the catalog.Lookup seam so tests can inject a fake.
 //
 // There is deliberately NO default region: every request carries its own region
-// (admission requires each aws pool to list ≥1 region, and placement stamps it onto
-// the ProvisionRequest), and observed instances report their region from the
-// region-pinned client — so nothing needs a fallback, and no AWS_REGION env is read.
+// (ExpandRegions turns even an omitted pool declaration into concrete regions, and
+// placement stamps one onto the ProvisionRequest), and observed instances report
+// their region from the region-pinned client — so nothing needs a fallback, and no
+// AWS_REGION env is read.
 func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource) *Provider {
 	return &Provider{
 		Base:         catalog.Base{ProviderName: provider.ProviderAWS, Catalog: cat},
@@ -249,6 +282,78 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 	// invoking the (constant) factory.
 	p.clients[region] = client
 	return p
+}
+
+// ExpandRegions implements provider.Provider, overriding catalog.Base's pass-through:
+// EC2 region names do not contain the pool's group tokens, so AWS needs the
+// regionGroups table. Three levels, in the order they are checked:
+//
+//	nil/[]          => every default-enabled region (the union of regionGroups)
+//	["us"]          => that group's regions
+//	["us-east-1"]   => itself, verbatim and unvalidated
+//
+// A value that is not a group token is a literal region name. It is NOT checked
+// against any list: EC2 gains regions faster than this table is edited, so a
+// hardcoded validation would reject a region that exists, whereas passing an
+// impossible name through fails at clientFor with AWS's own error. Forwarding is the
+// safer direction of wrongness. That is also the escape hatch for opt-in regions,
+// which no group contains.
+//
+// The result is deduped (["us", "us-east-1"] is 4 regions, not 5) and order-stable:
+// group order follows the table, and a literal keeps its declared position, so the
+// failover walk is reproducible.
+//
+// Unconstrained is the widest case and worth understanding before using it: ~17
+// regions per capacity tier, each a candidate placement walks in turn, and each swept
+// by List/Offerings on every poll tick. Prefer a group when the workload does not
+// genuinely need global reach.
+// It delegates to the package-level ExpandRegions so the same resolution is
+// available to the region source in cmd/main.go, which must expand each pool's
+// declaration BEFORE unioning across pools (a pool declaring nothing means "all", a
+// meaning that would be lost if raw lists were unioned first) and therefore cannot
+// wait for a constructed Provider.
+func (p *Provider) ExpandRegions(declared []string) []string { return ExpandRegions(declared) }
+
+// ExpandRegions is Provider.ExpandRegions as a package-level function; see that
+// method for the semantics. It is exported because the NodePool-backed RegionSource
+// in cmd/main.go must apply the identical expansion, and it needs it per-pool at a
+// point where no Provider is in hand.
+func ExpandRegions(declared []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(r string) {
+		if r == "" || seen[r] {
+			return
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	// Unconstrained: every default-enabled region. Walk the group table in sorted key
+	// order so the union is deterministic (Go randomizes map iteration).
+	if len(declared) == 0 {
+		groups := make([]string, 0, len(regionGroups))
+		for g := range regionGroups {
+			groups = append(groups, g)
+		}
+		sort.Strings(groups)
+		for _, g := range groups {
+			for _, r := range regionGroups[g] {
+				add(r)
+			}
+		}
+		return out
+	}
+	for _, d := range declared {
+		d = strings.TrimSpace(d)
+		if group, ok := regionGroups[strings.ToLower(d)]; ok {
+			for _, r := range group {
+				add(r)
+			}
+			continue
+		}
+		add(d) // a literal region name: forwarded unvalidated
+	}
+	return out
 }
 
 // sweepRegions returns the regions List and Offerings fan out across: the union of

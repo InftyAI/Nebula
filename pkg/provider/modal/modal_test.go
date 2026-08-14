@@ -513,6 +513,169 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 // client derives it, so the routed port can never name one outside the set). No
 // declared port is not "no endpoint" — every workload is credentialed — it means Modal
 // picks, defaulting to 8080.
+func TestProvision_CarriesRegion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		region string
+		want   []string
+	}{{
+		// The unconstrained case, and the one that must NOT become []string{""}: an
+		// empty region means "no placement constraint", which is Modal's widest pool
+		// and its un-multiplied price. A one-element slice holding "" would instead ask
+		// Modal to place in a region named "".
+		name:   "no region leaves placement unconstrained",
+		region: "",
+		want:   nil,
+	}, {
+		name:   "broad region is forwarded",
+		region: "us",
+		want:   []string{"us"},
+	}, {
+		// Modal owns this vocabulary and gains regions faster than the adapter ships,
+		// so a value it does not recognize is forwarded rather than rejected here.
+		name:   "narrow region is forwarded verbatim",
+		region: "us-east",
+		want:   []string{"us-east"},
+	}, {
+		// The whole point of the join: a pool declaring several regions must hand Modal
+		// ALL of them in the one create call, because that call cannot fail over — it
+		// returns an accepted id with no capacity error, so no second region would ever
+		// be attempted. Modal's scheduler picks among these itself.
+		name:   "a multi-region candidate is split back into the full set",
+		region: "us-east" + regionSeparator + "us-west" + regionSeparator + "eu-west",
+		want:   []string{"us-east", "us-west", "eu-west"},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeClient{createID: "sb-1"}
+			p := newTestProvider(f)
+			req := provider.ProvisionRequest{ClaimName: "claim-a", Region: tc.region}
+			if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if !slices.Equal(f.lastSpec.Regions, tc.want) {
+				t.Fatalf("spec.Regions = %v, want %v", f.lastSpec.Regions, tc.want)
+			}
+		})
+	}
+}
+
+// TestExpandRegions_CollapsesToOneCandidate pins the axis decision that matters most
+// for Modal: a pool's whole region declaration becomes exactly ONE placement
+// candidate. Modal's create accepts a sandbox and queues it without a capacity error,
+// so nothing re-drives placement afterwards — one candidate per region would mean the
+// first region walked is the only one ever tried, silently discarding the rest of the
+// operator's declaration. Collapsing hands the full set to Modal's own scheduler.
+func TestExpandRegions_CollapsesToOneCandidate(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	for _, tc := range []struct {
+		name     string
+		declared []string
+		want     []string
+	}{{
+		name:     "no declaration stays unconstrained",
+		declared: nil,
+		want:     nil,
+	}, {
+		// Not []string{""}: an empty candidate and no candidate must not be confused,
+		// and regionsFor supplies the one candidate the walk needs.
+		name:     "a declaration of only blanks is unconstrained, not an empty region",
+		declared: []string{"", "  "},
+		want:     nil,
+	}, {
+		name:     "a single region is one candidate holding it",
+		declared: []string{"us"},
+		want:     []string{"us"},
+	}, {
+		name:     "several regions are ONE candidate, not several",
+		declared: []string{"us-east", "eu-west"},
+		want:     []string{"us-east" + regionSeparator + "eu-west"},
+	}, {
+		name:     "duplicates collapse and order is the operator's",
+		declared: []string{"eu-west", "us-east", "eu-west"},
+		want:     []string{"eu-west" + regionSeparator + "us-east"},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.ExpandRegions(tc.declared)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ExpandRegions(%v) = %v, want %v", tc.declared, got, tc.want)
+			}
+			if len(got) > 1 {
+				t.Fatalf("ExpandRegions(%v) produced %d candidates; Modal cannot fail "+
+					"over, so every extra candidate is a region silently never tried", tc.declared, len(got))
+			}
+		})
+	}
+}
+
+// TestExpandRegions_RoundTripsThroughProvision is the invariant that makes the
+// collapse safe: whatever ExpandRegions joins, regionsOf must split back to the exact
+// declared set by the time it reaches Modal's API. The two are inverses, and this
+// asserts it end to end through Provision rather than on the helpers alone — a
+// mismatch here would send Modal a region name it has never heard of (the joined
+// token), which is precisely the failure a unit test on either half would miss.
+func TestExpandRegions_RoundTripsThroughProvision(t *testing.T) {
+	for _, declared := range [][]string{
+		nil,
+		{"us"},
+		{"us-east", "us-west"},
+		{"us", "eu", "ap", "jp"},
+	} {
+		f := &fakeClient{createID: "sb-1"}
+		p := newTestProvider(f)
+
+		candidates := p.ExpandRegions(declared)
+		// Placement's own fallback when expansion is empty: one unconstrained candidate.
+		if len(candidates) == 0 {
+			candidates = []string{""}
+		}
+		req := provider.ProvisionRequest{ClaimName: "claim-a", Region: candidates[0]}
+		if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
+			t.Fatalf("Provision: %v", err)
+		}
+
+		// A nil declaration must stay nil all the way down, not become [""].
+		var want []string
+		if len(declared) > 0 {
+			want = declared
+		}
+		if !slices.Equal(f.lastSpec.Regions, want) {
+			t.Fatalf("declared %v reached Modal as %v, want %v", declared, f.lastSpec.Regions, want)
+		}
+	}
+}
+
+func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	// A capacity shortage in one region must not disqualify the others: Modal's
+	// regions are independent pools, so without this the first regional failure would
+	// block every region the pool lists.
+	got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", "us-east")
+	if got.Region == nil || *got.Region != "us-east" {
+		t.Fatalf("expected the block confined to us-east, got Region=%v", got.Region)
+	}
+
+	// Unconstrained: no region axis was used, so Region stays nil — which per
+	// BlockScope's three-state rule matches only an empty-region candidate, and so
+	// cannot leak onto region-pinned ones.
+	if got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", ""); got.Region != nil {
+		t.Fatalf("expected nil Region for an unconstrained request, got %q", *got.Region)
+	}
+
+	// Auth fails in every region, so DenyAll must not be narrowed to one.
+	if got := p.ClassifyProvisionError(provider.ErrAuth, "H100:1", "us-east"); got.Region != nil {
+		t.Fatalf("DenyAll must not be confined to a region, got %q", *got.Region)
+	}
+
+	// No error, no block. recordBlock installs any non-empty scope it is handed, so
+	// decorating the zero scope with a region would turn "nothing failed" into a live
+	// block on that region.
+	if got := p.ClassifyProvisionError(nil, "H100:1", "us-east"); got != (provider.BlockScope{}) {
+		t.Fatalf("a nil error must classify to the zero scope, got %+v", got)
+	}
+}
+
 func TestProvision_CarriesDeclaredPorts(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

@@ -20,11 +20,30 @@ limitations under the License.
 // Modal's shape drives several adapter decisions:
 //   - Lifecycle is create/terminate only. A Modal Sandbox is spun up and later
 //     terminated; there is no stop/resume, so Capabilities.SupportsStop=false.
-//   - Modal does not expose a user-facing spot/preemptible tier, so
-//     SupportsSpot=false. Placement consults that trait (servesCapacity in the
-//     capacity-tier loop) and skips a Spot candidate here rather than downgrading
-//     it silently, so only OnDemand (or default-tier) ProvisionRequests reach this
-//     adapter and it never has to interpret CapacityType.
+//   - The Go SDK exposes no spot/preemptible knob, so SupportsSpot=false. (Modal's
+//     own API does have one — SchedulerPlacement's lifecycle, surfaced in Python as
+//     nonpreemptible — but the pinned Go client only ever builds SchedulerPlacement
+//     from Regions, so there is no way to ask for it from here.) Placement consults
+//     the trait (servesCapacity in the capacity-tier loop) and SKIPS a Spot candidate
+//     rather than downgrading it silently, so only OnDemand (or default-tier)
+//     ProvisionRequests reach this adapter and it never interprets CapacityType.
+//   - Region is OPTIONAL here, unlike AWS: Modal's scheduler places freely when no
+//     region is given, and that unconstrained mode is both the widest capacity pool
+//     and the cheapest — a pinned region costs 1.5x (broad, e.g. "us") or 1.75x
+//     (narrow, e.g. "us-east") on the whole compute bill. So this adapter forwards a
+//     region only when the pool asked for one, and the empty case is not a fallback
+//     but the preferred path. The vocabulary is Modal's own and needs no translation
+//     table, since it already spans both levels a NodePool speaks.
+//   - A pool's regions are sent in ONE call, not walked one at a time. This follows
+//     from create being non-failing (above): an accepted-but-queued sandbox reports no
+//     capacity error, so nothing ever re-drives placement to a second region, and
+//     splitting the declaration into candidates would strand the workload in whichever
+//     region happened to be walked first while discarding the others. Modal's
+//     scheduler is the right chooser here — it accepts several regions and has the
+//     live capacity view to pick among them — so ExpandRegions collapses the whole
+//     declaration into one opaque candidate and regionsOf splits it back at the API
+//     boundary. The trade is blocklist precision, which costs nothing because no
+//     Modal failure is region-attributable anyway.
 //   - Modal Sandboxes carry native tags, so NativeTags=true and the ClaimName
 //     is stored as a tag rather than smuggled into the instance name.
 //   - There is no preemption push; detection is poll-based like every provider.
@@ -107,6 +126,27 @@ type SandboxSpec struct {
 	// routes to the first of them (see firstPort) — one token routes to one port.
 	// Empty leaves both the exposed set and the routed port to Modal's own default.
 	Ports []int
+	// Regions constrains where Modal may place the sandbox, in Modal's own
+	// vocabulary — a broad region ("us", "eu", "ap") or a narrow one ("us-east",
+	// "eu-west", "jp"). It comes from ProviderSpec.Regions via ProvisionRequest.Region
+	// and is forwarded unvalidated, since Modal owns that vocabulary and gains regions
+	// faster than this adapter ships.
+	//
+	// EMPTY IS THE PREFERRED VALUE and the one to reach for unless a workload has a
+	// real placement requirement. Modal prices a pinned region at a multiplier over
+	// its unconstrained default — 1.5x for a broad region, 1.75x for a narrow one,
+	// applied to the whole compute bill (GPU + CPU + memory) — and an unconstrained
+	// sandbox also draws on Modal's widest capacity pool, which is what makes it both
+	// cheapest and most available. So this field trades money and availability for
+	// locality; it is a data-residency knob, not a performance one.
+	//
+	// It carries EVERY region the pool declared, not one per attempt. Modal's
+	// scheduler accepts several and picks among them with its own live view of
+	// capacity, and it must, because a Modal create cannot fail over: it returns an
+	// accepted id with no capacity error, so nothing here could try a second region
+	// afterwards. See ExpandRegions and regionsOf for the join/split that carries
+	// the set through placement's single-region candidate.
+	Regions []string
 	// Timeout is the sandbox's maximum lifetime. It MUST be non-zero: Modal treats
 	// a zero timeout as its 5-minute default, which would terminate a real
 	// workload almost immediately. The adapter always sets it (from the Pod's
@@ -199,6 +239,51 @@ func New(client Client, cat catalog.Lookup) *Provider {
 		Base:   catalog.Base{ProviderName: provider.ProviderModal, Catalog: cat},
 		client: client,
 	}
+}
+
+// regionSeparator joins several Modal regions into the ONE candidate placement
+// walks. It is deliberately a character no region name contains, so splitting is
+// unambiguous, and deliberately not a comma: the value lands in RegionAnnotation and
+// a comma reads like a list a consumer might re-split with different rules.
+const regionSeparator = "|"
+
+// ExpandRegions implements provider.Provider, overriding catalog.Base's
+// pass-through. It resolves the pool's whole declaration to at most ONE candidate,
+// carrying every declared region in it, rather than one candidate per region.
+//
+// This is the opposite of AWS, and the reason is that Modal cannot fail over. An
+// AWS CreateFleet reports a capacity shortage synchronously, so walking regions one
+// at a time is what lets the next region be tried. Sandboxes.Create instead ACCEPTS
+// the sandbox immediately and returns a real id with Reserved=false — the GPU may
+// still be queued for minutes. There is no error, so ClassifyProvisionError never
+// runs, nothing is blocklisted, and placement is never re-driven: the first region
+// walked is the only region ever tried. Splitting the declaration into candidates
+// would therefore SHRINK the capacity pool to one region and discard the rest.
+//
+// Handing Modal the full set instead moves the choice to the party that can act on
+// it: Modal's scheduler accepts several regions (SchedulerPlacement.Regions) and
+// picks among them itself, with its own live view of capacity. So a pool declaring
+// several regions gets all of them considered, which is what the operator asked for.
+//
+// The cost is precision, and it is worth naming: the resulting candidate's region is
+// a joined token, so a blocklist entry covers the whole declared set rather than one
+// region. That loses nothing today — no Modal failure is region-attributable in the
+// first place, since a queued sandbox never reports which region ran dry.
+func (p *Provider) ExpandRegions(declared []string) []string {
+	seen := make(map[string]bool)
+	regions := make([]string, 0, len(declared))
+	for _, d := range declared {
+		d = strings.TrimSpace(d)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		regions = append(regions, d)
+	}
+	if len(regions) == 0 {
+		return nil // unconstrained: the widest and cheapest case
+	}
+	return []string{strings.Join(regions, regionSeparator)}
 }
 
 // Capabilities implements provider.Provider. See the package doc for why each
@@ -323,10 +408,32 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // matching shared sentinel (e.g. fmt.Errorf("...: %w", provider.ErrNoCapacity));
 // ClassifyError honours those first and falls back to string heuristics for raw
 // API messages, so no Modal-specific matching is duplicated here.
-func (p *Provider) ClassifyProvisionError(err error, accelerator, _ string) provider.BlockScope {
-	// Region is ignored: Modal is region-simple (no region axis), so the block's
-	// Region stays nil — see BlockScope's three-state rule.
-	return provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
+//
+// It also confines the block to the failing CANDIDATE, the same way the AWS adapter
+// does, now that a pool can pin a Modal sandbox. Note this is the candidate, not
+// necessarily a single region: ExpandRegions hands Modal every declared region at
+// once, so the token here may name the whole set and the block then covers all of it.
+// That is the honest scope — a failure on a multi-region create tells us nothing
+// about which region was short, and there is no narrower attempt left to make. A pool
+// that wants per-region blocking has to declare per-region pools. The unconstrained
+// case keeps the region-simple behaviour:
+// an empty region leaves Region nil, which per BlockScope's three-state rule matches
+// only a candidate whose region is also empty, so the block neither widens across an
+// axis the request never used nor leaks onto region-pinned candidates.
+func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
+	// No failure, no block. ClassifyError already returns the zero scope here, but
+	// the region decoration below would repopulate it into a non-empty scope that
+	// recordBlock would install — so the guard has to come first, as it does in AWS.
+	if err == nil {
+		return provider.BlockScope{}
+	}
+	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
+	// DenyAll already covers every region (auth fails everywhere), so narrowing it
+	// would contradict the category.
+	if region != "" && !scope.DenyAll {
+		scope.Region = &region
+	}
+	return scope
 }
 
 // findByClaim returns the sandbox tagged with claimName, or nil if none.
@@ -375,12 +482,17 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 	}
 
 	spec := SandboxSpec{
-		Image:          c.Image,
-		Command:        append(append([]string{}, c.Command...), c.Args...),
-		Env:            env,
-		CPU:            cpuCores(&c),
-		MemoryMiB:      memoryMiB(&c),
-		Ports:          containerPorts(&c),
+		Image:     c.Image,
+		Command:   append(append([]string{}, c.Command...), c.Args...),
+		Env:       env,
+		CPU:       cpuCores(&c),
+		MemoryMiB: memoryMiB(&c),
+		Ports:     containerPorts(&c),
+		// An empty request region stays an empty slice, not a one-element [""]: that
+		// is the unconstrained case (no region declared on the pool), and it must
+		// reach Modal as "no placement constraint" — its widest pool and its
+		// un-multiplied price. See SandboxSpec.Regions.
+		Regions:        regionsOf(req.Region),
 		Timeout:        sandboxTimeout(pod),
 		Tags:           tags,
 		ReadinessProbe: c.ReadinessProbe,
@@ -404,6 +516,28 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 	}
 	// No annotation => CPU-only sandbox (GPU/"" GPUCount 0), handled naturally.
 	return spec, nil
+}
+
+// regionsOf turns placement's single region candidate back into the slice Modal's
+// API takes. It is the exact inverse of ExpandRegions' join: that collapses the
+// pool's whole declaration into ONE candidate (see there for why Modal cannot fail
+// over region by region), and this expands it again at the call boundary, so the
+// set the operator declared is what Modal's scheduler gets to choose among.
+//
+// An empty region means "unconstrained" and must produce a nil slice rather than
+// [""], since a one-element slice holding the empty string would ask Modal to place
+// in a region named "" — turning the cheapest, widest case into a malformed request.
+func regionsOf(region string) []string {
+	if region == "" {
+		return nil
+	}
+	var out []string
+	for _, r := range strings.Split(region, regionSeparator) {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // cpuCores reads the container's CPU request as fractional physical cores (Modal's

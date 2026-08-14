@@ -134,7 +134,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					continue
 				}
 			}
-			for _, region := range regionsFor(ref) { // inner: region
+			for _, region := range regionsFor(prov, ref) { // inner: region
 				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
@@ -192,17 +192,29 @@ func servesCapacity(prov provider.Provider, tier nebulav1alpha1.CapacityType) bo
 	return prov.Capabilities().SupportsSpot
 }
 
-// regionsFor is the inner axis for one provider ref: the regions to try, in listed
-// order. An empty/omitted list means "the provider's configured default region",
-// represented as a single empty-string candidate so the walk runs once for
-// region-simple providers (Modal, RunPod). AWS is required by admission to list at
-// least one region (the CEL rule on NodePoolSpec). An "all regions" wildcard is not
-// supported yet (see ProviderSpec.Regions), so there is nothing to expand here.
-func regionsFor(ref nebulav1alpha1.ProviderSpec) []string {
-	if len(ref.Regions) == 0 {
-		return []string{""} // omitted => provider default region (region-simple providers)
+// regionsFor is the inner axis for one provider ref: the concrete regions to try, in
+// expansion order. The pool's declaration is a CONSTRAINT, not a list of regions —
+// it may be omitted (unconstrained), name a geography group ("us"), or name regions
+// literally — so only the provider can resolve it, and ExpandRegions does (see
+// provider.Provider for the three levels).
+//
+// The empty-string fallback survives for the case where expansion yields nothing: a
+// region-simple provider whose pool declared no regions (Modal returns nil unchanged)
+// still needs ONE candidate or `range` would run zero times and the provider would be
+// silently unplaceable. That empty candidate means "send no region; let the provider
+// place freely" — which for Modal is both its normal mode and its cheapest.
+//
+// This and awsRegionSource (cmd/main.go) are the only two readers of
+// ProviderSpec.Regions and MUST expand it identically: a region placement provisions
+// into but the sweep does not cover is absent from List, and absence is reported as
+// Terminated on a live, billing instance. Routing both through ExpandRegions is what
+// makes divergence impossible.
+func regionsFor(prov provider.Provider, ref nebulav1alpha1.ProviderSpec) []string {
+	regions := prov.ExpandRegions(ref.Regions)
+	if len(regions) == 0 {
+		return []string{""} // unconstrained on a region-simple provider
 	}
-	return ref.Regions
+	return regions
 }
 
 // blockedUntil reports whether the (provider, accelerator, tier, region)
