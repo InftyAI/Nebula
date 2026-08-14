@@ -12,6 +12,7 @@ spec:
     listKind: SandboxSetList
     plural: sandboxsets
     shortNames:
+    - sbs
     - sbxs
     singular: sandboxset
   scope: Namespaced

@@ -1,8 +1,8 @@
 # Maintains N Sandboxes. Provisioning an instance takes MINUTES while an agent's
 # exec call wants sub-second, so boxes are kept ready ahead of demand:
 #
-#   kubectl get sandboxes -l nebula.inftyai.com/sandboxset=sample
-#   kubectl scale sandboxset/sample --replicas=5
+#   kubectl get sb -l nebula.inftyai.com/sandboxset=sample
+#   kubectl scale sbs/sample --replicas=5
 #
 # Boxes get generated names (sample-a4f2x), not ordinals, because an ordinal would
 # imply a slot that gets refilled — a replacement box wearing a dead box's name is
