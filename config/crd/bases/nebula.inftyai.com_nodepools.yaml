@@ -57,8 +57,8 @@ spec:
               CapacityTypes (in listed order):   // outer: hard tier\n\t    candidates
               = Providers x (each provider's Regions) x {this capacityType},\n\t                 available
               now, minus blocklist                // region nests per provider\n\t
-              \   IF candidates non-empty:\n\t        pick one via Strategy (LowestPrice
-              | Ordered | Weighted) // inner: rank candidates\n\t        DONE\n\t
+              \   IF candidates non-empty:\n\t        pick one via Strategy (Ordered
+              today; see Strategy)      // inner: rank candidates\n\t        DONE\n\t
               \   // else fall through to the next capacity tier\n\nRegion is a per-provider
               axis (see ProviderSpec.Regions), nested under each\nprovider because
               a region name only means something to one provider. It\nwidens the candidate
@@ -71,11 +71,15 @@ spec:
               capacity tier; it never crosses tiers.\n\nThe Weighted strategy requires
               a weight on every provider ref. This is a\nstatic property of the spec,
               so it is enforced at admission by the CEL rule\nbelow rather than surfaced
-              as a status condition after the fact.\n(AWS once required at least one
-              region here, because an omitted list meant \"the\nclient's default region\"
-              and its client has none. Omitted now means \"every region\nthe provider
-              serves\", which is a valid — if broad — AWS policy, so the rule is gone.\nSee
-              ProviderSpec.Regions.)"
+              as a status condition after the fact.\n\nThe rule is currently UNREACHABLE
+              — Strategy's enum admits only Ordered, so no\nobject can carry Weighted
+              for it to check. It is retained rather than deleted so\nthat widening
+              the enum is a one-line change that cannot silently ship without its\nweight
+              validation; the cost is one always-true CEL evaluation per admission.\n(AWS
+              once required at least one region here, because an omitted list meant
+              \"the\nclient's default region\" and its client has none. Omitted now
+              means \"every region\nthe provider serves\", which is a valid — if broad
+              — AWS policy, so the rule is gone.\nSee ProviderSpec.Regions.)"
             properties:
               capacityTypes:
                 default:
@@ -168,7 +172,8 @@ spec:
                     weight:
                       description: |-
                         Weight is the relative share of new placements for the Weighted strategy.
-                        Ignored by other strategies.
+                        Ignored by other strategies, which today means ignored entirely: Strategy
+                        accepts only Ordered, so setting this has no effect until Weighted is enabled.
                       format: int32
                       minimum: 1
                       type: integer
@@ -183,10 +188,15 @@ spec:
                 description: |-
                   Strategy is the INNER axis: how to rank providers within the active
                   capacity tier. It never overrides the capacity tier ordering.
+
+                  Only Ordered is accepted today. LowestPrice and Weighted are defined as
+                  constants (and the Weighted weight rule is already enforced above) but are
+                  deliberately kept OUT of the enum until the ranking is implemented: admitting
+                  a value the placement walk silently ignores would let a pool claim a policy it
+                  does not get, which is worse than rejecting it at admission. Widening the enum
+                  is the one change needed to enable them once selectPlacement ranks.
                 enum:
-                - LowestPrice
                 - Ordered
-                - Weighted
                 type: string
             required:
             - providers

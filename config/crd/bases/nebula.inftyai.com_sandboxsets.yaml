@@ -13,7 +13,6 @@ spec:
     plural: sandboxsets
     shortNames:
     - sbs
-    - sbxs
     singular: sandboxset
   scope: Namespaced
   versions:
