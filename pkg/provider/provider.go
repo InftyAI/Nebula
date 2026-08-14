@@ -148,9 +148,20 @@ type Provider interface {
 	// error, which beats Nebula refusing a region that shipped last week.
 	//
 	// Expansion happens HERE, at the pool boundary, so everything downstream keeps
-	// seeing exactly one concrete region: ProvisionRequest.Region, RegionAnnotation,
+	// seeing exactly one CANDIDATE region: ProvisionRequest.Region, RegionAnnotation,
 	// and the failover blocklist key all stay single-valued, and a capacity failure
-	// blocks the one region that failed rather than the whole group it came from.
+	// blocks the one candidate that failed rather than the whole group it came from.
+	//
+	// How many candidates a declaration becomes is the provider's call, and it turns
+	// on whether that provider can FAIL OVER between regions. A provider whose
+	// provision reports a capacity shortage synchronously (AWS) should return one
+	// candidate per region, so a shortage in one is retried in the next. A provider
+	// that accepts a request and queues it with no error (Modal) must NOT: nothing
+	// would ever re-drive placement, so the first candidate is the only one tried, and
+	// splitting the declaration would discard every other region the operator asked
+	// for. Such a provider returns ONE candidate carrying the whole set and lets its
+	// own scheduler choose — the candidate is then opaque to the control plane, which
+	// only ever passes it back to the provider that minted it.
 	//
 	// It is a pure function of the declaration (no API calls, no ctx): the result
 	// feeds both placement's candidate walk and the observability fan-out
@@ -190,12 +201,17 @@ type ProvisionRequest struct {
 	// This is the one workload-independent decision that cannot be expressed on
 	// the Pod, so it must be passed explicitly.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region is the ONE concrete region placement chose for this attempt, in the
-	// provider's own vocabulary (AWS "us-east-1", Modal "us-east"). Like CapacityType
-	// it is a workload-independent decision absent from the Pod. It is always a single
-	// resolved region, never a group token or a list: the pool's constraint was already
-	// expanded by ExpandRegions and walked one candidate at a time, which is what lets
-	// a capacity failure blocklist exactly the region that failed.
+	// Region is the ONE candidate placement chose for this attempt, as its own
+	// ExpandRegions minted it. Like CapacityType it is a workload-independent decision
+	// absent from the Pod. It is never a raw pool declaration or a group token — that
+	// was already resolved — and the control plane treats it as an OPAQUE token,
+	// passing back exactly what the provider produced.
+	//
+	// For a provider that fails over region by region this is one concrete region
+	// (AWS "us-east-1"), which is what lets a capacity failure blocklist exactly the
+	// region that failed. For one that cannot (Modal), it may encode the several
+	// regions its scheduler should choose among; only that provider's own code parses
+	// it. Nothing between here and the adapter inspects the value.
 	//
 	// Empty means "no region constraint — let the provider place freely". That is a
 	// real, common mode, not a fallback: a pool that declares no regions leaves it

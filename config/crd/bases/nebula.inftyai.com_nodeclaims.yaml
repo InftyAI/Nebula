@@ -128,13 +128,20 @@ spec:
                 type: string
               region:
                 description: |-
-                  Region is the provider region the placement optimizer selected, in the
+                  Region is the region candidate the placement optimizer selected, in the
                   provider's own vocabulary (e.g. AWS "us-east-1"). Stored durably alongside
                   Provider/CapacityType because it is a provisioning input that cannot be read
                   off the Pod, and Provision needs it to re-issue the request in the same
                   region after a controller restart. Immutable, like Provider. Empty means
-                  "the provider's configured default region" — region-simple providers (Modal,
-                  RunPod) leave it empty.
+                  "the provider's configured default region" — a provider with no region
+                  constraint declared on the pool leaves it empty.
+
+                  It is not always a single region NAME: a provider whose create cannot fail
+                  over collapses every region the pool declared into ONE candidate, and stores
+                  them joined by a provider-private separator (Modal uses "|", so a pool
+                  declaring us-east and us-west records "us-east|us-west"). Only that provider
+                  can split the value back, which it does at the API boundary. Treat the field
+                  as an opaque provider-scoped token rather than parsing it.
                 type: string
             required:
             - podRef

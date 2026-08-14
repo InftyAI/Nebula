@@ -59,6 +59,17 @@ mapping), see [docs/status.md](status.md).
   declaration cannot yet prefer the cheapest region. Modal is the sharper case — a
   pinned region there costs 1.5x (group) or 1.75x (narrow) over its unconstrained
   default, which the catalog does not model.
+- Failover on a provider that *queues*. The blocklist has exactly one writer: the
+  virtual kubelet's `Provision` error path. A provider that reports a capacity
+  shortfall synchronously (AWS `CreateFleet`) therefore fails over across zone,
+  region and tier, but one that ACCEPTS the request and queues for capacity returns
+  an instance id and no error — so nothing is blocklisted and placement is never
+  re-driven. Modal is that case: a `[modal, aws]` pool never advances to AWS on
+  capacity, and the Pod waits in Modal's queue at `Initializing` (which, per
+  [status](status.md#modal), is indistinguishable from booting). Modal also collapses
+  its regions into a single candidate, so it has no intra-provider region failover
+  either. Making failover live for such a provider needs a reserved-by deadline that
+  synthesizes `ErrNoCapacity` — the classification side already handles it.
 - Bin-packing multiple unrelated Pods onto one external instance. The current
   model is one workload Pod to one external instance.
 - In-place migration. Recovery from reclaim, failure, or spec changes is
@@ -148,12 +159,20 @@ Follow one GPU Pod from creation to teardown:
    ```text
    for each capacityType in pool.spec.capacityTypes:     # outer axis
      for each provider in pool.spec.providers:           # listed order today
-       for each region in provider.regions or [""]:      # provider-local axis
+       for each region in ExpandRegions(provider.regions): # provider-local axis
          skip unregistered providers
          skip providers that do not offer the accelerator type/count
+         skip providers that cannot serve the tier (Modal has no Spot)
          skip candidates blocked by failover blocklist
          choose the first remaining candidate
    ```
+
+   The inner axis is whatever the provider's `ExpandRegions` returns, which is not
+   one iteration per declared region: AWS expands a group token into many candidates,
+   while Modal collapses every declared region into a single candidate carrying them
+   all (so its inner loop always runs exactly once, and the chosen `region` may be a
+   joined token rather than one region name). An empty expansion still yields one
+   unconstrained `""` candidate so the walk runs.
 
    `Ordered`, `LowestPrice`, and `Weighted` are API values, but the current inner
    ranking is still listed order. The placement flow is already structured so
