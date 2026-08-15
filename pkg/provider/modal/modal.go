@@ -224,8 +224,10 @@ const (
 
 // Provider is the Modal implementation of provider.Provider. It embeds
 // catalog.Base for the generic catalog methods (Name, Offerings, and the
-// identity MapAccelerator — Modal names its GPUs exactly like Nebula's canonical
-// names) and implements only the Modal-specific lifecycle here.
+// catalog-driven MapAccelerator — Modal names its GPUs nearly identically to
+// Nebula's canonical names, so most rows map by identity and the ones that don't
+// carry an accelerator_id in modal.csv) and implements only the Modal-specific
+// lifecycle here.
 type Provider struct {
 	catalog.Base
 	client Client
