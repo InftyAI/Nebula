@@ -509,6 +509,141 @@ func TestProvision_NoProbeLeavesSpecUnset(t *testing.T) {
 	}
 }
 
+// TestPlanProbe: the Pod-probe -> Modal-probe mapping, which is where the two
+// vocabularies disagree. Modal offers exec and TCP only, so the interesting cases
+// are the ones Kubernetes can express and Modal cannot:
+//
+//   - httpGet DEGRADES to a TCP connect on the same port. The path is never
+//     fetched, so the bar weakens from "answers 2xx" to "is listening" — accepted
+//     because the alternative (dropping the probe) reports a sandbox ready the
+//     moment it is created, which is far more wrong.
+//   - a NAMED port is dropped entirely rather than degraded. Resolving it needs the
+//     container spec, which the SDK probe has no access to, and IntValue() yields 0
+//     for a name — emitting port 0 would create a probe that can never pass.
+//
+// ok=false is load-bearing beyond the create call: it also gates ProbeTagKey, so a
+// dropped probe must not be tagged (see TestProvision_ProbeTagStampedOnlyWithProbe).
+func TestPlanProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		probe    *corev1.Probe
+		wantOK   bool
+		wantExec []string
+		wantPort int
+		wantIvl  time.Duration
+	}{{
+		name: "httpGet numeric port degrades to a TCP probe on that port",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)},
+			},
+			PeriodSeconds: 5,
+		},
+		wantOK:   true,
+		wantPort: 8080,
+		wantIvl:  5 * time.Second,
+	}, {
+		// The path and scheme are simply lost: nothing in a Modal TCP probe can carry
+		// them, so two httpGet probes differing only by path plan identically.
+		name: "httpGet on an https path still degrades by port alone",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/ready",
+					Port:   intstr.FromInt(8443),
+					Scheme: corev1.URISchemeHTTPS,
+				},
+			},
+		},
+		wantOK:   true,
+		wantPort: 8443,
+	}, {
+		name: "httpGet named port is dropped, not degraded to port 0",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")},
+			},
+			PeriodSeconds: 5,
+		},
+	}, {
+		name: "tcpSocket numeric port maps straight through",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(8000)},
+			},
+			PeriodSeconds: 10,
+		},
+		wantOK:   true,
+		wantPort: 8000,
+		wantIvl:  10 * time.Second,
+	}, {
+		name: "tcpSocket named port is dropped",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("web")},
+			},
+		},
+	}, {
+		// exec wins when a Pod somehow declares both: it is the only handler Modal runs
+		// faithfully, so degrading to the httpGet's port would weaken the bar for nothing.
+		name: "exec takes precedence over httpGet",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec:    &corev1.ExecAction{Command: []string{"nvidia-smi", "-L"}},
+				HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromInt(8080)},
+			},
+		},
+		wantOK:   true,
+		wantExec: []string{"nvidia-smi", "-L"},
+	}, {
+		// Zero interval is deliberate, not a default filled in here: the SDK
+		// constructors reject a zero interval, so this leaves Modal's own default.
+		name: "no periodSeconds leaves the interval zero",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(80)},
+			},
+		},
+		wantOK:   true,
+		wantPort: 80,
+	}, {
+		name:  "nil probe",
+		probe: nil,
+	}, {
+		name:  "probe with no handler",
+		probe: &corev1.Probe{PeriodSeconds: 5},
+	}, {
+		name: "exec with an empty command is not a probe",
+		probe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{}},
+		},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := planProbe(tc.probe)
+			if ok != tc.wantOK {
+				t.Fatalf("planProbe ok = %v, want %v (plan=%+v)", ok, tc.wantOK, got)
+			}
+			if !ok {
+				return
+			}
+			if !slices.Equal(got.exec, tc.wantExec) {
+				t.Errorf("exec = %v, want %v", got.exec, tc.wantExec)
+			}
+			if got.port != tc.wantPort {
+				t.Errorf("port = %d, want %d", got.port, tc.wantPort)
+			}
+			if got.interval != tc.wantIvl {
+				t.Errorf("interval = %v, want %v", got.interval, tc.wantIvl)
+			}
+			// Exactly one of the two handlers is planned: modalProbe branches on
+			// exec != nil, so a plan carrying both would silently drop the port.
+			if (got.exec != nil) == (got.port > 0) {
+				t.Errorf("plan must set exactly one of exec/port, got %+v", got)
+			}
+		})
+	}
+}
+
 // The spec carries the container's declared ports verbatim: they are the set Modal is
 // told to accept traffic on, and the connect URL routes to the first of them (the
 // client derives it, so the routed port can never name one outside the set). No
