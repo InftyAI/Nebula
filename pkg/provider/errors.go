@@ -17,6 +17,7 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"errors"
 	"strings"
 
@@ -93,21 +94,10 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 		return s
 	}
 
-	switch {
-	case errors.Is(err, ErrAuth):
+	switch categorize(err) {
+	case catAuth:
 		return BlockScope{DenyAll: true}
-	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator), errors.Is(err, ErrQuota):
-		return capacityScope()
-	}
-
-	// Fall back to string heuristics for errors not wrapped with a sentinel.
-	msg := strings.ToLower(err.Error())
-	switch {
-	case containsAny(msg, "unauthorized", "forbidden", "authentication", "invalid token", "api key"):
-		return BlockScope{DenyAll: true}
-	case containsAny(msg, "quota", "limit exceeded", "rate limit"):
-		return capacityScope()
-	case containsAny(msg, "no capacity", "capacity", "unavailable", "out of", "no gpu"):
+	case catCapacity:
 		return capacityScope()
 	default:
 		// An unrecognized error is scoped like capacity (this accelerator + tier, and
@@ -116,8 +106,91 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 		// which is far too broad a blast radius for a failure we can't even identify
 		// (e.g. a transient malformed-request blip in one region). Failover past the
 		// one failing candidate is the safer default; the TTL still bounds it.
+		//
+		// This answers "how widely, IF we block", not "should we block": a caller that
+		// cannot attribute the failure to the request at all should not be filing a block
+		// in the first place — see IsRejection.
 		return capacityScope()
 	}
+}
+
+// failureCategory is the internal classification ClassifyError and IsRejection both
+// drive off, so the two can never disagree about whether an error was recognized.
+type failureCategory int
+
+const (
+	// catUnattributable: nothing in the error says what the provider decided, because
+	// it may not have decided anything — a transport failure, a timeout, an
+	// unparseable API blip. Kept distinct from the scope ClassifyError ultimately
+	// returns for it.
+	catUnattributable failureCategory = iota
+	// catAuth: credentials or authorization failed, so nothing on the provider works.
+	catAuth
+	// catCapacity: the provider refused THIS request — no capacity, quota exhausted,
+	// or an accelerator it does not offer.
+	catCapacity
+)
+
+// categorize buckets a provision error, sentinels first and string heuristics after.
+func categorize(err error) failureCategory {
+	// Sentinels first. An adapter that wrapped one has made an explicit decision, and
+	// it outranks anything the raw message text happens to contain.
+	switch {
+	case errors.Is(err, ErrAuth):
+		return catAuth
+	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator), errors.Is(err, ErrQuota):
+		return catCapacity
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	// Transport and timeout markers are checked BEFORE the category heuristics,
+	// because they are the failures those heuristics most reliably MISREAD: a gRPC
+	// status renders as "rpc error: code = Unavailable desc = ...", whose
+	// "unavailable" would otherwise match the capacity bucket below and turn "we could
+	// not reach the provider" into "the provider has no capacity" — the exact
+	// misattribution IsRejection exists to prevent. A deadline is unattributable for a
+	// second reason too: our own ProvisionTimeout can fire on a call the provider went
+	// on to honour, so the instance may well exist.
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return catUnattributable
+	case containsAny(msg,
+		"rpc error", "connection refused", "connection reset", "broken pipe",
+		"no such host", "i/o timeout", "eof", "tls handshake",
+		"service unavailable", "bad gateway", "gateway timeout", "internal server error"):
+		return catUnattributable
+	}
+
+	switch {
+	case containsAny(msg, "unauthorized", "forbidden", "authentication", "invalid token", "api key"):
+		return catAuth
+	case containsAny(msg, "quota", "limit exceeded", "rate limit"):
+		return catCapacity
+	case containsAny(msg, "no capacity", "capacity", "unavailable", "out of", "no gpu"):
+		return catCapacity
+	default:
+		return catUnattributable
+	}
+}
+
+// IsRejection reports whether err is a provider DECISION about this request — "no
+// capacity", "over quota", "bad credentials", "I do not offer that accelerator" — as
+// opposed to a failure to find out what the provider would have decided: a transport
+// error, a timeout, a 503, an unparseable response.
+//
+// The distinction exists because the two call for opposite handling and the costs are
+// asymmetric. A rejection is authoritative, so the Pod is failed and the candidate
+// blocklisted, and failover routes around it — all correct, because the provider said
+// no. An unattributable failure is authoritative about nothing, so the same writes
+// stamp a terminal status onto a request the provider may have accepted (leaving a
+// paid instance running behind a Pod that is about to be reaped) and fence off a
+// candidate that never misbehaved. Retrying costs a request and Provision is
+// idempotent on ClaimName; acting on a guess costs an instance.
+//
+// A nil error is not a rejection.
+func IsRejection(err error) bool {
+	return err != nil && categorize(err) != catUnattributable
 }
 
 // containsAny reports whether s contains any of subs.

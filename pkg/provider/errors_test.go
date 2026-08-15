@@ -17,6 +17,8 @@ limitations under the License.
 package provider
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -79,6 +81,68 @@ func TestClassifyError_EmptyAcceleratorStaysNil(t *testing.T) {
 	}
 	if got.DenyAll || got.CapacityType != nebulav1alpha1.CapacityOnDemand {
 		t.Fatalf("expected an OnDemand capacity scope, got %+v", got)
+	}
+}
+
+// IsRejection separates a provider DECISION about the request from a failure to
+// learn what it would have decided. The vnode handler fails the Pod and blocklists
+// the candidate only for the former, so a transport error misclassified as a
+// rejection stamps a terminal status on a request that may have been accepted.
+func TestIsRejection(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil is not a rejection", nil, false},
+		{"auth sentinel", ErrAuth, true},
+		{"no-capacity sentinel", ErrNoCapacity, true},
+		{"quota sentinel", ErrQuota, true},
+		{"unsupported sentinel", ErrUnsupportedAccelerator, true},
+		{"wrapped sentinel", fmt.Errorf("create sandbox: %w", ErrNoCapacity), true},
+		{"string capacity", errors.New("InsufficientInstanceCapacity"), true},
+		{"string auth", errors.New("HTTP 401 unauthorized"), true},
+
+		// The failures this predicate exists for.
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"wrapped deadline", fmt.Errorf("provision: %w", context.DeadlineExceeded), false},
+		{"canceled", context.Canceled, false},
+		{"connection refused", errors.New("dial tcp 10.0.0.1:443: connect: connection refused"), false},
+		{"eof", errors.New("unexpected EOF"), false},
+		{"http 503", errors.New("503 Service Unavailable"), false},
+		{"unrecognized", errors.New("weird transient blip"), false},
+
+		// A gRPC status renders "Unavailable" in its text, which the capacity heuristic
+		// would otherwise match — this is the misread the transport check precedes it for.
+		{"grpc unavailable", errors.New("rpc error: code = Unavailable desc = transport is closing"), false},
+		// ...but a sentinel the adapter wrapped still wins over the raw text, so an
+		// adapter that classified a gRPC error itself is not second-guessed.
+		{"grpc unavailable wrapping a sentinel",
+			fmt.Errorf("rpc error: code = Unavailable desc = no gpu: %w", ErrNoCapacity), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsRejection(tt.err); got != tt.want {
+				t.Fatalf("IsRejection(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// ClassifyError answers "how widely, IF we block" and keeps its capacity-shaped
+// default for an unattributable error: a caller that has decided to block something
+// still wants the narrow blast radius. IsRejection is the separate question of
+// whether to block at all, so the two must not be collapsed.
+func TestClassifyError_UnattributableStillScopesNarrow(t *testing.T) {
+	got := ClassifyError(
+		errors.New("rpc error: code = Unavailable desc = transport is closing"),
+		nebulav1alpha1.CapacitySpot, "H100:8")
+	if got.DenyAll {
+		t.Fatalf("an unattributable error must never widen to DenyAll, got %+v", got)
+	}
+	if got.Accelerator == nil || *got.Accelerator != "H100:8" ||
+		got.CapacityType != nebulav1alpha1.CapacitySpot {
+		t.Fatalf("expected a Spot/H100:8-scoped block, got %+v", got)
 	}
 }
 

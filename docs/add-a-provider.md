@@ -32,6 +32,33 @@ The Pod is the single source of truth for the workload shape; `ProvisionRequest`
 carries only what the Pod cannot express (the optimizer's capacity tier and the
 claim identity). Do not duplicate Pod fields onto the request.
 
+### Wrap the errors your `Provision` returns
+
+`ClassifyProvisionError` decides *how widely* to blocklist, but a separate predicate —
+`provider.IsRejection` — decides *whether to blocklist at all*, and whether the Pod is
+failed. It answers: did the provider make a decision about this request ("no capacity",
+"over quota", "bad credentials"), or did we merely fail to find out what it would have
+decided (a transport error, a timeout, a 503)?
+
+Only a **decision** is acted on. An unattributable failure leaves the Pod
+non-terminal at `Provisioning` for the pod controller to retry, and records nothing —
+because failing a Pod there would stamp a terminal verdict on a request the provider may
+well have accepted, reaping the Pod out from under a paid instance whose id was never
+returned.
+
+What this asks of an adapter: **wrap every error your `Provision` path returns with the
+matching sentinel** (`fmt.Errorf("...: %w", provider.ErrNoCapacity)`). A wrapped sentinel
+always outranks the message text, so it is the only way to be certain of the outcome.
+Unwrapped errors fall back to a string heuristic that recognizes the obvious API
+phrasings and treats transport markers (`rpc error`, `connection refused`, `503`, `EOF`)
+as unattributable — a reasonable default, but not one to rely on for a condition you can
+classify yourself.
+
+The metrics say when an adapter has skipped this: an unwrapped rejection lands on
+`nebula_provision_failures_total{reason="other"}`, so a sustained rate on that series for
+your provider is a to-do list of conditions still to wrap (see
+[metrics.md](metrics.md)).
+
 Most adapters embed `catalog.Base` for the generic `Name`, `Offerings`, and the
 identity `MapAccelerator`, overriding only what the provider does differently (see
 how `pkg/provider/modal` embeds it).
