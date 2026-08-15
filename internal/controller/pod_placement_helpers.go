@@ -191,7 +191,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 //
 // The accelerator type and count are passed apart, not as the joined pool identity
 // placement.accelerator carries, because a metric label must be aggregatable (see
-// metrics.provisionLabels). The parse cannot fail here: selectPlacement already
+// metrics.candidateLabels). The parse cannot fail here: selectPlacement already
 // rejected a malformed request before any placement was returned.
 func placementLabels(pod *corev1.Pod, p placement) metrics.Labels {
 	accel, count, _ := util.AcceleratorRequest(pod)

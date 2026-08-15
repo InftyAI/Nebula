@@ -14,31 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package metrics holds Nebula's Prometheus instrumentation.
-//
-// Everything here registers into controller-runtime's registry, so it is served on
-// the manager's existing --metrics-bind-address endpoint alongside the standard
-// controller/workqueue metrics. Importing this package is what registers the
-// collectors (see init); no wiring is needed in main.
-//
-// The instrumented surface is the path a Pod takes from admission to a running
-// external instance: PLACEMENT (this file's siblings in placement.go) and
-// PROVISIONING (here). Those are the parts whose cost and failure modes are
-// otherwise invisible — placement can silently leave a Pod gated forever, and
-// provisioning runs against a third party, takes seconds to minutes, bills money,
-// and fails for reasons the Pod status flattens away. Everything else (reconcile
-// counts, queue depth, API latency) is already covered by controller-runtime's own
-// metrics, and Pod-population questions by kube-state-metrics.
-//
-// The two halves deliberately share one label set (Labels, provisionLabels) so a
-// placement and the provisioning attempt it led to carry identical label values and
-// can be joined in PromQL without label surgery.
 package metrics
 
 import (
 	"context"
 	"errors"
-	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -81,28 +61,6 @@ const (
 	ReasonOther = "other"
 )
 
-// none is the placeholder for a label the request genuinely did not carry: no
-// region (unconstrained), no capacity tier (the provider's default), or no
-// accelerator (a CPU-only Pod). An explicit token beats an empty string, which in
-// PromQL is indistinguishable from a label that was never set and silently matches
-// `{region=""}` selectors an operator did not mean to write.
-const none = "none"
-
-// provisionLabels is the label set every provisioning metric carries, in order.
-// Region is included because a capacity shortfall is region-local and comparing
-// regions is the whole point of collecting this; note that for a provider which
-// collapses several declared regions into one candidate (Modal) the value is that
-// provider's joined token, not a single region name — see NodeClaimSpec.Region.
-//
-// The accelerator TYPE and COUNT are two labels, not the joined "H100:8" pool identity
-// used as the blocklist key. A metric label set is meant to be aggregated over, and a
-// joined string cannot be: `sum by (accelerator)` over every size of H100 requires
-// splitting the value in PromQL, and selecting all 8-GPU requests across types is not
-// expressible at all. Two labels give both for free, and the pool key is still
-// recoverable as accelerator + ":" + accelerator_count when correlating with a
-// blocklist entry.
-var provisionLabels = []string{"provider", "region", "capacity_type", "accelerator", "accelerator_count"}
-
 var (
 	// ProvisionAttempts counts provisioning attempts by outcome. Rate of the
 	// result="failure" series over the total is the provisioning error rate; the
@@ -110,7 +68,7 @@ var (
 	ProvisionAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_provision_attempts_total",
 		Help: "Total external instance provisioning attempts, by provider, region, capacity type, accelerator type, accelerator count and outcome.",
-	}, append(append([]string{}, provisionLabels...), "result"))
+	}, withExtra("result"))
 
 	// ProvisionFailures breaks failures down by coarse cause. It deliberately
 	// overlaps ProvisionAttempts{result="failure"} rather than adding a reason label
@@ -120,7 +78,7 @@ var (
 	ProvisionFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_provision_failures_total",
 		Help: "Failed provisioning attempts by coarse cause (capacity, quota, auth, unsupported_accelerator, timeout, other).",
-	}, append(append([]string{}, provisionLabels...), "reason"))
+	}, withExtra("reason"))
 
 	// ProvisionDuration measures the provider's Provision call alone — not the
 	// wait for the instance to become usable. The two differ enormously and for
@@ -133,7 +91,7 @@ var (
 		Name:    "nebula_provision_duration_seconds",
 		Help:    "Latency of the provider's Provision call, by provider, region, capacity type, accelerator type, accelerator count and outcome.",
 		Buckets: []float64{0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300},
-	}, append(append([]string{}, provisionLabels...), "result"))
+	}, withExtra("result"))
 
 	// InstanceReadyDuration measures the whole user-visible wait: from the moment
 	// CreatePod starts provisioning to the first poll tick that reports the instance
@@ -151,7 +109,7 @@ var (
 		Name:    "nebula_instance_ready_duration_seconds",
 		Help:    "Time from the start of provisioning to the instance first reporting Running, by provider, region, capacity type, accelerator type and accelerator count.",
 		Buckets: []float64{5, 10, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800},
-	}, provisionLabels)
+	}, candidateLabels)
 )
 
 func init() {
@@ -161,50 +119,6 @@ func init() {
 		ProvisionDuration,
 		InstanceReadyDuration,
 	)
-}
-
-// Labels identifies the placement one provisioning attempt was made against. The
-// zero value is valid: every field normalizes to "none".
-type Labels struct {
-	Provider     string
-	Region       string
-	CapacityType string
-	// Accelerator is the accelerator TYPE alone (e.g. "H100"), and AcceleratorCount how
-	// many were requested. They are kept apart so both aggregations work — see
-	// provisionLabels. Empty/zero for a CPU-only Pod.
-	Accelerator      string
-	AcceleratorCount int32
-}
-
-// values renders the label set in provisionLabels order, with extra appended for
-// the metrics that carry a result/reason dimension.
-func (l Labels) values(extra ...string) []string {
-	return append([]string{
-		orNone(l.Provider),
-		orNone(l.Region),
-		orNone(l.CapacityType),
-		orNone(l.Accelerator),
-		countOrNone(l.AcceleratorCount),
-	}, extra...)
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return none
-	}
-	return s
-}
-
-// countOrNone renders an accelerator count, or the placeholder when there is no
-// accelerator to count. Zero is deliberately NOT rendered as "0": a CPU-only Pod did not
-// request zero GPUs, it requested none at all, and "0" would put it in the same numeric
-// series an operator reads as a real count. util.AcceleratorRequest never returns a
-// positive count without a type, so this cannot mask a real request.
-func countOrNone(n int32) string {
-	if n <= 0 {
-		return none
-	}
-	return strconv.FormatInt(int64(n), 10)
 }
 
 // ObserveProvision records one completed provisioning attempt: its outcome, its

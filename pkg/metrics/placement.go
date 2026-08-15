@@ -64,7 +64,7 @@ var (
 	PlacementDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_placement_decisions_total",
 		Help: "Pods placed, by provider, region, capacity type, accelerator type and accelerator count.",
-	}, provisionLabels)
+	}, candidateLabels)
 
 	// PlacementWaitDuration measures from Pod creation to the gate being removed: the
 	// user-visible queue time BEFORE provisioning starts, which
@@ -80,7 +80,7 @@ var (
 		Name:    "nebula_placement_wait_duration_seconds",
 		Help:    "Time from Pod creation to placement (scheduling gate removal), by provider, region, capacity type, accelerator type and accelerator count.",
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800},
-	}, provisionLabels)
+	}, candidateLabels)
 
 	// PlacementDeferrals counts reconciles that ended without placing the Pod, by
 	// reason.
