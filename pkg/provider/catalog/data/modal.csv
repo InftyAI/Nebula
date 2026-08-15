@@ -14,10 +14,11 @@
 #
 # Columns (shared header across all provider CSVs; unused cells left blank):
 #   accelerator_type  canonical Nebula accelerator type
-#   accelerator_id    BLANK — Modal names its GPUs exactly like the canonical types,
-#                     so the mapping is identity and MapAccelerator falls back to
-#                     accelerator_type. A provider whose ids diverge (AWS instance
-#                     types) fills it in.
+#   accelerator_id    USUALLY BLANK — Modal names its GPUs exactly like the canonical
+#                     types, so the mapping is identity and MapAccelerator falls back
+#                     to accelerator_type. A provider whose ids diverge (AWS instance
+#                     types) fills it in. The one exception here is H100, which is
+#                     pinned to "H100!" — see the note below.
 #   gpu_count         BLANK — Modal takes the accelerator count as a runtime
 #                     parameter (off the Pod's nvidia.com/gpu resource), so it is
 #                     not a catalog lookup dimension. AWS, where the count is baked
@@ -34,5 +35,7 @@ A10G,,,OnDemand,1.10,true,,2026-07-25
 L40S,,,OnDemand,1.95,true,,2026-07-25
 A100-40GB,,,OnDemand,2.10,true,,2026-07-25
 A100-80GB,,,OnDemand,2.50,true,,2026-07-25
-H100,,,OnDemand,3.95,true,,2026-07-25
+# "H100!", not "H100": Modal silently upgrades a bare H100 request onto an H200, and
+# the "!" suffix is its documented opt-out.
+H100,H100!,,OnDemand,3.95,true,,2026-07-25
 H200,,,OnDemand,4.55,true,,2026-07-25

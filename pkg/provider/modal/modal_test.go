@@ -30,6 +30,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -861,5 +862,55 @@ func TestModalProbe(t *testing.T) {
 		if got, err := modalProbe(pr); err != nil || got != nil {
 			t.Fatalf("named-port case %d: modalProbe = (%v, %v), want (nil, nil)", i, got, err)
 		}
+	}
+}
+
+// Modal may silently place a bare gpu="H100" request on an H200, which would make
+// Nebula's own bookkeeping lie: the optimizer picked the row on the H100 price, the
+// blocklist keys failures on "H100:1", and the NodeClaim reports accelerator=H100 —
+// while a workload benchmarking an H100 would measure a different card. modal.csv
+// therefore pins the row's accelerator_id to Modal's documented opt-out, "H100!".
+// This runs against the REAL embedded catalog, not a fake, because the pin IS the
+// data — a fake would assert nothing about what ships.
+func TestProvision_PinsH100AgainstAutoUpgrade(t *testing.T) {
+	cat, err := catalog.Load()
+	if err != nil {
+		t.Fatalf("load embedded catalog: %v", err)
+	}
+	f := &fakeClient{createID: "sb-1"}
+	p := New(f, cat)
+
+	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 2),
+		provider.ProvisionRequest{ClaimName: "claim-a"}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if f.lastSpec.GPU != "H100!" {
+		t.Fatalf("spec GPU = %q, want H100! — a bare H100 lets Modal substitute an H200", f.lastSpec.GPU)
+	}
+	// The suffix must survive the count suffix too: "H100!:2", not "H100:2!".
+	if got := gpuReservation(f.lastSpec.GPU, f.lastSpec.GPUCount); got != "H100!:2" {
+		t.Fatalf("gpuReservation = %q, want H100!:2", got)
+	}
+}
+
+// The counterpart to the H100 pin: every other Modal row maps by identity. A100 is
+// the one to watch — Modal upgrades a bare "A100" to the 80GB card, but the catalog
+// never emits that token; it ships the already-exact A100-40GB/A100-80GB names.
+func TestMapAccelerator_OtherRowsMapByIdentity(t *testing.T) {
+	cat, err := catalog.Load()
+	if err != nil {
+		t.Fatalf("load embedded catalog: %v", err)
+	}
+	p := New(&fakeClient{}, cat)
+
+	for _, canonical := range []string{"T4", "L4", "A10G", "L40S", "A100-40GB", "A100-80GB", "H200"} {
+		ids, ok := p.MapAccelerator(canonical, 1)
+		if !ok || len(ids) != 1 || ids[0] != canonical {
+			t.Errorf("MapAccelerator(%q, 1) = (%v, %v), want ([%s], true)", canonical, ids, ok, canonical)
+		}
+	}
+	// And bare A100 is not an offering at all, so it can never reach Modal.
+	if ids, ok := p.MapAccelerator("A100", 1); ok {
+		t.Errorf("MapAccelerator(A100, 1) = (%v, true), want not-offered: the bare token is the fuzzy one", ids)
 	}
 }
