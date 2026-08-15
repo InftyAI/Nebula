@@ -67,7 +67,8 @@ var (
 	// per-region/accelerator breakdown is what tells you WHERE it is failing.
 	ProvisionAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_provision_attempts_total",
-		Help: "Total external instance provisioning attempts, by provider, region, capacity type, accelerator type, accelerator count and outcome.",
+		Help: "Total external instance provisioning attempts, by provider, region, capacity type, " +
+			"accelerator type, accelerator count and outcome.",
 	}, withExtra("result"))
 
 	// ProvisionFailures breaks failures down by coarse cause. It deliberately
@@ -77,7 +78,8 @@ var (
 	// them.
 	ProvisionFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_provision_failures_total",
-		Help: "Failed provisioning attempts by coarse cause (capacity, quota, auth, unsupported_accelerator, timeout, other).",
+		Help: "Failed provisioning attempts by coarse cause " +
+			"(capacity, quota, auth, unsupported_accelerator, timeout, other).",
 	}, withExtra("reason"))
 
 	// ProvisionDuration measures the provider's Provision call alone — not the
@@ -88,8 +90,9 @@ var (
 	// Bucketed out to 300s because the call is bounded by
 	// Capabilities.ProvisionTimeout, which AWS raises above the 90s default.
 	ProvisionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "nebula_provision_duration_seconds",
-		Help:    "Latency of the provider's Provision call, by provider, region, capacity type, accelerator type, accelerator count and outcome.",
+		Name: "nebula_provision_duration_seconds",
+		Help: "Latency of the provider's Provision call, by provider, region, capacity type, " +
+			"accelerator type, accelerator count and outcome.",
 		Buckets: []float64{0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300},
 	}, withExtra("result"))
 
@@ -106,8 +109,9 @@ var (
 	// 30min because a queueing provider on a large GPU shape genuinely takes that
 	// long.
 	InstanceReadyDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "nebula_instance_ready_duration_seconds",
-		Help:    "Time from the start of provisioning to the instance first reporting Running, by provider, region, capacity type, accelerator type and accelerator count.",
+		Name: "nebula_instance_ready_duration_seconds",
+		Help: "Time from the start of provisioning to the instance first reporting Running, " +
+			"by provider, region, capacity type, accelerator type and accelerator count.",
 		Buckets: []float64{5, 10, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800},
 	}, candidateLabels)
 )

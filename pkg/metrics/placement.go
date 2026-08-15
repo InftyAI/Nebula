@@ -77,8 +77,9 @@ var (
 	// magnitude because the honest range does: an unblocked Pod is placed in
 	// milliseconds, while one waiting out a failover block waits the blocklist TTL.
 	PlacementWaitDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "nebula_placement_wait_duration_seconds",
-		Help:    "Time from Pod creation to placement (scheduling gate removal), by provider, region, capacity type, accelerator type and accelerator count.",
+		Name: "nebula_placement_wait_duration_seconds",
+		Help: "Time from Pod creation to placement (scheduling gate removal), by provider, region, " +
+			"capacity type, accelerator type and accelerator count.",
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800},
 	}, candidateLabels)
 
@@ -92,7 +93,8 @@ var (
 	// kube-state-metrics and use this series to explain WHY.
 	PlacementDeferrals = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_placement_deferrals_total",
-		Help: "Reconciles that ended without placing a Pod, by pool and reason (no_pool, invalid_request, all_blocked, no_candidate, stale_claim).",
+		Help: "Reconciles that ended without placing a Pod, by pool and reason " +
+			"(no_pool, invalid_request, all_blocked, no_candidate, stale_claim).",
 	}, []string{"pool", "reason"})
 
 	// CandidateSkips counts individual (tier, provider, region) candidates passed over

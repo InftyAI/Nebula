@@ -91,7 +91,11 @@ func TestObserveProvision_CountersStayInStep(t *testing.T) {
 		t.Fatalf("success attempts delta = %v, want 1", got)
 	}
 	// A success must never touch the failure-reason counter, whatever the reason.
-	for _, reason := range []string{ReasonCapacity, ReasonAuth, ReasonQuota, ReasonUnsupported, ReasonTimeout, ReasonUnreachable, ReasonOther} {
+	allReasons := []string{
+		ReasonCapacity, ReasonAuth, ReasonQuota,
+		ReasonUnsupported, ReasonTimeout, ReasonUnreachable, ReasonOther,
+	}
+	for _, reason := range allReasons {
 		if reason == ReasonCapacity {
 			continue // asserted above
 		}
