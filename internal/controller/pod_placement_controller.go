@@ -28,6 +28,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/failover"
+	"github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
@@ -125,11 +126,15 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if pool == nil {
 		// No pool to place against. Leave the Pod gated rather than guessing; an
-		// operator sees a SchedulingGated Pod and a missing/mislabeled pool.
+		// operator sees a SchedulingGated Pod and a missing/mislabeled pool. The pool
+		// label is deliberately NOT filed on the metric — see metrics.RecordDeferral.
+		metrics.RecordDeferral("", metrics.DeferNoPool)
 		log.Info("no NodePool resolved for Pod; leaving it gated", "pod", pod.Name)
 		return ctrl.Result{}, nil
 	}
 
+	// selectPlacement files its own deferral reason on the !ok paths — it is the only
+	// place that knows which of the three applies (see its doc).
 	placement, ok, retryAfter := r.selectPlacement(ctx, &pod, pool)
 	if !ok {
 		// No provider in the pool can serve this Pod's GPU type right now. Leave it
@@ -164,6 +169,7 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// A stale claim for a prior same-named Pod still exists. Do NOT ungate
 		// against the wrong ledger; wait for the NodeClaim backstop to reap it,
 		// then a requeue re-creates the claim with this Pod's UID.
+		metrics.RecordDeferral(pool.Name, metrics.DeferStaleClaim)
 		log.Info("waiting for a stale NodeClaim to be reclaimed before placing",
 			"pod", pod.Name, "claim", util.ClaimName(pod.Namespace, pod.Name))
 		return ctrl.Result{RequeueAfter: staleClaimRequeue}, nil
@@ -173,6 +179,11 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.place(ctx, &pod, pool, placement); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Counted only after the Update lands, which is also what keeps it from
+	// double-counting: a reconcile driven by a stale cache would see the gate still
+	// present, redo the walk, and then fail this Update on a resourceVersion conflict —
+	// returning above rather than reaching here.
+	metrics.ObservePlacement(placementLabels(&pod, placement), time.Since(pod.CreationTimestamp.Time))
 	log.Info("placed Pod", "pod", pod.Name, "provider", placement.provider,
 		"capacityType", placement.capacityType, "region", placement.region)
 	return ctrl.Result{}, nil

@@ -337,6 +337,61 @@ func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 	}
 }
 
+// An error the provider never attributed to the request is not a rejection, so it
+// must not be acted on like one: no terminal status (the request may have been
+// accepted, and a Failed Pod is reaped out from under a paid instance), no blocklist
+// entry against a candidate that never misbehaved, and no tracking (a tracked pod with
+// no instance id is written Terminated by the very next poll tick). The Pod stays
+// Provisioning with the error as its message and VK retries with backoff.
+func TestCreatePod_UnattributableErrorLeavesPodProvisioning(t *testing.T) {
+	provErr := errors.New("rpc error: code = Unavailable desc = transport is closing")
+	// A non-empty classifyScope proves the guard runs BEFORE classification: a provider
+	// willing to hand back a blockable scope still must not have one recorded.
+	accel := "H100:1"
+	fp := &fakeProvider{
+		provisionErr:  provErr,
+		classifyScope: provider.BlockScope{Accelerator: &accel},
+	}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl)
+
+	var mu sync.Mutex
+	var emitted []string
+	h.NotifyPods(context.Background(), func(p *corev1.Pod) {
+		mu.Lock()
+		emitted = append(emitted, string(p.Status.Phase)+"/"+p.Status.Reason)
+		mu.Unlock()
+	})
+
+	pod := testPod("default", "p1")
+	err := h.CreatePod(context.Background(), pod)
+	if !errors.Is(err, provErr) {
+		t.Fatalf("CreatePod must return the provision error for VK to back off, got %v", err)
+	}
+	if pod.Status.Phase != corev1.PodPending || pod.Status.Reason != reasonProvisioning {
+		t.Fatalf("status = %s/%s, want the non-terminal %s/%s",
+			pod.Status.Phase, pod.Status.Reason, corev1.PodPending, reasonProvisioning)
+	}
+	if !strings.Contains(pod.Status.Message, provErr.Error()) {
+		t.Fatalf("expected the error surfaced as the Pod message, got %q", pod.Status.Message)
+	}
+	if bl.calls != 0 {
+		t.Fatalf("expected no blocklist entry for an unattributable error, got %d", bl.calls)
+	}
+	if len(h.tracked) != 0 {
+		t.Fatalf("expected the Pod left untracked, got %d tracked", len(h.tracked))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// Both emits are the same non-terminal status: the pre-call stamp and the retry
+	// message. Neither may be Failed.
+	for _, e := range emitted {
+		if strings.HasPrefix(e, string(corev1.PodFailed)) {
+			t.Fatalf("emitted a terminal status %q for an unattributable error: %v", e, emitted)
+		}
+	}
+}
+
 func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	accel, region := "H100", "us-east-1"
 	scope := provider.BlockScope{
@@ -1144,6 +1199,48 @@ func TestGetPod_ReAdoptsLiveInstanceAfterRestart(t *testing.T) {
 	// the instance id to terminate.
 	if _, err := h.GetPod(context.Background(), "default", "p1"); err != nil {
 		t.Fatalf("expected the re-adopted Pod to be tracked: %v", err)
+	}
+}
+
+// A List error means "we do not know whether an instance exists", which must NOT be
+// reported as NotFound. VK discards GetPod's error and branches on nil-ness alone, so
+// a nil pod re-issues CreatePod against an instance that may already be running — the
+// path that reaps a live workload after a restart. A non-nil pod suppresses the create;
+// the non-NotFound error makes VK's delete path requeue instead of terminating.
+func TestGetPod_ListErrorIsUnknownNotAbsent(t *testing.T) {
+	fp := &fakeProvider{listErr: errors.New("rpc error: code = Unavailable")}
+	h := NewHandler(fp, nil, nil)
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err == nil {
+		t.Fatal("expected an error when the provider cannot be listed")
+	}
+	if errdefs.IsNotFound(err) {
+		t.Fatalf("a List failure must not read as NotFound (VK would then CreatePod): %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected a non-nil Pod so VK takes the adopt branch instead of creating")
+	}
+	if got.Namespace != "default" || got.Name != "p1" {
+		t.Fatalf("stub Pod identity = %s/%s, want default/p1", got.Namespace, got.Name)
+	}
+	// Nothing may be tracked off a failed List: a tracked pod with no instance id would
+	// be found absent from the next List and written Terminated.
+	if len(h.tracked) != 0 {
+		t.Fatalf("expected nothing tracked after a failed List, got %d", len(h.tracked))
+	}
+
+	// Once the provider answers, the same call re-adopts normally.
+	fp.listErr = nil
+	fp.list = []provider.Instance{{
+		ID: "inst-9", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}
+	got, err = h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod after the provider recovered: %v", err)
+	}
+	if got.Status.Phase != corev1.PodRunning {
+		t.Fatalf("expected re-adoption once List succeeds, got %q", got.Status.Phase)
 	}
 }
 

@@ -28,6 +28,7 @@ mapping), see [docs/status.md](status.md).
   - [Provider Abstraction](#6-provider-abstraction)
   - [Placement Optimizer and Poll Loop](#7-placement-optimizer-and-poll-loop)
 - [CRDs](#crds)
+- [Observability](#observability)
 - [Failure Domains and HA](#failure-domains-and-ha)
 - [Current Implementation Status](#current-implementation-status)
 
@@ -538,6 +539,29 @@ paths as direct Pod/Deployment workloads.
 
 ---
 
+## Observability
+
+The instrumented surface is the path a Pod takes from admission to a running external
+instance: **placement**, then **provisioning**. Those are the parts whose cost and
+failure modes are otherwise invisible — placement can silently leave a Pod gated forever,
+and provisioning runs against a third party, takes seconds to minutes, bills money, and
+fails for reasons the Pod status flattens away. Everything else is covered elsewhere and
+deliberately not duplicated: reconcile counts, queue depth and API latency by
+controller-runtime's own collectors, Pod-population questions by kube-state-metrics.
+
+Two design rules are worth knowing here, because they constrain the code above:
+
+- Placement and provisioning metrics share **one label set** (`provider`, `region`,
+  `capacity_type`, `accelerator`, `accelerator_count`), so a placement and the
+  provisioning attempt it led to join in PromQL without label surgery. That is why
+  `Handler.metricLabels` and `placementLabels` are field-for-field mirrors.
+- Every label is bounded by **configuration** (NodePools, provider catalogs), never by
+  workload. Nothing derived from a Pod name, UID, namespace or unresolved user-supplied
+  pool label is ever a label value.
+
+See [metrics.md](metrics.md) for the full series list, label semantics, example queries
+and the two known gaps.
+
 ## Failure Domains and HA
 
 Components on the fail-closed path:
@@ -560,7 +584,19 @@ Components designed to degrade without leaks:
   manager restarts with credentials available.
 - **Provider List temporarily failing.** VK skips that poll tick and retries on
   the next cadence. The NodeClaim finalizer does not release on transient list
-  errors, so teardown retries instead of abandoning the instance.
+  errors, so teardown retries instead of abandoning the instance. A `List` failure
+  during post-restart re-adoption is likewise treated as *unknown*, not *absent*:
+  `Handler.GetPod` returns a non-nil Pod together with a non-NotFound error, which
+  suppresses both a duplicate `CreatePod` and a premature `DeletePod` until the
+  provider answers. Conflating the two would let one failed list mark a healthy Pod
+  `Failed` for reaping while the paid instance kept running behind a zero instance id.
+- **Provider unreachable during `Provision`.** Distinguished from a *rejection*
+  (`provider.IsRejection`). Only a rejection — no capacity, quota, auth, unsupported
+  accelerator — fails the Pod and files a blocklist entry. A transport error, timeout
+  or 503 leaves the Pod non-terminal at `Provisioning` with the error as its message
+  and records nothing, because it is not evidence about the request: the provider may
+  have accepted it. `Provision` is idempotent on `ClaimName`, so the retry adopts
+  whatever the failed attempt created rather than doubling it.
 
 Leader election (`LeaderElectionID: nebula.inftyai.com`) keeps a single active
 manager reconciling controllers and owning virtual-node leases.

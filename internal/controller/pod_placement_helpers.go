@@ -33,6 +33,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/failover"
+	"github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
@@ -86,6 +87,12 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 // expires, rather than idling until the periodic resync — blocklist TTL expiry
 // emits no event of its own.
 //
+// It also owns the placement metrics for everything it decides: a skip counter per
+// candidate passed over, and — on ok=false — the deferral reason, because this is the
+// only scope that can tell an invalid request from an all-blocked pool from a pool that
+// simply cannot serve the request. The caller files the two deferrals it owns instead
+// (no resolvable pool, and a stale NodeClaim).
+//
 // Strategy (LowestPrice/Weighted price-ranking) is a later swap-in for the inner
 // ordering; today the inner walk is listed order (Ordered), which the caller's
 // flow does not depend on — only that a (provider, capacityType, region) comes
@@ -102,6 +109,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 	// source object) before placement can proceed.
 	accel, count, err := util.AcceleratorRequest(pod)
 	if err != nil {
+		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
 		log.Info("invalid accelerator request; leaving Pod gated", "error", err.Error())
 		return placement{}, false, 0
 	}
@@ -111,11 +119,15 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 		for _, ref := range pool.Spec.Providers { // provider (Ordered = listed order)
 			prov, ok := r.provider(ref.Name)
 			if !ok {
+				// No region on this skip and the two below: they are decided before the
+				// walk reaches the region axis, so they rule out every region at once.
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipProviderUnregistered)
 				log.V(1).Info("skipping candidate: provider not registered",
 					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
 			}
 			if !servesCapacity(prov, tier) {
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipCapacityUnsupported)
 				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
 					"provider", ref.Name, "capacityType", tier)
 				continue
@@ -129,6 +141,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			accelerator := util.AcceleratorPool(accel, count)
 			if accel != "" {
 				if _, offered := prov.MapAccelerator(accel, count); !offered {
+					metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipAcceleratorUnsupported)
 					log.V(1).Info("skipping candidate: provider does not offer the accelerator",
 						"provider", ref.Name, "accelerator", accel, "count", count)
 					continue
@@ -138,6 +151,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
+					metrics.RecordCandidateSkip(ref.Name, tier, region, metrics.SkipBlocked)
 					log.Info("skipping candidate: blocked by failover blocklist",
 						"provider", ref.Name, "accelerator", accelerator,
 						"capacityType", tier, "region", region, "freesIn", until.String())
@@ -157,7 +171,37 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			}
 		}
 	}
+	// The walk is exhausted. Which deferral this is turns on whether anything was
+	// merely blocked: a positive soonest means a servable candidate exists and failover
+	// is holding it off (self-clearing, and the caller requeues for it), while zero
+	// means nothing in the pool can serve this request at all.
+	if soonest > 0 {
+		metrics.RecordDeferral(pool.Name, metrics.DeferAllBlocked)
+	} else {
+		metrics.RecordDeferral(pool.Name, metrics.DeferNoCandidate)
+	}
 	return placement{}, false, soonest
+}
+
+// placementLabels renders the metric label set for a completed placement. It mirrors
+// the virtual kubelet's Handler.metricLabels field for field — that symmetry is the
+// point, not a coincidence: the handler reads region and capacity type back off the
+// annotations that place() stamps from this very decision, so both halves of a Pod's
+// journey report identical label values and their series join cleanly.
+//
+// The accelerator type and count are passed apart, not as the joined pool identity
+// placement.accelerator carries, because a metric label must be aggregatable (see
+// metrics.provisionLabels). The parse cannot fail here: selectPlacement already
+// rejected a malformed request before any placement was returned.
+func placementLabels(pod *corev1.Pod, p placement) metrics.Labels {
+	accel, count, _ := util.AcceleratorRequest(pod)
+	return metrics.Labels{
+		Provider:         p.provider,
+		Region:           p.region,
+		CapacityType:     string(p.capacityType),
+		Accelerator:      accel,
+		AcceleratorCount: count,
+	}
 }
 
 // capacityTiers is the outer axis to walk: the pool's CapacityTypes in fallback

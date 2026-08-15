@@ -103,6 +103,7 @@ placement controller owns those.
 - See [docs/architecture.md](docs/architecture.md) for design details.
 - See [docs/status.md](docs/status.md) for how instance lifecycle becomes Pod and
   NodeClaim status, per provider.
+- See [docs/metrics.md](docs/metrics.md) for what is instrumented and how to query it.
 
 ## License
 
