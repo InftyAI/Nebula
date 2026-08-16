@@ -166,6 +166,48 @@ type LogStreamer interface {
 	Logs(ctx context.Context, instanceID string) (io.ReadCloser, error)
 }
 
+// Executor is the other OPTIONAL half: run one command inside a live instance, which is
+// what makes `kubectl exec` work. A backend with no way in (no agent, no SSH key) does
+// not implement it, and the virtual node answers NotFound.
+//
+// Exec only STARTS the command; the caller pumps the streams and waits. That keeps the
+// copy loop in pkg/vnode/exec.go, so stdin EOF, output draining and exit-code reporting
+// are identical for every provider and no adapter can quietly get one wrong.
+//
+// ctx covers the START ONLY, and the caller bounds it — an interactive shell outlives it
+// by hours. So the returned Process must not tie its streams or Wait to ctx, or a long
+// exec would die the moment the start budget ran out.
+type Executor interface {
+	Exec(ctx context.Context, instanceID string, cmd []string, opts ExecOptions) (Process, error)
+}
+
+// ExecOptions is what the client asked for that the provider must know at start time.
+// Everything else about the command is in cmd.
+type ExecOptions struct {
+	// TTY asks for a pseudo-terminal, so the command believes it is interactive and line
+	// editing works (`kubectl exec -it`). A provider that cannot allocate one still runs
+	// the command: a shell without a TTY beats no shell.
+	TTY bool
+}
+
+// Process is one command running inside an instance. The caller always calls Close.
+type Process interface {
+	// Stdin is the command's input; closing it is how the command sees EOF. Nil when the
+	// provider cannot write stdin, which makes the exec output-only.
+	Stdin() io.WriteCloser
+	// Stdout is the command's output — under a TTY, everything it writes.
+	Stdout() io.Reader
+	// Stderr is separate error output, or nil when there is none to separate. Nil is the
+	// normal case under a TTY, where one terminal carries both.
+	Stderr() io.Reader
+	// Wait blocks until the command exits and returns its exit code. A non-zero code is
+	// the command's own answer, NOT a failure — err is for "we could not find out".
+	Wait(ctx context.Context) (int, error)
+	// Close releases the streams and whatever connection carried them. It must unblock a
+	// parked Read/Write, so a disconnected client cannot leave the transport running.
+	Close() error
+}
+
 // ProvisionRequest carries only the placement decisions that are NOT already on the Pod.
 // Everything about the workload — image, command, env, ports, cpu/memory, accelerator type
 // and count — is read from the Pod, the single source of truth. That leaves the tier, the

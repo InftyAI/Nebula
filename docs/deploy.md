@@ -133,7 +133,7 @@ Manager flags worth knowing (edit `config/manager/manager.yaml` `args`):
 The endpoint needs `POD_IP` (projected via `fieldRef` in `config/manager/manager.yaml`)
 because virtual nodes advertise the leader's Pod IP, not a Service. Running the manager
 off-cluster leaves it unset, and logs degrade to unsupported. See
-[status.md § Logs](status.md#logs).
+[kubelet-api.md](kubelet-api.md).
 
 ---
 

@@ -66,12 +66,14 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
-// compile-time assertions that Provider satisfies the interfaces. LogStreamer is
-// the optional half: it is what makes `kubectl logs` work here, and asserting it
-// separately is the point — a provider is free not to serve logs.
+// compile-time assertions that Provider satisfies the interfaces. LogStreamer and
+// Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
+// work here, and asserting them separately is the point — a provider is free to serve
+// neither.
 var (
 	_ provider.Provider    = (*Provider)(nil)
 	_ provider.LogStreamer = (*Provider)(nil)
+	_ provider.Executor    = (*Provider)(nil)
 )
 
 // Client is the narrow seam over Modal's API. It is intentionally small: only
@@ -95,6 +97,9 @@ type Client interface {
 	// SandboxLogs returns merged stdout+stderr, from the first byte, following until
 	// the sandbox exits (see provider.LogStreamer). The caller owns Close.
 	SandboxLogs(ctx context.Context, id string) (io.ReadCloser, error)
+	// SandboxExec starts cmd inside a running sandbox and returns the handle to its
+	// streams and exit code (see provider.Executor). The caller owns Close.
+	SandboxExec(ctx context.Context, id string, cmd []string, opts provider.ExecOptions) (provider.Process, error)
 }
 
 // SandboxSpec is the resolved, Modal-shaped request the Client turns into a
@@ -354,6 +359,22 @@ func (p *Provider) Logs(ctx context.Context, instanceID string) (io.ReadCloser, 
 		return nil, fmt.Errorf("modal: no sandbox for this pod yet")
 	}
 	return p.client.SandboxLogs(ctx, instanceID)
+}
+
+// Exec implements provider.Executor, and is what `kubectl exec` runs. A pass-through:
+// the streams are the caller's job (pkg/vnode/exec.go pumps them).
+//
+// Modal needs no agent in the image for this — its own worker runs the command — so exec
+// works on any sandbox, including the `sleep infinity` placeholder a Sandbox gets. The
+// sandbox must be RUNNING though: Modal routes an exec through the container's task, so
+// one still queued fails here rather than waiting.
+func (p *Provider) Exec(
+	ctx context.Context, instanceID string, cmd []string, opts provider.ExecOptions,
+) (provider.Process, error) {
+	if instanceID == "" {
+		return nil, fmt.Errorf("modal: no sandbox for this pod yet")
+	}
+	return p.client.SandboxExec(ctx, instanceID, cmd, opts)
 }
 
 // Get implements provider.Provider.

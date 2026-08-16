@@ -204,10 +204,10 @@ func (r *SandboxReconciler) buildPod(sbx *nebulav1alpha1.Sandbox) *corev1.Pod {
 				// and takes the instance down: the box would surface as Failed seconds after
 				// being provisioned.
 				//
-				// A PLACEHOLDER process, not a control surface. There is no agent in the
-				// container, so `kubectl exec`/`logs` against a sandbox do not work yet.
-				// Whatever restores them replaces this command; a bare `sleep` keeps any
-				// bootstrap from having to inject a binary into an arbitrary user image.
+				// A PLACEHOLDER process, not a control surface. `kubectl exec` and
+				// `kubectl logs` do not go through it: the provider starts the command
+				// itself, so a bare `sleep` is enough and no binary has to be injected
+				// into an arbitrary user image.
 				//
 				// No tension with a user-supplied command: SandboxSpec has no command field.
 				Command:   []string{"sleep", "infinity"},

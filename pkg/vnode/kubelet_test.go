@@ -17,9 +17,11 @@ limitations under the License.
 package vnode
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +32,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	utilexec "k8s.io/utils/exec"
 )
 
 func TestNewKubeletServer_Validation(t *testing.T) {
@@ -125,6 +130,81 @@ func TestKubeletServer_ServesLogsOverTLS(t *testing.T) {
 	if body, code := getLogs(t, base, "default", "p1", "main"); code != http.StatusNotFound {
 		t.Fatalf("no handlers: status = %d, body = %q, want 404", code, body)
 	}
+}
+
+// The end-to-end shape of a `kubectl exec`: the API server's own SPDY client against the
+// exec route. Covers what unit tests cannot — the route is attached, the streams are
+// negotiated, and the command's output and exit code both survive the wire.
+func TestKubeletServer_ServesExecOverTLS(t *testing.T) {
+	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("hi from exec\n", "", 0))
+	h := NewHandler(ep, nil, nil)
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	_, base := startTestKubeletServer(t, map[string]*Handler{"nebula-fake": h})
+
+	stdout, err := execCommand(t, base, "default", "p1", []string{"echo", "hi"})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if stdout != "hi from exec\n" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	if ep.askedFor != "inst-1" {
+		t.Fatalf("provider asked for %q, want inst-1", ep.askedFor)
+	}
+
+	// A Pod nobody tracks fails, rather than exec'ing into someone else's instance.
+	if _, err := execCommand(t, base, "default", "ghost", []string{"echo", "hi"}); err == nil {
+		t.Fatal("unknown pod: expected an error")
+	}
+}
+
+// The exit code is the one thing an exec must not lose: a failed command has to look
+// failed to the client, with its own status, not like a broken kubelet.
+func TestKubeletServer_ExecReportsExitCode(t *testing.T) {
+	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("", "boom\n", 3))
+	h := NewHandler(ep, nil, nil)
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	_, base := startTestKubeletServer(t, map[string]*Handler{"nebula-fake": h})
+
+	_, err := execCommand(t, base, "default", "p1", []string{"false"})
+	var exitErr utilexec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("err = %v (%T), want an exit error the client can read a code from", err, err)
+	}
+	if exitErr.ExitStatus() != 3 {
+		t.Fatalf("exit status = %d, want 3", exitErr.ExitStatus())
+	}
+}
+
+// execCommand runs one command through the exec route the way the API server does,
+// returning what the command wrote to stdout.
+func execCommand(t *testing.T, base, namespace, pod string, cmd []string) (string, error) {
+	t.Helper()
+	u, err := url.Parse(fmt.Sprintf("%s/exec/%s/%s/main", base, url.PathEscape(namespace), url.PathEscape(pod)))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	q := url.Values{"command": cmd, "output": {"1"}, "error": {"1"}}
+	u.RawQuery = q.Encode()
+
+	// Self-signed, like a real kubelet's; the API server does not verify it either.
+	cfg := &rest.Config{Host: base, TLSClientConfig: rest.TLSClientConfig{Insecure: true}}
+	exec, err := remotecommand.NewSPDYExecutor(cfg, http.MethodPost, u)
+	if err != nil {
+		t.Fatalf("NewSPDYExecutor: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr})
+	return stdout.String(), err
 }
 
 // One listener serves every provider and the route carries no node name, so a request
