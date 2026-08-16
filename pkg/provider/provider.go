@@ -1,35 +1,27 @@
-// Package provider defines the abstraction every compute provider (RunPod,
-// Modal, Kubernetes, ...) implements. It is the single narrow seam between
-// Nebula's provider-agnostic control plane (placement controller, NodeClaim
-// controller, poll loop) and the heterogeneous cloud APIs underneath.
+// Package provider defines the abstraction every compute provider (Modal, AWS, ...)
+// implements — the one narrow seam between Nebula's provider-agnostic control plane and
+// the heterogeneous cloud APIs underneath.
 //
-// Scope: region IS modeled, as one axis of the placement candidate key and of
-// BlockScope, but it stays OPTIONAL — an empty region means "no constraint, let
-// the provider place freely", which is a normal mode (and on Modal the cheapest
-// one), not a degenerate fallback. Zone is not modeled: AWS's CreateFleet already
-// spreads across the AZs of a region on its own, and no NeoCloud exposes zones.
-// Providers differ in how coarse their region vocabulary is, and the pool speaks
-// group tokens ("us") on top of that, so translation lives behind ExpandRegions
-// rather than in the control plane. Do not hard-code any one provider's geography
-// into the control plane; keep provider quirks behind Capabilities/ExpandRegions.
+// Region IS modeled, as one axis of the placement candidate and of BlockScope, but it
+// stays OPTIONAL: an empty region means "let the provider place freely", a normal mode
+// (the cheapest one on Modal). Zone is not modeled — AWS's CreateFleet already spreads
+// across a region's AZs and no NeoCloud exposes zones. Region vocabularies differ per
+// provider, and the pool speaks group tokens ("us") on top, so translation lives behind
+// ExpandRegions rather than in the control plane.
 //
-// Design rules learned from SkyPilot / the Nebula design discussion:
-//   - The Pod is the source of truth for the workload shape. Provision takes the
-//     Pod and reads image/command/env/ports/resources and the accelerators
-//     annotation off it; the control plane never re-encodes that into a provider
-//     call itself.
-//   - Providers differ in capabilities (RunPod cannot stop, has no native tags,
-//     no preemption push). Those quirks are declared via Capabilities and
-//     handled here, not leaked into the control plane.
-//   - Detection is poll-based everywhere (no provider gives a reliable
-//     preemption push, and even those with a spot notice are polled uniformly),
-//     so List must return all of this provider's instances in as few calls as
-//     possible.
+// Design rules:
+//   - The Pod is the source of truth for the workload shape. Provision reads
+//     image/command/env/ports/resources off it; the control plane never re-encodes that.
+//   - Provider quirks are declared via Capabilities and handled here, never leaked into
+//     the control plane.
+//   - Detection is poll-based everywhere (no provider pushes preemption reliably), so
+//     List must return every instance in as few calls as possible.
 package provider
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -50,124 +42,97 @@ type Provider interface {
 
 	// --- Lifecycle -------------------------------------------------------
 
-	// Provision creates exactly one external instance for the given Pod. The Pod
-	// is the source of truth for the entire workload shape: the implementation
-	// reads image/command/env/ports/cpu/memory from pod.Spec, the accelerator type
-	// from the accelerator-type label, and the accelerator count from the
-	// nvidia.com/gpu resource (via util.AcceleratorRequest; the type is then
-	// translated via MapAccelerator). The request carries
-	// only what the Pod cannot express: the optimizer-chosen capacity tier and
-	// the claim identity.
+	// Provision creates exactly one external instance for the Pod, which is the source of
+	// truth for the whole workload shape: the implementation reads
+	// image/command/env/ports/cpu/memory off pod.Spec, and the accelerator type+count via
+	// util.AcceleratorRequest (then MapAccelerator). The request carries only what the Pod
+	// cannot express: the chosen capacity tier and the claim identity.
 	//
-	// It returns a ProvisionResult: the instance id, whether capacity is RESERVED,
-	// and any connect credential minted for the instance. Reserved is whether the
-	// provider has committed actual capacity, as opposed to merely accepting the
-	// request. The two are genuinely different guarantees and an id alone cannot
-	// express either one:
+	// It returns the instance id, whether capacity is RESERVED, and any minted connect
+	// credential. Reserved means the provider committed real capacity, not merely accepted
+	// the request — two different guarantees an id alone cannot express:
 	//
-	//   - AWS reserves. CreateFleet with an *instant* request is synchronous, so an
-	//     id means EC2 found capacity and the instance is booting on real hardware;
-	//     a shortfall is an error, never a pending instance.
-	//   - Modal does not. Sandboxes.Create returns as soon as the control plane
-	//     accepts the sandbox; the GPU may still be queued, for minutes on a large
-	//     shape.
+	//   - AWS reserves: an *instant* CreateFleet is synchronous, so an id means EC2 found
+	//     capacity and the instance is booting; a shortfall is an error.
+	//   - Modal does not: Create returns once the control plane accepts the sandbox, and
+	//     the GPU may stay queued for minutes on a large shape.
 	//
-	// Callers use it to report honest status: an unreserved instance is not yet
-	// initializing, so its Pod stays at the provisioning reason. Note that reserved
-	// says nothing about readiness — a reserved instance is still booting, and
-	// readiness is observed later through List/Get. An id with reserved=false still
-	// carries the full teardown obligation, since the instance exists as far as the
-	// provider is concerned; a provider that cannot distinguish the two should
-	// return true, matching the pre-existing assumption.
+	// Callers use it for honest status: an unreserved instance is not yet initializing, so
+	// its Pod stays at the provisioning reason. It says nothing about readiness, which is
+	// observed later through List/Get. reserved=false still carries the full teardown
+	// obligation; a provider that cannot tell the two apart returns true.
 	//
-	// Idempotency: if an instance already exists for req.ClaimName (encoded in
-	// the provider's naming scheme, since most providers lack tags), return that
-	// id instead of creating a second. Such a call returns NO credential — the
-	// original one was already published and cannot be re-read (see
-	// ProvisionResult.ConnectURL).
+	// Idempotency: if an instance already exists for req.ClaimName (encoded in the
+	// provider's naming scheme, since most lack tags), return that id rather than creating
+	// a second. Such a call returns NO credential — the original cannot be re-read.
 	Provision(ctx context.Context, pod *corev1.Pod, req ProvisionRequest) (ProvisionResult, error)
 
-	// Terminate destroys the instance by id. Must be idempotent: terminating an
-	// already-gone instance returns nil (so the NodeClaim finalizer can retry
-	// safely). This is the call the terminate finalizer relies on to never leak
-	// a paid instance.
+	// Terminate destroys the instance by id. Must be idempotent — terminating an
+	// already-gone instance returns nil, so the finalizer that guarantees no paid instance
+	// leaks can retry safely.
 	Terminate(ctx context.Context, instanceID string) error
 
 	// Get returns the current state of one instance, or (nil, nil) if it no
 	// longer exists (treat absence as terminated).
 	Get(ctx context.Context, instanceID string) (*Instance, error)
 
-	// List returns every instance owned by Nebula on this provider, in as few
-	// API calls as possible (ideally one — e.g. RunPod's myPods). This is the
-	// engine of the poll loop: preemption/termination is detected by an instance
-	// disappearing or changing state here, since no provider pushes such events.
+	// List returns every instance Nebula owns on this provider, in as few API calls as
+	// possible (ideally one). This is the engine of the poll loop: since no provider pushes
+	// events, preemption and termination are detected by an instance disappearing or
+	// changing state here.
 	List(ctx context.Context) ([]Instance, error)
 
 	// --- Catalog ---------------------------------------------------------
 
-	// Offerings returns the current price/availability rows this provider can
-	// serve, feeding the optimizer's {provider,accelerator,capacityType}->
-	// {price,avail} table. Cached + periodically refreshed by the caller;
-	// implementations may combine a static catalog with a live availability probe.
+	// Offerings returns the price/availability rows this provider can serve, feeding the
+	// optimizer's {provider,accelerator,capacityType} -> {price,avail} table. The caller
+	// caches and refreshes it; an implementation may combine a static catalog with a live
+	// availability probe.
 	Offerings(ctx context.Context) ([]Offering, error)
 
 	// --- Translation -----------------------------------------------------
 
-	// MapAccelerator translates a canonical Nebula accelerator request (type +
-	// count) into the provider ids that can serve it — the PRIMARY first, then any
-	// interchangeable alternates. Count is part of the key because on some providers
-	// the GPU count is baked into the offering rather than a free knob: on AWS
-	// (L4, 1) and (L4, 8) resolve to DIFFERENT instance types (g6.xlarge vs
-	// g6.48xlarge) — distinct capacity pools — so the id must distinguish them.
-	// Providers that attach an arbitrary count to a single offering (Modal) ignore
-	// count and return the same id for every count. Returns ok=false if the provider
-	// offers no id for that (type, count).
+	// MapAccelerator translates a canonical accelerator request (type + count) into the
+	// provider ids that can serve it: the PRIMARY first, then interchangeable alternates.
 	//
-	// Most of the system uses ids[0], the PRIMARY: it is what failover keys a
-	// capacity block on, so two requests that share a capacity pool must return the
-	// same primary and two that do not must differ. Any further ids are equivalent
-	// alternates a provider may try within a SINGLE provisioning attempt (AWS's
-	// launch fleet spans several instance types so EC2 lands on whichever has
-	// capacity) — they broaden one launch, they do NOT widen the blocklist: an
-	// alternate running dry never disables the primary. A provider with no alternates
-	// returns a single-element slice.
+	// Count is part of the key because on some providers the GPU count is baked into the
+	// offering: on AWS (L4, 1) and (L4, 8) are different instance types (g6.xlarge vs
+	// g6.48xlarge) and so distinct capacity pools. A provider that attaches an arbitrary
+	// count to one offering (Modal) ignores count. ok=false means no id for that pair.
+	//
+	// Most of the system uses ids[0], the PRIMARY, because failover keys a capacity block
+	// on it: requests sharing a capacity pool must return the same primary, and ones that
+	// do not must differ. The alternates broaden a SINGLE launch (AWS's fleet spans
+	// instance types so EC2 lands on whichever has capacity) but never widen the
+	// blocklist — an alternate running dry does not disable the primary.
 	MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool)
 
-	// ExpandRegions resolves a NodePool's declared region constraint
-	// (ProviderSpec.Regions) into the concrete regions placement may walk, in this
-	// provider's own vocabulary. The pool speaks two levels and this is what tells
-	// them apart, because only the provider knows its own geography:
+	// ExpandRegions resolves a pool's declared region constraint (ProviderSpec.Regions)
+	// into the concrete regions placement may walk, in this provider's own vocabulary —
+	// only the provider knows its geography:
 	//
 	//   - nil/empty  => unconstrained: every region this provider serves.
 	//   - a GROUP token ("us", "eu", "ap") => that geography's regions.
 	//   - anything else => a literal region name, passed through UNVALIDATED.
 	//
-	// The last case is deliberate: region names are the provider's vocabulary and
-	// change faster than this code, so an unrecognized value is forwarded rather than
-	// rejected. A genuinely bad name fails at provision time with the provider's own
-	// error, which beats Nebula refusing a region that shipped last week.
+	// That last case is deliberate: region names change faster than this code, so an
+	// unrecognized one is forwarded and a genuinely bad name fails at provision time with
+	// the provider's own error. Better than refusing a region that shipped last week.
 	//
-	// Expansion happens HERE, at the pool boundary, so everything downstream keeps
-	// seeing exactly one CANDIDATE region: ProvisionRequest.Region, RegionAnnotation,
-	// and the failover blocklist key all stay single-valued, and a capacity failure
-	// blocks the one candidate that failed rather than the whole group it came from.
+	// Expanding HERE, at the pool boundary, keeps everything downstream single-valued —
+	// ProvisionRequest.Region, RegionAnnotation and the blocklist key — so a capacity
+	// failure blocks the one candidate that failed, not the group it came from.
 	//
-	// How many candidates a declaration becomes is the provider's call, and it turns
-	// on whether that provider can FAIL OVER between regions. A provider whose
-	// provision reports a capacity shortage synchronously (AWS) should return one
-	// candidate per region, so a shortage in one is retried in the next. A provider
-	// that accepts a request and queues it with no error (Modal) must NOT: nothing
-	// would ever re-drive placement, so the first candidate is the only one tried, and
-	// splitting the declaration would discard every other region the operator asked
-	// for. Such a provider returns ONE candidate carrying the whole set and lets its
-	// own scheduler choose — the candidate is then opaque to the control plane, which
-	// only ever passes it back to the provider that minted it.
+	// How many candidates a declaration becomes depends on whether the provider can FAIL
+	// OVER between regions. One that reports a shortage synchronously (AWS) returns one
+	// candidate per region, so the next is tried. One that just queues the request with no
+	// error (Modal) must not: nothing would re-drive placement, so only the first
+	// candidate would ever be tried. It returns ONE opaque candidate carrying the whole
+	// set and lets its own scheduler choose.
 	//
-	// It is a pure function of the declaration (no API calls, no ctx): the result
-	// feeds both placement's candidate walk and the observability fan-out
-	// (List/Offerings), and those two MUST agree — a region provisioned into but not
-	// swept would be absent from List, which reports a live instance as Terminated.
-	// So it must not be able to fail differently between the two callers.
+	// Pure (no API calls, no ctx), because the result feeds both placement's candidate walk
+	// and the List/Offerings fan-out, and those MUST agree: a region provisioned into but
+	// not swept is absent from List, which reports a live instance as Terminated.
 	ExpandRegions(declared []string) []string
 
 	// ClassifyProvisionError maps a Provision error to the granularity at which
@@ -175,56 +140,58 @@ type Provider interface {
 	// a "no H100 capacity" error blocks only {provider, H100, capacityType, region},
 	// while an auth/quota error blocks the whole provider. See BlockScope.
 	//
-	// accelerator and region are the two request facts the error itself does not
-	// carry: the accelerator the failing request asked for ("" for a CPU-only Pod)
-	// and the region it targeted ("" for a region-simple provider, or when the
-	// request did not pin one). The provider is the single owner of the complete
-	// scope — it stamps the accelerator on a capacity block, confines the block to
-	// the region that actually failed (a region-aware provider), and widens
-	// auth/quota to the whole provider. No caller assembles a scope piecemeal after
-	// this returns.
+	// accelerator and region are the two request facts the error does not carry, both ""
+	// when absent (a CPU-only Pod, a region-simple provider). The provider returns the
+	// COMPLETE scope; no caller assembles one piecemeal afterwards.
 	ClassifyProvisionError(err error, accelerator, region string) BlockScope
 }
 
-// ProvisionRequest carries only the decisions the placement controller made
-// that are NOT already on the Pod. Everything about the workload — image,
-// command, env, ports, cpu/memory, accelerator type (accelerator-type label) and
-// count (nvidia.com/gpu resource) — is read from the Pod itself, which
-// is the single source of truth; duplicating it here would repeat the mistake
-// NodeClaim deliberately avoids. That leaves exactly two fields: the optimizer's
-// capacity-tier choice (nowhere on the Pod) and the claim identity.
+// LogStreamer is the OPTIONAL half of a provider: one instance's console output, which is
+// what makes `kubectl logs` work. A backend with no console history simply does not
+// implement it, and the virtual node answers NotFound.
+//
+// The returned stream must:
+//
+//   - start at the instance's FIRST byte, not at "now";
+//   - FOLLOW until the instance exits, ctx is cancelled, or Close;
+//   - MERGE stdout and stderr (the kubelet API has one stream);
+//   - release everything on Close, which the caller always calls.
+//
+// A missing instance must return an error, never an empty stream — silence reads as
+// "the workload logged nothing".
+//
+// No options here: --follow/--tail/--limit-bytes are applied by pkg/vnode/logs.go so
+// every provider behaves the same and no adapter can quietly ignore one.
+type LogStreamer interface {
+	Logs(ctx context.Context, instanceID string) (io.ReadCloser, error)
+}
+
+// ProvisionRequest carries only the placement decisions that are NOT already on the Pod.
+// Everything about the workload — image, command, env, ports, cpu/memory, accelerator type
+// and count — is read from the Pod, the single source of truth. That leaves the tier, the
+// region, and the claim identity.
 type ProvisionRequest struct {
 	// ClaimName is the NodeClaim name; providers without native tags encode it
 	// into the instance name so List/Terminate can find the instance later.
 	ClaimName string
-	// CapacityType is the tier the optimizer selected (Spot/OnDemand).
-	// This is the one workload-independent decision that cannot be expressed on
-	// the Pod, so it must be passed explicitly.
+	// CapacityType is the tier the optimizer chose (Spot/OnDemand) — a decision that has
+	// nowhere to live on the Pod.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region is the ONE candidate placement chose for this attempt, as its own
-	// ExpandRegions minted it. Like CapacityType it is a workload-independent decision
-	// absent from the Pod. It is never a raw pool declaration or a group token — that
-	// was already resolved — and the control plane treats it as an OPAQUE token,
-	// passing back exactly what the provider produced.
+	// Region is the ONE candidate placement chose, exactly as this provider's own
+	// ExpandRegions minted it — already resolved (never a group token) and opaque to the
+	// control plane. Usually one concrete region (AWS "us-east-1"), which is what lets a
+	// capacity failure blocklist just that region; a provider that cannot fail over
+	// (Modal) may encode several for its own scheduler, and only that adapter parses it.
 	//
-	// For a provider that fails over region by region this is one concrete region
-	// (AWS "us-east-1"), which is what lets a capacity failure blocklist exactly the
-	// region that failed. For one that cannot (Modal), it may encode the several
-	// regions its scheduler should choose among; only that provider's own code parses
-	// it. Nothing between here and the adapter inspects the value.
-	//
-	// Empty means "no region constraint — let the provider place freely". That is a
-	// real, common mode, not a fallback: a pool that declares no regions leaves it
-	// empty, and on Modal that is the widest and cheapest option (a pinned region
-	// carries a 1.5-1.75x multiplier there). The AWS adapter cannot honour it — EC2
-	// endpoints are regional, so it has no "anywhere" call and returns ErrConfig — but
-	// its ExpandRegions never produces an empty region, so the case does not arise.
+	// Empty means "no region constraint" — common, not a fallback: a pool declaring no
+	// regions leaves it empty, which on Modal is the widest and cheapest option (pinning
+	// costs 1.5-1.75x). AWS cannot honour it, but its ExpandRegions never produces it.
 	Region string
 }
 
-// ProvisionResult is what one Provision call produced. It is a struct rather than
-// more positional returns because the credential below is delivered ONCE, and a
-// value that can only ever be observed here deserves to be named.
+// ProvisionResult is what one Provision call produced. A struct rather than more
+// positional returns because the credential below is delivered ONCE, and a value that can
+// only be observed here deserves a name.
 type ProvisionResult struct {
 	// InstanceID is the provider's id for the instance. Non-empty on success, and
 	// carrying the full teardown obligation from that moment on.
@@ -232,39 +199,29 @@ type ProvisionResult struct {
 	// Reserved is whether the provider committed actual capacity, as opposed to
 	// merely accepting the request. See Provision.
 	Reserved bool
-	// ConnectURL and ConnectToken are the credential for reaching the instance: an
-	// address plus the bearer token that authenticates against it. Together they are
-	// what a consumer needs and all they need:
+	// ConnectURL and ConnectToken are the credential for reaching the instance — an address
+	// plus the bearer token authenticating against it, which is all a consumer needs:
 	//
 	//	curl -H "Authorization: Bearer $token" $url
 	//
-	// They are returned HERE, and only here, because minting is one-shot: providers
-	// issue a credential at create and offer no way to read it back (Modal's
-	// CreateConnectToken returns a DIFFERENT token on a second call, so there is not
-	// even a stable value to re-read). This is therefore the single moment the pair
-	// exists in Nebula's hands, and the caller must persist it durably — the virtual
-	// kubelet writes both to a Secret in the Pod's namespace — or it is gone. Empty
-	// when the instance needs no credential, and empty on an idempotent re-Provision
-	// of an existing instance, whose credential was published already.
+	// Returned here and ONLY here: minting is one-shot with no read-back (Modal's
+	// CreateConnectToken returns a DIFFERENT token each call). The caller must persist it
+	// durably — the virtual kubelet writes both to a Secret — or it is gone. Empty when
+	// the instance needs no credential, or on an idempotent re-Provision.
 	//
-	// The TOKEN is a SECRET: never log it, never put it on the Pod (an annotation is
-	// readable by anyone with `get pod` and lands unencrypted in etcd), never in an
-	// error string. Neither field is on Instance: List/Get are the level-triggered
-	// read path, and a credential that cannot be re-read has no business there.
+	// The TOKEN is a SECRET: never log it, never put it on the Pod (annotations are
+	// readable with `get pod` and unencrypted in etcd), never in an error string.
 	//
-	// ConnectURL is not itself secret, and it is NOT the same value as
-	// Instance.Endpoint even when they agree. This is the one-shot create path; the
-	// endpoint is the observed read path, which is what reports an address that does
-	// not exist until the instance boots (AWS's public DNS name) and what still
-	// reports one after a restart, when no Provision call happens at all.
+	// ConnectURL is not secret, and is NOT Instance.Endpoint even when they agree: this is
+	// the one-shot create path, while the endpoint is observed, so it is what reports an
+	// address that only exists after boot and survives a manager restart.
 	ConnectURL   string
 	ConnectToken string
 }
 
-// String redacts ConnectToken so a ProvisionResult can be logged safely. The
-// compiler cannot stop a future log.Info("...", "result", res) from leaking it;
-// %v/%s go through here instead. GoString covers %#v for the same reason. The URL
-// is not secret and is printed as-is.
+// String redacts ConnectToken so a ProvisionResult can be logged safely: the compiler
+// cannot stop a future log.Info("...", "result", res), so %v/%s go through here. The URL is
+// not secret and prints as-is.
 func (r ProvisionResult) String() string {
 	return fmt.Sprintf("ProvisionResult{InstanceID:%s Reserved:%t ConnectURL:%s ConnectToken:%s}",
 		r.InstanceID, r.Reserved, r.ConnectURL, redacted(r.ConnectToken))
@@ -287,26 +244,16 @@ type Capabilities struct {
 	// PreemptionNotice is the advance warning before a spot reclaim; zero means
 	// none (RunPod: 0 — abrupt, detected only by polling).
 	PreemptionNotice time.Duration
-	// PollInterval is how often the virtual node re-lists this provider to detect
-	// out-of-band state changes (Pending→Running, preemption, external teardown);
-	// see pkg/vnode. It is a per-provider knob because the trade-off differs by
-	// provider: a spot-heavy backend where preemption is common and costly wants a
-	// short interval to notice reclaims quickly, while an OnDemand-only backend
-	// that never preempts can poll lazily. Zero means "use the vnode default"
-	// (15s). The happy-path transitions (provision start, teardown) do not wait on
-	// this — they are pushed synchronously by CreatePod/DeletePod — so this only
-	// bounds detection latency for events no provider pushes.
+	// PollInterval is how often the virtual node re-lists this provider to catch
+	// changes nobody pushes: Pending→Running, preemption, external teardown. Per
+	// provider because a spot-heavy backend wants reclaims noticed fast while an
+	// OnDemand-only one can poll lazily. Zero means the vnode default (15s).
 	PollInterval time.Duration
-	// ProvisionTimeout bounds a single Provision call end to end. It exists for
-	// region-aware providers that fail over across capacity pools (e.g. AWS tries
-	// each availability zone in turn on a capacity error): the deadline caps how
-	// long that inner failover loop may spend before giving up so the outer
-	// region-level failover can proceed, rather than a slow provider stalling a
-	// Pod indefinitely. It bounds the PROVISIONING attempt (the launch API calls
-	// and any per-zone retries), NOT "the workload became healthy" — that remains
-	// the poll loop's job. Zero means "no adapter-imposed deadline" (the caller's
-	// context still applies); providers with a single capacity pool (Modal) leave
-	// it zero.
+	// ProvisionTimeout bounds a single Provision call end to end, so a provider that
+	// retries across capacity pools internally (AWS tries each AZ) gives up in time for
+	// the outer region failover to run. It bounds the launch attempt, not "the workload
+	// became healthy" — that stays the poll loop's job. Zero means no deadline beyond
+	// the caller's context; single-pool providers (Modal) leave it zero.
 	ProvisionTimeout time.Duration
 }
 
@@ -364,73 +311,50 @@ type Offering struct {
 	// emits one row per {accelerator, capacityType, region}.
 	Region string
 	// AcceleratorID is this provider's own name for what serves the canonical
-	// AcceleratorType — the per-provider half of the mapping the canonical GPU
-	// vocabulary is translated through (e.g. AWS "p5.48xlarge" for H100). It is
-	// the lookup data a diverging provider's MapAccelerator override returns. Left
-	// unset by providers whose mapping is identity (Modal names its GPUs exactly
-	// like the canonical types), which reuse catalog.Base's default MapAccelerator
-	// and so need no per-name id. Mirrors the providerAcceleratorID that
-	// MapAccelerator returns.
+	// AcceleratorType (AWS "p5.48xlarge" for H100) — the lookup data MapAccelerator
+	// returns. Unset when the mapping is identity (Modal names its GPUs like the
+	// canonical types) and catalog.Base's default MapAccelerator is used.
 	AcceleratorID string
-	// GPUCount is how many accelerators the AcceleratorID provides. It matters for
-	// providers where the accelerator count is not a free knob but is baked into
-	// the offering: on AWS you do not ask for "N T4s", you pick an instance type
-	// whose GPU count is fixed (T4x1 = g4dn.xlarge, T4x8 = g4dn.metal), so the
-	// mapping key is (AcceleratorType, GPUCount) and the same accelerator appears
-	// once per count. Left 0 by providers that attach an arbitrary count to a
-	// single offering (Modal takes the count as a parameter), for whom it is not a
-	// lookup dimension.
+	// GPUCount is how many accelerators the AcceleratorID provides. It matters where the
+	// count is baked into the offering: on AWS you pick an instance type with a fixed GPU
+	// count (T4x1 = g4dn.xlarge, T4x8 = g4dn.metal), so the mapping key is
+	// (AcceleratorType, GPUCount) and each accelerator appears once per count. Left 0 by
+	// providers that take the count as a parameter (Modal).
 	GPUCount int32
 }
 
-// BlockScope is the granularity at which a failed placement is excluded, matched
-// to what actually failed (SkyPilot's blocklist-granularity rule). It is a partial
-// MATCH PATTERN, not a value, and AcceleratorID/Region are THREE-STATE pointers
-// so a pattern can distinguish "any value" from "no value":
+// BlockScope is how narrowly a failed placement is excluded, matched to what actually
+// failed. It is a MATCH PATTERN, not a value, so the pointer fields are three-state:
 //
-//   - nil   => the axis is NOT APPLICABLE to this block: it matches only a
-//     candidate whose corresponding field is also empty. A CPU-only Pod (no
-//     accelerator) and a region-simple provider (no region) both leave the axis
-//     nil, so the block never spuriously widens across it.
-//   - &""   => WILDCARD: matches any value on that axis (a Spot-capacity block that
-//     spans every accelerator, say).
-//   - &"v"  => EXACT: matches only candidates whose field equals "v" (so a failed
-//     H100 request must not disqualify A100 on the same provider).
+//   - nil   => axis not applicable; matches only a candidate whose field is also empty
+//     (a CPU-only Pod has no accelerator, a region-simple provider no region).
+//   - &""   => wildcard: matches any value on that axis.
+//   - &"v"  => exact: only candidates equal to "v" (a failed H100 must not block A100).
 //
-// This is why the scope is assembled in two places: the adapter classifies from the
-// error alone (which knows the region — AWS is bound to one — but never the
-// accelerator, a property of the request), and the vnode handler fills the
-// accelerator in from the failing Pod. Neither can produce the full scope, so the
-// unset fields must be distinguishable from a deliberate wildcard — hence pointers.
-// DenyAll is the broadest scope and ignores the pattern fields entirely.
+// Pointers are needed because the scope is built in two places: the adapter classifies
+// from the error alone (which knows the region but not the accelerator, a property of the
+// request), and the vnode handler fills the accelerator in from the failing Pod. So
+// "unset" must be distinguishable from a deliberate wildcard. DenyAll ignores the pattern
+// fields entirely.
 //
-// This is the opposite sense to a value field like NodePoolSpec's
-// ProviderSpec.Regions, where empty means "the one default region" — because a
-// pattern matches, while a request takes a single default. The blocklist never
-// mixes the two: a NodePool candidate is resolved to fully-concrete values before
-// it is matched against these patterns.
+// Note this is the opposite sense to a value field like ProviderSpec.Regions, where empty
+// means "the default region". A candidate is resolved to concrete values before being
+// matched here, so the two never mix.
 type BlockScope struct {
-	// Accelerator: nil => not applicable (CPU-only Pod, or a DenyAll scope);
-	// &"" => wildcard, matches every accelerator; &"H100:8" => exactly that one
-	// pool. It is the request's POOL identity (type:count), NOT the provider's SKU
-	// id. Keying on the pool is what confines a capacity block to what actually ran
-	// out: an L4:8 Spot shortage must not exclude L4:1, a different pool, though both
-	// are "L4" — and it stays stable when a launch spans several interchangeable
-	// provider instance types (so a post-launch SKU choice never desyncs the key). A
-	// capacity error carries no accelerator (it is classified from the error alone),
-	// so the adapter leaves this nil and the vnode handler fills it in from the
-	// failing Pod's request.
+	// Accelerator: nil => not applicable (CPU-only Pod, or DenyAll); &"" => every
+	// accelerator; &"H100:8" => that one pool. The value is the request's POOL identity
+	// (type:count), not the provider's SKU id, so a block stays confined to what ran out:
+	// an L4:8 shortage must not exclude L4:1. It also stays stable when a launch spans
+	// several interchangeable instance types. Filled in by the vnode handler, since the
+	// adapter classifies from the error alone and cannot know it.
 	Accelerator *string
 	// CapacityType empty => blocks all capacity types.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region: nil => the provider has no region axis (a region-simple provider like
-	// Modal/RunPod, whose candidate carries an empty region too, so nil matches it);
-	// &"us-east-1" => confines the block to that one region, so a "no capacity in
-	// us-east-1" failure does not disqualify the same request in us-west-2. A
-	// region-aware provider (AWS) sets it; a region-simple one leaves it nil.
+	// Region: nil => the provider has no region axis (Modal/RunPod, whose candidates
+	// carry an empty region too); &"us-east-1" => that region only, so a shortage there
+	// does not disqualify us-west-2.
 	Region *string
-	// DenyAll true => block everything on this provider (e.g. auth/quota errors),
-	// ignoring AcceleratorID/CapacityType/Region. The scope is still this one
-	// provider; it never spans providers.
+	// DenyAll true => block everything on this provider (auth/quota errors), ignoring the
+	// fields above. Still scoped to this one provider; it never spans providers.
 	DenyAll bool
 }

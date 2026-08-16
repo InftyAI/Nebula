@@ -1,9 +1,10 @@
 # One remote box, provisioned on a NeoCloud GPU provider and surfaced as a Pod.
 #
-# NOTE: `kubectl exec` and `kubectl logs` do NOT work against a sandbox yet. The Pod
-# is backed by an instance in another cloud rather than a kubelet, and the in-container
-# agent that would serve those routes is not part of the project today — the virtual
-# kubelet answers NotFound. Watch `kubectl get sandbox` for phase/endpoint instead.
+# NOTE: `kubectl logs` works against the Pod backing this box — the manager answers the
+# log route the API server proxies to (pkg/vnode/kubelet.go). `kubectl exec` does NOT:
+# the Pod is backed by an instance in another cloud, and the in-container agent that
+# would serve exec is not part of the project today, so the virtual kubelet answers
+# NotFound. Watch `kubectl get sandbox` for phase/endpoint.
 #
 # There is no command field, by design: a box has nothing to run at boot, so the
 # controller supplies a placeholder command whose only job is to keep the container

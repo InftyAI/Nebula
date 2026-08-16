@@ -63,35 +63,29 @@ spec:
           spec:
             description: |-
               NodeClaimSpec is the durable identity of one external instance: who it serves,
-              which provider it lives on, and which policy produced it. It is created and
-              owned by the controller (not users), one per placed Pod. The workload shape
-              (image, resources, GPU type/count, spot) is NOT duplicated here — that lives
-              on the Pod, which the provider controller reads directly. NodeClaim is a
-              ledger, not a spec: its reason to exist is to survive the Node so teardown can
-              reclaim the external instance and never leak a paid GPU.
+              which provider it lives on, and which policy produced it. Controller-created (not
+              user-facing), one per placed Pod. The workload shape (image, resources, GPU
+              type/count, spot) is NOT duplicated here — it lives on the Pod, which the provider
+              controller reads directly. This is a ledger, not a spec: it exists to survive the
+              Node so teardown can reclaim the instance and never leak a paid GPU.
             properties:
               accelerator:
                 description: |-
-                  Accelerator is the requested accelerator pool this claim serves, as
-                  "type:count" (e.g. "H100:8"), resolved at placement time from the Pod's
-                  accelerator type + count. It names the POOL, not the concrete SKU: a launch
-                  may span several interchangeable provider instance types (AWS's fleet tries
-                  alternates), so the exact instance type is only known post-launch from the
-                  observed instance — this field stays truthful regardless of which alternate
-                  lands. Unlike Provider/CapacityType/Region it is NOT a provisioning input (the
-                  provider re-derives it from the Pod) — it is recorded for reporting, like
-                  PoolRef, so `kubectl get nc` shows what each instance serves without
-                  cross-referencing the Pod. Empty for a CPU-only claim, which requests no
-                  accelerator.
+                  Accelerator is the accelerator pool this claim serves, as "type:count" (e.g.
+                  "H100:8"), resolved at placement time from the Pod. It names the POOL, not the
+                  SKU: a launch may span several interchangeable instance types (AWS's fleet tries
+                  alternates), so this stays truthful regardless of which alternate lands. Unlike
+                  Provider/CapacityType/Region it is NOT a provisioning input (the provider
+                  re-derives it from the Pod) — it is recorded so `kubectl get nc` shows what each
+                  instance serves. Empty for a CPU-only claim.
                 type: string
               capacityType:
                 description: |-
-                  CapacityType is the purchase tier the placement optimizer selected
-                  (Spot/OnDemand). It is stored durably here because it is the one
-                  provisioning input that cannot be read off the Pod, and Provision needs it
-                  to re-issue the request after a controller restart. Immutable, like
-                  Provider. Empty means "let the provider use its default" (e.g. Modal is
-                  OnDemand-only and ignores it).
+                  CapacityType is the purchase tier placement selected (Spot/OnDemand). Stored
+                  durably because it is a provisioning input that cannot be read off the Pod, and
+                  Provision needs it to re-issue the request after a controller restart. Immutable,
+                  like Provider. Empty means "use the provider's default" (Modal is OnDemand-only
+                  and ignores it).
                 enum:
                 - Spot
                 - OnDemand
@@ -128,20 +122,15 @@ spec:
                 type: string
               region:
                 description: |-
-                  Region is the region candidate the placement optimizer selected, in the
-                  provider's own vocabulary (e.g. AWS "us-east-1"). Stored durably alongside
-                  Provider/CapacityType because it is a provisioning input that cannot be read
-                  off the Pod, and Provision needs it to re-issue the request in the same
-                  region after a controller restart. Immutable, like Provider. Empty means
-                  "the provider's configured default region" — a provider with no region
-                  constraint declared on the pool leaves it empty.
+                  Region is the region candidate placement selected, in the provider's own
+                  vocabulary (e.g. AWS "us-east-1"). Durable and immutable for the same reason as
+                  CapacityType: Provision must re-issue in the same region after a restart. Empty
+                  means the provider's default — a pool that declared no region constraint.
 
-                  It is not always a single region NAME: a provider whose create cannot fail
-                  over collapses every region the pool declared into ONE candidate, and stores
-                  them joined by a provider-private separator (Modal uses "|", so a pool
-                  declaring us-east and us-west records "us-east|us-west"). Only that provider
-                  can split the value back, which it does at the API boundary. Treat the field
-                  as an opaque provider-scoped token rather than parsing it.
+                  Not always a single region NAME: a provider whose create cannot fail over
+                  collapses every declared region into ONE candidate, joined by a provider-private
+                  separator (Modal uses "|", so us-east + us-west records "us-east|us-west"). Only
+                  that provider can split it back. Treat the value as an opaque token.
                 type: string
             required:
             - podRef

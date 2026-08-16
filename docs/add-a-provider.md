@@ -63,6 +63,33 @@ Most adapters embed `catalog.Base` for the generic `Name`, `Offerings`, and the
 identity `MapAccelerator`, overriding only what the provider does differently (see
 how `pkg/provider/modal` embeds it).
 
+### Optional: `provider.LogStreamer`, for `kubectl logs`
+
+Implement it and `kubectl logs` works against your provider's Pods; leave it out and
+they answer `NotFound`. Nothing else changes either way — the capability is resolved by
+type assertion, so there is no stub to carry (`pkg/provider/modal` is the reference).
+
+```go
+Logs(ctx context.Context, instanceID string) (io.ReadCloser, error)
+```
+
+The contract is deliberately **option-free**: return ONE stream that starts at the
+instance's first byte, follows until the instance exits or the stream is closed, and
+merges stdout and stderr. Do not interpret `--follow`, `--tail` or `--limit-bytes` —
+`pkg/vnode/logs.go` applies all of them for every provider, so a provider that
+second-guessed them would give a different answer to the same flags. Two requirements
+carry weight:
+
+- A missing or unknown instance must return an **error**, never an empty stream. An
+  empty stream reads as "this workload printed nothing", which is a lie about a
+  sandbox that has aged out of the provider's retention.
+- `Close` on your reader must release the underlying call. It is called when a
+  `kubectl logs -f` client disconnects, and on a long-polling API that is one open
+  request per abandoned client if it does not land.
+
+See [status.md § Logs](status.md#logs) for what the kubelet side does with the stream,
+including which kubectl flags are ignored and why.
+
 ## 2. Add the price/availability catalog
 
 Add `pkg/provider/catalog/data/<name>.csv` (embedded at build time — see

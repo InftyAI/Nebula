@@ -43,14 +43,11 @@ import (
 // after the Pod is created, and a stale "absent" must not trigger teardown of a
 // live instance.
 //
-// The window it needs to cover is small: the claim is always created AFTER its
-// Pod (placement reads the Pod, then creates the claim), so the Pod already
-// exists at the API server by the time this claim reconciles — only cache
-// propagation, not Pod creation, is being waited on. A Pod watch re-enqueues the
-// claim the moment the cache catches up, so this is just the backstop for a
-// missed event; seconds are plenty. Once an instance has been confirmed to exist
-// (Phase set to Bound) a later disappearance is trusted immediately — no grace —
-// because we KNOW the Pod existed and is now gone.
+// The window is small: a claim is always created AFTER its Pod, so the Pod already exists at
+// the API server and only cache propagation is being waited on. A Pod watch re-enqueues the
+// claim as soon as the cache catches up, so this is just the backstop for a missed event.
+// Once an instance has been confirmed (Phase Bound), a later disappearance is trusted
+// immediately — we KNOW the Pod existed and is now gone.
 const placementGracePeriod = 15 * time.Second
 
 // podReasonInitializing is the Pod status.Reason the virtual node stamps while the
@@ -63,25 +60,19 @@ const podReasonInitializing = nebulav1alpha1.PodReasonInitializing
 
 // NodeClaimReconciler reconciles a NodeClaim object.
 //
-// Ownership model: the virtual kubelet owns the instance lifecycle — its pod
-// controller provisions on CreatePod and terminates on DeletePod (see
-// pkg/vnode). Workload status is the POD's job; the claim does not mirror it.
-// The claim exists for exactly one reason: to be a durable, cluster-scoped
-// TEARDOWN BACKSTOP.
+// Ownership model: the virtual kubelet owns the instance lifecycle (provision on CreatePod,
+// terminate on DeletePod), and workload status is the POD's job. The claim exists for one
+// reason: to be a durable, cluster-scoped TEARDOWN BACKSTOP.
 //
-// Why a backstop is needed: VK's teardown is edge-triggered (it reacts to a Pod
-// delete event) and its instance tracking is in-memory, so a Pod force-deleted
-// while a provider's VK is down leaks a paid instance — on restart VK sees no
-// Pod and no delete event, so it never calls Terminate. The claim closes that
-// gap by holding a finalizer: because the claim is cluster-scoped it outlives
-// the namespaced Pod, so its lifecycle is level-triggered (reconciled on every
-// restart). When the served Pod is gone the claim self-deletes, and the
-// finalizer reclaims the instance — resolving the provider, finding the instance
-// by its Pod-derived claim name via List, and Terminating it — independent of VK
-// liveness.
+// Why a backstop is needed: VK's teardown is edge-triggered and its tracking in-memory, so a
+// Pod force-deleted while that provider's VK is down leaks a paid instance — on restart VK
+// sees no Pod and no delete event, so it never calls Terminate. The claim is cluster-scoped,
+// so it outlives the namespaced Pod and is reconciled level-triggered on every restart. When
+// the served Pod is gone it self-deletes, and its finalizer reclaims the instance (resolve
+// provider → find by claim name via List → Terminate) independent of VK liveness.
 //
-// Self-delete is guarded (see placementGracePeriod) so cache lag never tears
-// down a live workload.
+// Self-delete is guarded by placementGracePeriod so cache lag never tears down a live
+// workload.
 type NodeClaimReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -277,31 +268,22 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 // claim does NOT mirror the Pod's fine-grained runtime status — it tracks only
 // the coarse lifecycle its teardown job needs:
 //
-//   - Terminal Pod (Failed/Succeeded) => Terminated. VK reports a vanished
-//     instance this way; a restartPolicy:Never Pod lingers terminal rather than
-//     being deleted, so keying off existence alone would wedge the claim at Bound.
-//   - Pod being deleted (DeletionTimestamp set) => Terminating. The workload is on
-//     its way out but the instance may not be reclaimed yet, so this is a forward
-//     transition from ANY phase — it is checked before the Bound-hold below so a
-//     Bound (or Provisioning) Pod that starts deleting is not stranded on its prior
-//     phase. Terminal wins over it: an already-gone instance is Terminated, not
-//     merely terminating.
-//   - Bound already => "" (hold). Bound is the durable teardown guard, and it must
-//     never be stripped: losing it would make a later disappearance read as cache
-//     lag and skip teardown of a live instance. Returning "" holds the phase while
-//     markPhase still refreshes the id.
-//   - An instance EXISTS => Bound. Two Pod shapes prove existence, and the claim
-//     treats them identically because its question is existence, not readiness:
-//     Running (up and past its readiness bar) and Pending/Initializing (created and
-//     booting — vnode stamps that reason only on evidence of existence, either an
-//     instance observed in the provider's List or a reserved Provision). A booting
-//     GPU box is just as real, and just as billable, as a serving one; if its Pod
-//     vanishes it must be reclaimed with no grace.
-//   - Otherwise => Provisioning. No capacity has been allocated (the Provision call
-//     may still be in flight, or it returned an unreserved id — a Modal sandbox still
-//     queued for a GPU), so a vanished Pod may be cache lag and the grace window
-//     applies. An unreserved instance does exist, so this understates it for one poll
-//     tick; the grace path still reclaims by asking the provider what exists.
+//   - Terminal Pod (Failed/Succeeded) => Terminated. A restartPolicy:Never Pod lingers
+//     terminal rather than being deleted, so keying off existence alone would wedge the
+//     claim at Bound.
+//   - Pod being deleted => Terminating. A forward transition from ANY phase, checked before
+//     the Bound-hold so a deleting Pod is not stranded on its prior phase. Terminal wins:
+//     an already-gone instance is Terminated, not merely terminating.
+//   - Bound already => "" (hold). Bound is the durable teardown guard and must never be
+//     stripped, or a later disappearance would read as cache lag and skip teardown of a
+//     live instance. "" holds the phase while markPhase still refreshes the id.
+//   - An instance EXISTS => Bound. Both Running and Pending/Initializing prove existence,
+//     and the claim's question is existence, not readiness: a booting GPU box is just as
+//     billable as a serving one, so if its Pod vanishes it is reclaimed with no grace.
+//   - Otherwise => Provisioning. No capacity allocated yet (the call may be in flight, or
+//     returned an unreserved id), so a vanished Pod may be cache lag and grace applies. An
+//     unreserved instance does exist, so this understates it for one tick; the grace path
+//     still reclaims by asking the provider what exists.
 func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) nebulav1alpha1.NodeClaimPhase {
 	switch {
 	case isTerminal(pod.Status.Phase):

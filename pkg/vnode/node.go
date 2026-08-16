@@ -41,12 +41,10 @@ import (
 // informerResync is the full-resync period for the virtual node's informers.
 const informerResync = time.Minute
 
-// podSyncWorkers is the number of concurrent workers the pod controller runs per
-// queue (create/delete/status-sync). VK serializes work per pod key, so distinct
-// pods provision in parallel while the same key never runs twice at once — this
-// removes the head-of-line blocking where one slow (cold-region) provision stalled
-// pods that would otherwise succeed instantly. Kept modest to bound concurrent
-// CreateFleet bursts against the provider's API rate limits.
+// podSyncWorkers is how many workers the pod controller runs per queue. VK serializes
+// work per pod key, so distinct pods provision in parallel while one key never runs
+// twice — without this, a single slow provision blocks pods that would succeed
+// instantly. Modest, to bound concurrent bursts against a provider's rate limits.
 const podSyncWorkers = 8
 
 // NodeName returns the virtual node name for a provider: "nebula-<provider>".
@@ -56,11 +54,9 @@ func NodeName(providerName string) string {
 	return "nebula-" + providerName
 }
 
-// RBAC for the virtual kubelet. The VK pod controller reports Pod status back to
-// the API server and reacts to the config/secret/service objects a Pod
-// references; the node controller creates/maintains the virtual Node and its
-// node lease and emits events. These grants back the node/pod controllers wired
-// in Start.
+// RBAC for the virtual kubelet: the pod controller reports Pod status and reads the
+// config/secret/service objects a Pod references; the node controller maintains the
+// Node, its lease, and events.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;create;update;patch;delete
@@ -69,32 +65,37 @@ func NodeName(providerName string) string {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
-// Runner is a manager.Runnable that owns one provider's virtual node. It starts
-// the VK node/pod controllers and blocks until the manager's context is
-// cancelled, so it participates in the manager's lifecycle (and, if enabled,
-// leader election) like any other runnable.
+// Runner is a manager.Runnable owning one provider's virtual node. It starts the VK
+// node/pod controllers and blocks until the manager's context is cancelled, so it
+// follows the manager's lifecycle and leader election like any other runnable.
 //
-// It deliberately wires the lower-level virtual-kubelet `node` package directly
-// rather than the `nodeutil` convenience wrapper: nodeutil pulls in a kubelet
-// HTTP/auth stack whose apiserver dependency does not compile against the k8s
-// 0.33 line this project pins. Nebula does not serve the kubelet API (logs/exec
-// are unsupported — see handler.go), so none of that surface is needed.
+// It wires virtual-kubelet's lower-level `node` package directly rather than the
+// `nodeutil` wrapper, which pulls in a kubelet HTTP/auth stack whose apiserver
+// dependency does not compile against the k8s 0.33 line we pin. The one kubelet route
+// we serve (logs) is hosted by KubeletServer, which needs none of it.
 type Runner struct {
 	prov      provider.Provider
 	client    kubernetes.Interface
 	blocklist Blocklister
 	nodeName  string
+
+	// kubelet is the shared endpoint serving `kubectl logs` for every node. Nil is
+	// supported: the node then advertises no address, so the API server reports "node does
+	// not have an address" instead of hanging on a port nothing serves.
+	kubelet *KubeletServer
 }
 
-// NewRunner builds the virtual-node runner for one provider. blocklist is the
-// shared failover blocklist the handler records Provision failures on (may be
-// nil).
-func NewRunner(prov provider.Provider, client kubernetes.Interface, blocklist Blocklister) *Runner {
+// NewRunner builds the virtual-node runner for one provider. blocklist (Provision
+// failures) and kubelet (the log endpoint) are both shared, and both may be nil.
+func NewRunner(
+	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister, kubelet *KubeletServer,
+) *Runner {
 	return &Runner{
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
 		nodeName:  NodeName(prov.Name()),
+		kubelet:   kubelet,
 	}
 }
 
@@ -107,6 +108,15 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	handler := NewHandler(r.prov, r.client, r.blocklist)
 	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
+
+	// Register on the endpoint AND advertise it, so the API server can proxy `kubectl
+	// logs` here. Both together: advertising an endpoint nobody serves makes logs hang
+	// instead of failing fast.
+	if r.kubelet != nil {
+		r.kubelet.Register(r.nodeName, handler)
+		nodeSpec.Status.Addresses = r.kubelet.nodeAddress()
+		nodeSpec.Status.DaemonEndpoints = r.kubelet.daemonEndpoints()
+	}
 
 	// Pod informer scoped to this node only (spec.nodeName == nodeName), so the
 	// pod controller reacts to exactly the Pods the scheduler bound here.
@@ -219,20 +229,16 @@ func nodeSpec(nodeName, providerName string) *corev1.Node {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: nodeName,
 			Labels: map[string]string{
-				// hostname is a well-known label the scheduler's default topology
-				// spread keys off. ProviderLabel routes a Pod to this provider's node
-				// (the placement controller's nodeSelector, paired with the NoSchedule
-				// taint of the same key below). ManagedByLabel is the management-scoped
-				// "this object is Nebula's" marker for tooling, policies, and queries.
+				// hostname is what the scheduler's default topology spread keys off.
+				// ProviderLabel routes a Pod here (placement's nodeSelector, paired with
+				// the NoSchedule taint of the same key below). ManagedByLabel marks the
+				// object as Nebula's for tooling and policies.
 				corev1.LabelHostname:          nodeName,
 				nebulav1alpha1.ProviderLabel:  providerName,
 				nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
-				// Populate the ROLES column of `kubectl get nodes`, which is derived
-				// solely from node-role.kubernetes.io/<role> label KEYS (the value is
-				// ignored, so it is conventionally ""). Two roles are advertised:
-				// "worker" so the node reads as a schedulable worker like any other (it
-				// runs Pods), and "nebula" so Nebula's virtual nodes are identifiable at
-				// a glance rather than blending in with real workers.
+				// The ROLES column of `kubectl get nodes` comes from these label KEYS
+				// alone (the value is ignored, hence ""). "worker" so the node reads as a
+				// normal schedulable worker, "nebula" so ours stand out from real ones.
 				"node-role.kubernetes.io/worker": "",
 				"node-role.kubernetes.io/nebula": "",
 			},
@@ -246,19 +252,15 @@ func nodeSpec(nodeName, providerName string) *corev1.Node {
 		},
 		Status: corev1.NodeStatus{
 			NodeInfo: corev1.NodeSystemInfo{
-				// Surfaces in the VERSION column of `kubectl get nodes`. Stamped at
-				// build time via -ldflags (see pkg/version); an unstamped build reports
-				// "nebula-dev".
+				// The VERSION column of `kubectl get nodes`, stamped at build time via
+				// -ldflags (see pkg/version); an unstamped build reports "nebula-dev".
 				KubeletVersion:  version.Get(),
 				OperatingSystem: "linux",
-				// Architecture feeds the well-known kubernetes.io/arch label, which
-				// workloads pin via nodeSelector/affinity. amd64 is correct for every
-				// currently-wired provider (Modal/RunPod are x86). The true arch isn't
-				// known at node-creation time (no instance exists yet), so this is a
-				// per-provider default, not a universal truth.
-				// TODO: source arch from the provider (e.g. via Capabilities) when an
-				// arm64 provider (e.g. Grace-Hopper/GH200) lands, or a Pod pinning
-				// kubernetes.io/arch=arm64 will fail to schedule onto this node.
+				// Architecture feeds the kubernetes.io/arch label that workloads pin on.
+				// A default, not a truth: no instance exists yet at node-creation time,
+				// and amd64 is right for every wired provider.
+				// TODO: source it from the provider when an arm64 backend (GH200) lands,
+				// or a Pod pinning arch=arm64 will fail to schedule here.
 				Architecture: "amd64",
 			},
 			// Advertise generous virtual capacity; the external provider, not the
@@ -289,29 +291,21 @@ func markNodeReady(n *corev1.Node) {
 	})
 }
 
-// nvidiaGPUResource is the extended-resource key GPU Pods may request under. A
-// Nebula Pod expresses its accelerator type+count on the accelerators annotation
-// (the provider reads it from there, not from limits), but a Pod author may
-// still set nvidia.com/gpu limits for portability; if they do, the virtual node
-// must advertise the resource or the scheduler rejects the Pod with "Insufficient
-// nvidia.com/gpu" before provisioning ever starts.
+// nvidiaGPUResource is the extended-resource key GPU Pods may request under. A Nebula Pod
+// declares its accelerator on the annotation (which the provider reads), but an author may
+// also set nvidia.com/gpu limits for portability — and then the node must advertise the
+// resource or the scheduler rejects the Pod before provisioning starts.
 const nvidiaGPUResource = "nvidia.com/gpu"
 
-// virtualCapacity is the nominal capacity advertised by a virtual node. The
-// numbers are deliberately synthetic and effectively infinite: a virtual node
-// has no real machine behind it, so capacity's only job is to clear the
-// scheduler's fit check (requests ≤ allocatable) and let the Pod bind. The
-// provider enforces the real shape and rejects (→ failover) if the workload
-// can't actually be satisfied. GPUs are advertised for the same reason as
-// cpu/memory — a GPU Pod carries nvidia.com/gpu in its limits, and without an
-// allocatable count here the scheduler would never bind it.
+// virtualCapacity is what a virtual node advertises. The numbers are synthetic and
+// effectively infinite: there is no real machine here, so capacity's only job is to clear
+// the scheduler's fit check and let the Pod bind. The provider enforces the real shape and
+// rejects (→ failover) what it cannot satisfy.
 //
-// TODO: this advertises only nvidia.com/gpu, the sole key the current (Modal)
-// provider reads. A provider serving a different accelerator resource key (e.g.
-// amd.com/gpu, or a typed MIG key) would have its GPU Pods rejected by the
-// scheduler before provisioning. When such a provider lands, drive capacity from
-// the provider instead of this shared list — e.g. have Capabilities declare the
-// accelerator resource keys it serves and build the node capacity from that.
+// TODO: only nvidia.com/gpu is advertised. A provider serving a different accelerator key
+// (amd.com/gpu, a typed MIG key) would have its GPU Pods rejected before provisioning;
+// when one lands, have Capabilities declare its resource keys and build capacity from
+// that.
 func virtualCapacity() corev1.ResourceList {
 	return corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("1k"),

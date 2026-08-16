@@ -92,8 +92,9 @@ the standard `nvidia.com/gpu` resource limit, so scheduling and provisioning rea
 the same number. Do not set `nodeName` or a provider `nodeSelector` yourself — the
 placement controller owns those.
 
-> `kubectl logs`/`exec` do not work against a virtual node (it doesn't serve the
-> kubelet API); read workload output on the provider side.
+> `kubectl logs` works, `-f` and `--tail` included: the manager serves the one kubelet
+> route the API server proxies for logs. `--timestamps`/`--previous`/`--since` are
+> ignored, and `kubectl exec` still does not work — use the provider's shell for that.
 
 ## Getting started
 

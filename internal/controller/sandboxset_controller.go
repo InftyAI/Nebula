@@ -37,16 +37,14 @@ import (
 // objects so that spec.Replicas of them exist, and rolls their readiness up into
 // the set's status.
 //
-// It deliberately knows nothing about Pods, instances, or providers. Its entire
-// vocabulary is Sandbox objects, and the Sandbox controller handles what one box
-// means — which is what makes the two-type split pay off: scaling logic and box
-// lifecycle never tangle.
+// It knows nothing about Pods, instances, or providers — its whole vocabulary is Sandbox
+// objects, and the Sandbox controller handles what one box means. That split keeps scaling
+// logic and box lifecycle from tangling.
 //
-// A template change does NOT roll existing boxes. This mirrors ReplicaSet, not
-// Deployment, and here it is the only defensible behaviour: a rolling update would
-// evict live sessions and burn minutes of provisioning per box to deliver a change
-// nobody attached to a running sandbox asked for. New boxes get the new template;
-// existing ones are left alone until something else removes them.
+// A template change does NOT roll existing boxes: this mirrors ReplicaSet, not Deployment,
+// because a rolling update would evict live sessions and burn minutes of provisioning per
+// box for a change nobody attached to a running sandbox asked for. New boxes get the new
+// template; existing ones are left alone.
 type SandboxSetReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -255,14 +253,12 @@ func (r *SandboxSetReconciler) scaleDown(ctx context.Context, victims []nebulav1
 //  3. Ready boxes — youngest first, on the reasoning that the most recently created
 //     box is the least likely to have been claimed and worked in.
 //
-// This is deliberately NOT StatefulSet's highest-ordinal rule, which here would
-// mean "kill whichever box happens to sort last" — including one in active use
-// while a failed box sits beside it.
+// Deliberately NOT StatefulSet's highest-ordinal rule, which would kill whichever box sorts
+// last — possibly one in active use while a failed box sits beside it.
 //
-// The rule we actually want for step 3 is least-recently-USED, so an idle box goes
-// before one holding a live session. That needs per-box activity data, which nothing
-// inside the box reports today; "youngest Ready" is the best available proxy until
-// something does.
+// TODO: step 3 really wants least-recently-USED, so an idle box goes before one holding a
+// live session. That needs per-box activity data nothing reports today; "youngest Ready" is
+// the proxy until something does.
 func selectForRemoval(owned []nebulav1alpha1.Sandbox, n int) []nebulav1alpha1.Sandbox {
 	if n >= len(owned) {
 		return owned

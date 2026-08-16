@@ -26,13 +26,10 @@ import (
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
-// Pod status reasons the virtual node stamps on the Pod it reports. The Pod is the
-// source of truth for the external instance's runtime state (the NodeClaim is a
-// passive ledger and does not mirror it), and this package is the only writer — but
-// the reason strings themselves are a shared contract (the NodeClaim controller
-// reads them, and operators match on them), so they are declared once in
-// api/v1alpha1 rather than privately here. See the const block there for what each
-// value means and why the set is public.
+// Pod status reasons the virtual node stamps on the Pods it reports. This package is
+// the only writer, but the strings are a shared contract (the NodeClaim controller reads
+// them, operators match on them), so they live in api/v1alpha1 — see that const block
+// for what each means.
 const (
 	reasonProvisioning    = nebulav1alpha1.PodReasonProvisioning
 	reasonInitializing    = nebulav1alpha1.PodReasonInitializing
@@ -42,39 +39,31 @@ const (
 	reasonTerminated      = nebulav1alpha1.PodReasonTerminated
 )
 
-// applyState maps a provider Instance state onto the Pod status the virtual node
-// reports. The Pod is the object the scheduler and user see, so the external
-// instance's lifecycle is projected onto standard Pod phases/conditions:
+// applyState projects a provider Instance state onto the Pod status, since the Pod is
+// what the scheduler and user see:
 //
 //	Running    -> PodRunning, Ready=True
 //	Pending    -> PodPending, Ready=False (starting)
 //	Failed     -> PodFailed
 //	Terminated -> PodFailed (instance gone: torn down or reclaimed out-of-band)
 //
-// Running already means "reachable": a provider only reports InstanceRunning once
-// the instance has passed its readiness bar — for AWS the 2/2 EC2 status checks,
-// for Modal its readiness probe when the sandbox was created with one (see each
-// adapter's toState). So reaching Running is the point at which the Pod is both
-// Running and Ready. Ready is the condition Kubernetes counts toward a
-// Deployment's ready replicas, which is why holding it back until the instance is
-// genuinely reachable matters.
+// Running already means "reachable": a provider reports InstanceRunning only once the
+// instance passed its readiness bar (AWS's 2/2 status checks, Modal's readiness probe).
+// That matters because Ready is what Kubernetes counts toward a Deployment's ready
+// replicas.
 //
-// The bar is only as good as the provider's signal: a Modal sandbox created
-// WITHOUT a readiness probe has no observable readiness at all, so it reaches
-// Running as soon as its process is live.
+// The bar is only as good as the provider's signal — a Modal sandbox created WITHOUT a
+// probe has no observable readiness, so it reaches Running as soon as its process is live.
 func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, now metav1.Time) {
 	switch state {
 	case provider.InstanceRunning:
 		setPhase(pod, corev1.PodRunning, reasonRunning, "external instance is running", now)
 		setReady(pod, corev1.ConditionTrue, now)
 		setContainerStatuses(pod, corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}}, true)
-		// PodIP is validated by the API server as a literal IP, so only populate it
-		// when the endpoint actually is one — an AWS public DNS name (the common
-		// case) would make the whole status UpdateStatus fail with a 422 and strand
-		// the Pod on its prior (Initializing) status forever. The endpoint is always
-		// surfaced on EndpointAnnotation regardless of form (see Handler.patchEndpoint),
-		// so a DNS-only instance still exposes its reachable address; PodIP just stays
-		// empty in that case.
+		// The API server validates PodIP as a literal IP, so only set it when the
+		// endpoint is one: a DNS name (AWS's common case) would fail the whole
+		// UpdateStatus with a 422 and strand the Pod on its prior status. The address is
+		// published on EndpointAnnotation either way, so nothing is lost.
 		if endpoint != "" && net.ParseIP(endpoint) != nil {
 			pod.Status.PodIP = endpoint
 		}
@@ -95,10 +84,10 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 			},
 		}, false)
 	case provider.InstanceTerminated:
-		// The instance is simply gone — absent from the provider's List, whether
-		// torn down by us, deleted out-of-band, or reclaimed. We cannot tell WHY
-		// from disappearance alone, so report the neutral, accurate "Terminated"
-		// rather than "Preempted", which would falsely assert a provider reclaim.
+		// Gone from the provider's List — torn down by us, deleted out-of-band, or
+		// reclaimed. Disappearance alone cannot say WHY, so report the neutral
+		// "Terminated" rather than "Preempted", which would assert a reclaim we
+		// did not observe.
 		setPhase(pod, corev1.PodFailed, reasonTerminated, "external instance is gone", now)
 		setReady(pod, corev1.ConditionFalse, now)
 		setContainerStatuses(pod, corev1.ContainerState{
@@ -111,14 +100,11 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 	}
 }
 
-// setContainerStatuses projects the single external-instance lifecycle onto a
-// per-container status for every container in the Pod spec. Kubernetes has no
-// notion of the external instance — the READY column, `kubectl wait`, and any
-// controller keying off container readiness all read Status.ContainerStatuses,
-// so a Pod with an empty array reads as 0/N even when its Ready condition is
-// True. There is one real workload behind the whole Pod, so every container
-// mirrors the same state. The container's Image is echoed back (required field);
-// RestartCount stays 0 (the provider owns restarts, not the kubelet).
+// setContainerStatuses mirrors the one instance's state onto every container in the spec.
+// The READY column, `kubectl wait`, and anything keying off container readiness read
+// Status.ContainerStatuses, so an empty array reads as 0/N even with Ready=True. There is
+// one real workload behind the Pod, so every container reports the same thing. Image is
+// echoed back (required field); RestartCount stays 0, since the provider owns restarts.
 func setContainerStatuses(pod *corev1.Pod, state corev1.ContainerState, ready bool) {
 	statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
 	for i := range pod.Spec.Containers {

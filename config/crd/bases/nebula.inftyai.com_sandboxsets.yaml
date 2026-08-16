@@ -55,29 +55,20 @@ spec:
             type: object
           spec:
             description: |-
-              SandboxSetSpec maintains N Sandboxes. That is the whole contract, and the name
-              says exactly that much: it is a SET, not a pool. A pool would imply lease
-              semantics — claim a box, hold it, return it, with the pool tracking who has what
-              — and none of that is implemented here. Keeping N boxes alive is what ENABLES
-              warm pooling (holding instances ready because provisioning takes minutes while
-              an agent's exec call wants sub-second) and fan-out ("twenty boxes for this
-              batch"), but those are uses of a set, not the set's job. "Pool" would also be a
-              third meaning of that word in this API group, where NodePool already means
-              placement policy.
+              SandboxSetSpec maintains N Sandboxes. That is the whole contract — a SET, not a
+              pool: there are no lease semantics here (claim a box, hold it, return it). Keeping
+              N boxes alive is what ENABLES warm pooling and fan-out, but those are uses of a
+              set, not its job. "Pool" is also already taken in this API group by NodePool.
 
-              It creates Sandbox OBJECTS, not replicas inside itself, and that is the point of
-              having two types. The count is a genuinely different concern from the box: a set
-              answers "how many", a Sandbox answers "which one, running what, for whom".
-              Because each box stays its own object underneath, per-box RBAC, per-box status
-              and a failure that stays visible all keep working — none of which survives being
-              flattened into a replica index.
+              It creates Sandbox OBJECTS, not replicas inside itself: a set answers "how many",
+              a Sandbox answers "which one, running what, for whom". Because each box stays its
+              own object, per-box RBAC, per-box status, and a visible failure keep working —
+              none of which survives being flattened into a replica index.
 
-              Boxes get GENERATED names (myset-a4f2x), not ordinals. Ordinals would imply a
-              slot that gets refilled, so a box that died would be replaced by an empty one
-              wearing the same name — the same address with a different filesystem, which is
-              the most confusing thing this API could do. A generated name means a replacement
-              is visibly a NEW box, and callers that need a stable handle hold the Sandbox name
-              they were given rather than an index into a set.
+              Boxes get GENERATED names (myset-a4f2x), not ordinals. An ordinal implies a slot
+              that gets refilled, so a dead box would be replaced by an empty one wearing the
+              same name — same address, different filesystem. A generated name makes a
+              replacement visibly a NEW box.
             properties:
               replicas:
                 default: 1
@@ -259,26 +250,20 @@ spec:
                       image:
                         default: ubuntu:24.04
                         description: |-
-                          Image is the container image the sandbox runs. It defaults to a plain Ubuntu,
-                          because unlike the accelerator the image is not a decision a caller has to make
-                          to get a useful box: `kubectl exec` into a bare distro is exactly the "give me a
-                          remote shell" case, and anything else can be installed from inside it. Defaulting
-                          a paid GPU shape would be guessing at spend; defaulting a shell is not.
+                          Image is the container image the sandbox runs, defaulting to a plain Ubuntu:
+                          a bare distro to exec into IS the "give me a remote shell" case, and anything
+                          else can be installed from inside it. (Defaulting a paid GPU shape would be
+                          guessing at spend; defaulting a shell is not.)
 
-                          Note it deliberately does NOT default to a CUDA image even when an accelerator is
-                          requested. A conditional default would make the image depend on another field,
-                          which structural-schema defaulting cannot express and which would surprise anyone
-                          reading the object back. Ask for a CUDA image explicitly when you want one.
+                          It does NOT switch to a CUDA image when an accelerator is requested: a default
+                          that depends on another field is not expressible in a structural schema. Ask for
+                          a CUDA image explicitly.
 
-                          There is deliberately no command field, and one cannot be set: the CRD is a
-                          structural schema, so `command:` in a Sandbox spec is rejected as an unknown
-                          field by the apiserver itself — no webhook required. That is not a
-                          simplification, it is the process model: a sandbox has nothing to run at boot,
-                          so the controller supplies a placeholder command whose only job is to keep the
-                          container from exiting (today this is implemented with a long-running `sleep`,
-                          which must exist in the chosen image). Nebula does not currently support
-                          `kubectl exec`/`kubectl logs` against sandboxes; a user-supplied command would
-                          displace the placeholder and take the instance down with it.
+                          There is no command field and one cannot be set — the structural schema rejects
+                          `command:` as unknown, no webhook needed. A sandbox has nothing to run at boot,
+                          so the controller supplies a placeholder that only has to not exit (today a
+                          long-running `sleep`, which the image must have). A user command would displace
+                          it and take the instance down.
                         minLength: 1
                         type: string
                       nodePoolRef:

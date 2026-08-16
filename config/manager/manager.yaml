@@ -82,6 +82,17 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+          # What the virtual nodes advertise as their kubelet endpoint, which is what
+          # makes `kubectl logs` work — the API server proxies logs there rather than
+          # reading them from etcd (see pkg/vnode/kubelet.go).
+          #
+          # Must be THIS Pod's IP, not a Service: tracked pods live in the leader's
+          # memory, so a Service could reach a replica that knows nothing about the pod.
+          # Unset (manager off-cluster) just disables the endpoint.
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
         envFrom:
           # Provider credentials live in a per-provider Secret, one secretRef per
           # provider — NOT a single shared secret. This matches the "creds-absent →
@@ -107,7 +118,19 @@ spec:
           # - secretRef:
           #     name: nebula-runpod-credentials
           #     optional: true
-        ports: []
+        ports:
+        # The kubelet API the API server dials for `kubectl logs` (10250, like a real
+        # kubelet). Declaring it is documentation and NetworkPolicy surface; the
+        # listener binds either way.
+        #
+        # It serves TLS with a self-signed cert but does NOT verify client certs by
+        # default, because which CA signs the API server's kubelet client cert is not
+        # portable — requiring it would break logs on managed control planes. So
+        # anything able to reach this port can read any Nebula pod's logs: restrict it
+        # with a NetworkPolicy, or set --kubelet-client-ca to require mTLS.
+        - name: kubelet-api
+          containerPort: 10250
+          protocol: TCP
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false

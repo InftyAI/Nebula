@@ -18,8 +18,9 @@
 # fails or is torn down, so the workload — and its backing GPU instance — is
 # self-healing rather than a one-shot that lingers Failed.
 #
-# Prereqs: the NodePool below must exist (kubectl apply -k config/samples applies
-# both), and its providers must be registered (their credential Secrets present).
+# Prereqs: the NodePool must exist (kubectl apply -f config/samples/nodepool.yaml
+# -f config/samples/deployment.yaml applies both), and its providers must be
+# registered (their credential Secrets present).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,7 +29,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: nebula
 spec:
-  replicas: 8
+  replicas: 1
   selector:
     matchLabels:
       app: gpu-workload-sample
@@ -38,7 +39,7 @@ spec:
         app: gpu-workload-sample
         nebula.inftyai.com/enabled: "true"
         nebula.inftyai.com/nodepool: sample
-        nebula.inftyai.com/accelerator-type: a100-40gb
+        nebula.inftyai.com/accelerator-type: t4
     spec:
       # Do NOT set nodeName or a provider nodeSelector yourself — the placement
       # controller fills the nodeSelector in when it ungates the Pod. Setting
@@ -49,32 +50,75 @@ spec:
         # plain image (e.g. busybox) has no nvidia-smi. Any CUDA/GPU image works;
         # this one is small and only needs the driver from the host.
         image: nvidia/cuda:12.4.1-base-ubuntu22.04
-        # Print the GPUs the sandbox sees at startup, then idle.
+        # Print the GPUs the sandbox sees, then run the daemon-server webserver in
+        # the foreground so the sandbox has a real, reachable service on it.
         #
-        # NOTE: `kubectl logs` and `kubectl exec` do NOT work against a Nebula
-        # virtual node — it does not serve the kubelet API (see pkg/vnode
-        # handler.go: GetContainerLogs/RunInContainer return NotFound). So to see
-        # this output, read it on the PROVIDER side (the Modal dashboard or
-        # `modal app logs`), not via kubectl.
-        command: ["sh", "-c", "nvidia-smi --query-gpu=index,name,memory.total --format=csv || echo 'no nvidia-smi'; sleep 3600"]
-        # The readiness bar for the EXTERNAL instance. On Modal this is the only
-        # thing that lets Nebula tell "still coming up" (queued, pulling the image,
-        # attaching the GPU) from "up and serving": the cheap poll signal answers
-        # only "has the process exited?", so WITHOUT a probe the Pod — and its
-        # Deployment's ready count — goes Running the moment the sandbox is created.
-        # With one, it stays Pending/Initializing until the probe passes.
+        # Split command/args purely for readability: the provider concatenates them
+        # (Command + Args) into the one argv Modal takes, so this is exactly
+        # ["sh", "-c", "<script>"].
         #
-        # An EXEC probe, because this sample serves nothing and declares no ports:
-        # tcpSocket/httpGet need a numeric port, and a named or missing one omits
-        # the probe entirely. `nvidia-smi -L` is a real bar here — it passes only
-        # once the GPU is actually attached and the driver answers.
+        # `kubectl logs` works here, -f and --tail included (pkg/vnode/kubelet.go).
+        # `--timestamps`, `--previous` and `--since` are accepted but ignored: a
+        # provider stream has no per-line time and no restart history.
         #
-        # Only exec and tcpSocket reach Modal (httpGet degrades to tcpSocket on its
-        # port); periodSeconds maps to the probe interval, and the other timing
-        # fields are the kubelet's, which never runs here.
+        # `kubectl exec` does not — no in-container agent serves it. Use the Modal
+        # dashboard or `modal shell` for a shell.
+        command: ["sh", "-c"]
+        args:
+        - |
+          set -eu
+          nvidia-smi --query-gpu=index,name,memory.total --format=csv || echo 'no nvidia-smi'
+
+          # curl is absent from the CUDA base image, so install it before fetching.
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl ca-certificates
+
+          # linux-amd64 because every currently-wired provider is x86 (the virtual
+          # node advertises kubernetes.io/arch=amd64 — see pkg/vnode/node.go).
+          cd /tmp
+          base=https://github.com/hiverge/daemon-server/releases/download/v0.0.1-dev20
+          curl -fsSLO "$base/daemon-server-linux-amd64"
+          curl -fsSLO "$base/daemon-server-linux-amd64.sha256"
+          # Verify before executing — this is a binary pulled off the internet into a
+          # box holding your credentials. Keep the asset FILENAME as downloaded: the
+          # published .sha256 names it, so renaming to ./daemon-server (as the release
+          # notes' snippet does) makes `sha256sum -c` fail on a missing file.
+          sha256sum -c daemon-server-linux-amd64.sha256
+          chmod +x daemon-server-linux-amd64
+
+          # REPO_DIR/BACKUP_DIR default to these; create them so the server does not
+          # have to. exec so the webserver becomes the container's main process and
+          # receives the provider's stop signal directly.
+          mkdir -p /app /.backup
+          exec env PORT=8080 ./daemon-server-linux-amd64
+        # Declaring the port is what makes the webserver REACHABLE. Modal routes one
+        # port per connect token and the first declared port wins (see firstPort in
+        # pkg/provider/modal), so this is the port the URL published on the Pod's
+        # nebula.inftyai.com/endpoint annotation lands on. With no port declared the
+        # URL would route to Modal's own default and never reach daemon-server.
+        ports:
+        - containerPort: 8080
+        # The readiness bar for the EXTERNAL instance, and on Modal the only way to tell
+        # "still coming up" from "up and serving": the poll signal answers only "has the
+        # process exited?", so without a probe the Pod (and the Deployment's ready
+        # count) goes Running as soon as the sandbox is created.
+        #
+        # /health is daemon-server's own endpoint, so it passes only once the GPU
+        # attached, curl installed, and the binary started. An exec probe on
+        # `nvidia-smi -L` would go ready during apt-get, publishing an endpoint that
+        # still refuses connections.
+        #
+        # On Modal this DEGRADES to a tcpSocket probe on the same port — it offers exec
+        # and TCP only, so the real bar is "is 8080 listening?" (see planProbe). Written
+        # as httpGet anyway, because that is right on a provider that serves it.
+        #
+        # The port must be NUMERIC: a named port cannot become a Modal probe, so the
+        # probe — and the readiness signal — is dropped. periodSeconds becomes the probe
+        # interval; the other timing fields are the kubelet's, which never runs here.
         readinessProbe:
-          exec:
-            command: ["nvidia-smi", "-L"]
+          httpGet:
+            path: /health
+            port: 8080
           periodSeconds: 5
         resources:
           requests:
@@ -84,4 +128,4 @@ spec:
             # GPU count. Standard extended resource, so the scheduler's fit check
             # and provisioning read the same number. 8 => 8x the accelerator-type
             # above.
-            nvidia.com/gpu: "8"
+            nvidia.com/gpu: "1"

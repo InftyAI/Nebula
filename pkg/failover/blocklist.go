@@ -14,23 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package failover holds the in-memory, TTL-bounded blocklist that turns a single
-// provision failure into a temporary exclusion, so placement can fail over to the
-// next candidate (zone → region → tier) instead of hot-looping against a provider
-// that just rejected the same request.
+// Package failover holds the in-memory, TTL-bounded blocklist that turns a provision
+// failure into a temporary exclusion, so placement fails over to the next candidate
+// (zone → region → tier) instead of hot-looping against a provider that just said no.
 //
-// The design mirrors SkyPilot's blocklist-granularity rule: a failure is recorded
-// at the exact granularity that failed (a provider.BlockScope), and a candidate is
-// blocked only if some live entry's scope MATCHES it. Empty scope fields are
-// wildcards, so "no Spot capacity for H100 in us-east-1" never disqualifies an
-// OnDemand request, a different accelerator, or another region — but an auth
-// failure (DenyAll) blocks the whole provider until its TTL lapses.
+// It follows SkyPilot's blocklist-granularity rule: record at the exact granularity
+// that failed (a provider.BlockScope), and block a candidate only if some live
+// entry's scope MATCHES it. Empty scope fields are wildcards, so "no Spot H100 in
+// us-east-1" never disqualifies an OnDemand request, another accelerator, or another
+// region — while an auth failure (DenyAll) blocks the whole provider until its TTL
+// lapses.
 //
-// It is deliberately in-memory and per-process: the blocklist is a hint that
-// bounds churn, not durable state. On a manager restart it is empty and the next
-// attempt re-probes the provider — the worst case is one wasted attempt, which the
-// provider itself rejects and re-records. This keeps the control plane free of a
-// blocklist CRD and the reconcile hot-path free of an API round-trip.
+// In-memory and per-process on purpose: this is a hint that bounds churn, not durable
+// state. After a restart it is empty and the next attempt re-probes the provider,
+// costing at worst one rejected attempt that is then re-recorded. No blocklist CRD, no
+// API round-trip on the reconcile hot path.
 package failover
 
 import (
@@ -86,21 +84,16 @@ func newWithClock(c clock.Clock) *Blocklist {
 	return &Blocklist{clock: c}
 }
 
-// Record adds a block for prov at scope, lapsing after ttl. A DenyAll scope blocks
-// the whole provider; a scoped block confines it to the matching wildcard fields.
-// A non-positive ttl or an empty provider is a no-op (nothing to bound, or nothing
-// to key on) — the caller is expected to skip zero scopes, but Record is defensive
-// so a misfire cannot install a permanent or provider-less block. Recording also
-// opportunistically drops expired entries so the slice cannot grow without bound.
+// Record adds a block for prov at scope, lapsing after ttl. A DenyAll scope blocks the
+// whole provider; anything else is confined to its matching fields. A non-positive ttl
+// or empty provider is a no-op — defensive, so a misfire cannot install a permanent or
+// provider-less block. Recording also drops expired entries, bounding the slice.
 //
-// Records COALESCE: if a live entry with the same provider and an identical scope
-// already exists, its expiry is extended to the later of its current value and
-// now+ttl rather than appending a duplicate. Several Pods failing for the same
-// (provider, accelerator, tier, region) reason therefore produce ONE entry, not one
-// per failure — the slice is bounded by the number of distinct live scopes, not by
-// failure volume. The externally observable behaviour is unchanged: Blocked/
-// BlockedUntil already took the latest covering expiry, and coalescing preserves
-// exactly that latest value.
+// Records COALESCE: an existing live entry with the same provider and an identical
+// scope has its expiry extended (never shortened) instead of gaining a duplicate. So
+// many Pods failing for the same reason produce ONE entry — the slice is bounded by
+// distinct live scopes, not failure volume. Behaviour is unchanged, since Blocked/
+// BlockedUntil already used the latest covering expiry.
 func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Duration) {
 	if prov == "" || ttl <= 0 {
 		return
@@ -191,18 +184,16 @@ func (b *Blocklist) gcLocked(now time.Time) {
 	b.entries = kept
 }
 
-// scopeCovers reports whether scope (a recorded block) applies to candidate c.
-// DenyAll covers everything on the provider. Otherwise each field must match the
-// candidate's, per the three-state semantics of BlockScope's pointer fields:
+// scopeCovers reports whether scope (a recorded block) applies to candidate c. DenyAll
+// covers the whole provider; otherwise every field must match, per BlockScope's
+// three-state pointer semantics:
 //
-//   - nil   => the axis is not applicable: it matches ONLY a candidate whose field
-//     is empty. A CPU-only Pod (no accelerator) or a region-simple provider (no
-//     region) blocks without widening across an axis it never had.
+//   - nil   => axis not applicable: matches ONLY a candidate whose field is empty, so
+//     a CPU-only Pod or a region-simple provider blocks without widening.
 //   - &""   => wildcard: matches any value on that axis.
 //   - &"v"  => exact: matches only a candidate whose field equals "v".
 //
-// This is the match half of the blocklist-granularity rule: the block is as broad
-// as the failure was, no broader.
+// This is the match half of the granularity rule: as broad as the failure, no broader.
 func scopeCovers(scope provider.BlockScope, c Candidate) bool {
 	if scope.DenyAll {
 		return true

@@ -63,40 +63,24 @@ spec:
           spec:
             description: |-
               SandboxSpec is one long-lived, interactive remote box: an agent's workspace, a
-              shell, a scratch GPU machine. It is the first workload class Nebula serves
-              beyond a hand-written Pod.
+              shell, a scratch GPU machine.
 
-              A Sandbox is SINGULAR — one object, one instance. There is deliberately no
-              replicas field and no pod template, because a sandbox is not fungible: someone
-              is attached to it, it accumulates state in its filesystem, and the object's own
-              name IS its stable identity (`kubectl exec sandbox-alice` always reaches the
-              same box). Set-shaped controllers exist because containers are interchangeable,
-              which is exactly the property a sandbox lacks — a rolling update would evict a
-              live session, and "scale in by one" would have to guess whose box to kill. A
-              caller that wants N boxes creates N Sandboxes, each with its own image,
-              lifetime and identity.
+              A Sandbox is SINGULAR — one object, one instance, no replicas field. A sandbox is
+              not fungible: someone is attached to it, it holds state in its filesystem, and its
+              name is its stable identity. A rolling update would evict a live session, and
+              "scale in by one" would have to guess whose box to kill. The count lives one level
+              up in SandboxSet, which creates N Sandbox OBJECTS — that is what keeps per-box
+              RBAC, image, TTL, and a visible failure working underneath a pool.
 
-              The count lives one level up, in SandboxSet, which maintains N Sandboxes and
-              owns /scale so `kubectl scale` and HPA work. That split is what lets this type
-              stay singular: because the set creates Sandbox OBJECTS rather than replicas
-              inside one object, everything that depends on a box being its own object —
-              per-box RBAC (grant a user their sandbox and not their neighbour's), a
-              per-box image and TTL, and a failure that stays visible instead of being
-              papered over by a replacement — keeps working underneath a pool.
+              It reuses corev1 types (ResourceRequirements, EnvVar) because the controller
+              synthesizes a Pod, so the spec must be PodSpec-shaped anyway. Re-declaring them
+              would fork the source of truth for the accelerator COUNT, which placement and the
+              scheduler both read from the container's nvidia.com/gpu limit.
 
-              The spec deliberately reuses corev1 types (ResourceRequirements, EnvVar) rather
-              than inventing parallel fields. The controller synthesizes a Pod, so anything
-              it accepts must ultimately BE PodSpec-shaped; re-declaring resources or env
-              would fork the vocabulary and, worse, fork the source of truth for the
-              accelerator COUNT — which placement and the scheduler's fit check both read
-              from the container's nvidia.com/gpu limit (see util.AcceleratorRequest).
-
-              The CEL rule below rejects a GPU count with no accelerator type. That pair is
-              contradictory rather than merely incomplete — util.AcceleratorRequest returns an
-              error for it — so without the rule the object is admitted and then fails at
-              PLACEMENT, minutes later and one object removed from the mistake. Note the
-              inverse is fine and deliberately allowed: a type with no count means one
-              accelerator.
+              The CEL rule below rejects a GPU count with no accelerator type: that pair is
+              contradictory (util.AcceleratorRequest errors on it), so without the rule the
+              object is admitted and then fails at PLACEMENT minutes later. The inverse is
+              allowed — a type with no count means one accelerator.
             properties:
               acceleratorType:
                 description: |-
@@ -235,26 +219,20 @@ spec:
               image:
                 default: ubuntu:24.04
                 description: |-
-                  Image is the container image the sandbox runs. It defaults to a plain Ubuntu,
-                  because unlike the accelerator the image is not a decision a caller has to make
-                  to get a useful box: `kubectl exec` into a bare distro is exactly the "give me a
-                  remote shell" case, and anything else can be installed from inside it. Defaulting
-                  a paid GPU shape would be guessing at spend; defaulting a shell is not.
+                  Image is the container image the sandbox runs, defaulting to a plain Ubuntu:
+                  a bare distro to exec into IS the "give me a remote shell" case, and anything
+                  else can be installed from inside it. (Defaulting a paid GPU shape would be
+                  guessing at spend; defaulting a shell is not.)
 
-                  Note it deliberately does NOT default to a CUDA image even when an accelerator is
-                  requested. A conditional default would make the image depend on another field,
-                  which structural-schema defaulting cannot express and which would surprise anyone
-                  reading the object back. Ask for a CUDA image explicitly when you want one.
+                  It does NOT switch to a CUDA image when an accelerator is requested: a default
+                  that depends on another field is not expressible in a structural schema. Ask for
+                  a CUDA image explicitly.
 
-                  There is deliberately no command field, and one cannot be set: the CRD is a
-                  structural schema, so `command:` in a Sandbox spec is rejected as an unknown
-                  field by the apiserver itself — no webhook required. That is not a
-                  simplification, it is the process model: a sandbox has nothing to run at boot,
-                  so the controller supplies a placeholder command whose only job is to keep the
-                  container from exiting (today this is implemented with a long-running `sleep`,
-                  which must exist in the chosen image). Nebula does not currently support
-                  `kubectl exec`/`kubectl logs` against sandboxes; a user-supplied command would
-                  displace the placeholder and take the instance down with it.
+                  There is no command field and one cannot be set — the structural schema rejects
+                  `command:` as unknown, no webhook needed. A sandbox has nothing to run at boot,
+                  so the controller supplies a placeholder that only has to not exit (today a
+                  long-running `sleep`, which the image must have). A user command would displace
+                  it and take the instance down.
                 minLength: 1
                 type: string
               nodePoolRef:
