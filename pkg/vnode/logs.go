@@ -71,7 +71,7 @@ const (
 //
 // Ignored, because this seam cannot serve them: Timestamps (raw bytes, no per-line time),
 // Previous, SinceSeconds, SinceTime (no restart history, no time index). Ignored rather
-// than rejected, so a habitual --since still prints the log. See docs/status.md.
+// than rejected, so a habitual --since still prints the log. See docs/kubelet-api.md.
 //
 // Close tears down src and every goroutine below, and the VK log route always calls it,
 // including when a --follow client disconnects.

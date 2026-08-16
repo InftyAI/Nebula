@@ -339,7 +339,7 @@ serves one HTTPS listener in the manager pod and every virtual node advertises i
 `manager.Runnable`, hence leader-scoped — correct, because only the leader holds the
 tracked Pods a log request resolves against. A provider opts in by implementing
 `provider.LogStreamer`; one that does not answers `NotFound`. See
-[status.md § Logs](status.md#logs) for the transport, the trust model, and which kubectl
+[kubelet-api.md](kubelet-api.md) for the transport, the trust model, and which kubectl
 flags are honoured.
 
 Exec, attach, stats, and port-forward are not implemented — those need an agent inside

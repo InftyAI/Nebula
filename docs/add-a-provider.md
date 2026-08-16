@@ -87,7 +87,7 @@ carry weight:
   `kubectl logs -f` client disconnects, and on a long-polling API that is one open
   request per abandoned client if it does not land.
 
-See [status.md § Logs](status.md#logs) for what the kubelet side does with the stream,
+See [kubelet-api.md](kubelet-api.md) for what the kubelet side does with the stream,
 including which kubectl flags are ignored and why.
 
 ## 2. Add the price/availability catalog
