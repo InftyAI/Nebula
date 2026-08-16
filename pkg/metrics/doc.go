@@ -27,13 +27,12 @@ limitations under the License.
 //	placement.go   the Pod is gated -> a candidate is chosen -> the gate is removed
 //	provision.go   the provider is called -> the instance reports Running
 //
-// Those are the parts whose cost and failure modes are otherwise invisible —
-// placement can silently leave a Pod gated forever, and provisioning runs against a
-// third party, takes seconds to minutes, bills money, and fails for reasons the Pod
-// status flattens away. Everything else is already covered elsewhere and deliberately
-// not duplicated: reconcile counts, queue depth and API latency by
-// controller-runtime's own collectors, Pod-population questions ("how many Pods are
-// gated right now?") by kube-state-metrics.
+// Those are the legs whose cost and failure modes are otherwise invisible: placement
+// can silently leave a Pod gated forever, and provisioning runs against a third party,
+// takes minutes, bills money, and fails for reasons Pod status flattens away.
+// Everything else is covered elsewhere and not duplicated — reconcile counts, queue
+// depth and API latency by controller-runtime's collectors, "how many Pods are gated
+// right now?" by kube-state-metrics.
 //
 // The two legs deliberately share one label set (labels.go) so a placement and the
 // provisioning attempt it led to carry identical label values and can be joined in

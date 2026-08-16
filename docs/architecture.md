@@ -332,8 +332,18 @@ Nebula uses one static virtual Node per registered provider. The node name is
 | `GetPodStatus` / `GetPods` | Return tracked status or tracked Pods. |
 | `NotifyPods(cb)` | Start the provider `List()` poll loop and push status/endpoint changes through VK's callback. |
 
-The kubelet API surfaces for logs, exec, attach, stats, and port-forward are not
-implemented; Nebula places external workloads but does not proxy their consoles.
+Of the kubelet API surfaces, only **container logs** is implemented. `kubectl logs` is
+proxied by the API server to the node's kubelet endpoint, so `pkg/vnode/kubelet.go`
+serves one HTTPS listener in the manager pod and every virtual node advertises it as its
+`status.addresses` InternalIP plus `status.daemonEndpoints` port. It is a
+`manager.Runnable`, hence leader-scoped — correct, because only the leader holds the
+tracked Pods a log request resolves against. A provider opts in by implementing
+`provider.LogStreamer`; one that does not answers `NotFound`. See
+[status.md § Logs](status.md#logs) for the transport, the trust model, and which kubectl
+flags are honoured.
+
+Exec, attach, stats, and port-forward are not implemented — those need an agent inside
+the container, so Nebula places external workloads but does not proxy their consoles.
 
 #### Interaction with Capacity Types
 

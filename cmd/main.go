@@ -83,6 +83,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var kubeletAddr, kubeletClientCA string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -101,6 +102,14 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&kubeletAddr, "kubelet-bind-address", vnode.DefaultKubeletAddr,
+		"The address the virtual nodes' kubelet API (container logs, i.e. `kubectl logs`) binds to. "+
+			"Set to \"\" to disable it, which makes logs unsupported.")
+	flag.StringVar(&kubeletClientCA, "kubelet-client-ca", "",
+		"PEM bundle of CAs whose client certificates may call the kubelet API. Empty (the default) "+
+			"serves TLS without client verification, because which CA signs the API server's kubelet "+
+			"client certificate is not portable across distributions; restrict the port with a "+
+			"NetworkPolicy, or set this to your API server's kubelet client CA.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -258,6 +267,11 @@ func main() {
 	// both sides rather than persisted.
 	blocklist := failover.New()
 
+	// The kubelet endpoint for `kubectl logs` — one listener shared by every provider's
+	// node, hence built here rather than in setupVirtualNodes. Nil is supported: the
+	// nodes then advertise no address, and logs report NotFound.
+	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA)
+
 	// Controller and webhook registration is deferred until the cert exists, so it
 	// runs in a goroutine: the cert cannot be minted until the manager is STARTED
 	// (the rotator is a Runnable and needs a synced cache), so blocking here would
@@ -274,7 +288,7 @@ func main() {
 		<-certsReady
 		setupLog.Info("webhook certificate ready")
 
-		if err := setupControllers(mgr, blocklist); err != nil {
+		if err := setupControllers(mgr, blocklist, kubeletSrv); err != nil {
 			setupLog.Error(err, "unable to set up controllers")
 			os.Exit(1)
 		}
@@ -340,7 +354,7 @@ func managerNamespace() string {
 // It runs only after the webhook serving cert is ready (see main), which is why it
 // is a function rather than inline: everything here depends on Pod admission
 // working, so none of it may be registered before the API server trusts the webhook.
-func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
+func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSrv *vnode.KubeletServer) error {
 	if err := (&controller.NodePoolReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -383,7 +397,7 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
 	// provider.Terminate on DeletePod, so an ungated Pod bound to a provider's
 	// virtual node materializes an external instance. Each Runner is a
 	// manager.Runnable, so it shares the manager's lifecycle and leader election.
-	if err := setupVirtualNodes(mgr, blocklist); err != nil {
+	if err := setupVirtualNodes(mgr, blocklist, kubeletSrv); err != nil {
 		return fmt.Errorf("unable to set up virtual nodes: %w", err)
 	}
 	if enableWebhooks() {
@@ -395,11 +409,46 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist) error {
 	return nil
 }
 
+// setupKubeletServer builds the shared endpoint that serves `kubectl logs` for Pods
+// on the virtual nodes, and adds it to the manager.
+//
+// Returns nil — logs unsupported, nodes advertising no address — rather than failing
+// the process, when addr is empty (turned off) or POD_IP is missing. That address is
+// what the API server dials and nothing substitutes for it: a Service would balance to
+// a non-leader replica, which holds no tracked Pods. Either way only logs degrade, so
+// it is logged loudly and the manager carries on.
+func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletServer {
+	if addr == "" {
+		setupLog.Info("kubelet API disabled by configuration; `kubectl logs` will not work for Nebula pods")
+		return nil
+	}
+	podIP := vnode.PodIPFromEnv()
+	if podIP == "" {
+		setupLog.Info("POD_IP is not set; serving no kubelet API, so `kubectl logs` will not work " +
+			"for Nebula pods (project it with a fieldRef — see config/manager)")
+		return nil
+	}
+	srv, err := vnode.NewKubeletServer(podIP, addr, clientCA)
+	if err != nil {
+		// A real misconfiguration, but only of the log path: fail the feature, not the
+		// manager.
+		setupLog.Error(err, "unable to set up the kubelet API; `kubectl logs` will not work for Nebula pods")
+		return nil
+	}
+	if err := mgr.Add(srv); err != nil {
+		setupLog.Error(err, "unable to add the kubelet API to the manager")
+		return nil
+	}
+	setupLog.Info("kubelet API enabled", "addr", addr, "advertisedIP", podIP, "clientCertRequired", clientCA != "")
+	return srv
+}
+
 // setupVirtualNodes adds a vnode.Runner to the manager for every registered
 // provider. The Runner needs a typed clientset (the virtual kubelet's node/pod
 // controllers use client-go directly, not the controller-runtime client), built
-// from the same rest.Config the manager uses.
-func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister) error {
+// from the same rest.Config the manager uses. kubeletSrv is the shared kubelet API
+// each node advertises for logs; nil disables it.
+func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv *vnode.KubeletServer) error {
 	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		return err
@@ -409,7 +458,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister) error {
 		if !ok {
 			continue
 		}
-		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist)); err != nil {
+		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist, kubeletSrv)); err != nil {
 			return err
 		}
 		setupLog.Info("registered virtual node", "provider", name, "node", vnode.NodeName(name))
@@ -461,18 +510,15 @@ func registerProviders(ctx context.Context, c client.Client) {
 }
 
 // awsRegionSource returns the AWS adapter's RegionSource: the union of
-// ProviderSpec.Regions across every NodePool that references the "aws" provider. It
-// needs no env/flag — regions are the operator's per-pool declaration — and a pool
-// added/edited at runtime widens the swept set on the next List tick, no restart
-// required.
+// ProviderSpec.Regions across every NodePool referencing the "aws" provider. No
+// env/flag needed — regions are the operator's per-pool declaration — and editing a
+// pool widens the swept set on the next List tick without a restart.
 //
-// It is evaluated on each List/Offerings tick. The underlying List is served from
-// the manager's informer cache (no API call), so scanning the pools per tick is
-// cheap even though it is O(pools); sweepRegions dedupes the result. On a list error
-// (cache not yet synced at startup, a transient failure) it returns nil and
-// sweepRegions falls back to the regions already provisioned into. It uses a
-// background context, not the registration ctx, since it runs long after
-// registration returns.
+// Evaluated per List/Offerings tick, served from the manager's informer cache (no API
+// call), so the O(pools) scan is cheap; sweepRegions dedupes. On a list error (cache
+// not synced yet, a transient failure) it returns nil and sweepRegions falls back to
+// the regions already provisioned into. Uses a background context, since it runs long
+// after registration returns.
 func awsRegionSource(c client.Client) awsprovider.RegionSource {
 	return func() []string {
 		var pools nebulav1alpha1.NodePoolList

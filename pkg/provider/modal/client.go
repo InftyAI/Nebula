@@ -19,6 +19,7 @@ package modal
 import (
 	"context"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,43 +34,33 @@ import (
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
 
-// sdkClient is the real Client, backed by Modal's official Go SDK
-// (github.com/modal-labs/modal-client/go, beta). It is the seam between our
-// provider-agnostic adapter and Modal's API; all Modal-specific SDK calls live
-// here so the adapter and its tests stay SDK-free.
+// sdkClient is the real Client, backed by Modal's official Go SDK (beta). Every
+// Modal-specific SDK call lives here so the adapter and its tests stay SDK-free.
 //
-// A NodeClaim maps to one Modal Sandbox. Identity is carried in the sandbox's
-// native Tags (ClaimTagKey), which are server-side filterable, so List/Get can
-// recover the owning claim without a naming hack.
+// A NodeClaim maps to one Modal Sandbox, identified by the sandbox's native Tags
+// (ClaimTagKey) — server-side filterable, so List/Get need no naming hack.
 type sdkClient struct {
 	mc      *modal.Client
 	appName string
 
-	// readyTimeout is the budget one background readiness waiter gets. It is a real
-	// budget, not a hint: WaitUntilReady BLOCKS and returns early only to say
-	// "ready" — never to say "not ready" — so a budget below the call's own setup
-	// cost cannot produce an answer, it can only produce a deadline. Setup dominates
-	// (getCommandRouter polls for the task id, then dials a fresh TLS gRPC
-	// connection to the task's own router), measured at ~16s cold, so this must be
-	// comfortably above that. It is affordable precisely because the wait no longer
-	// runs on the read path.
+	// readyTimeout is how long one background readiness waiter gets. WaitUntilReady
+	// returns early only to say "ready", never "not ready", so a budget under the call's
+	// own setup cost yields a deadline rather than an answer. Setup dominates (~16s cold:
+	// poll for the task id, then dial a fresh TLS gRPC connection to its router), so keep
+	// this comfortably above it — affordable now that the wait is off the read path.
 	readyTimeout time.Duration
 
 	// Readiness latch. WaitUntilReady is a one-shot blocking WAIT, but observe is a
-	// level-triggered READ that must answer from state on every poll tick; wrapping
-	// the wait in a short timeout to fake a read is what made a timeout masquerade
-	// as "not ready". So the wait happens once, in the background, and its result is
-	// latched here for observe to read.
+	// level-triggered READ answering from state on every tick — wrapping the wait in a
+	// short timeout to fake a read made a timeout masquerade as "not ready". So the wait
+	// runs once in the background and latches its result here.
 	//
-	// ready is latched on CONFIRMED readiness only — the default is not-ready, so an
-	// ambiguous error can no longer promote a sandbox that is still coming up.
-	// waiting dedupes waiters so repeated ticks don't pile up goroutines on one
-	// sandbox. Both are keyed by sandbox id and dropped by forgetReady when the
-	// sandbox goes away, so neither grows without bound.
+	// ready is set on CONFIRMED readiness only, so an ambiguous error cannot promote a
+	// sandbox that is still coming up. waiting dedupes waiters so repeated ticks don't
+	// pile up goroutines. Both are keyed by sandbox id and dropped by forgetReady.
 	//
-	// The latch does not DEMOTE: a probe that passes and later starts failing leaves
-	// the sandbox Running. Poll still observes process exit, so death is caught;
-	// sickness is not. Demotion would need a re-armed waiter and a staleness stamp.
+	// The latch never DEMOTES: a probe that passes and later fails leaves the sandbox
+	// Running. Poll still catches process exit, so death is noticed; sickness is not.
 	readyMu sync.Mutex
 	ready   map[string]bool
 	waiting map[string]struct{}
@@ -150,55 +141,34 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	return sb.SandboxID, c.mintCredential(ctx, sb, spec), nil
 }
 
-// mintCredential issues the sandbox's connect credential and RETURNS it. Nothing is
-// stored here — not in a tag, not in memory.
+// mintCredential issues the sandbox's connect credential and RETURNS it, storing nothing.
+// Not in a tag, since Modal's tags are plaintext and bulk-listable — one ListSandboxes
+// would hand over every workload's token. Not in memory, which is not durable. A
+// credential belongs in an access-controlled Secret, and this layer has no cluster
+// access, so it hands the pair up to the virtual kubelet, which writes it.
 //
-// Not in a tag, because Modal's tags are plaintext and bulk-listable: one
-// ListSandboxes would hand over every workload's token at once, with no revocation
-// and no rotation to fall back on. Not in memory, because memory is not durable. The
-// only place a credential belongs is an access-controlled Secret, which this layer
-// has no cluster access to write — so it hands the pair to the one caller that does:
-// the virtual kubelet, which writes both halves to a Secret in the Pod's namespace
-// and the address to the Pod's endpoint annotation.
+// Minting is one-shot: every CreateConnectToken call mints a FRESH token, with no
+// read-back. A caller that drops the return value has lost it for the sandbox's life.
+// That is also why this cannot move to the read path — observe would hand out a token
+// that changed every tick. (The endpoint lives on the Pod annotation instead, so Modal
+// reports no observed endpoint at all; see observe.)
 //
-// Returning it is enough, and that is the part worth stating: the credential is
-// minted on the one-shot CREATE path, but its consumers are durable Kubernetes
-// objects, so nothing needs to re-derive it later. The annotation in etcd is the
-// endpoint's record of truth (nothing on the read path ever clears it), which is
-// strictly better than a tag — no provider round trip to recover a value the API
-// server already stores. Modal therefore reports NO observed endpoint at all; see
-// observe.
+// It can run this early because the RPC needs only the sandbox id and port — no task id,
+// no running container, no booted GPU (contrast Tunnels, which needs the container up).
+// So the credential is in hand while the sandbox is still queued.
 //
-// Minting is one-shot: every CreateConnectToken call mints a FRESH token, so there is
-// no read-back and no re-derivation later. A caller that drops the return value has
-// lost the credential for the life of the sandbox. That is also why this cannot move
-// to the read path — observe would hand the user a token that changed every tick.
+// Every workload gets one: an authenticated URL is the only general way to reach a
+// NeoCloud instance, and a workload with nothing to serve just leaves it unused. The URL
+// routes to the first of spec.Ports, or Modal's default 8080 if none are declared.
 //
-// It can run this early because the RPC is keyed on the sandbox id alone
-// (SandboxCreateConnectToken takes sandbox_id + port, and the SDK checks only client
-// liveness): no task id, no running container, no booted GPU. Contrast Tunnels, which
-// resolves only once the container is up. So the credential is in hand the moment
-// Create returns, while the sandbox is still queued.
+// TODO: a Sandbox is reached by identity (`kubectl exec sbx-alice`), not by address, so it
+// should not get a credential — it does today because it arrives here as an ordinary Pod.
 //
-// Every workload gets one. An authenticated URL is the only general way to reach
-// something running on a NeoCloud — there is no cluster network to fall back on —
-// so the useful default is that the credential exists, and a workload with nothing
-// to serve simply leaves it unused. The URL routes to the first of spec.Ports — one
-// token routes to one port — and no declared port means Modal's own default (8080)
-// applies.
-//
-// This is scoped to service-shaped workloads (a Deployment/StatefulSet/bare Pod
-// that serves traffic). A Sandbox is reached by identity, not by address —
-// `kubectl exec sbx-alice` — so it should NOT carry a credential; today it still
-// gets one, because it reaches this adapter as an ordinary Pod and nothing here
-// distinguishes the two classes yet.
-//
-// Best-effort by design: a sandbox that exists must be reported (and reclaimed)
-// whether or not it got a credential, so a failure here returns the zero Credential
-// and the instance is simply unreachable. The error is NOT returned, because that
-// would fail a Provision whose sandbox is already running — leaking a paid instance
-// to save an address. The error text is dropped rather than logged for the same
-// reason a token is never logged: it can echo the request.
+// Best-effort: a sandbox that exists must be reported and reclaimed whether or not it got
+// a credential, so a failure returns the zero Credential and the instance is simply
+// unreachable. Returning the error would fail a Provision whose sandbox is already
+// running, leaking a paid instance to save an address. The text is dropped rather than
+// logged because it can echo the request.
 func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, spec SandboxSpec) Credential {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 		// Derived from the exposed set rather than carried separately, so the routed
@@ -218,11 +188,9 @@ func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, spec 
 // gets no Modal probe. PeriodSeconds maps to the probe interval; zero leaves the
 // SDK default (a zero interval is rejected by the SDK constructors).
 //
-// A TCP/HTTPGet probe with a NAMED port (e.g. port: http) is treated as
-// unsupported: resolving the name to a number needs the container's ports list,
-// which this helper does not have, and passing the intstr's 0 fallback would
-// create an invalid Modal TCP probe on port 0. So a named port omits the probe
-// rather than emitting a bogus one.
+// A NAMED port (port: http) counts as unsupported: resolving it needs the container's
+// ports list, which this helper does not have, and the intstr's 0 fallback would build an
+// invalid Modal probe on port 0. Better to omit the probe than emit a bogus one.
 func modalProbe(p *corev1.Probe) (*modal.Probe, error) {
 	plan, ok := planProbe(p)
 	if !ok {
@@ -246,12 +214,9 @@ type probePlan struct {
 // reporting ok=false when it does not (nil probe, no handler, or a named port —
 // see modalProbe for why a named port cannot be resolved here).
 //
-// This is split out from modalProbe so the CREATE path and the ProbeTagKey gate
-// cannot disagree: the tag asserts "Modal received a probe for this sandbox", and
-// deriving it from `pod.Spec.Containers[0].ReadinessProbe != nil` made that a lie
-// for every probe shape modalProbe drops — those sandboxes advertised a probe
-// Modal never got, so the readiness wait was asked about a probe that did not
-// exist. One predicate, two callers, no drift.
+// Split out from modalProbe so the CREATE path and the ProbeTagKey gate cannot disagree:
+// the tag asserts "Modal received a probe", and deriving it from `ReadinessProbe != nil`
+// made that a lie for every shape modalProbe drops. One predicate, two callers, no drift.
 func planProbe(p *corev1.Probe) (probePlan, bool) {
 	if p == nil {
 		return probePlan{}, false
@@ -330,6 +295,91 @@ func (c *sdkClient) GetSandbox(ctx context.Context, id string) (*Sandbox, error)
 	return &out, nil
 }
 
+// SandboxLogs implements Client: stdout and stderr merged into one stream, from the
+// sandbox's first byte, following until it exits — the shape provider.LogStreamer
+// requires.
+//
+// The SDK's streams already have those semantics (SandboxGetLogs with LastEntryId
+// "0-0" replays then long-polls), so there is no offset bookkeeping here. They are
+// lazy: no gRPC call until the first Read.
+//
+// Interleaving is best-effort — the two streams share no sequence, so stderr can
+// appear before an earlier stdout line. Same guarantee the kubelet gives, and dropping
+// stderr would hide the output users read logs to find.
+func (c *sdkClient) SandboxLogs(ctx context.Context, id string) (io.ReadCloser, error) {
+	sb, err := c.mc.Sandboxes.FromID(ctx, id, &modal.SandboxFromIDParams{})
+	if err != nil {
+		if isNotFound(err) {
+			// An error, not an empty stream: silence would read as "logged nothing".
+			return nil, fmt.Errorf("modal: sandbox %s not found: %w", id, err)
+		}
+		return nil, err
+	}
+	return mergeStreams(ctx, sb.Stdout, sb.Stderr), nil
+}
+
+// mergeStreams fans log streams into one ReadCloser. Close tears everything down: it
+// closes the sources (unblocking the copiers) and the pipe (returning an in-flight
+// Read). ctx does the same, so a disconnected `kubectl logs -f` cannot leave
+// goroutines long-polling Modal forever.
+func mergeStreams(ctx context.Context, streams ...io.ReadCloser) io.ReadCloser {
+	pr, pw := io.Pipe()
+
+	var wg sync.WaitGroup
+	for _, s := range streams {
+		if s == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(src io.ReadCloser) {
+			defer wg.Done()
+			// Copy errors are not reported: one stream ending must not truncate the other,
+			// and the shared failure (sandbox gone) already surfaces as EOF.
+			_, _ = io.Copy(pw, src)
+		}(s)
+	}
+
+	// Only close the pipe once BOTH sources are done, so EOF means no more output.
+	go func() {
+		wg.Wait()
+		_ = pw.Close()
+	}()
+
+	closeAll := func() {
+		for _, s := range streams {
+			if s != nil {
+				_ = s.Close()
+			}
+		}
+	}
+	// ctx and Close converge on the same teardown, safe to run twice. stop is buffered
+	// so a Close after ctx already fired does not block.
+	stop := make(chan struct{}, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stop:
+		}
+		closeAll()
+		_ = pw.CloseWithError(ctx.Err())
+	}()
+
+	return &mergedStream{ReadCloser: pr, stop: stop}
+}
+
+// mergedStream is the pipe plus the teardown signal, so Close releases the upstream
+// Modal streams too — the bare pipe would leak the copiers.
+type mergedStream struct {
+	io.ReadCloser
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func (m *mergedStream) Close() error {
+	m.stopOnce.Do(func() { close(m.stop) })
+	return m.ReadCloser.Close()
+}
+
 // ListSandboxes implements Client. It scopes the list server-side to Nebula's
 // own Modal App (AppID), which is what isolates Nebula-owned sandboxes: every
 // sandbox Nebula creates lives under this one App, so sandboxes in other Apps
@@ -377,31 +427,24 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) (Sandbox, er
 	// probe-ness (ProbeTagKey), read by observeReady below — so this must precede the
 	// status block.
 	//
-	// A read failure is NOT "no tags", and it cannot be tolerated like the others:
-	// without ClaimTagKey the sandbox has no recoverable identity, and every way of
-	// reporting it anyway is wrong. An empty ClaimName matches no claim, and dropping
-	// the sandbox is indistinguishable from that — the poll loop reads both as "this
-	// claim's instance is gone" and reports the Pod Terminated, which is terminal-sticky
-	// and makes the NodeClaim reclaim a live sandbox. A missing ProbeTagKey would also
-	// make observeReady report a still-booting sandbox ready.
+	// A read failure is NOT "no tags", and cannot be tolerated: without ClaimTagKey the
+	// sandbox has no recoverable identity, and the poll loop reads that as "the instance
+	// is gone" → Pod Terminated, which is terminal-sticky and makes the NodeClaim reclaim
+	// a live sandbox. A missing ProbeTagKey would likewise report a booting sandbox ready.
 	//
-	// So the error propagates and fails the whole read. Callers already treat that as
-	// "do not act on a half-known fleet": the poll loop leaves statuses untouched and
-	// retries next tick, re-adoption falls through to NotFound, and the teardown
-	// backstop requeues. A stalled tick is recoverable; a stuck terminal phase is not.
+	// So the error fails the whole read, which callers already treat as "do not act on a
+	// half-known fleet" and retry. A stalled tick is recoverable; a stuck terminal phase
+	// is not.
 	tags, err := sb.GetTags(ctx, &modal.SandboxGetTagsParams{})
 	if err != nil {
 		return out, fmt.Errorf("modal: read tags for sandbox %s: %w", sb.SandboxID, err)
 	}
 	out.Tags = tags
 
-	// Status. Poll (== sandboxWait(0)) reports whether the sandbox PROCESS HAS
-	// EXITED — a non-nil exit code means it is gone (terminated), nil means it is
-	// still live. Poll alone cannot tell "still scheduling" (queued, image pull,
-	// GPU attach, container boot) apart from "running and serving": both read as
-	// nil. So liveness comes from Poll, and readiness — the part that decides
-	// whether the Pod may be advanced to Running — is read from the latch by
-	// isReady, which never blocks (see there).
+	// Status. Poll says only whether the PROCESS HAS EXITED: a non-nil exit code means
+	// gone, nil means still live. It cannot tell "still scheduling" (queued, image pull,
+	// GPU attach, boot) from "running and serving" — both read as nil. So liveness comes
+	// from Poll, and readiness from the latch via observeReady, which never blocks.
 	if code, err := sb.Poll(ctx, &modal.SandboxPollParams{}); err == nil {
 		switch {
 		case code != nil:
@@ -418,53 +461,35 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) (Sandbox, er
 	// minted at create and already persisted on the Pod's endpoint annotation, so
 	// re-deriving it per tick would be a round trip for a value the API server holds.
 	//
-	// The alternative would be a tunnel URL, and reporting one is worse than reporting
-	// nothing: a tunnel is PUBLIC to whoever learns it, so serving it as a stand-in for
-	// an authenticated URL silently downgrades access to the workload. A sandbox whose
-	// mint failed is therefore reported with no address at all — an honest "unreachable"
-	// rather than an open one — and that stays a FACT, not an error: observe's errors
-	// fail the entire List (see the tags block above), so one credential-less sandbox
-	// would otherwise stall status for every pod on the node.
+	// The alternative — a tunnel URL — is worse than nothing: a tunnel is PUBLIC to
+	// whoever learns it, so substituting one for an authenticated URL silently downgrades
+	// access. A sandbox whose mint failed reports no address at all, and that stays a FACT
+	// rather than an error, since observe's errors fail the entire List.
 	return out, nil
 }
 
-// Exit codes Modal substitutes for a non-exit outcome, since Poll conforms to the
-// subprocess API and has only an int to say it with (see getReturnCode in the
-// SDK). Both mean "Modal ended this sandbox", not "the workload failed":
+// Exit codes Modal substitutes for a non-exit outcome, since Poll follows the subprocess
+// API and has only an int to say it with. Both mean "Modal ended this sandbox" (by our
+// Terminate, or on the configured Timeout), not "the workload failed".
 //
-//	sandboxExitTerminated  the sandbox was terminated — by our own Terminate on the
-//	                       teardown path, or by Modal.
-//	sandboxExitTimeout     the sandbox hit its configured Timeout.
-//
-// They are the conventional signal-derived codes (128+SIGKILL, 128-4), which is
-// exactly why they are AMBIGUOUS: a workload that genuinely exits 137 is
-// indistinguishable from a Modal termination. See exitStatus for why that is
-// tolerable here.
+// Being the conventional signal-derived codes makes them AMBIGUOUS: a workload that truly
+// exits 137 is indistinguishable from a Modal termination. See exitStatus.
 const (
 	sandboxExitTerminated = 137
 	sandboxExitTimeout    = 124
 )
 
-// exitStatus classifies an exited sandbox from its Poll exit code, splitting "it
-// failed" from "it is gone".
+// exitStatus classifies an exited sandbox from its Poll exit code, splitting "it failed"
+// from "it is gone". Poll flattens the two: Modal's control plane has eight result
+// statuses and collapses them all into one int before we see it. Treating every exit as
+// terminated reported a sandbox that never came up — bad image, no GPU, OOM at init — as a
+// clean teardown, hiding the failure.
 //
-// The distinction is worth recovering because Poll is LOSSY in a way that
-// flattens the two: the control plane's GenericResult carries eight statuses
-// (SUCCESS, FAILURE, INIT_FAILURE, INTERNAL_FAILURE, TERMINATED, TIMEOUT,
-// IDLE_TIMEOUT), and getReturnCode collapses every one of them into a single int
-// before we ever see it. Treating any exit as terminated therefore reported a
-// sandbox that never came up — a bad image, an unavailable GPU, an OOM at init —
-// as "the instance is gone", which reads like a clean teardown and hides the
-// failure from whoever has to fix it.
-//
-// The mapping is deliberately conservative, because the collapse cannot be
-// undone: only the two codes Modal SUBSTITUTES for a non-exit outcome, plus a
-// clean 0, count as terminated; everything else is the workload's own nonzero
-// exit and counts as failed. The ambiguity is real but harmless in the direction
-// it errs — a workload exiting exactly 137 is read as terminated rather than
-// failed, so an odd exit code can understate a failure. It cannot invent one, and
-// it cannot affect teardown either way: both states are terminal for the claim,
-// which reclaims by asking the provider what exists, not by reading this.
+// Conservative, since the collapse cannot be undone: only the two substituted codes plus a
+// clean 0 count as terminated, everything else is the workload's own nonzero exit. So a
+// workload exiting exactly 137 understates a failure — but it can never invent one, and
+// teardown is unaffected either way (both states are terminal for the claim, which
+// reclaims by asking the provider what exists).
 func exitStatus(code int) string {
 	switch code {
 	case 0, sandboxExitTerminated, sandboxExitTimeout:
@@ -474,25 +499,18 @@ func exitStatus(code int) string {
 	}
 }
 
-// observeReady reports whether a live sandbox may be treated as Running, WITHOUT
-// making a network call: it reads the latch and, on a miss, starts the one
-// background waiter that will fill it. This is what keeps observe bounded — the
-// cost per sandbox per tick is a mutex, not a ~16s blocking wait, so List does
-// not degrade with the number of sandboxes.
+// observeReady reports whether a live sandbox may be treated as Running WITHOUT a network
+// call: it reads the latch and, on a miss, starts the one background waiter that fills it.
+// That keeps observe bounded — a mutex per sandbox per tick, not a ~16s blocking wait — so
+// List does not degrade with fleet size. It takes no context because there is nothing to
+// cancel, which is what makes it safe to call inside List.
 //
-// A sandbox with no probe (no ProbeTagKey) is ready by definition: Modal has no
-// readiness concept without one, so there is nothing to wait for and asking would
-// error. This folds the startup window into Running for exactly those sandboxes
-// Nebula cannot observe — including any created before ProbeTagKey existed.
+// A sandbox with no probe (no ProbeTagKey) is ready by definition: Modal has no readiness
+// concept without one, so there is nothing to wait for and asking would error.
 //
-// A miss reports NOT ready. That is the point of the inversion: the previous code
-// defaulted to ready and let an ambiguous error promote a sandbox that was still
-// booting, which flapped the Pod between Running and Pending (and permanently
-// latched its NodeClaim to Bound off one spurious tick). Not-ready is the safe
-// default because it is self-correcting — the waiter promotes it within one
-// budget — whereas a wrong Running is not.
-// It takes no context on purpose: there is nothing here to cancel, which is the
-// property that makes it safe to call once per sandbox inside List.
+// A miss reports NOT ready. Not-ready is the safe default because it self-corrects — the
+// waiter promotes it within one budget — whereas a wrong Running does not, and flapped the
+// Pod while permanently latching its NodeClaim to Bound.
 func (c *sdkClient) observeReady(id string, tags map[string]string) bool {
 	if tags[ProbeTagKey] != probeTagValue {
 		return true
@@ -513,31 +531,19 @@ func (c *sdkClient) observeReady(id string, tags map[string]string) bool {
 	return ready
 }
 
-// awaitReady runs the one blocking readiness wait for a sandbox and latches the
-// result. It runs in its own goroutine, off the poll loop, which is what lets the
-// wait have a budget big enough to actually reach an answer.
+// awaitReady runs the one blocking readiness wait for a sandbox and latches the result.
+// Being off the poll loop is what lets the wait have a budget big enough to reach an
+// answer. It builds its own context and re-resolves the sandbox by id because the caller
+// is List, whose context (and *modal.Sandbox) die the moment List returns.
 //
-// It takes its own context rather than inheriting the caller's: the caller is
-// List, whose context is cancelled the moment List returns — long before this
-// wait could finish. The sandbox is re-resolved by id for the same reason, since
-// the *modal.Sandbox the List iterator yielded belongs to that finished call.
+// Only a CONFIRMED answer latches: err == nil (the probe passed), or FailedPrecondition,
+// which is Modal saying the sandbox has no probe configured — a definitive no-probe
+// answer, reachable when the tag and the actual probe disagree, and latching it avoids
+// paying a full wait every tick.
 //
-// Only a CONFIRMED answer latches:
-//
-//   - err == nil: the probe passed.
-//   - FailedPrecondition: Modal's "sandbox does not have a readiness probe
-//     configured". A definitive no-probe answer, so it latches ready for the same
-//     reason a missing ProbeTagKey does. It is reachable when the tag and the
-//     actual probe disagree (see sandboxSpecFromPod), and latching keeps that from
-//     costing a full wait every tick.
-//
-// Anything else — a deadline, a transient API failure, a not-found — latches
-// nothing and just clears the in-flight marker, so the next tick retries. Note
-// the deliberate absence of error classification: the four shapes an expired
-// deadline can take (*status.Error with code DeadlineExceeded,
-// context.deadlineExceededError, modal.TimeoutError, modal.SandboxTimeoutError —
-// and errors.Is(grpcErr, context.DeadlineExceeded) is FALSE for the first) no
-// longer need telling apart, because none of them can promote a sandbox now.
+// Anything else — deadline, transient failure, not-found — latches nothing and just clears
+// the in-flight marker, so the next tick retries. No error classification is needed now
+// that none of those can promote a sandbox.
 func (c *sdkClient) awaitReady(id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.readyTimeout)
 	defer cancel()

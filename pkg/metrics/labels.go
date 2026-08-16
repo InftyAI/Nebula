@@ -25,27 +25,22 @@ import "strconv"
 // `{region=""}` selectors an operator did not mean to write.
 const none = "none"
 
-// candidateLabels is the label set that identifies a PLACEMENT CANDIDATE — the
-// (provider, region, capacity type, accelerator pool) tuple that placement selects and
-// provisioning then acts on. Both legs carry it, in this order, which is what lets a
-// placement and the provisioning attempt it led to be joined in PromQL without label
-// surgery. Extending it therefore touches both legs at once; that is intended.
+// candidateLabels identifies a PLACEMENT CANDIDATE — the (provider, region, capacity
+// type, accelerator) tuple placement selects and provisioning acts on. Both legs carry
+// it in this order, so a placement and the provisioning attempt it led to join in
+// PromQL without label surgery; extending it touches both legs at once, by design. The
+// dimensions match failover.Candidate (minus the joined accelerator) so a counted
+// failure and an excluded candidate line up.
 //
-// It is deliberately the same dimensions as failover.Candidate, minus the joined
-// accelerator (see below), so a counted failure and an excluded candidate line up.
+// Region is here because a capacity shortfall is region-local. For a provider that
+// collapses several declared regions into one candidate (Modal) the value is that
+// provider's joined token, not a single region — see NodeClaimSpec.Region.
 //
-// Region is included because a capacity shortfall is region-local and comparing regions
-// is the whole point of collecting this; note that for a provider which collapses
-// several declared regions into one candidate (Modal) the value is that provider's
-// joined token, not a single region name — see NodeClaimSpec.Region.
-//
-// The accelerator TYPE and COUNT are two labels, not the joined "H100:8" pool identity
-// used as the blocklist key. A metric label set is meant to be aggregated over, and a
-// joined string cannot be: `sum by (accelerator)` over every size of H100 requires
-// splitting the value in PromQL, and selecting all 8-GPU requests across types is not
-// expressible at all. Two labels give both for free, and the pool key is still
-// recoverable as accelerator + ":" + accelerator_count when correlating with a
-// blocklist entry.
+// Accelerator TYPE and COUNT are two labels, not the joined "H100:8" blocklist key,
+// because labels are meant to be aggregated and a joined string cannot be:
+// `sum by (accelerator)` over every H100 size would need PromQL string splitting, and
+// "all 8-GPU requests across types" is not expressible at all. The pool key is still
+// recoverable as accelerator + ":" + accelerator_count.
 var candidateLabels = []string{"provider", "region", "capacity_type", "accelerator", "accelerator_count"}
 
 // withExtra returns candidateLabels plus one trailing dimension (result, reason), for

@@ -20,29 +20,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// SandboxSetSpec maintains N Sandboxes. That is the whole contract, and the name
-// says exactly that much: it is a SET, not a pool. A pool would imply lease
-// semantics — claim a box, hold it, return it, with the pool tracking who has what
-// — and none of that is implemented here. Keeping N boxes alive is what ENABLES
-// warm pooling (holding instances ready because provisioning takes minutes while
-// an agent's exec call wants sub-second) and fan-out ("twenty boxes for this
-// batch"), but those are uses of a set, not the set's job. "Pool" would also be a
-// third meaning of that word in this API group, where NodePool already means
-// placement policy.
+// SandboxSetSpec maintains N Sandboxes. That is the whole contract — a SET, not a
+// pool: there are no lease semantics here (claim a box, hold it, return it). Keeping
+// N boxes alive is what ENABLES warm pooling and fan-out, but those are uses of a
+// set, not its job. "Pool" is also already taken in this API group by NodePool.
 //
-// It creates Sandbox OBJECTS, not replicas inside itself, and that is the point of
-// having two types. The count is a genuinely different concern from the box: a set
-// answers "how many", a Sandbox answers "which one, running what, for whom".
-// Because each box stays its own object underneath, per-box RBAC, per-box status
-// and a failure that stays visible all keep working — none of which survives being
-// flattened into a replica index.
+// It creates Sandbox OBJECTS, not replicas inside itself: a set answers "how many",
+// a Sandbox answers "which one, running what, for whom". Because each box stays its
+// own object, per-box RBAC, per-box status, and a visible failure keep working —
+// none of which survives being flattened into a replica index.
 //
-// Boxes get GENERATED names (myset-a4f2x), not ordinals. Ordinals would imply a
-// slot that gets refilled, so a box that died would be replaced by an empty one
-// wearing the same name — the same address with a different filesystem, which is
-// the most confusing thing this API could do. A generated name means a replacement
-// is visibly a NEW box, and callers that need a stable handle hold the Sandbox name
-// they were given rather than an index into a set.
+// Boxes get GENERATED names (myset-a4f2x), not ordinals. An ordinal implies a slot
+// that gets refilled, so a dead box would be replaced by an empty one wearing the
+// same name — same address, different filesystem. A generated name makes a
+// replacement visibly a NEW box.
 type SandboxSetSpec struct {
 	// Replicas is how many Sandboxes to maintain. Zero is legal and useful: it
 	// releases every box while keeping the set's definition, which is how a set is

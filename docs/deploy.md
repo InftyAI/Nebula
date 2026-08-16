@@ -123,6 +123,18 @@ Non-secret config, passed as `make` variables:
 | `DEPLOY_KIND_CLUSTER` | *(empty)* | If set, load the image into this Kind cluster instead of pushing. Separate from the e2e `KIND_CLUSTER`, so a plain `make deploy-all` pushes. |
 | `KUBECTL` | `kubectl` | kubectl binary to use |
 
+Manager flags worth knowing (edit `config/manager/manager.yaml` `args`):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--kubelet-bind-address` | `:10250` | Where the kubelet log endpoint listens — the address the API server proxies `kubectl logs` to. Set it empty to disable the endpoint, which disables logs and nothing else. |
+| `--kubelet-client-ca` | *(empty)* | PEM bundle of CAs whose client certificates are accepted on that port. **Empty means client certificates are not verified**, so anything able to reach port 10250 can read the logs of any Pod on Nebula's virtual nodes. Set it to your API server's kubelet client CA to require mTLS, or keep the port closed with a NetworkPolicy. The default is open because which CA signs that client cert is not portable — kubeadm uses the cluster CA, EKS/GKE their own — so requiring it by default would break logs on managed control planes. |
+
+The endpoint needs `POD_IP` (projected via `fieldRef` in `config/manager/manager.yaml`)
+because virtual nodes advertise the leader's Pod IP, not a Service. Running the manager
+off-cluster leaves it unset, and logs degrade to unsupported. See
+[status.md § Logs](status.md#logs).
+
 ---
 
 ## Manual deployment

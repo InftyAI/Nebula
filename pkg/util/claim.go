@@ -34,27 +34,20 @@ const (
 	claimHashLen = 10
 )
 
-// ClaimName is the instance-identity token Nebula encodes into a provider
-// instance's name/tag so List/Terminate can find it later without a durable id.
-// It is a deterministic, PURE function of the served workload's namespace and
-// name, so any component that knows the Pod (the virtual kubelet) or the claim's
-// PodRef (the teardown backstop) computes the same token. Keep this the single
-// source of truth for the convention — the vnode handler and the NodeClaim
-// finalizer both depend on producing identical values.
+// ClaimName is the instance-identity token Nebula encodes into a provider instance's
+// name/tag so List/Terminate can find it later without a durable id. It is a PURE
+// function of the workload's namespace and name, so whoever knows the Pod (the virtual
+// kubelet) or the claim's PodRef (the teardown backstop) derives the same token. Keep
+// this the single source of truth — both depend on producing identical values.
 //
-// The common case is a plain "namespace-name" join, kept verbatim: it is the
-// historical format, so instances already tagged this way keep matching, and it
-// is human-readable in `kubectl get nodeclaim`.
+// Normally a plain "namespace-name" join, kept verbatim: it is the historical format
+// (already-tagged instances keep matching) and it is readable in kubectl output.
 //
-// A NodeClaim's metadata.name is capped at maxClaimNameLen (a cluster-scoped
-// object name is a DNS subdomain). A long namespace + long Pod name can exceed
-// that, and then the join would be an invalid, un-creatable name — the Pod would
-// never be placed. Only in that over-length case do we fall back to a bounded,
-// collision-resistant form: the join truncated to fit, with a hash of the full,
-// canonical "namespace/name" key appended. Hashing the "/"-joined key (— "/" is
-// illegal in both a namespace and a name, so the input is unambiguous) keeps the
-// suffix stable and distinct even when two different (namespace, name) pairs
-// truncate to the same prefix.
+// A NodeClaim name is a DNS subdomain, capped at maxClaimNameLen, and a long namespace
+// plus long Pod name can exceed it — then the join is un-creatable and the Pod is never
+// placed. Only in that case do we truncate and append a hash of the canonical
+// "namespace/name" key. "/" is illegal in both, so the hashed input is unambiguous and
+// two pairs that truncate to the same prefix still differ.
 func ClaimName(namespace, name string) string {
 	joined := namespace + "-" + name
 	if len(joined) <= maxClaimNameLen {

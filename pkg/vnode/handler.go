@@ -43,90 +43,64 @@ import (
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
-// defaultPollInterval is how often the notifier re-lists the provider to detect
-// state changes (ready, preemption, disappearance). Detection is poll-based
-// everywhere — no provider pushes preemption/termination — so this is the
-// resolution at which the virtual node notices instance state transitions. It is
-// only the fallback: a provider may override the cadence via
-// Capabilities.PollInterval (e.g. a spot-heavy backend polls faster to notice
-// reclaims sooner; an OnDemand-only one can poll lazily).
+// defaultPollInterval is how often we re-list the provider to notice state changes
+// (ready, preempted, gone). No provider pushes those events, so polling is the only
+// signal. A provider can override the cadence via Capabilities.PollInterval.
 const defaultPollInterval = 15 * time.Second
 
-// defaultBlocklistTTL is the BASE exclusion for a failed placement when the Pod
-// carries no BlocklistTTLAnnotation (an out-of-band Pod, or one placed before the
-// annotation existed). It mirrors FailoverPolicy.BlocklistTTL's own default so the
-// behaviour is identical whether or not the pool policy reached the handler. The
-// effective TTL is this base plus a random jitter of up to blocklistJitter (see
-// recordBlock), so it is deliberately short: the jitter, not a long fixed floor,
-// is what spreads retries.
+// defaultBlocklistTTL is the base exclusion for a failed placement when the Pod
+// carries no BlocklistTTLAnnotation. Short on purpose: the jitter added in
+// recordBlock, not a long floor, is what spreads retries.
 const defaultBlocklistTTL = 30 * time.Second
 
-// blocklistJitter is the upper bound on the random delay ADDED to the base TTL for
-// every recorded block. Without it, all Pods that failed for one (accelerator,
-// tier, region) scope re-block in lockstep and their exclusions lapse at the same
-// instant, so they stampede the same just-freed candidate together — and, because
-// records coalesce on the LATEST expiry (see Blocklist.Record), the shared entry
-// would otherwise carry an identical deadline for all of them. A per-record jitter
-// in [0, blocklistJitter) decorrelates those wake-ups so freed capacity is sampled
-// across a spread of moments instead of one thundering retry.
+// blocklistJitter is the largest random delay added to a block's base TTL. Without
+// it, every Pod that failed for one scope re-tries the instant the shared entry
+// expires and they stampede the same just-freed candidate together.
 const blocklistJitter = 30 * time.Second
 
-// Blocklister records a failed placement so the placement controller can fail over
-// to the next candidate instead of hot-looping against a provider that just
-// rejected the request. It is the write half of pkg/failover.Blocklist; the
-// handler depends on this narrow interface (not the concrete type) so it stays
-// testable and a nil blocklist is a no-op.
+// Blocklister records a failed placement so the placement controller fails over to
+// the next candidate instead of hot-looping on a provider that just said no. The
+// write half of pkg/failover.Blocklist; a nil blocklist is a no-op.
 type Blocklister interface {
 	Record(prov string, scope provider.BlockScope, ttl time.Duration)
 }
 
-// defaultProvisionTimeout bounds a single Provision call when the provider does
-// not override it (Capabilities.ProvisionTimeout). Provisioning is a network
-// call to the backend (Modal's gRPC CreateSandbox, AWS's RunInstances and its
-// per-zone capacity failover), and none of them are guaranteed to return
-// promptly — a hung call would otherwise pin the pod controller's worker
-// indefinitely. Enforcing it here, at the single call site, keeps every provider
-// bounded by default; a provider that legitimately needs longer (AWS sweeping
-// several zones) raises it via Capabilities. It is deliberately generous: the
-// happy path returns in well under this, so it is a backstop, not a tuning knob.
+// defaultProvisionTimeout bounds one Provision call, so a hung backend cannot pin a
+// pod-controller worker forever. Deliberately generous — a backstop, not a tuning
+// knob. A provider that needs longer (AWS sweeping zones) raises it via
+// Capabilities.ProvisionTimeout.
 const defaultProvisionTimeout = 90 * time.Second
 
-// Handler bridges one provider into the virtual kubelet: it implements the VK
-// PodLifecycleHandler (+ PodNotifier) so the pod controller's CreatePod
-// provisions an external instance through the provider seam and DeletePod
-// terminates it. This is the "VK owns provisioning" model — there is no separate
-// controller issuing Provision/Terminate.
+// Handler bridges one provider into the virtual kubelet: CreatePod provisions an
+// external instance, DeletePod terminates it. This is the "VK owns provisioning"
+// model — no separate controller issues Provision/Terminate.
 //
-// Leak-safety: the pod controller only calls DeletePod for a pod it is tracking,
-// and CreatePod records the instance id before returning success, so a paid
-// instance is always reachable for teardown. Provision is idempotent on
-// ClaimName, so a CreatePod retried after a crash between provider-create and
-// status-write adopts the existing instance rather than creating a second.
+// Leak-safety: CreatePod records the instance id before returning success, so a paid
+// instance is always reachable for teardown, and Provision is idempotent on
+// ClaimName, so a retry after a crash adopts the existing instance instead of
+// creating a second.
 type Handler struct {
 	prov provider.Provider
 
-	// client patches the endpoint annotation onto the Pod's metadata. VK persists
-	// only the status subresource (its UpdateStatus never touches metadata), so the
-	// reachable address — which must be visible on the Pod for anyone to reach the
-	// workload — needs a metadata write of its own. May be nil in tests, where the
-	// annotation is set on the in-memory tracked Pod but not persisted.
+	// client patches the endpoint annotation onto the Pod's metadata. VK persists only
+	// the status subresource, so metadata needs a write of its own. Nil in tests, where
+	// the annotation stays on the in-memory Pod.
 	client kubernetes.Interface
 
-	// blocklist records failed placements so the placement controller can fail over
-	// (zone → region → tier). Shared across every provider's handler and the
-	// placement controller. May be nil (a no-op), keeping tests and any
-	// blocklist-less wiring simple.
+	// blocklist records failed placements so placement fails over (zone → region →
+	// tier). Shared with every other handler and the placement controller. Nil is a
+	// no-op.
 	blocklist Blocklister
 
 	mu sync.Mutex
 
-	// tracked is the poll loop's work list and what GetPod/GetPodStatus serve, keyed
-	// by namespace/name.
+	// tracked is the poll loop's work list and what GetPod/GetPodStatus serve, keyed by
+	// namespace/name.
 	//
-	// INVARIANT: only pods whose instance the provider has acknowledged (Provision
-	// returned an id) or that are already terminal. Never one whose Provision call is
-	// still in flight — reconcileOnce maps a tracked pod absent from List() to
-	// Terminated, which for a live provision is a wrong, unrecoverable write.
+	// INVARIANT: only pods the provider has acknowledged (Provision returned an id), or
+	// already terminal ones. Never one with Provision still in flight — reconcileOnce
+	// writes Terminated for any tracked pod missing from List(), which for a live
+	// provision is wrong and unrecoverable.
 	tracked map[string]*trackedPod
 
 	notify func(*corev1.Pod)
@@ -135,59 +109,46 @@ type Handler struct {
 	nowFn     func() metav1.Time
 	pollEvery time.Duration
 
-	// jitterFn returns the random delay added to a block's base TTL (see
-	// recordBlock). A seam so tests can pin it (e.g. to 0) and assert an exact TTL;
-	// production wires it to a uniform draw in [0, blocklistJitter).
+	// jitterFn returns the delay added to a block's base TTL (see recordBlock). A seam
+	// so tests can pin it to 0 and assert an exact TTL.
 	jitterFn func() time.Duration
 }
 
-// trackedPod is the virtual node's local record of one pod it provisioned for.
-// The Pod object is the source of truth for the workload; we additionally hold
-// the provider instance id (for Terminate) and the derived claim name (to match
-// this pod against the provider's List during polling).
+// trackedPod is the local record of one pod we provisioned for: the Pod itself, plus
+// the instance id (for Terminate) and the claim name (to match it against the
+// provider's List while polling).
 type trackedPod struct {
 	pod       *corev1.Pod
 	claimName string
 	instance  string
-	// connectEndpoint is the endpoint value last written to the Pod's metadata
-	// annotation via patchEndpoint. The notify callback fires every poll tick, so
-	// this dedups the metadata patch to the ticks where the reachable address
-	// actually changed (first appearance, or a re-provision) rather than every tick.
+	// connectEndpoint is the endpoint last patched onto the Pod. notify fires every poll
+	// tick, so this narrows the patch to the ticks where the address actually changed.
 	//
-	// It is a cache, not a record: losing it (a restart) costs one redundant patch,
-	// never a lost value, because the annotation itself lives in etcd. No credential is
-	// held here — see persistCredential.
+	// A cache, not a record: losing it on a restart costs one redundant patch, never a
+	// lost value, since the annotation lives in etcd. Holds no credential — see
+	// persistCredential.
 	connectEndpoint string
 
-	// provisionStart is when THIS process began provisioning for the pod. It arms the
+	// provisionStart is when THIS process began provisioning. It arms the one
 	// metrics.InstanceReadyDuration observation the poll loop makes on the first
-	// transition to Running, and is CONSUMED by it — a one-shot token, not a record, so
-	// zero carries both halves of "do not observe":
+	// Running, and is consumed by it, so zero means "do not observe" for either reason:
 	//
-	//   - Never armed. A pod re-adopted after a restart (GetPod's cold-map path) has no
-	//     recoverable start time — it died with the process — and measuring from
-	//     re-adoption would report a multi-minute wait as milliseconds. Zero means "do
-	//     not observe", NOT "observe as 0": a missing sample beats a wrong one.
-	//   - Already spent. The poll loop walks every tracked pod every tick and a pod sits
-	//     in Running for its whole life, so an observation that stayed armed would fire
-	//     per tick with an ever-growing duration — a one-minute boot would contribute
-	//     hundreds of samples stretching to the pod's full age, measuring longevity
-	//     instead of readiness.
+	//   - never armed: a pod re-adopted after a restart lost its real start time with
+	//     the process, and measuring from re-adoption would report minutes as
+	//     milliseconds — a missing sample beats a wrong one;
+	//   - already spent: the poll loop sees Running every tick for the pod's whole life,
+	//     so a still-armed token would fire per tick with a growing duration, measuring
+	//     longevity instead of readiness.
 	//
-	// The first case is a known bias worth naming: a provision still in flight when the
-	// manager restarts never contributes, so the histogram under-samples exactly the
-	// slowest boots. Closing it needs the start time persisted somewhere durable (a Pod
-	// annotation or NodeClaim status), which is a write on the provisioning path we have
-	// not taken.
+	// Known bias: a provision still in flight across a restart never contributes, so the
+	// histogram under-samples the slowest boots. Fixing it means persisting the start
+	// time, a write on the provisioning path we have not taken.
 	provisionStart time.Time
 }
 
-// NewHandler builds a Handler for the given provider backend. The poll cadence
-// comes from the provider's Capabilities.PollInterval, falling back to
-// defaultPollInterval when the provider does not set one. blocklist is the shared
-// failover blocklist a Provision failure is recorded on; it may be nil (no-op).
-// client is used to patch the endpoint annotation onto the Pod metadata (VK only
-// writes status); it may be nil in tests, where the annotation stays in-memory.
+// NewHandler builds a Handler for one provider backend. The poll cadence comes from
+// Capabilities.PollInterval, falling back to defaultPollInterval. blocklist (failover
+// recording) and client (the endpoint patch) may both be nil.
 func NewHandler(prov provider.Provider, client kubernetes.Interface, blocklist Blocklister) *Handler {
 	poll := prov.Capabilities().PollInterval
 	if poll <= 0 {
@@ -228,15 +189,14 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "claim", claim)
 
-	// Bound the provision call so a wedged backend cannot pin this worker forever.
-	// The provider may raise the deadline via Capabilities.ProvisionTimeout (AWS
-	// does, to leave room for cross-zone failover); zero means "use the default".
+	// Bound the provision call so a wedged backend cannot pin this worker forever. A
+	// provider may raise the deadline via Capabilities.ProvisionTimeout (AWS does, for
+	// cross-zone failover).
 	//
-	// The deadline is scoped to that ONE call and must not be reused for the writes
-	// that follow it. A Provision returning just under the timeout would leave those
-	// writes with no time budget at all, so they would fail with DeadlineExceeded on
-	// success — and the credential write below cannot be retried, so a timeout there
-	// loses the token for good. The follow-up writes stay on the caller's ctx.
+	// Scoped to that ONE call: the writes after it stay on the caller's ctx. A Provision
+	// returning just under the deadline would leave them no budget, so they would fail
+	// on success — and the credential write cannot be retried, so a timeout there loses
+	// the token for good.
 	timeout := h.prov.Capabilities().ProvisionTimeout
 	if timeout <= 0 {
 		timeout = defaultProvisionTimeout
@@ -247,46 +207,39 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	log.Info("provisioning external instance",
 		"capacityType", req.CapacityType, "region", req.Region, "timeout", timeout.String())
 
-	// Two clocks, because they measure two different waits. provisionStart anchors the
-	// end-to-end wait a user experiences (it runs until the instance reports Running,
-	// and is handed to store below), while callStart isolates the Provision call itself.
-	// They are NOT interchangeable: the emit between them is a synchronous notify that
-	// can issue an API write, so reusing one timestamp would silently charge that write
+	// Two clocks for two different waits: provisionStart measures the end-to-end wait a
+	// user feels (until the instance reports Running; handed to store below), callStart
+	// only the Provision call. Not interchangeable — the emit between them is a
+	// synchronous notify that can issue an API write, which would otherwise be charged
 	// to the provider's latency.
 	provisionStart := time.Now()
 	mlabels := h.metricLabels(pod)
 
-	// Report Provisioning BEFORE the call. It can run for minutes (AWS sweeps the
-	// region's zones on a capacity error), and until it returns this is the only
-	// explanation the Pod carries. Emit but do NOT store — see the tracked invariant.
+	// Report Provisioning BEFORE the call: it can run for minutes (AWS sweeps a region's
+	// zones on a capacity error), and until it returns this is the only explanation the
+	// Pod carries. Emit but do NOT store — see the tracked invariant.
 	h.markStatus(pod, corev1.PodPending, reasonProvisioning, "allocating external instance")
 	h.emit(pod)
 
 	callStart := time.Now()
 	res, err := h.prov.Provision(provisionCtx, pod, req)
-	// One call site for both outcomes, so the attempt and failure counters cannot drift
-	// out of step. It counts the attempt regardless of how the error is handled below:
-	// an unreachable provider is a failed attempt even though nothing is blocklisted for
-	// it, and result="failure" with reason="unreachable" is precisely the series that
-	// says so.
+	// One call site for both outcomes, so the attempt and failure counters cannot drift.
+	// An unreachable provider still counts as a failed attempt even though nothing gets
+	// blocklisted for it.
 	metrics.ObserveProvision(mlabels, time.Since(callStart), err)
 	if err != nil {
 		// An error the provider never attributed to this request — a transport failure,
-		// our own ProvisionTimeout, a 503 — is not a rejection, so it must not be acted
-		// on like one (see provider.IsRejection). Failing the Pod here would be a
-		// terminal verdict drawn from no evidence: the request may have been accepted, in
-		// which case the Pod is reaped out from under a paid instance whose id we never
-		// learned. Blocklisting would fence off a candidate that never misbehaved.
+		// our own timeout, a 503 — is not a rejection (see provider.IsRejection). The
+		// request may even have been accepted, so failing the Pod would reap it out from
+		// under a paid instance whose id we never learned, and blocklisting would fence
+		// off a candidate that never misbehaved.
 		//
-		// So leave the Pod NON-terminal at the Provisioning it was already stamped with,
-		// carrying the error as its message so the wait is explained, and return the error
-		// for VK to retry with backoff. Provision is idempotent on ClaimName, so a retry
-		// adopts whatever the failed attempt may have created rather than doubling it.
+		// So leave it NON-terminal at the Provisioning already stamped, with the error as
+		// its message, and return the error for VK to retry with backoff. Provision is
+		// idempotent on ClaimName, so the retry adopts whatever the failed attempt created.
 		//
-		// Deliberately NOT stored: the tracked invariant admits only acknowledged or
-		// terminal pods, and tracking this one with no instance id would have the poll
-		// loop find it absent from List and write the very Terminated status this branch
-		// exists to avoid.
+		// Deliberately NOT stored: a tracked pod with no instance id would be read as
+		// absent from List and written the very Terminated this branch avoids.
 		if !provider.IsRejection(err) {
 			log.Error(err, "provision failed with an error the provider did not attribute "+
 				"to this request; Pod left provisioning for retry, nothing blocklisted")
@@ -296,83 +249,65 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		}
 
 		log.Error(err, "provision rejected by the provider; Pod marked Failed for failover")
-		// Record the failure on the shared blocklist so placement fails over to the
-		// next candidate (zone → region → tier) instead of hot-looping here. The
-		// provider classifies its own error into the precise BlockScope (a Spot
-		// no-capacity in one region blocks only that, not OnDemand or other regions;
-		// auth/quota blocks the whole provider); the TTL rides on the Pod from the
-		// pool's FailoverPolicy.
+		// Record the failure so placement fails over to the next candidate (zone → region
+		// → tier) instead of hot-looping here. The provider narrows its own error into a
+		// BlockScope (a Spot shortage in one region blocks only that; auth/quota blocks
+		// the whole provider); the TTL rides on the Pod from the pool's FailoverPolicy.
 		h.recordBlock(ctx, pod, err)
-		// Surface the failure on the Pod so the placement controller can fail
-		// over, and return the error so the pod controller retries with backoff.
+		// Surface the failure so placement can fail over, and return the error so the pod
+		// controller retries with backoff.
 		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, err.Error())
-		// A zero start: this pod is terminal and will never reach Running, so there is no
-		// ready-duration to observe.
+		// Zero start: terminal, so it never reaches Running and has no ready-duration.
 		h.store(pod, claim, "", time.Time{})
 		h.emit(pod)
 		return err
 	}
 
 	// Only a RESERVED instance advances: capacity is committed and it is booting. An
-	// unreserved id (a Modal sandbox accepted but still queued for a GPU) is left at
-	// the Provisioning stamped above, which is exactly true — the id is real and must
-	// be reclaimed, but nothing is allocated yet. One poll tick later the queued
-	// sandbox reads Initializing too, since Modal cannot tell queued from booting (see
-	// docs/status.md).
+	// unreserved id (a Modal sandbox accepted but still queued for a GPU) stays at the
+	// Provisioning stamped above, which is exactly true — the id is real and must be
+	// reclaimed, but nothing is allocated yet.
 	//
-	// store runs either way: an id means the instance exists. markStatus precedes it
-	// because store deep-copies — storing first would track a copy without the status
-	// just written.
+	// store runs either way: an id means the instance exists. markStatus first, because
+	// store deep-copies and would otherwise track a copy without the new status.
 	log.Info("external instance provisioned", "instanceID", res.InstanceID, "reserved", res.Reserved)
 	if res.Reserved {
 		h.markStatus(pod, corev1.PodPending, reasonInitializing, "external instance is initializing")
 	}
-	// Stamp a create-time address BEFORE store, because store deep-copies and the
-	// tracked copy is what the poll loop re-emits. That is the whole publication: the
-	// emit below carries it to the API server through the same notify wrapper the poll
-	// loop uses, and every later tick re-offers it until a write lands. No lock: this
-	// Pod is not shared until store, VK having handed us a copy of its own.
+	// Stamp the create-time address BEFORE store, since store deep-copies and the tracked
+	// copy is what the poll loop re-emits. The emit below publishes it, and every later
+	// tick re-offers it until a write lands. No lock: the Pod is not shared until store.
 	setEndpoint(pod, res.ConnectURL)
 	h.store(pod, claim, res.InstanceID, provisionStart)
 
-	// The TOKEN, unlike the address, cannot ride the Pod (it would be readable by
-	// anyone with `get pod` and sit unencrypted in etcd), so it gets its own write
-	// here — the only place it exists, since the provider mints it once and cannot
-	// re-read it (see provider.ProvisionResult). It runs after store and before emit so
-	// a tracked pod is never observable without its credential, and it does not gate
-	// the status: a Pod that provisioned is reported provisioned even if the Secret
-	// write failed.
+	// The TOKEN cannot ride the Pod (readable with `get pod`, unencrypted in etcd), so it
+	// gets its own write — the only place it exists, since the provider mints it once and
+	// cannot re-read it. After store and before emit, so a tracked pod is never visible
+	// without its credential. It does not gate the status: a Pod that provisioned is
+	// reported provisioned even if the Secret write failed.
 	h.persistCredential(ctx, pod, res.ConnectURL, res.ConnectToken)
 
 	h.emit(pod)
 	return nil
 }
 
-// persistCredential writes the bearer token, and a copy of the address it
-// authenticates against, into a Secret.
+// persistCredential writes the bearer token, plus the address it authenticates against,
+// into a Secret.
 //
-// It handles ONLY the secret half. The address is published by stamping it on the Pod
-// (see CreatePod / setEndpoint), which routes it through the one endpoint write path
-// every provider shares; this function exists because the token cannot travel that way.
-// An annotation is readable by anyone with `get pod` and lands unencrypted in etcd,
-// which is fine for an address and unacceptable for a credential, so the token goes to
-// an access-controlled Secret — with the URL alongside it, so the pair is usable from
-// one object.
+// Only the secret half. The address is published on the Pod (see setEndpoint), but a
+// token cannot travel that way: an annotation is readable with `get pod` and lands
+// unencrypted in etcd. So it goes to an access-controlled Secret, with the URL alongside
+// it so the pair is usable from one object.
 //
-// The token is one-shot and unrepeatable: minting is create-only with no read-back, so
-// a failed write cannot be retried, here or later. That is the difference from the
-// address, which the poll loop keeps re-offering until it lands. The Secret is instead
-// written once and never rewritten, so it needs nothing held in memory.
+// One-shot and unrepeatable: minting is create-only with no read-back, so a failed write
+// cannot be retried, here or later. That is the difference from the address, which the
+// poll loop keeps re-offering until it lands.
 //
-// An empty url means the provider mints no credential (AWS, whose address is not known
-// until boot and is reported through the observed endpoint instead) or that minting
-// failed; an empty token means an address with nothing to authenticate, so a Secret
-// would imply a credential that does not exist. Either way there is nothing to write
-// and nothing to fail — the poll loop still reports the instance, and an unreachable
-// workload is reported unreachable.
+// An empty url means the provider mints no credential (AWS, whose address is only known
+// at boot); an empty token means an address with nothing to authenticate. Either way
+// there is nothing to write.
 //
-// Best-effort: a nil client (tests) is a no-op, and a failure is logged, never with the
-// token.
+// Best-effort: a nil client (tests) is a no-op, failures are logged without the token.
 func (h *Handler) persistCredential(ctx context.Context, pod *corev1.Pod, url, token string) {
 	if h.client == nil || url == "" || token == "" {
 		return
@@ -380,20 +315,17 @@ func (h *Handler) persistCredential(ctx context.Context, pod *corev1.Pod, url, t
 	h.createConnectSecret(ctx, pod, url, token)
 }
 
-// UpdatePod is a no-op: the external instance's shape is immutable once
-// provisioned (recovery from any change is delete-and-recreate, matching the
-// NodeClaim ledger's immutability). We still refresh our tracked copy so
-// GetPod reflects the latest metadata.
+// UpdatePod is a no-op: an instance's shape is immutable once provisioned (recovery
+// from any change is delete-and-recreate). We still refresh the tracked copy so GetPod
+// reflects the latest metadata.
 func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		// Preserve what WE own and the API server does not yet know: the status we
-		// compute from the provider, and the endpoint — which may be an address minted
-		// at create whose patch has not landed yet, so the incoming Pod would not carry
-		// it. Dropping it would discard the only copy (a minted URL is never
-		// re-observed) and strand the retry with nothing to replay. Everything else is
-		// adopted from the incoming spec/meta.
+		// Keep what WE own and the API server does not know yet: the status we compute,
+		// and the endpoint — possibly an address minted at create whose patch has not
+		// landed, so the incoming Pod lacks it. Dropping it would discard the only copy,
+		// since a minted URL is never re-observed. Everything else is adopted.
 		status := tp.pod.Status
 		endpoint := tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation]
 		tp.pod = pod.DeepCopy()
@@ -420,8 +352,8 @@ func (h *Handler) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 
 	log.Info("terminating external instance")
 	if err := h.prov.Terminate(ctx, instance); err != nil {
-		// A failed Terminate is the leak-risk path: VK will retry DeletePod, but if it
-		// never succeeds the NodeClaim backstop is the last line of defense. Log loudly.
+		// The leak-risk path: VK retries DeletePod, and if that never succeeds the
+		// NodeClaim backstop is the last line of defense. Log loudly.
 		log.Error(err, "terminate failed; external instance may still be running (NodeClaim backstop will retry)")
 		return err
 	}
@@ -439,30 +371,23 @@ func (h *Handler) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
-// GetPod returns the tracked pod, or a NotFound error the pod controller
-// understands.
+// GetPod returns the tracked pod, or a NotFound error the pod controller understands.
 //
-// Tracking is in-memory, so a VK restart (redeploy, crash, OOM, leader handoff)
-// starts with an empty map even though the external instances are still running.
-// VK's createOrUpdatePod calls GetPod to decide adopt-vs-create: a nil result
-// makes it re-issue CreatePod, which resets the Pod's status to Provisioning and
-// re-drives provisioning. To avoid that regression we RE-ADOPT here — when the
-// Pod is not in the map we ask the provider whether an instance with this Pod's
-// claim is still live, and if so rebuild the tracking entry from it. VK then sees
-// a non-nil pod and takes the UpdatePod (adopt) branch, and the re-tracked pod is
-// advanced to its true state by the next poll tick.
+// Tracking is in-memory, so a restart (redeploy, crash, leader handoff) starts with an
+// empty map while the instances are still running. VK's createOrUpdatePod treats a nil
+// result as "create", which would re-drive provisioning. So on a cold map we RE-ADOPT:
+// ask the provider whether an instance with this claim is live, and rebuild the entry
+// from it. VK then takes the adopt branch and the next poll tick advances the pod.
 //
-// The three outcomes are kept DISTINCT, because "the provider has no such instance"
-// and "we could not ask the provider" have opposite consequences here. Reporting the
-// latter as NotFound is what let a single failed List destroy a healthy workload: VK
-// discards this function's error and branches on nil-ness alone (createOrUpdatePod in
-// node/pod.go), so a nil pod re-issues CreatePod against an instance that is already
-// running — and if the provider is still unreachable, that Provision fails too, marking
-// the Pod Failed for a reap while the real instance keeps billing behind a zero
-// instance id. So an unreachable provider returns a non-nil pod WITH an error: the
-// non-nil pod suppresses the create, and the non-NotFound error makes VK's other
-// caller (the pod controller's delete path) requeue rather than terminate. Both then
-// wait for the next sync, which is the only correct move while ownership is unknown.
+// The three outcomes stay DISTINCT, because "no such instance" and "could not ask" have
+// opposite consequences. Reporting the latter as NotFound is what let one failed List
+// destroy a healthy workload: VK discards this error and branches on nil-ness alone, so
+// a nil pod re-issues CreatePod against a running instance — and with the provider still
+// unreachable that Provision fails too, marking the Pod Failed for a reap while the real
+// instance keeps billing behind a zero id. So an unreachable provider returns a non-nil
+// pod WITH an error: the pod suppresses the create, and the non-NotFound error makes the
+// delete path requeue instead of terminating. Both wait for the next sync, the only
+// correct move while ownership is unknown.
 func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
 	h.mu.Lock()
 	tp, ok := h.tracked[key(namespace, name)]
@@ -478,9 +403,9 @@ func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.P
 	claim := util.ClaimName(namespace, name)
 	inst, found, err := h.instanceByClaim(ctx, claim)
 	if err != nil {
-		// Loud, and never swallowed: this is the only signal that a Pod is being held
-		// back, and every alternative to holding back is a guess that costs either a
-		// duplicate paid instance or a reaped live one.
+		// Loud, and never swallowed: this is the only signal a Pod is being held back, and
+		// every alternative guesses — costing either a duplicate paid instance or a
+		// reaped live one.
 		log.Error(err, "cannot determine whether an instance exists for this Pod; "+
 			"holding off create and delete until the provider answers", "claim", claim)
 		stub := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
@@ -492,22 +417,21 @@ func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.P
 	}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	applyState(pod, inst.State, inst.Endpoint, h.nowFn())
-	// A zero start: this process never provisioned the instance, so its real start time
-	// is gone and its ready-duration is not observable (see trackedPod.provisionStart).
+	// Zero start: this process never provisioned it, so the real start time is gone and
+	// the ready-duration is not observable (see trackedPod.provisionStart).
 	h.store(pod, claim, inst.ID, time.Time{})
 	log.Info("re-adopted live instance after cold tracking map (VK restart)",
 		"claim", claim, "instanceID", inst.ID, "state", inst.State)
 	return pod.DeepCopy(), nil
 }
 
-// instanceByClaim returns the live provider instance whose ClaimName matches, whether
-// one was found, and any List error.
+// instanceByClaim returns the live instance whose ClaimName matches, whether one was
+// found, and any List error. It backs GetPod's post-restart re-adoption.
 //
-// The error is returned rather than folded into found=false because the two are not
-// the same answer: found=false ASSERTS the instance does not exist, while an error
-// means we do not know. GetPod acts very differently on each, and conflating them
-// turned "unknown" into "absent" — the strongest possible claim from the least
-// information. It backs GetPod's post-restart re-adoption.
+// The error is kept separate from found=false because they are different answers:
+// found=false ASSERTS the instance does not exist, an error means we do not know.
+// Conflating them turns "unknown" into "absent" — the strongest claim from the least
+// information — and GetPod acts very differently on each.
 func (h *Handler) instanceByClaim(ctx context.Context, claim string) (provider.Instance, bool, error) {
 	instances, err := h.prov.List(ctx)
 	if err != nil {
@@ -543,16 +467,13 @@ func (h *Handler) GetPods(_ context.Context) ([]*corev1.Pod, error) {
 	return pods, nil
 }
 
-// NotifyPods registers the async status callback and starts the poll loop. VK
-// calls this once at startup; the loop runs until ctx is cancelled.
+// NotifyPods registers the async status callback and starts the poll loop. VK calls it
+// once at startup; the loop runs until ctx is cancelled.
 //
-// We WRAP VK's callback rather than store it raw. VK's cb drives its status path
-// (enqueuePodStatusUpdate -> UpdateStatus), which writes only the /status
-// subresource and silently drops any metadata change on the same object. The
-// reachable endpoint must live on the Pod's metadata (PodIP cannot hold a DNS
-// name — see applyState), so the wrapper publishes the instance's access details
-// with their own writes first, then hands the same Pod to VK for the status write.
-// This folds those writes onto the one notify signal: every status push also
+// We WRAP VK's callback: its status path writes only the /status subresource and
+// silently drops metadata changes on the same object, but the endpoint has to live on
+// metadata (PodIP cannot hold a DNS name — see applyState). So the wrapper writes the
+// access details first, then hands the same Pod to VK. Every status push therefore also
 // reconciles how the workload is reached.
 func (h *Handler) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	h.mu.Lock()
@@ -583,15 +504,12 @@ func (h *Handler) pollLoop(ctx context.Context) {
 	}
 }
 
-// reconcileOnce lists the provider once and updates every tracked pod's status
-// from the matching instance (matched by claim name, since a pod maps 1:1 to a
-// claim). A tracked pod whose instance is absent from the list is treated as
-// terminated (preempted / externally torn down), per the provider contract.
+// reconcileOnce lists the provider once and updates every tracked pod from its matching
+// instance (matched by claim name, 1:1 with a pod). A tracked pod absent from the list is
+// treated as terminated — preempted, or torn down externally.
 //
-// A List error is logged and skipped (retry next tick) rather than swallowed:
-// a provider whose List fails every tick would otherwise strand every tracked
-// pod in its last status forever with no signal, which is exactly the failure
-// mode this logging exists to surface.
+// A List error is logged and retried next tick rather than swallowed: a provider whose
+// List always fails would otherwise strand every pod in its last status with no signal.
 func (h *Handler) reconcileOnce(ctx context.Context) {
 	log := logf.FromContext(ctx).WithName("vnode-poll").WithValues("provider", h.prov.Name())
 	instances, err := h.prov.List(ctx)
@@ -621,11 +539,9 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			setEndpoint(tp.pod, inst.Endpoint)
 			h.observeReady(tp, inst.State)
 		}
-		// Log the before -> after status every tick. This is the "how does the system
-		// look" signal an operator watches: the lifecycle progression (Provisioning ->
-		// Initializing -> Running, or -> Terminated on a disappearance) shows as the
-		// before/after differing; a steady state shows them equal, which is itself the
-		// confirmation the pod is being observed and re-emitted, not stuck.
+		// Log before -> after every tick: a differing pair is the lifecycle moving
+		// (Provisioning -> Initializing -> Running, or -> Terminated), an equal pair
+		// confirms the pod is still being observed rather than stuck.
 		log.V(1).Info("observed pod status",
 			"pod", key(tp.pod.Namespace, tp.pod.Name), "before", before,
 			"after", statusSignature(tp.pod))
@@ -634,24 +550,20 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	notify := h.notify
 	h.mu.Unlock()
 
-	// At V(1) so a healthy steady state stays quiet, but the counts are there when
-	// pods appear stuck: tracked>0 with matched==0 means List returns instances the
-	// claim names don't line up with (the classic "provisioned but never Running").
+	// V(1) so a healthy steady state stays quiet. tracked>0 with matched==0 means the
+	// claim names don't line up with what List returns — the classic "provisioned but
+	// never Running".
 	log.V(1).Info("poll tick",
 		"listed", len(instances), "tracked", tracked, "matched", matched)
 
-	// Re-emit EVERY tracked pod's current status each tick. Notification is otherwise
-	// edge-triggered (notify only on a signature change), and VK dedups each emit
-	// against the last status IT received from us — never against the API server. So
-	// if a single UpdateStatus is dropped (a transient conflict, informer-cache lag),
-	// VK believes it already delivered that status and never retries, and an
-	// edge-triggered loop never re-sends it: the Pod wedges on a stale status forever
-	// (classic: instance is Running but the Pod stays Pending/Initializing). Re-handing
-	// VK the unchanged status is cheap — it dedups the identical object without an API
-	// write — and, crucially, arms VK's own drift-correction: the dedup sets
-	// lastPodStatusUpdateSkipped, so the next informer resync notices the API server
-	// disagrees with what we last sent and re-issues the write. This makes status
-	// propagation level-triggered and self-healing within one resync period.
+	// Re-emit EVERY tracked pod each tick, which makes status propagation
+	// level-triggered. VK dedups an emit against the last status IT received from us,
+	// never against the API server, so one dropped UpdateStatus (a conflict, cache lag)
+	// leaves VK believing it delivered that status — and an edge-triggered loop never
+	// re-sends it, wedging the Pod on a stale status (instance Running, Pod still
+	// Pending). Re-handing the unchanged status is cheap (dedup, no API write) and arms
+	// VK's own drift correction: the dedup sets lastPodStatusUpdateSkipped, so the next
+	// resync notices the API server disagrees and re-issues the write.
 	if notify != nil {
 		for _, p := range emit {
 			notify(p)
@@ -659,20 +571,16 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// observeReady records the end-to-end provisioning wait the first time a tracked pod's
-// instance reports Running. This is where the whole user-visible number is available and
-// nowhere else: the poll loop is the only place InstanceRunning is ever reached (see
-// applyState), because a provider's create returns long before the instance is usable.
+// observeReady records the end-to-end provisioning wait the first time an instance
+// reports Running. The poll loop is the only place that number exists, since a
+// provider's create returns long before the instance is usable.
 //
-// It measures with time.Since rather than h.nowFn, deliberately. nowFn is the seam for
-// the STATUS clock, which a test may pin to a fixed instant; subtracting a real start
-// time from a pinned now would yield a nonsense (possibly negative) duration, so the
-// measurement is kept independent of it.
+// It measures with time.Since, not h.nowFn: nowFn is the STATUS clock, which a test may
+// pin to a fixed instant, and subtracting a real start time from a pinned now would give
+// a nonsense duration.
 //
-// The observation is ONE-SHOT: it consumes provisionStart, so a zero value covers both
-// "never armed" (a re-adopted instance, whose real start died with the previous process)
-// and "already recorded" — see trackedPod.provisionStart for why leaving it armed would
-// turn one boot into a sample per poll tick. Callers must hold h.mu.
+// ONE-SHOT — it consumes provisionStart, whose zero value covers both "never armed" and
+// "already recorded" (see trackedPod.provisionStart). Callers must hold h.mu.
 func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
 	if state != provider.InstanceRunning || tp.provisionStart.IsZero() {
 		return
@@ -681,26 +589,21 @@ func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
 	tp.provisionStart = time.Time{} // spent; never observe this pod again
 }
 
-// setEndpoint stamps a reachable address onto a Pod's annotation — the single stamp
-// every path uses, so the annotation has one assignment site regardless of where the
-// address came from. The notify wrapper then patches it to the API server (PodIP cannot
-// hold a DNS name — see applyState), and its write half (persistEndpoint) reads the
-// value back off the emitted Pod knowing nothing about its origin.
+// setEndpoint stamps a reachable address onto the Pod's annotation — the one assignment
+// site, wherever the address came from. persistEndpoint then patches it to the API
+// server (PodIP cannot hold a DNS name — see applyState).
 //
-// Callers, and what each one knows:
+// Callers, and what each knows:
 //
-//   - CreatePod — an address MINTED at create, from ProvisionResult. Modal's connect
-//     URL, which exists before the sandbox does and is never reported again.
-//   - reconcileOnce — an address OBSERVED at boot, from a listed Instance. AWS assigns a
-//     public DNS name only once EC2 has one, so it can only arrive on the read path.
-//   - UpdatePod — nothing new; it re-applies what VK's replacement Pod may have
-//     dropped.
+//   - CreatePod — an address MINTED at create (Modal's connect URL, which exists before
+//     the sandbox does and is never reported again);
+//   - reconcileOnce — one OBSERVED at boot (AWS assigns a public DNS name only once EC2
+//     has one, so it can only arrive on the read path);
+//   - UpdatePod — nothing new; it re-applies what VK's replacement Pod may have dropped.
 //
-// An empty address is ignored rather than cleared, which is what lets those coexist: a
-// provider that published at create and then reports no observed endpoint (Modal), or
-// one that momentarily omits the value, never erases a working address. No credential
-// is ever stamped here — a token cannot ride the Pod (see persistCredential), and
-// cannot be observed at all, being minted once on the create path.
+// An empty address is ignored, not cleared, which is what lets those coexist: a provider
+// that published at create and reports no observed endpoint never erases a working
+// address. Never a credential — see persistCredential.
 //
 // Callers stamping a tracked pod's own Pod must hold h.mu.
 func setEndpoint(pod *corev1.Pod, endpoint string) {
@@ -713,11 +616,9 @@ func setEndpoint(pod *corev1.Pod, endpoint string) {
 	pod.Annotations[nebulav1alpha1.EndpointAnnotation] = endpoint
 }
 
-// statusSignature is a compact rendering of the Pod status fields the poll loop
-// surfaces to the API server, logged before/after each tick so a pod's lifecycle
-// progression is visible. It intentionally goes beyond Phase: reason (Provisioning
-// -> Initializing -> Running), readiness, and the assigned IP all move WITHIN a
-// single phase, so a phase-only view would hide those transitions. Keep this in
+// statusSignature is a compact rendering of the status fields the poll loop reports,
+// logged before/after each tick. It goes beyond Phase because reason, readiness and the
+// assigned IP all move WITHIN one phase, which a phase-only view would hide. Keep in
 // sync with what applyState writes.
 func statusSignature(pod *corev1.Pod) string {
 	ready := corev1.ConditionUnknown
@@ -730,11 +631,9 @@ func statusSignature(pod *corev1.Pod) string {
 	return string(pod.Status.Phase) + "|" + pod.Status.Reason + "|" + string(ready) + "|" + pod.Status.PodIP
 }
 
-// store records/updates the tracked pod under lock.
-//
-// provisionStart is when provisioning began, and arms the ready-duration observation
-// (see trackedPod.provisionStart). Pass the zero Time from any path that cannot know
-// it — a re-adoption after a restart, or a pod already terminal.
+// store records/updates the tracked pod under lock. provisionStart arms the
+// ready-duration observation (see trackedPod.provisionStart); pass the zero Time from
+// any path that cannot know it — a re-adoption, or an already-terminal pod.
 func (h *Handler) store(pod *corev1.Pod, claim, instance string, provisionStart time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -746,14 +645,12 @@ func (h *Handler) store(pod *corev1.Pod, claim, instance string, provisionStart 
 	}
 }
 
-// metricLabels renders the provisioning metric label set for a Pod, read off what
-// placement stamped on it.
+// metricLabels renders the provisioning metric labels for a Pod, read off what placement
+// stamped on it.
 //
-// The accelerator type and count are passed SEPARATELY, unlike recordBlock, which files
-// the joined pool identity (util.AcceleratorPool). The two want opposite things from the
-// same pair: a blocklist needs one opaque key so an H100:8 shortage never excludes
-// H100:1, while a metric needs two dimensions so it can be aggregated either way. The
-// pool key is still recoverable from the labels when correlating the two.
+// Type and count stay SEPARATE here, unlike recordBlock, which files the joined pool key:
+// a blocklist needs one opaque key so an H100:8 shortage never excludes H100:1, while a
+// metric needs two dimensions to be aggregated either way.
 func (h *Handler) metricLabels(pod *corev1.Pod) metrics.Labels {
 	accel, count, _ := util.AcceleratorRequest(pod)
 	return metrics.Labels{
@@ -775,24 +672,17 @@ func (h *Handler) emit(pod *corev1.Pod) {
 	}
 }
 
-// persistEndpoint writes the reachable address on the emitted Pod to the API server. It
-// is the write half for whichever path stamped it (see setEndpoint): CreatePod for an
-// address minted at create, the poll loop for one observed at boot. It runs inside the
-// notify wrapper (see NotifyPods), just before VK's status callback, because VK's
-// callback writes only the /status subresource and drops everything else on the same
-// object.
+// persistEndpoint writes the address on the emitted Pod to the API server — the write
+// half for whichever path stamped it (see setEndpoint). It runs inside the notify wrapper,
+// just before VK's status callback, which would drop this metadata change.
 //
-// Because the poll loop re-emits every tracked pod each tick, this is also the retry for
-// any patch that failed, including a create-time one: it keeps patching until a write
-// succeeds. It carries no credential — a token is written once on the create path (see
-// persistCredential), never per tick.
+// Because the poll loop re-emits every pod each tick, this is also the retry for any
+// failed patch. It carries no credential — a token is written once on the create path.
 //
-// This runs per pod per tick, so anything it does unconditionally is multiplied by the
-// whole fleet — hence the dedup below, which narrows it to the ticks where the address
-// changed or a previous patch has not yet landed.
+// It runs per pod per tick, so anything unconditional is multiplied by the whole fleet;
+// hence the dedup below.
 //
-// Best-effort: a nil client (tests) is a no-op, and a failure is logged and retried
-// next tick rather than failing the poll.
+// Best-effort: a nil client (tests) is a no-op, and a failure is retried next tick.
 func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
 	if h.client == nil {
 		return
@@ -804,9 +694,8 @@ func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
 
 	h.mu.Lock()
 	tp, tracked := h.tracked[key(pod.Namespace, pod.Name)]
-	// An untracked pod has nothing to dedup against, so its endpoint is patched
-	// unconditionally: the annotation is the only place that address is published, and
-	// skipping it would strand an unreachable Pod.
+	// An untracked pod has nothing to dedup against, so patch unconditionally: the
+	// annotation is the only place the address is published.
 	patched := false
 	if tracked {
 		patched = tp.connectEndpoint == endpoint
@@ -818,21 +707,17 @@ func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
 	}
 }
 
-// patchEndpoint patches the endpoint annotation onto the Pod metadata. The
-// reachable address — which is how anything reaches the workload, and which PodIP
-// cannot hold when it is a DNS name (see applyState) — needs this dedicated
-// metadata write, since VK's status callback drops metadata. A merge patch scoped to
-// the single annotation is a no-op for every other field and so does not collide
-// with the status write that follows.
+// patchEndpoint merge-patches the endpoint annotation onto the Pod metadata, which needs
+// its own write since VK's status callback drops metadata. Scoped to the single
+// annotation, so it does not collide with the status write that follows.
 //
-// This is the ONLY write of the endpoint annotation, and persistEndpoint its only
-// caller, so every address — minted at create or observed at boot — reaches etcd
-// through this one merge patch. The annotation is then where the address LIVES, and
-// nothing clears it: this is only ever called with a non-empty value, so it survives
-// for the Pod's life without the provider being asked for it again.
+// The ONLY write of this annotation, and persistEndpoint its only caller, so every
+// address — minted at create or observed at boot — reaches etcd through here. It is never
+// called with an empty value, so nothing ever clears it: the annotation is where the
+// address lives for the Pod's life.
 //
-// connectEndpoint advances only on success, so a failed patch is retried on the next
-// tick. NotFound is ignored — the Pod is gone.
+// connectEndpoint advances only on success, so a failed patch retries next tick. NotFound
+// is ignored — the Pod is gone.
 func (h *Handler) patchEndpoint(ctx context.Context, pod *corev1.Pod, endpoint string) {
 	patch, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
@@ -840,8 +725,8 @@ func (h *Handler) patchEndpoint(ctx context.Context, pod *corev1.Pod, endpoint s
 		},
 	})
 	if err != nil {
-		// A marshal of a fixed-shape map cannot realistically fail; guard anyway so a
-		// future change surfaces rather than panics.
+		// A fixed-shape map cannot realistically fail to marshal; guard anyway so a future
+		// change surfaces rather than panics.
 		logf.FromContext(ctx).WithName("vnode-handler").Error(err,
 			"marshal endpoint annotation patch", "pod", key(pod.Namespace, pod.Name))
 		return
@@ -867,39 +752,31 @@ func (h *Handler) patchEndpoint(ctx context.Context, pod *corev1.Pod, endpoint s
 // ConnectSecretName is the Secret holding a Pod's connect credential.
 func ConnectSecretName(podName string) string { return podName + "-connect" }
 
-// createConnectSecret writes the instance's connect URL and bearer token to a
-// Secret in the Pod's namespace, so a consumer can reach the workload with
+// createConnectSecret writes the instance's connect URL and bearer token to a Secret in
+// the Pod's namespace, so a consumer can reach the workload with
 // `curl -H "Authorization: Bearer $token" $url`.
 //
-// A Secret, not an annotation: the token authenticates every request to the
-// endpoint, and an annotation would expose it to anyone with `get pod` in the
-// namespace and store it unencrypted in etcd. The URL is duplicated in here
-// alongside it so the pair is usable from one object.
+// A Secret, not an annotation: the token authenticates every request, and an annotation
+// would expose it to anyone with `get pod` and store it unencrypted in etcd. The URL
+// rides along so the pair is usable from one object.
 //
-// It is ownerReferenced to the Pod, which is what reclaims it: teardown deletes the
-// Pod, and the garbage collector removes the Secret with it. Deleting it on the
-// DeletePod path instead would leak on every path that skips DeletePod (a force
-// delete, a VK outage) — the same reason the NodeClaim finalizer exists.
+// The ownerReference to the Pod is what reclaims it — deleting the Secret on the
+// DeletePod path would leak on every path that skips DeletePod (a force delete, a VK
+// outage), the same reason the NodeClaim finalizer exists.
 //
-// Write-once, and unrepeatable: this runs on the create path, from the one
-// ProvisionResult that ever carries the token (see persistCredential). There is no
-// retry loop behind it, because there is nothing to retry WITH — a later attempt has
-// no credential to write, since minting is one-shot and cannot be re-read. So a
-// failure here means the Secret is missing for this instance's life, and the recovery
-// is to replace the instance (delete the Pod), not to poll.
+// Write-once and unrepeatable: there is nothing to retry WITH, since minting is one-shot
+// and cannot be re-read. A failure means no Secret for this instance's life, and the fix
+// is to replace the instance, not to poll.
 //
-// AlreadyExists is therefore treated as success rather than reconciled: it means a
-// Secret under this name already exists, which happens when a Pod name is reused
-// before the GC has collected the previous owner's Secret. Overwriting is not
-// obviously better — the old Secret still belongs to a live-until-collected instance —
-// and the stale copy resolves itself when the ownerReference GC removes it.
+// AlreadyExists therefore counts as success: it means a Pod name was reused before the GC
+// collected the previous Secret. Overwriting is no better — the old one still belongs to a
+// live instance — and the stale copy goes away with its owner.
 //
-// A failure is logged (never with the token).
+// Failures are logged, never with the token.
 func (h *Handler) createConnectSecret(ctx context.Context, pod *corev1.Pod, url, token string) {
-	// No UID means the Pod is synthesized (GetPod's re-adoption stub), so an
-	// ownerReference would be invalid and the Secret would never be collected. Skip
-	// rather than create an unowned Secret that nothing would ever reclaim. In practice
-	// the create path always has the real Pod, so this is a guard, not a case.
+	// No UID means a synthesized Pod (GetPod's re-adoption stub), so an ownerReference
+	// would be invalid and the Secret never collected. The create path always has the
+	// real Pod, so this is a guard, not a case.
 	if pod.UID == "" {
 		return
 	}
@@ -912,8 +789,8 @@ func (h *Handler) createConnectSecret(ctx context.Context, pod *corev1.Pod, url,
 			Labels: map[string]string{
 				nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
 			},
-			// UID is what makes this a real ownerReference; a name alone would be
-			// ignored by the GC. It is set on any Pod that exists at the API server.
+			// UID is what makes this a real ownerReference; a name alone is ignored by
+			// the GC.
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "v1",
 				Kind:       "Pod",
@@ -932,8 +809,8 @@ func (h *Handler) createConnectSecret(ctx context.Context, pod *corev1.Pod, url,
 	case apierrors.IsAlreadyExists(err):
 		return // a Secret under this name already exists; see above
 	case err != nil:
-		// Loud, because it is not retried: the token cannot be re-minted, so this
-		// instance stays credential-less until it is replaced.
+		// Loud, because it is not retried: the token cannot be re-minted, so this instance
+		// stays credential-less until it is replaced.
 		log.Error(err, "write connect secret; the workload's credential is LOST (delete the Pod to re-provision)",
 			"pod", k, "secret", ConnectSecretName(pod.Name))
 		return
@@ -947,72 +824,60 @@ func (h *Handler) markStatus(pod *corev1.Pod, phase corev1.PodPhase, reason, msg
 	setPhase(pod, phase, reason, msg, h.nowFn())
 }
 
-// recordBlock classifies a Provision failure into a BlockScope (via the provider)
-// and records it on the shared blocklist for the pool's BlocklistTTL, so placement
-// fails over instead of retrying the same failing candidate. It is a no-op when no
-// blocklist is wired or the error yields an empty scope (nothing to block).
+// recordBlock classifies a Provision failure into a BlockScope and records it for the
+// pool's BlocklistTTL, so placement fails over instead of retrying the same candidate.
+// A no-op with no blocklist wired, or when the error yields an empty scope.
 //
-// The provider owns the whole scope: the handler resolves the requested accelerator
-// off the Pod (the error does not carry it) and passes it in, but does NOT assemble
-// or mutate the scope itself — narrowing to the failing accelerator and any
-// region axis is the provider's job (see ClassifyError / the adapters). This keeps
-// scope derivation in one place per provider rather than spread across the handler.
+// The provider owns the scope: the handler resolves the requested accelerator off the Pod
+// (the error does not carry it) and passes it in, but never assembles the scope itself, so
+// scope derivation lives in one place per provider.
 //
-// Because the provider stamps the accelerator, the block errs NARROW: a truly
-// account/region-wide error (e.g. a per-region Spot limit that spans accelerators)
-// is narrowed to just this accelerator too, since the error text does not
-// distinguish it from an instance-type shortage; the cost is that a sibling
-// accelerator gets one wasted re-probe before it re-records. That is the right
-// trade — over-narrow costs a fast retry, over-broad wrongly excludes serviceable
+// Because the accelerator is always stamped, blocks err NARROW: a genuinely region-wide
+// error is narrowed to this accelerator too, since the error text cannot be told apart
+// from an instance-type shortage. The cost is one wasted re-probe by a sibling
+// accelerator, which is the right trade — over-broad would exclude serviceable
 // accelerators. DenyAll (auth/quota) ignores the accelerator: it fails for all.
 func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, err error) {
 	if h.blocklist == nil {
 		return
 	}
-	// The accelerator pool and region are properties of the REQUEST, not the error;
-	// the provider cannot see them, so we resolve them off the Pod and hand them over.
-	// The block is keyed on the POOL identity (type:count, e.g. "H100:8") — the SAME
-	// key placement resolves and queries a candidate by (selectPlacement uses
-	// util.AcceleratorPool). A block filed under any other key would never be queried,
-	// and failover would silently re-place onto the candidate that just failed. We key
-	// on the pool, NOT the provider's resolved SKU, because a single launch may span
-	// several interchangeable instance types (AWS's fleet): the pool stays truthful
-	// whichever alternate lands, and a block is only written when the WHOLE launch
-	// failed (it succeeds if any alternate had capacity), so the pool key correctly
-	// names a request whose every equivalent option is dry. It keeps distinct
-	// (type, count) pools on distinct keys, so an H100:8 shortage never excludes
-	// H100:1. "" for either means "not applicable" (a CPU-only Pod, or a region-simple
-	// provider), which the provider treats accordingly.
+	// Pool and region are properties of the REQUEST, not the error, so we resolve them off
+	// the Pod. The key is the POOL identity (type:count, e.g. "H100:8") — the same key
+	// placement queries a candidate by, since a block filed under any other key would
+	// never be read and failover would re-place onto the candidate that just failed.
+	//
+	// The pool, NOT the provider's resolved SKU, because one launch may span several
+	// interchangeable instance types (AWS fleets) and only fails when every one is dry, so
+	// the pool truthfully names the request whichever alternate was tried. Distinct
+	// (type, count) pools stay on distinct keys, so an H100:8 shortage never excludes
+	// H100:1. "" means "not applicable" — a CPU-only Pod, or a region-simple provider.
 	accel, count, _ := util.AcceleratorRequest(pod)
 	accelerator := util.AcceleratorPool(accel, count)
 	region := pod.Annotations[nebulav1alpha1.RegionAnnotation]
 	scope := h.prov.ClassifyProvisionError(err, accelerator, region)
 
 	if scope == (provider.BlockScope{}) {
-		// An empty scope means the error is not one we know how to blocklist; do not
-		// install a wildcard block that would exclude everything on the provider.
+		// An error we do not know how to blocklist. Do not install a wildcard block that
+		// would exclude the whole provider.
 		return
 	}
 
-	// Effective TTL = base (pool policy or default) + a per-record jitter, so Pods
-	// that failed for the SAME scope do not all re-probe the just-freed candidate at
-	// the same instant. Coalescing keeps the latest expiry, so distinct jittered
-	// records spread the shared entry's deadline instead of pinning it.
+	// TTL = base (pool policy or default) + jitter, so Pods that failed for the SAME scope
+	// do not all re-probe the just-freed candidate at once. Coalescing keeps the latest
+	// expiry, so jittered records spread the shared deadline instead of pinning it.
 	ttl := blocklistTTL(pod) + h.jitterFn()
-	// Use the request-scoped logger from ctx (it carries the virtualNode/provider
-	// values controller-runtime attached upstream); a logf.FromContext on a fresh
-	// context.Background() would fall back to the global delegate and could be
-	// silently dropped before the real sink is installed.
+	// The ctx logger, because it carries the virtualNode/provider values attached
+	// upstream; a fresh context.Background() would fall back to the global delegate and
+	// could be dropped before the real sink is installed.
 	logf.FromContext(ctx).WithName("vnode-blocklist").Info(
 		"recording blocklist entry for failed placement",
 		"provider", h.prov.Name(), "scope", scope, "ttl", ttl.String(), "error", err.Error())
 	h.blocklist.Record(h.prov.Name(), scope, ttl)
 }
 
-// blocklistTTL reads the pool's FailoverPolicy.BlocklistTTL off the Pod annotation
-// the placement controller stamped, falling back to defaultBlocklistTTL when it is
-// absent or unparseable (an out-of-band Pod, or a non-positive value that could
-// otherwise install a permanent block).
+// blocklistTTL reads the pool's BlocklistTTL off the annotation placement stamped,
+// falling back to defaultBlocklistTTL when it is absent or unparseable — including a
+// non-positive value, which would otherwise install a permanent block.
 func blocklistTTL(pod *corev1.Pod) time.Duration {
 	raw := pod.Annotations[nebulav1alpha1.BlocklistTTLAnnotation]
 	if raw == "" {
@@ -1027,18 +892,56 @@ func blocklistTTL(pod *corev1.Pod) time.Duration {
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }
 
+// GetContainerLogs serves `kubectl logs` for a Pod on this virtual node (kubelet.go
+// carries the endpoint). Three things must line up, each failing as NotFound: the Pod is
+// TRACKED here, it has an instance id (one still inside Provision has nothing to read),
+// and the provider implements provider.LogStreamer (logs are optional).
+//
+// containerName is IGNORED: a Nebula Pod is one external instance with one console, so
+// there is no per-container stream to select.
+func (h *Handler) GetContainerLogs(
+	ctx context.Context, namespace, podName, containerName string, opts vkapi.ContainerLogOpts,
+) (io.ReadCloser, error) {
+	streamer, ok := h.prov.(provider.LogStreamer)
+	if !ok {
+		return nil, errdefs.NotFoundf("provider %q does not support container logs", h.prov.Name())
+	}
+
+	h.mu.Lock()
+	tp, tracked := h.tracked[key(namespace, podName)]
+	var instance string
+	if tracked {
+		instance = tp.instance
+	}
+	h.mu.Unlock()
+
+	if !tracked {
+		return nil, errdefs.NotFoundf("pod %q is not known to virtual node %q",
+			key(namespace, podName), NodeName(h.prov.Name()))
+	}
+	if instance == "" {
+		return nil, errdefs.NotFoundf("pod %q has no external instance yet", key(namespace, podName))
+	}
+
+	logf.FromContext(ctx).WithName("vnode-logs").V(1).Info("streaming container logs",
+		"provider", h.prov.Name(), "pod", key(namespace, podName), "container", containerName,
+		"instanceID", instance, "follow", opts.Follow, "tail", opts.Tail)
+
+	// The provider stream is option-free by contract; kubeletLogStream applies the
+	// kubelet's options and owns teardown. ctx is passed so a disconnected client releases
+	// the stream.
+	src, err := streamer.Logs(ctx, instance)
+	if err != nil {
+		return nil, fmt.Errorf("stream logs for instance %s: %w", instance, err)
+	}
+	return kubeletLogStream(ctx, src, opts), nil
+}
+
 // --- Unused nodeutil.Provider surface --------------------------------------
 //
-// The kubelet API (logs/exec/attach/stats/port-forward) is not part of the v1
-// scope: Nebula routes external GPU workloads, it does not proxy their consoles.
-// These satisfy the nodeutil.Provider interface required by nodeutil.NewNode and
-// return a NotFound so the VK core reports them cleanly rather than panicking.
-
-func (h *Handler) GetContainerLogs(
-	context.Context, string, string, string, vkapi.ContainerLogOpts,
-) (io.ReadCloser, error) {
-	return nil, errdefs.NotFound("container logs are not supported by the Nebula virtual node")
-}
+// Exec/attach/stats/port-forward are out of v1 scope: beyond logs, Nebula does not proxy
+// a workload's console. These satisfy the nodeutil.Provider interface and return NotFound
+// so the VK core reports them cleanly rather than panicking.
 
 func (h *Handler) RunInContainer(context.Context, string, string, string, []string, vkapi.AttachIO) error {
 	return errdefs.NotFound("exec is not supported by the Nebula virtual node")

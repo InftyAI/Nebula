@@ -1,3 +1,5 @@
+//go:build e2e
+
 /*
 Copyright 2026.
 
@@ -107,6 +109,13 @@ var _ = Describe("Manager", Ordered, func() {
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
+	//
+	// ORDER MATTERS: every NodeClaim holds the terminate finalizer, and the only thing
+	// that removes it is the NodeClaim controller. Undeploying the manager first strands
+	// them — `make uninstall` then blocks forever on a CRD that can never finish deleting
+	// (the CRD waits for its CRs; the CRs wait for a controller that is gone), and the
+	// external instance behind each claim is leaked, still billing. So claims are drained
+	// while the manager is still running.
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
@@ -118,13 +127,23 @@ var _ = Describe("Manager", Ordered, func() {
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakePoolName, "--ignore-not-found=true"))
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", fakeWorkloadNS, "--ignore-not-found=true"))
 
+		By("waiting for NodeClaims to drain while the manager can still terminate instances")
+		drained := waitForNodeClaimsGone(2 * time.Minute)
+
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
 
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
+		// Only safe once no claim holds the finalizer. Skipped otherwise, because
+		// deleting the CRD now would wedge it in Terminating for good.
+		if drained {
+			By("uninstalling CRDs")
+			cmd = exec.Command("make", "uninstall")
+			_, _ = utils.Run(cmd)
+		} else {
+			fmt.Println("WARNING: NodeClaims did not drain; skipping CRD uninstall to avoid " +
+				"a CRD stuck Terminating. Check the provider for leaked instances.")
+		}
 
 		By("removing manager namespace")
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
@@ -479,4 +498,27 @@ type tokenRequest struct {
 	Status struct {
 		Token string `json:"token"`
 	} `json:"status"`
+}
+
+// waitForNodeClaimsGone polls until no NodeClaim is left, reporting whether they
+// drained within timeout. A leftover claim means its terminate finalizer never ran, so
+// the caller must not delete the CRD (it would wedge) and an instance may be leaking.
+//
+// Deliberately a plain poll rather than Eventually: a failed assertion here would abort
+// the rest of AfterAll, skipping the undeploy it is trying to protect.
+func waitForNodeClaimsGone(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := utils.Run(exec.Command("kubectl", "get", "nodeclaims",
+			"-o", "go-template={{range .items}}{{.metadata.name}}{{\"\\n\"}}{{end}}"))
+		// A missing CRD counts as drained: there is nothing left to hold a finalizer.
+		if err != nil || len(utils.GetNonEmptyLines(out)) == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("NodeClaims still present after %s:\n%s", timeout, out)
+			return false
+		}
+		time.Sleep(2 * time.Second)
+	}
 }

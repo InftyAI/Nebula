@@ -50,36 +50,30 @@ spec:
             type: object
           spec:
             description: "NodePoolSpec is the placement policy for a set of workloads.
-              It is the\nlong-lived, user-facing object: editing it changes behaviour
-              for every Pod\nthat selects the pool, without touching any workload.\n\nPlacement
-              resolves along two orthogonal axes, and the ORDER between them is\nfixed:
+              Editing it changes\nbehaviour for every Pod that selects the pool, without
+              touching any workload.\n\nPlacement walks two axes in a fixed order:
               capacity type first, provider second.\n\n\tFOR each capacityType in
               CapacityTypes (in listed order):   // outer: hard tier\n\t    candidates
               = Providers x (each provider's Regions) x {this capacityType},\n\t                 available
               now, minus blocklist                // region nests per provider\n\t
               \   IF candidates non-empty:\n\t        pick one via Strategy (Ordered
               today; see Strategy)      // inner: rank candidates\n\t        DONE\n\t
-              \   // else fall through to the next capacity tier\n\nRegion is a per-provider
-              axis (see ProviderSpec.Regions), nested under each\nprovider because
-              a region name only means something to one provider. It\nwidens the candidate
-              key to {provider, region, accelerator, capacityType}\nwithout changing
-              the tier-first ordering above.\n\nSo CapacityTypes is a hard preference:
-              every provider's Spot is tried before\nANY provider's OnDemand. This
-              is deliberate — \"spot everywhere before any\non-demand\" is the least
-              surprising behaviour, even if a different provider's\non-demand were
-              momentarily cheaper. Strategy only ranks providers *within*\nthe active
-              capacity tier; it never crosses tiers.\n\nThe Weighted strategy requires
-              a weight on every provider ref. This is a\nstatic property of the spec,
-              so it is enforced at admission by the CEL rule\nbelow rather than surfaced
-              as a status condition after the fact.\n\nThe rule is currently UNREACHABLE
-              — Strategy's enum admits only Ordered, so no\nobject can carry Weighted
-              for it to check. It is retained rather than deleted so\nthat widening
-              the enum is a one-line change that cannot silently ship without its\nweight
-              validation; the cost is one always-true CEL evaluation per admission.\n(AWS
-              once required at least one region here, because an omitted list meant
-              \"the\nclient's default region\" and its client has none. Omitted now
-              means \"every region\nthe provider serves\", which is a valid — if broad
-              — AWS policy, so the rule is gone.\nSee ProviderSpec.Regions.)"
+              \   // else fall through to the next capacity tier\n\nRegion nests under
+              each provider (see ProviderSpec.Regions) because a region name\nonly
+              means something to one provider. It widens the candidate key to\n{provider,
+              region, accelerator, capacityType} but does not change the order above.\n\nSo
+              CapacityTypes is a HARD preference: every provider's Spot is tried before
+              ANY\nprovider's OnDemand, even if some provider's on-demand were momentarily
+              cheaper.\nStrategy only ranks providers within the active tier; it never
+              crosses tiers.\n\nThe CEL rule below enforces that Weighted has a weight
+              on every provider — a static\nproperty of the spec, so admission is
+              the right place for it. The rule is currently\nUNREACHABLE (the Strategy
+              enum admits only Ordered), kept so widening the enum\ncannot ship without
+              its weight validation.\n(AWS once required at least one region here,
+              because an omitted list meant \"the\nclient's default region\" and its
+              client has none. Omitted now means \"every region\nthe provider serves\",
+              which is a valid — if broad — AWS policy, so the rule is gone.\nSee
+              ProviderSpec.Regions.)"
             properties:
               capacityTypes:
                 default:
@@ -135,36 +129,27 @@ spec:
                       type: string
                     regions:
                       description: |-
-                        Regions constrains where this provider may place, in the provider's OWN
-                        vocabulary. Region is provider-namespaced — there is no cross-provider region
-                        vocabulary — so it lives here per provider, not on the pool. It is a
-                        CONSTRAINT, not a list of regions to use, and it has three levels:
-                          - omitted/empty => unconstrained: every region the provider serves. For a
-                            region-simple provider (Modal) this means "send no region and let the
-                            provider place freely", which is also its widest and cheapest mode.
-                          - a geography GROUP token ("us", "eu", "ap", ...) => that geography's
-                            regions. This is the recommended way to ask for breadth with a data
-                            residency boundary.
-                          - a literal region name ("us-east-1" on AWS, "us-east" on Modal) => exactly
-                            that region.
-                        The provider resolves which level a value is, since only it knows its own
-                        geography (see provider.Provider's ExpandRegions). Group tokens are shared
-                        across providers but the regions behind them are not: "eu" is eu-west-1 and
-                        friends on AWS, while London is eu-west-2 there and there is no "uk" group.
+                        Regions CONSTRAINS where this provider may place, in the provider's own
+                        vocabulary. It lives here per provider because region names are
+                        provider-namespaced. Three levels:
+                          - omitted/empty => every region the provider serves. For a region-simple
+                            provider (Modal) this sends no region at all, its widest and cheapest mode.
+                          - a geography GROUP token ("us", "eu", "ap", ...) => that geography's regions.
+                            The recommended way to ask for breadth with a residency boundary.
+                          - a literal region name ("us-east-1" on AWS, "us-east" on Modal) => just that.
+                        Only the provider knows its own geography, so it resolves which level a value is
+                        (see provider.Provider's ExpandRegions). Group tokens are shared across
+                        providers; the regions behind them are not.
 
-                        A value that is not a group token is passed to the provider UNVALIDATED.
-                        Region names change faster than Nebula ships, so an unrecognized one is
-                        forwarded rather than rejected: a genuinely bad name fails at provision time
-                        with the provider's own error, which is better than refusing a region that
-                        launched last week. It is also the escape hatch for AWS opt-in regions, which
-                        no group contains.
+                        A non-group value is passed through UNVALIDATED, because region names change
+                        faster than Nebula ships: a bad one fails at provision time with the provider's
+                        own error, which beats refusing a region that launched last week. It is also the
+                        escape hatch for AWS opt-in regions, which no group contains.
 
-                        Unconstrained on a region-aware provider is the widest setting and costs
-                        something: every region becomes a placement candidate to walk on failover, and
-                        every region is swept by the observability poll loop. Prefer a group unless the
-                        workload genuinely needs global reach. There is no cap on the number of entries
-                        (a group already expands to many, so capping the declaration would be
-                        arbitrary); maxLength bounds each entry.
+                        Unconstrained is the widest and costliest setting: every region becomes a
+                        failover candidate and gets swept by the poll loop. Prefer a group unless the
+                        workload needs global reach. Entry count is uncapped (a group already expands to
+                        many); maxLength bounds each entry.
                       items:
                         maxLength: 32
                         type: string

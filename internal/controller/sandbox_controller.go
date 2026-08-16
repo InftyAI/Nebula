@@ -194,27 +194,22 @@ func (r *SandboxReconciler) buildPod(sbx *nebulav1alpha1.Sandbox) *corev1.Pod {
 			Containers: []corev1.Container{{
 				Name:  sandboxContainerName,
 				Image: sbx.Spec.Image,
-				// The command is set HERE rather than in each provider's bootstrap, so the
-				// Pod stays the single source of truth for what runs on the instance — the
-				// same rule ProvisionRequest documents for image/env/resources. Every
-				// adapter already reads the command off the Pod, so this needs no
-				// per-provider code and cannot drift between providers.
+				// Set HERE rather than in each provider's bootstrap, so the Pod stays the
+				// single source of truth for what runs on the instance. Every adapter already
+				// reads the command off the Pod, so this needs no per-provider code.
 				//
-				// A sandbox has nothing to run at boot: the box exists to be connected to,
-				// so its command's only job is to not exit. Without it the container would
-				// run the image's own entrypoint (`bash` for the default ubuntu:24.04),
-				// which finds no TTY, exits immediately, and takes the instance down with
-				// it — the box would surface as Failed seconds after being provisioned.
+				// A sandbox has nothing to run at boot — the box exists to be connected to —
+				// so the command's only job is to not exit. Without it the container runs the
+				// image's own entrypoint (`bash` for ubuntu:24.04), which finds no TTY, exits,
+				// and takes the instance down: the box would surface as Failed seconds after
+				// being provisioned.
 				//
-				// This is a PLACEHOLDER process, not a control surface. It keeps the
-				// instance alive and nothing more; there is no agent inside the container,
-				// so `kubectl exec`/`logs` against a sandbox do not work today (the virtual
-				// kubelet answers NotFound — see pkg/vnode.Handler.RunInContainer). Whatever
-				// restores them replaces this command, and it is deliberately a bare
-				// `sleep` so no bootstrap has to inject a binary into an arbitrary user image.
+				// A PLACEHOLDER process, not a control surface. There is no agent in the
+				// container, so `kubectl exec`/`logs` against a sandbox do not work yet.
+				// Whatever restores them replaces this command; a bare `sleep` keeps any
+				// bootstrap from having to inject a binary into an arbitrary user image.
 				//
-				// This is never in tension with a user-supplied command: SandboxSpec has no
-				// command field, so the structural schema rejects one outright.
+				// No tension with a user-supplied command: SandboxSpec has no command field.
 				Command:   []string{"sleep", "infinity"},
 				Resources: sbx.Spec.Resources,
 				Env:       sbx.Spec.Env,

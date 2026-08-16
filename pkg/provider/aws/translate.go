@@ -141,21 +141,17 @@ func apiErrorFromFleet(code, message string) error {
 // so a capacity failure can additionally carry ErrSpotCapacity and confine the
 // block to the Spot tier.
 //
-// Capacity failures split by SCOPE, which drives the adapter's per-zone sweep:
-//   - ZONE-LOCAL (InsufficientInstanceCapacity/InsufficientHostCapacity, and
-//     "Unsupported" — how EC2 reports the instance type is not offered in the AZ of
-//     the chosen subnet): a sibling AZ may still satisfy the launch, so these carry
-//     errZoneLocal and RunInstance advances to the next subnet. If every AZ fails
-//     it collapses to a region no-capacity that hands off to region-level failover.
-//   - REGION/ACCOUNT-SCOPED (SpotMaxPriceTooLow, MaxSpotInstanceCountExceeded): a
-//     Spot price ceiling or per-region Spot limit that applies across the whole
-//     region, not one AZ. Sweeping sibling AZs is futile, so these OMIT errZoneLocal
-//     — RunInstance stops immediately and lets region/tier failover take over. They
-//     still carry ErrSpotCapacity (they are Spot-only), confining the block to Spot.
+// Capacity failures split by SCOPE, which drives the per-zone sweep:
+//   - ZONE-LOCAL (InsufficientInstanceCapacity/HostCapacity, and "Unsupported" — EC2's way
+//     of saying the type is not offered in that subnet's AZ): a sibling AZ may still work,
+//     so these carry errZoneLocal and RunInstance tries the next subnet. If every AZ fails
+//     it collapses to a region no-capacity and hands off to region-level failover.
+//   - REGION-SCOPED (SpotMaxPriceTooLow, MaxSpotInstanceCountExceeded): a price ceiling or
+//     per-region Spot limit, so sweeping AZs is futile. These OMIT errZoneLocal and still
+//     carry ErrSpotCapacity, confining the block to Spot.
 //
-// Returning the wrapped sentinel (not a BlockScope) keeps the
-// error-category → scope rule in one place (provider.ClassifyError, via the
-// adapter), so this function only has to recognize AWS's vocabulary.
+// Returning the wrapped sentinel rather than a BlockScope keeps the category → scope rule
+// in one place, so this only has to recognize AWS's vocabulary.
 func classifyEC2Error(err error, spot bool) error {
 	if err == nil {
 		return nil

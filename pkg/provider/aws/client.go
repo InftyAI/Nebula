@@ -95,30 +95,22 @@ type ec2API interface {
 // EC2-specific SDK calls live here so the adapter (aws.go) and its tests stay
 // SDK-free; the pure translation (user-data, error mapping) lives in translate.go.
 //
-// Execution model (see the package doc): a NodeClaim maps to one EC2 instance
-// launched via a CreateFleet "instant" request, which lets EC2 do the per-AZ
-// capacity search server-side in ONE call. CreateFleet cannot take an inline AMI /
-// user-data (its overrides only cover instance type / subnet / price), so the
-// launch references a launch template — but an EPHEMERAL one, created for this
-// provision and deleted before the call returns. No launch template or other
-// pre-created infra survives, so the self-configuring model holds: everything the
-// launch needs is derived from credentials alone at construction, and registering
-// AWS in a new region requires nothing but access:
+// Execution model: a NodeClaim maps to one EC2 instance launched via a CreateFleet
+// "instant" request, which does the per-AZ capacity search server-side in ONE call.
+// CreateFleet cannot take an inline AMI or user-data, so the launch references a launch
+// template — but an EPHEMERAL one, created for this provision and deleted before the call
+// returns. Nothing pre-created survives, so everything the launch needs is derived from
+// credentials alone at construction, and a new region needs nothing but access:
 //
-//   - amiID: the region's GPU AMI (NVIDIA driver + container runtime baked in),
-//     resolved live via DescribeImages against the Amazon-owned ECS GPU-optimized
-//     AMI (see resolveGPUAMI). AMI ids are per-region, so this cannot be a constant.
-//   - subnets: the default VPC's subnets, one per availability zone, discovered
-//     via DescribeSubnets (default-for-az=true). EC2 capacity is per-AZ, so trying
-//     another zone's subnet is the cheapest recovery from InsufficientInstance
-//     capacity before condemning the whole region.
-//   - security group: left UNSET. Launching into a default-VPC subnet with no
-//     SecurityGroupIds makes EC2 attach that VPC's default SG (outbound-open,
-//     inbound-from-itself) — exactly what a fire-and-forget `docker pull && run`
-//     needs, with no inbound exposure.
+//   - amiID: the region's GPU AMI (NVIDIA driver + container runtime baked in), resolved
+//     live via DescribeImages. AMI ids are per-region, so this cannot be a constant.
+//   - subnets: the default VPC's subnets, one per AZ. EC2 capacity is per-AZ, so another
+//     zone's subnet is the cheapest recovery from a shortage before giving up the region.
+//   - security group: left UNSET, so EC2 attaches the default VPC's SG (outbound-open,
+//     inbound-from-itself) — what a fire-and-forget `docker pull && run` needs.
 //
-// The adapter overrides only what is workload-specific: instance type, user-data
-// (the container bootstrap), Spot market option, and the identity tags.
+// The adapter overrides only the workload-specific parts: instance type, user-data, Spot
+// market option, and the identity tags.
 type sdkClient struct {
 	ec2 ec2API
 	// region is the resolved region this client operates in, echoed onto observed
@@ -133,20 +125,16 @@ type sdkClient struct {
 	// subnet (still valid, just no zone failover).
 	subnets []subnet
 
-	// azOfferings caches, per instance type, the AZ-offering lookup for that type in
-	// this region (DescribeInstanceTypeOfferings at AZ granularity). RunInstance
-	// consults it to prune fleet overrides that target an AZ where the type is not
-	// offered at all — e.g. g6.48xlarge in us-east-1e — which EC2 would otherwise
-	// reject per-override with InvalidFleetConfiguration, wasting a grid slot on a
-	// permanently-dead pair. Offerings are stable per region, so each type is looked
-	// up at most once (populated lazily on first use).
+	// azOfferings caches, per instance type, which AZs of this region offer it.
+	// RunInstance uses it to prune fleet overrides targeting an AZ where the type is not
+	// offered at all (g6.48xlarge in us-east-1e), which EC2 would reject with
+	// InvalidFleetConfiguration, wasting a grid slot on a permanently-dead pair.
+	// Offerings are stable per region, so each type is looked up at most once.
 	//
-	// offeringsMu guards ONLY the map bookkeeping — never a network call. Each entry
-	// is single-flight: the first caller for a type inserts an entry with an open
-	// `done` channel, releases the lock, runs the one Describe, fills the entry, and
-	// closes `done`; concurrent callers for the same type find the entry and wait on
-	// `done` without the lock and without issuing a duplicate Describe. So a burst of
-	// N pods for a new type costs ONE lookup, and cache hits never block on I/O.
+	// offeringsMu guards ONLY the map bookkeeping, never a network call. Each entry is
+	// single-flight: the first caller inserts an entry with an open `done` channel,
+	// unlocks, runs the one Describe, fills it, and closes `done`; concurrent callers wait
+	// on `done` without the lock. So a burst of N pods for a new type costs ONE lookup.
 	offeringsMu sync.Mutex
 	azOfferings map[string]*offeringEntry
 }
@@ -175,36 +163,20 @@ var _ Client = (*sdkClient)(nil)
 
 // NewSDKClient builds an EC2-backed multi-region Provider, ready to register.
 //
-// regionSource supplies the regions the List/Offerings fan-out sweeps, sourced from
-// the NodePool at call time (ProviderSpec.Regions). It is NOT env/flag config:
-// regions are the operator's per-pool declaration and change at runtime, and the
-// region a Pod lands in already flows NodePool -> placement -> ProvisionRequest, so
-// provisioning never needed a configured set. See RegionSource and Provider.sweepRegions.
+// regionSource supplies the regions the List/Offerings fan-out sweeps, read from the
+// NodePool at call time rather than from env/flags, since ProviderSpec.Regions is the
+// operator's declaration and changes at runtime. See RegionSource.
 //
-// Per-region clients are built LAZILY (see Provider.clientFor): this constructor
-// only loads the catalog — startup pays no per-region AMI+subnet resolution, no
-// region is resolved or validated here (the set is dynamic and comes from the
-// NodePool). The first Provision/List into a region resolves that region's GPU AMI
-// and default-VPC subnets on demand.
+// Per-region clients are built LAZILY (see Provider.clientFor), so this constructor only
+// loads the catalog: startup pays no AMI/subnet resolution, and no region is validated
+// here. There is no default region and AWS_REGION is not read — every request carries its
+// own region, so a fallback would be dead config. This fails only if the catalog cannot load.
 //
-// There is NO default region and NO region env (AWS_REGION is not read): every
-// request carries its own region (ExpandRegions resolves the pool's declaration —
-// omitted, a group token, or literal names — into concrete regions, and placement
-// stamps one), so a fallback would be dead config. This constructor fails
-// ONLY if the catalog cannot load — never on region config.
-//
-// Security contract (and why ONE credential set spans all regions):
-//   - NO non-secret config is accepted as an argument; regions come from the NodePool
-//     (API objects), not env/flags.
-//   - Credentials are SECRETS and are NEVER accepted here. The SDK's default
-//     credential chain (config.LoadDefaultConfig, used per-region in the factory) is
-//     used, preferring IRSA / instance-role and falling back to AWS_ACCESS_KEY_ID /
-//     AWS_SECRET_ACCESS_KEY from the environment. An IAM principal is ACCOUNT-GLOBAL,
-//     so the same credentials authorize every region — only the endpoint
-//     (config.WithRegion) differs per client. No per-region credential is needed.
-//
-// The catalog is loaded via catalog.Load() (embedded CSV / mounted ConfigMap),
-// identical to the other adapters.
+// Security contract, and why ONE credential set spans all regions: credentials are never
+// accepted as arguments. Each per-region client uses the SDK's default chain, preferring
+// IRSA / instance-role over AWS_ACCESS_KEY_ID from the environment. An IAM principal is
+// ACCOUNT-GLOBAL, so the same credentials authorize every region and only the endpoint
+// differs.
 func NewSDKClient(_ context.Context, regionSource RegionSource) (*Provider, error) {
 	cat, err := catalog.Load()
 	if err != nil {
@@ -272,21 +244,17 @@ var ErrConfig = errors.New("aws: not configured")
 // search server-side in ONE call rather than the adapter issuing a RunInstances
 // per zone and sweeping them serially.
 //
-// EC2 capacity is per-AZ, so the fleet is given one launch-template OVERRIDE per
-// discovered default-VPC subnet: EC2 tries them itself and returns whichever it
-// lands, collapsing the former N-call zone sweep into a single round-trip that no
-// longer burns the provision deadline attempt-by-attempt. When no subnets were
-// discovered (no default VPC) the fleet runs with no overrides, letting EC2 pick
-// the subnet — a valid launch, just without cross-AZ capacity search.
+// EC2 capacity is per-AZ, so the fleet gets one override per discovered default-VPC
+// subnet: EC2 tries them itself and returns whichever it lands, collapsing the former
+// N-call zone sweep into one round-trip. With no default VPC there are no overrides and
+// EC2 picks the subnet — still valid, just no cross-AZ search.
 //
-// Because CreateFleet's overrides cannot carry an AMI or user-data, the launch
-// references an ephemeral launch template built here (createLaunchTemplate) and
-// torn down before returning (best-effort; a stray template is swept by
-// name/tag). An instant fleet reports capacity shortfalls in the response's
-// Errors (not as a Go error), so a fleet that returns no instance is mapped back
-// through classifyEC2Error to the wrapped ErrNoCapacity the region-level failover
-// (ClassifyProvisionError + NodePool regions) expects. A non-capacity failure
-// (auth, quota, bad config) surfaces the same way and is terminal.
+// Since overrides cannot carry an AMI or user-data, the launch references an ephemeral
+// launch template built here and torn down before returning (best-effort; strays are swept
+// by name/tag). An instant fleet reports shortfalls in the response's Errors rather than as
+// a Go error, so a fleet returning no instance is mapped through classifyEC2Error into the
+// wrapped ErrNoCapacity that region-level failover expects. A non-capacity failure (auth,
+// quota, bad config) surfaces the same way and is terminal.
 func (c *sdkClient) RunInstance(ctx context.Context, spec InstanceSpec) (string, error) {
 	userData, err := buildUserData(spec)
 	if err != nil {
@@ -513,13 +481,11 @@ func launchTemplateName(claim string) string {
 // were discovered (no default VPC) it emits one override per instance type with the
 // subnet unset, so EC2 still tries every type — it just cannot search across AZs.
 //
-// offerings maps a type to the set of AZs that OFFER it (nil = unknown, don't prune;
-// see instanceTypeAZs): a (type, subnet) pair whose AZ is not in the type's offered
-// set is dropped so a permanently-unavailable pair (e.g. g6.48xlarge in us-east-1e)
-// never becomes an override EC2 would reject with InvalidFleetConfiguration. Pruning
-// is skipped for a type whose offered set is unknown (fail-open) OR when it would
-// leave the type with no subnet at all — in that last case the type keeps its full
-// subnet list so a stale/empty offerings map can never zero out the launch.
+// offerings maps a type to the AZs that OFFER it (nil = unknown, don't prune). A pair whose
+// AZ is not in that set is dropped, so a permanently-dead pair (g6.48xlarge in us-east-1e)
+// never becomes an override EC2 rejects with InvalidFleetConfiguration. Pruning is skipped
+// when the set is unknown, or when it would leave the type with no subnet at all — so a
+// stale offerings map can never zero out the launch.
 func fleetOverrides(
 	instanceTypes []string, subnets []subnet, offerings map[string]map[string]bool,
 ) []ec2types.FleetLaunchTemplateOverridesRequest {
@@ -591,22 +557,18 @@ func firstFleetInstanceID(out *ec2.CreateFleetOutput) string {
 	return ""
 }
 
-// fleetError turns an instant fleet that launched nothing into the classified
-// error region/tier failover expects. An instant fleet does not fail the API call
-// on a capacity shortfall — it succeeds and reports a PER-OVERRIDE reason for every
-// (instance type, subnet) pair it could not place in out.Errors — so the reported
-// codes are run back through classifyEC2Error to recover ErrNoCapacity /
-// ErrSpotCapacity / ErrQuota / ErrAuth. An empty Errors list (no instance and no
-// reason) is treated as a generic no-capacity so the caller still fails over rather
-// than wedging.
+// fleetError turns an instant fleet that launched nothing into the classified error
+// region/tier failover expects. An instant fleet does not fail the API call on a shortfall —
+// it succeeds and reports a per-override reason in out.Errors — so those codes go back
+// through classifyEC2Error to recover ErrNoCapacity / ErrSpotCapacity / ErrQuota / ErrAuth.
+// An empty Errors list is treated as generic no-capacity, so the caller still fails over
+// instead of wedging.
 //
-// The grid's errors are usually a MIX — one subnet's AZ may not offer the type
-// (InvalidFleetConfiguration) while the rest are genuinely capacity-starved
-// (InsufficientInstanceCapacity), and a terminal reason (auth/quota) can hide
-// behind them. Picking out.Errors[0] blindly would surface whichever AZ EC2 listed
-// first, so the most AUTHORITATIVE error is chosen instead (auth > quota > capacity
-// > unknown): a real terminal reason is never masked by a per-AZ availability gap,
-// and its true message is preserved for the log/Event.
+// The grid's errors are usually a MIX: one AZ may not offer the type
+// (InvalidFleetConfiguration) while the rest are genuinely starved, and a terminal reason
+// (auth/quota) can hide behind them. So the most AUTHORITATIVE error wins (auth > quota >
+// capacity > unknown) rather than out.Errors[0], which would just be whichever AZ EC2
+// listed first.
 func fleetError(out *ec2.CreateFleetOutput, spot bool) error {
 	if out != nil {
 		var best *ec2types.CreateFleetError

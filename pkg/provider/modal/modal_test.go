@@ -19,7 +19,9 @@ package modal
 import (
 	"context"
 	"fmt"
+	"io"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +46,12 @@ type fakeClient struct {
 	createID   string
 	cred       Credential // credential CreateSandbox returns; zero = none minted
 	terminated []string
+
+	// logs is the stream SandboxLogs hands back, and logsFor records the id it was
+	// asked for — the one thing the adapter decides on that path.
+	logs    string
+	logsErr error
+	logsFor string
 }
 
 func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string, Credential, error) {
@@ -77,6 +85,14 @@ func (f *fakeClient) GetSandbox(_ context.Context, id string) (*Sandbox, error) 
 
 func (f *fakeClient) ListSandboxes(_ context.Context) ([]Sandbox, error) {
 	return f.sandboxes, nil
+}
+
+func (f *fakeClient) SandboxLogs(_ context.Context, id string) (io.ReadCloser, error) {
+	f.logsFor = id
+	if f.logsErr != nil {
+		return nil, f.logsErr
+	}
+	return io.NopCloser(strings.NewReader(f.logs)), nil
 }
 
 // fakeCatalog is a trivial provider.Catalog for tests.
@@ -1049,3 +1065,56 @@ func TestMapAccelerator_OtherRowsMapByIdentity(t *testing.T) {
 		t.Errorf("MapAccelerator(A100, 1) = (%v, true), want not-offered: the bare token is the fuzzy one", ids)
 	}
 }
+
+// Modal implements the optional provider.LogStreamer, which is what makes
+// `kubectl logs` work. A thin pass-through: the id must reach the client unchanged,
+// since it is the only thing selecting whose output comes back.
+func TestLogs_StreamsSandboxOutput(t *testing.T) {
+	f := &fakeClient{logs: "sandbox says hi\n"}
+	p := newTestProvider(f)
+
+	rc, err := p.Logs(context.Background(), "sb-1")
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != "sandbox says hi\n" {
+		t.Fatalf("logs = %q", got)
+	}
+	if f.logsFor != "sb-1" {
+		t.Fatalf("client asked for sandbox %q, want sb-1", f.logsFor)
+	}
+}
+
+// An empty id is a Pod still inside Provision. It is rejected here rather than handed
+// on, and as an error — an empty stream would read as "printed nothing".
+func TestLogs_NoSandboxIDErrors(t *testing.T) {
+	f := &fakeClient{logs: "should not be read\n"}
+	p := newTestProvider(f)
+
+	if _, err := p.Logs(context.Background(), ""); err == nil {
+		t.Fatal("Logs(\"\"): expected an error")
+	}
+	if f.logsFor != "" {
+		t.Fatalf("client was called with %q; an empty id must not reach Modal", f.logsFor)
+	}
+}
+
+// A sandbox past Modal's retention, or an expired token, must surface as an error.
+func TestLogs_ClientErrorPropagates(t *testing.T) {
+	f := &fakeClient{logsErr: fmt.Errorf("sandbox sb-gone not found")}
+	p := newTestProvider(f)
+
+	if _, err := p.Logs(context.Background(), "sb-gone"); err == nil {
+		t.Fatal("expected the client error to propagate")
+	}
+}
+
+// The handler resolves LogStreamer by type assertion, so drift would compile fine and
+// silently revert `kubectl logs` to NotFound. Assert it here.
+var _ provider.LogStreamer = (*Provider)(nil)

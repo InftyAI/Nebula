@@ -1,3 +1,5 @@
+//go:build e2e
+
 /*
 Copyright 2026.
 
@@ -14,6 +16,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// This suite deploys and undeploys a real installation, so it is behind a build tag:
+// a plain `go test ./...` must not be able to pick it up and tear down a live cluster.
+// Run it with `make test-e2e`.
 package e2e
 
 import (
@@ -46,6 +51,13 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	// FIRST, before anything can reach a cluster: pin every command this suite runs to
+	// the throwaway kind cluster's own kubeconfig. Otherwise they follow the ambient
+	// current-context, and this suite deploys, undeploys, and deletes namespaces — on
+	// whatever the developer happened to be pointed at.
+	By("pinning the suite to its own kind cluster")
+	Expect(utils.UseKindKubeconfig()).To(Succeed(), "Failed to pin the suite to a kind cluster")
+
 	By("building the manager(Operator) image")
 	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
 	_, err := utils.Run(cmd)
@@ -56,4 +68,10 @@ var _ = BeforeSuite(func() {
 	By("loading the manager(Operator) image on Kind")
 	err = utils.LoadImageToKindClusterWithName(projectImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+})
+
+// AfterSuite unpins last, so no command can fall back to the ambient context while
+// any cleanup is still running.
+var _ = AfterSuite(func() {
+	utils.ReleaseKindKubeconfig()
 })

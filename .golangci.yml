@@ -1,6 +1,10 @@
 version: "2"
 run:
   allow-parallel-runners: true
+  # The e2e suite is behind this tag, so without it lint would silently skip the
+  # whole suite.
+  build-tags:
+    - e2e
 linters:
   default: none
   enable:

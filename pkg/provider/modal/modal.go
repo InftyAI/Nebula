@@ -18,46 +18,35 @@ limitations under the License.
 // (https://modal.com), a serverless GPU compute platform.
 //
 // Modal's shape drives several adapter decisions:
-//   - Lifecycle is create/terminate only. A Modal Sandbox is spun up and later
-//     terminated; there is no stop/resume, so Capabilities.SupportsStop=false.
-//   - The Go SDK exposes no spot/preemptible knob, so SupportsSpot=false. (Modal's
-//     own API does have one — SchedulerPlacement's lifecycle, surfaced in Python as
-//     nonpreemptible — but the pinned Go client only ever builds SchedulerPlacement
-//     from Regions, so there is no way to ask for it from here.) Placement consults
-//     the trait (servesCapacity in the capacity-tier loop) and SKIPS a Spot candidate
-//     rather than downgrading it silently, so only OnDemand (or default-tier)
-//     ProvisionRequests reach this adapter and it never interprets CapacityType.
-//   - Region is OPTIONAL here, unlike AWS: Modal's scheduler places freely when no
-//     region is given, and that unconstrained mode is both the widest capacity pool
-//     and the cheapest — a pinned region costs 1.5x (broad, e.g. "us") or 1.75x
-//     (narrow, e.g. "us-east") on the whole compute bill. So this adapter forwards a
-//     region only when the pool asked for one, and the empty case is not a fallback
-//     but the preferred path. The vocabulary is Modal's own and needs no translation
-//     table, since it already spans both levels a NodePool speaks.
-//   - A pool's regions are sent in ONE call, not walked one at a time. This follows
-//     from create being non-failing (above): an accepted-but-queued sandbox reports no
-//     capacity error, so nothing ever re-drives placement to a second region, and
-//     splitting the declaration into candidates would strand the workload in whichever
-//     region happened to be walked first while discarding the others. Modal's
-//     scheduler is the right chooser here — it accepts several regions and has the
-//     live capacity view to pick among them — so ExpandRegions collapses the whole
-//     declaration into one opaque candidate and regionsOf splits it back at the API
-//     boundary. The trade is blocklist precision, which costs nothing because no
-//     Modal failure is region-attributable anyway.
-//   - Modal Sandboxes carry native tags, so NativeTags=true and the ClaimName
-//     is stored as a tag rather than smuggled into the instance name.
-//   - There is no preemption push; detection is poll-based like every provider.
+//   - Lifecycle is create/terminate only — no stop/resume, so SupportsStop=false.
+//   - The pinned Go SDK exposes no spot knob (Modal's own API has one), so
+//     SupportsSpot=false. Placement SKIPS a Spot candidate rather than downgrading it
+//     silently, so only OnDemand requests reach here and CapacityType is never read.
+//   - Region is OPTIONAL, unlike AWS: Modal places freely when none is given, and that
+//     unconstrained mode is both the widest capacity pool and the cheapest — pinning
+//     costs 1.5x (broad, "us") or 1.75x (narrow, "us-east") on the whole bill. So empty
+//     is the preferred path, not a fallback. The vocabulary is Modal's own and needs no
+//     translation table.
+//   - A pool's regions go out in ONE call rather than being walked. Create never fails
+//     on capacity (it queues), so nothing would re-drive placement to a second region
+//     and walking would strand the workload in whichever came first. Modal's scheduler
+//     has the live capacity view, so ExpandRegions collapses the declaration into one
+//     opaque candidate and regionsOf splits it back at the API boundary. The cost is
+//     blocklist precision, which is free here since no Modal failure is
+//     region-attributable.
+//   - Sandboxes carry native tags, so NativeTags=true and ClaimName is a tag rather
+//     than smuggled into the instance name.
+//   - There is no preemption push; detection is poll-based.
 //
-// The concrete Modal API (auth, sandbox create/terminate/list) lives behind the
-// Client seam so this package holds only provider-agnostic translation and is
-// unit-testable without network access. A real Client wrapping Modal's API is
-// wired in separately.
+// The concrete Modal API lives behind the Client seam, so this package holds only
+// provider-agnostic translation and is unit-testable without network access.
 package modal
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -77,8 +66,13 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
-// compile-time assertion that Provider satisfies the interface.
-var _ provider.Provider = (*Provider)(nil)
+// compile-time assertions that Provider satisfies the interfaces. LogStreamer is
+// the optional half: it is what makes `kubectl logs` work here, and asserting it
+// separately is the point — a provider is free not to serve logs.
+var (
+	_ provider.Provider    = (*Provider)(nil)
+	_ provider.LogStreamer = (*Provider)(nil)
+)
 
 // Client is the narrow seam over Modal's API. It is intentionally small: only
 // the operations the adapter needs, expressed in provider-agnostic terms, so a
@@ -98,6 +92,9 @@ type Client interface {
 	// ListSandboxes returns every Nebula-owned sandbox, filtered by the tag the
 	// adapter sets at create time, in as few calls as possible.
 	ListSandboxes(ctx context.Context) ([]Sandbox, error)
+	// SandboxLogs returns merged stdout+stderr, from the first byte, following until
+	// the sandbox exits (see provider.LogStreamer). The caller owns Close.
+	SandboxLogs(ctx context.Context, id string) (io.ReadCloser, error)
 }
 
 // SandboxSpec is the resolved, Modal-shaped request the Client turns into a
@@ -132,20 +129,15 @@ type SandboxSpec struct {
 	// and is forwarded unvalidated, since Modal owns that vocabulary and gains regions
 	// faster than this adapter ships.
 	//
-	// EMPTY IS THE PREFERRED VALUE and the one to reach for unless a workload has a
-	// real placement requirement. Modal prices a pinned region at a multiplier over
-	// its unconstrained default — 1.5x for a broad region, 1.75x for a narrow one,
-	// applied to the whole compute bill (GPU + CPU + memory) — and an unconstrained
-	// sandbox also draws on Modal's widest capacity pool, which is what makes it both
-	// cheapest and most available. So this field trades money and availability for
-	// locality; it is a data-residency knob, not a performance one.
+	// EMPTY IS THE PREFERRED VALUE unless a workload has a real placement requirement.
+	// Modal charges 1.5x for a broad region and 1.75x for a narrow one, on the whole
+	// compute bill, and an unconstrained sandbox also draws on the widest capacity pool.
+	// So this trades money and availability for locality: a data-residency knob, not a
+	// performance one.
 	//
-	// It carries EVERY region the pool declared, not one per attempt. Modal's
-	// scheduler accepts several and picks among them with its own live view of
-	// capacity, and it must, because a Modal create cannot fail over: it returns an
-	// accepted id with no capacity error, so nothing here could try a second region
-	// afterwards. See ExpandRegions and regionsOf for the join/split that carries
-	// the set through placement's single-region candidate.
+	// It carries EVERY region the pool declared, not one per attempt, because a Modal
+	// create cannot fail over — it returns an accepted id with no capacity error, so
+	// nothing here could try a second region afterwards. See ExpandRegions and regionsOf.
 	Regions []string
 	// Timeout is the sandbox's maximum lifetime. It MUST be non-zero: Modal treats
 	// a zero timeout as its 5-minute default, which would terminate a real
@@ -165,13 +157,11 @@ type SandboxSpec struct {
 
 // Sandbox is the adapter-level view of a Modal sandbox as observed.
 //
-// There is no endpoint here, deliberately. Modal's reachable address is the connect
-// URL, which is minted at CREATE time (see Credential) and published straight to the
-// Pod's endpoint annotation, where it persists in etcd for the sandbox's whole life.
-// Re-deriving it on every read would be a Modal round trip for a value the API server
-// already holds — and there is no other address to report: a tunnel URL would be one,
-// but it is PUBLIC to anyone who learns it, so serving it as a substitute for an
-// authenticated URL would silently downgrade access.
+// No endpoint here, deliberately: Modal's reachable address is the connect URL, minted at
+// CREATE time and published to the Pod's endpoint annotation, where it persists for the
+// sandbox's life. Re-deriving it per read would be a round trip for a value the API server
+// already holds. The only other candidate, a tunnel URL, is PUBLIC to anyone who learns
+// it, so substituting it for an authenticated URL would downgrade access.
 type Sandbox struct {
 	ID     string
 	Tags   map[string]string
@@ -200,23 +190,18 @@ const ClaimTagKey = "nebula.inftyai.com/claim"
 // ProbeTagKey records that a sandbox was created WITH a readiness probe;
 // probeTagValue is the only value it is ever set to.
 //
-// Nebula has to carry this fact itself. observe needs it to tell "no probe, so
-// there is nothing to wait for" from "the probe has not passed yet" — and
-// WaitUntilReady errors on the former, so it cannot simply be attempted. The Pod
-// cannot answer it either: the read path (Provider.List) takes no Pod, and the
-// Pod that GetPod synthesizes when re-adopting after a VK restart carries only a
-// namespace and name, hence no spec and no readinessProbe.
+// Nebula has to carry this itself. observe needs it to tell "no probe, nothing to wait
+// for" from "the probe has not passed yet", and WaitUntilReady errors on the former so it
+// cannot just be attempted. The Pod cannot answer either: the read path takes no Pod, and
+// the one GetPod synthesizes on re-adoption has no spec.
 //
-// Modal's control plane does return it (SandboxInfo.ReadinessProbe, next to a
-// ReadyAt stamp), but the Go SDK builds its *Sandbox from a list response with
-// info.GetId() alone and keeps the control-plane client private, so neither field
-// is reachable through the public API. If a future SDK exposes SandboxInfo, this
-// tag and the WaitUntilReady call in observe both become unnecessary.
+// Modal's control plane does return it (SandboxInfo.ReadinessProbe), but the Go SDK builds
+// its *Sandbox from the id alone and keeps the control-plane client private. If a future
+// SDK exposes SandboxInfo, this tag and observe's WaitUntilReady both become unnecessary.
 //
-// A tag is the right carrier: observe already fetches tags before it reads status
-// (so the gate costs no extra call), and tags live with the sandbox at Modal, so
-// probe-ness is recovered exactly the way identity is — even for a sandbox this
-// process never created.
+// A tag is the right carrier: observe already fetches tags before status (so the gate is
+// free), and tags live with the sandbox, so probe-ness is recovered the way identity is —
+// even for a sandbox this process never created.
 const (
 	ProbeTagKey   = "nebula.inftyai.com/readiness-probe"
 	probeTagValue = "true"
@@ -253,24 +238,19 @@ const regionSeparator = "|"
 // pass-through. It resolves the pool's whole declaration to at most ONE candidate,
 // carrying every declared region in it, rather than one candidate per region.
 //
-// This is the opposite of AWS, and the reason is that Modal cannot fail over. An
-// AWS CreateFleet reports a capacity shortage synchronously, so walking regions one
-// at a time is what lets the next region be tried. Sandboxes.Create instead ACCEPTS
-// the sandbox immediately and returns a real id with Reserved=false — the GPU may
-// still be queued for minutes. There is no error, so ClassifyProvisionError never
-// runs, nothing is blocklisted, and placement is never re-driven: the first region
-// walked is the only region ever tried. Splitting the declaration into candidates
-// would therefore SHRINK the capacity pool to one region and discard the rest.
+// The opposite of AWS, because Modal cannot fail over. An AWS CreateFleet reports a
+// shortage synchronously, so walking regions one at a time lets the next be tried.
+// Sandboxes.Create instead ACCEPTS immediately and returns a real id with the GPU maybe
+// still queued. No error means ClassifyProvisionError never runs, nothing is blocklisted,
+// and placement is never re-driven — so the first region walked would be the only one ever
+// tried, shrinking the pool to one region and discarding the rest.
 //
-// Handing Modal the full set instead moves the choice to the party that can act on
-// it: Modal's scheduler accepts several regions (SchedulerPlacement.Regions) and
-// picks among them itself, with its own live view of capacity. So a pool declaring
-// several regions gets all of them considered, which is what the operator asked for.
+// Handing Modal the full set moves the choice to the party that can act on it: its
+// scheduler takes several regions and picks with a live view of capacity.
 //
-// The cost is precision, and it is worth naming: the resulting candidate's region is
-// a joined token, so a blocklist entry covers the whole declared set rather than one
-// region. That loses nothing today — no Modal failure is region-attributable in the
-// first place, since a queued sandbox never reports which region ran dry.
+// The cost is that the candidate's region is a joined token, so a blocklist entry covers
+// the whole set. That loses nothing today, since a queued sandbox never reports which
+// region ran dry.
 func (p *Provider) ExpandRegions(declared []string) []string {
 	seen := make(map[string]bool)
 	regions := make([]string, 0, len(declared))
@@ -303,19 +283,14 @@ func (p *Provider) Capabilities() provider.Capabilities {
 // Provision implements provider.Provider. The Pod is the source of truth for
 // the workload; req carries only the claim identity and capacity tier.
 //
-// A fresh sandbox is NEVER reserved. Sandboxes.Create returns as soon as Modal's
-// control plane accepts the sandbox: the id is real (listable, terminable, and
-// carrying the full teardown obligation), but the GPU may still be queued —
-// potentially for minutes on a large shape. So the id and the capacity are two
-// separate facts here, unlike AWS, and reporting reserved=false is what lets the
-// Pod stay at the provisioning reason instead of claiming to be initializing.
+// A fresh sandbox is NEVER reserved. Create returns as soon as Modal accepts it: the id is
+// real (listable, terminable, fully on the hook for teardown) but the GPU may be queued for
+// minutes. So id and capacity are two separate facts here, unlike AWS, and reserved=false
+// is what keeps the Pod at the provisioning reason instead of claiming to be initializing.
+// The queued→running transition is then observed through the poll loop's List.
 //
-// The queued→running transition is then observed the same way readiness is, through
-// the poll loop's List: the sandbox reads statusInitializing until it is live.
-//
-// The connect credential comes back on this call and only this call, because Modal
-// mints it once and cannot re-read it. The caller must persist it (the virtual kubelet
-// writes it to a Secret) or it is lost; see mintCredential.
+// The connect credential comes back on this call and only this call, since Modal mints it
+// once with no read-back. The caller must persist it or it is lost; see mintCredential.
 func (p *Provider) Provision(
 	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
 ) (provider.ProvisionResult, error) {
@@ -329,18 +304,15 @@ func (p *Provider) Provision(
 	// Idempotency: if a sandbox already carries this claim tag, return it rather
 	// than creating a second (guards against a retry after a partial create).
 	//
-	// Unlike a fresh create, this one has been OBSERVED, so its state is known: a
-	// sandbox the poll loop reports live (Pending once it is up, or Running once
-	// ready) has necessarily been allocated capacity, whereas one still queued is
-	// not yet reserved. That is strictly more information than a create can return,
-	// so use it rather than flatly reporting false.
+	// Unlike a fresh create, this sandbox has been OBSERVED, so its state is known: one
+	// the poll loop reports Running has capacity, one still queued does not. That is more
+	// information than a create can return, so report it rather than a flat false.
 	//
-	// It carries NO credential, per the interface contract: the original was minted at
-	// the first create and cannot be re-read, and minting a second one here would hand
-	// the consumer a token that changes on every retry. The consequence is a real gap —
-	// if the first create succeeded but its credential never reached a Secret, nothing
-	// recovers it. Closing that means re-minting for a sandbox with no Secret yet, which
-	// needs cluster access this layer does not have.
+	// It carries NO credential, per the interface contract: the original cannot be
+	// re-read, and minting a second would hand the consumer a token that changed on every
+	// retry. That leaves a real gap — if the first create succeeded but its credential
+	// never reached a Secret, nothing recovers it. Closing it needs cluster access this
+	// layer does not have.
 	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {
@@ -374,6 +346,16 @@ func (p *Provider) Terminate(ctx context.Context, instanceID string) error {
 	return p.client.TerminateSandbox(ctx, instanceID)
 }
 
+// Logs implements provider.LogStreamer, and is what `kubectl logs` reads. A straight
+// pass-through: the options are the caller's job. An empty id (nothing provisioned
+// yet) is an error, not an empty stream, which would misreport as "logged nothing".
+func (p *Provider) Logs(ctx context.Context, instanceID string) (io.ReadCloser, error) {
+	if instanceID == "" {
+		return nil, fmt.Errorf("modal: no sandbox for this pod yet")
+	}
+	return p.client.SandboxLogs(ctx, instanceID)
+}
+
 // Get implements provider.Provider.
 func (p *Provider) Get(ctx context.Context, instanceID string) (*provider.Instance, error) {
 	sb, err := p.client.GetSandbox(ctx, instanceID)
@@ -400,28 +382,18 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	return out, nil
 }
 
-// ClassifyProvisionError implements provider.Provider. The failure CATEGORIES
-// and the scope-derivation rule are shared across all adapters
-// (provider.ClassifyError, provider.ErrNoCapacity, ...), so this method only
-// supplies what is Modal-specific: the capacity tier to stamp on an
-// accelerator-scoped block. Modal is OnDemand-only, so that is always OnDemand.
+// ClassifyProvisionError implements provider.Provider. The categories and the
+// scope-derivation rule are shared (provider.ClassifyError, provider.ErrNoCapacity), so
+// this only supplies the Modal-specific part: the tier to stamp on an accelerator block,
+// always OnDemand. A Client that recognizes an SDK error should wrap the matching shared
+// sentinel; ClassifyError honours those first, then falls back to string heuristics.
 //
-// A real Modal Client that recognizes an SDK error condition should wrap the
-// matching shared sentinel (e.g. fmt.Errorf("...: %w", provider.ErrNoCapacity));
-// ClassifyError honours those first and falls back to string heuristics for raw
-// API messages, so no Modal-specific matching is duplicated here.
-//
-// It also confines the block to the failing CANDIDATE, the same way the AWS adapter
-// does, now that a pool can pin a Modal sandbox. Note this is the candidate, not
-// necessarily a single region: ExpandRegions hands Modal every declared region at
-// once, so the token here may name the whole set and the block then covers all of it.
-// That is the honest scope — a failure on a multi-region create tells us nothing
-// about which region was short, and there is no narrower attempt left to make. A pool
-// that wants per-region blocking has to declare per-region pools. The unconstrained
-// case keeps the region-simple behaviour:
-// an empty region leaves Region nil, which per BlockScope's three-state rule matches
-// only a candidate whose region is also empty, so the block neither widens across an
-// axis the request never used nor leaks onto region-pinned candidates.
+// It confines the block to the failing CANDIDATE, which is not necessarily one region:
+// ExpandRegions sends every declared region at once, so the token may name the whole set
+// and the block then covers all of it. That is honest — a multi-region create never says
+// which region was short — and a pool wanting per-region blocking declares per-region
+// pools. An empty region leaves Region nil, which per BlockScope matches only candidates
+// with no region, so the block never leaks onto region-pinned ones.
 func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
 	// No failure, no block. ClassifyError already returns the zero scope here, but
 	// the region decoration below would repopulate it into a non-empty scope that
@@ -643,29 +615,23 @@ const (
 	// to completion (exit 0), or Modal reclaimed it (our own Terminate, a sandbox
 	// timeout). "Gone", with no claim about why.
 	statusTerminated = "terminated"
-	// statusFailed: the process exited nonzero — it crashed, or never came up at
-	// all (a bad image, an unavailable GPU, an OOM at init: Modal's INIT_FAILURE).
-	// Distinct from terminated because "it failed" and "it is gone" are different
-	// facts to put in front of an operator: a sandbox that never started reported as
-	// terminated reads like a clean teardown, which is the opposite of what happened.
+	// statusFailed: the process exited nonzero — it crashed, or never came up at all (bad
+	// image, unavailable GPU, OOM at init). Distinct from terminated because a sandbox
+	// that never started reads like a clean teardown if reported as gone.
 	statusFailed = "failed"
 )
 
 // toState maps the status strings observe produces to the provider-agnostic
 // lifecycle state.
 //
-// A live sandbox is only reported Running once its readiness probe has passed.
-// Modal's cheap Poll signal cannot see readiness at all — it answers "has the
-// process exited?", so a sandbox that is still scheduling reads exactly like one
-// that is serving — and reporting Running that early advances the Pod, and the
-// owning Deployment's ready replicas, before the box can be reached. This mirrors
-// the AWS adapter holding a running-but-unchecked instance at Pending until its
-// 2/2 EC2 status checks clear.
+// A live sandbox is only reported Running once its readiness probe has passed. Poll cannot
+// see readiness — it only answers "has the process exited?" — so a still-scheduling sandbox
+// reads like a serving one, and reporting Running that early advances the Pod (and its
+// Deployment's ready replicas) before the box is reachable. Same as AWS holding an instance
+// at Pending until its 2/2 status checks clear.
 //
-// statusInitializing needs no case of its own: it falls to the default, which is
-// where every unrecognized status — including the empty string observe leaves when
-// Poll errors — maps to Pending, so the poll loop keeps watching rather than
-// declaring a premature terminal state.
+// statusInitializing needs no case: it falls to the default, where every unrecognized
+// status maps to Pending so the poll loop keeps watching instead of going terminal early.
 func toState(modalStatus string) provider.InstanceState {
 	switch strings.ToLower(modalStatus) {
 	case statusRunning:

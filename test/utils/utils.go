@@ -49,6 +49,11 @@ func Run(cmd *exec.Cmd) (string, error) {
 	cmd.Dir = dir
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	// Pin the target cluster when the suite has one (see UseKindKubeconfig). Appended
+	// last so it wins over any inherited KUBECONFIG.
+	if kubeconfigPath != "" {
+		cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfigPath)
+	}
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
 	output, err := cmd.CombinedOutput()
@@ -107,13 +112,73 @@ func IsPrometheusCRDsInstalled() bool {
 // webhook serving cert in-process (pkg/cert), so the e2e suite has nothing to
 // install or wait for before deploying.
 
+// defaultKindCluster is the throwaway cluster the e2e suite targets when
+// KIND_CLUSTER is unset. It matches the Makefile's KIND_CLUSTER default, and is
+// deliberately NOT "kind": that is the conventional name of a developer's own
+// cluster, and this suite deploys, undeploys and deletes namespaces.
+const defaultKindCluster = "nebula-test-e2e"
+
+// KindClusterName is the kind cluster the suite runs against.
+func KindClusterName() string {
+	if v := os.Getenv("KIND_CLUSTER"); v != "" {
+		return v
+	}
+	return defaultKindCluster
+}
+
+// kubeconfigPath pins every command Run launches to one cluster. Empty until
+// UseKindKubeconfig succeeds.
+var kubeconfigPath string
+
+// UseKindKubeconfig points the whole suite at KindClusterName()'s own kubeconfig,
+// so nothing it runs can reach the ambient current-context.
+//
+// This is a safety mechanism, not a convenience. Every kubectl call here inherits
+// the current context, and the suite runs `make undeploy` and
+// `kubectl delete ns nebula-system` — against a live cluster that destroys a real
+// installation. KIND_CLUSTER alone does not prevent it: it only chose which cluster
+// `kind load` pushed the image to, so the image and the API calls could land on
+// DIFFERENT clusters. Writing a private kubeconfig fixes it centrally, and covers the
+// `make install`/`deploy-e2e`/`undeploy` subprocesses too, since they inherit the env.
+//
+// A missing cluster is a hard error: failing to start beats deploying somewhere else.
+func UseKindKubeconfig() error {
+	cluster := KindClusterName()
+	out, err := exec.Command("kind", "get", "kubeconfig", "--name", cluster).Output()
+	if err != nil {
+		return fmt.Errorf("get kubeconfig for kind cluster %q (create it with `make setup-test-e2e`): %w", cluster, err)
+	}
+
+	f, err := os.CreateTemp("", "nebula-e2e-kubeconfig-")
+	if err != nil {
+		return fmt.Errorf("create temp kubeconfig: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Write(out); err != nil {
+		return fmt.Errorf("write temp kubeconfig: %w", err)
+	}
+
+	kubeconfigPath = f.Name()
+	_, _ = fmt.Fprintf(GinkgoWriter, "e2e pinned to kind cluster %q via %s\n", cluster, kubeconfigPath)
+	return nil
+}
+
+// ReleaseKindKubeconfig removes the temp kubeconfig. Unpinning is deliberate: a later
+// Run must not silently fall back to the ambient context, so callers use this only at
+// the very end of the suite.
+func ReleaseKindKubeconfig() {
+	if kubeconfigPath == "" {
+		return
+	}
+	if err := os.Remove(kubeconfigPath); err != nil {
+		warnError(err)
+	}
+	kubeconfigPath = ""
+}
+
 // LoadImageToKindClusterWithName loads a local docker image to the kind cluster
 func LoadImageToKindClusterWithName(name string) error {
-	cluster := "kind"
-	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
-		cluster = v
-	}
-	kindOptions := []string{"load", "docker-image", name, "--name", cluster}
+	kindOptions := []string{"load", "docker-image", name, "--name", KindClusterName()}
 	cmd := exec.Command("kind", kindOptions...)
 	_, err := Run(cmd)
 	return err

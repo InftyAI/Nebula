@@ -64,39 +64,27 @@ const preemptionNotice = 2 * time.Minute
 // we poll faster than the vnode default so a reclaim is noticed promptly.
 const spotPollInterval = 10 * time.Second
 
-// provisionTimeout is this adapter's override of the vnode handler's generic
-// Provision deadline (Capabilities.ProvisionTimeout). EC2 capacity is per-zone,
-// so RunInstance fails over across the region's availability zones on a capacity
-// error; AWS raises the deadline above the generic default to leave room for that
-// inner zone sweep, while still capping it so a capacity-starved region yields
-// promptly to the outer region-level failover rather than stalling a Pod. It
-// bounds the launch attempts, not "the container became healthy" (that is the
-// poll loop's job).
+// provisionTimeout overrides the vnode handler's generic Provision deadline. EC2 capacity
+// is per-zone, so RunInstance sweeps the region's AZs on a capacity error; this leaves room
+// for that sweep while still capping it, so a starved region yields to the outer
+// region-level failover instead of stalling a Pod. It bounds the launch attempts, not "the
+// container became healthy" — that is the poll loop's job.
 const provisionTimeout = 2 * time.Minute
 
-// regionGroups maps a NodePool geography token to the EC2 regions it covers. A
-// group token is NOT an EC2 region name and cannot be derived from one by string
-// surgery ("us" is not a callable endpoint, and London is eu-west-2, not uk-*), so
-// the mapping is data. Every value here is a DEFAULT-enabled region: opt-in regions
-// (launched after 2019-03-20 and disabled until an operator enables them — af-south-1,
-// ap-east-1/2, ap-south-2, ap-southeast-3/4/5/6/7, ca-west-1, eu-central-2,
-// eu-south-1/2, il-central-1, me-central-1, me-south-1, mx-central-1) are
-// deliberately EXCLUDED, so a group or an unconstrained pool can only ever expand to
-// regions the account can actually use.
+// regionGroups maps a NodePool geography token to the EC2 regions it covers. A group token
+// is not an EC2 region name and cannot be derived from one ("us" is not an endpoint, London
+// is eu-west-2), so the mapping is data.
 //
-// That exclusion is what keeps the wide cases cheap. clientFor resolves a GPU AMI and
-// the default VPC's subnets on first use and deliberately does not cache failures, so
-// a region the account has not enabled would fail that resolution and retry on every
-// poll tick (every spotPollInterval), logging forever, for a region nobody asked for.
-// An operator who HAS enabled one names it explicitly — a literal region name is
-// passed through untouched, so nothing here restricts them.
+// Only DEFAULT-enabled regions are listed. Opt-in ones (af-south-1, ap-east-1, ca-west-1,
+// eu-south-1, me-central-1, …) are excluded because clientFor resolves a GPU AMI and the
+// default VPC's subnets on first use and does not cache failures — a region the account has
+// not enabled would fail and retry every poll tick, forever, for a region nobody asked for.
+// An operator who HAS enabled one names it explicitly; literal names pass through untouched.
 //
-// GovCloud (us-gov-*) and China (cn-*) are absent for a stronger reason: they are
-// separate IAM partitions, so one credential set cannot reach them at all (see
-// NewSDKClient's security contract). They are not a group member under any token.
+// GovCloud (us-gov-*) and China (cn-*) are absent for a stronger reason: separate IAM
+// partitions, so one credential set cannot reach them at all.
 //
-// Kept sorted so expansion order — and therefore the failover walk order within a
-// group — is stable and reviewable rather than an accident of map iteration.
+// Kept sorted so the failover walk order within a group is stable and reviewable.
 var regionGroups = map[string][]string{
 	"us": {"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
 	"eu": {"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3"},
@@ -201,18 +189,15 @@ type EC2Instance struct {
 // set serves every region and only the region endpoint differs.
 type ClientFactory func(ctx context.Context, region string) (Client, error)
 
-// RegionSource reports the regions the adapter should sweep in List and Offerings.
-// The NodePool is the source of truth: cmd/main.go backs this with a lister over
-// ProviderSpec.Regions across every pool referencing "aws", so the region set is
-// DYNAMIC (a pool added at runtime widens the sweep) and needs no env var or flag —
-// the region a Pod lands in already flows NodePool -> selectPlacement ->
-// RegionAnnotation -> ProvisionRequest.Region, so provisioning never depended on a
-// configured set; only the List/Offerings fan-out did, and this supplies it.
+// RegionSource reports the regions the adapter should sweep in List and Offerings. The
+// NodePool is the source of truth: cmd/main.go backs this with a lister over
+// ProviderSpec.Regions across every "aws" pool, so the set is DYNAMIC (a pool added at
+// runtime widens the sweep) and needs no env var. Provisioning never needed it — the target
+// region rides on the request — only the fan-out does.
 //
-// It may return an empty slice (no aws pool exists yet, or the cache has not synced):
-// sweepRegions then falls back to the regions already in the lazy client cache
-// (regions actually provisioned into), so a fleet placed by a prior generation is
-// still swept. It must be safe to call concurrently.
+// It may return empty (no aws pool yet, or an unsynced cache); sweepRegions then falls back
+// to the lazy client cache's keys, so a fleet placed by a prior generation is still swept.
+// Must be safe to call concurrently.
 type RegionSource func() []string
 
 // Provider is the EC2 implementation of provider.Provider. It embeds catalog.Base
@@ -220,21 +205,14 @@ type RegionSource func() []string
 // resolves the accelerator_id/instance-type mapping straight from the catalog, so
 // no override is needed here) and implements the EC2-specific lifecycle.
 //
-// Multi-region: unlike the OnDemand-only NeoClouds, one AWS Provider spans several
-// regions. EC2 is region-partitioned (an instance, its AMI, its subnets, and its
-// capacity all live in one region), so the Provider holds a region -> Client map,
-// each Client pinned to one region, built LAZILY on first use via newClient. The
-// map is keyed by region and guarded by mu. A single registry entry ("aws") and a
-// single virtual node still front all regions; the region is a per-Pod placement
-// choice carried on the ProvisionRequest, not a per-node fact — so it must be an
-// axis inside the one adapter, not a provider-per-region.
+// Multi-region: EC2 is region-partitioned (instance, AMI, subnets, capacity all live in one
+// region), so the Provider holds a region -> Client map, each Client pinned to one region
+// and built lazily by newClient. One registry entry ("aws") and one virtual node still front
+// them all, because the region is a per-Pod placement choice on the ProvisionRequest, not a
+// per-node fact — so it has to be an axis inside the adapter, not a provider per region.
 //
-// The region set is NOT configured at construction: it is sourced from the NodePool
-// at call time via regionSource (see RegionSource), because ProviderSpec.Regions is
-// the operator's declaration of which regions this provider may use and it changes
-// at runtime. Provisioning never needed a configured set (the target region rides on
-// the request); only the List/Offerings fan-out does, and sweepRegions derives it
-// from the NodePool plus the regions already provisioned into (the cache keys).
+// The region set is not configured at construction but read from the NodePool at call time
+// via regionSource, since ProviderSpec.Regions changes at runtime.
 type Provider struct {
 	catalog.Base
 	// newClient lazily builds the Client for a region (AMI/subnet resolution). The
@@ -292,26 +270,20 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 //	["us"]          => that group's regions
 //	["us-east-1"]   => itself, verbatim and unvalidated
 //
-// A value that is not a group token is a literal region name. It is NOT checked
-// against any list: EC2 gains regions faster than this table is edited, so a
-// hardcoded validation would reject a region that exists, whereas passing an
-// impossible name through fails at clientFor with AWS's own error. Forwarding is the
-// safer direction of wrongness. That is also the escape hatch for opt-in regions,
-// which no group contains.
+// A non-group value is a literal region name, NOT validated against any list: EC2 gains
+// regions faster than this table is edited, so validating would reject a region that
+// exists, while an impossible name simply fails at clientFor with AWS's own error. That is
+// also the escape hatch for opt-in regions, which no group contains.
 //
-// The result is deduped (["us", "us-east-1"] is 4 regions, not 5) and order-stable:
-// group order follows the table, and a literal keeps its declared position, so the
+// The result is deduped (["us", "us-east-1"] is 4 regions, not 5) and order-stable, so the
 // failover walk is reproducible.
 //
-// Unconstrained is the widest case and worth understanding before using it: ~17
-// regions per capacity tier, each a candidate placement walks in turn, and each swept
-// by List/Offerings on every poll tick. Prefer a group when the workload does not
-// genuinely need global reach.
-// It delegates to the package-level ExpandRegions so the same resolution is
-// available to the region source in cmd/main.go, which must expand each pool's
-// declaration BEFORE unioning across pools (a pool declaring nothing means "all", a
-// meaning that would be lost if raw lists were unioned first) and therefore cannot
-// wait for a constructed Provider.
+// Unconstrained is wide: ~17 regions per capacity tier, each walked as a candidate and
+// swept by List/Offerings every tick. Prefer a group unless the workload needs global reach.
+//
+// It delegates to the package-level ExpandRegions, which cmd/main.go's region source also
+// needs — it must expand each pool BEFORE unioning across pools (a pool declaring nothing
+// means "all", a meaning lost if raw lists were unioned first).
 func (p *Provider) ExpandRegions(declared []string) []string { return ExpandRegions(declared) }
 
 // ExpandRegions is Provider.ExpandRegions as a package-level function; see that
@@ -435,15 +407,12 @@ func (p *Provider) Capabilities() provider.Capabilities {
 //   - AWS itself holds the PER-REGION truth: which instance types the configured
 //     region actually offers, queried live via the AvailableInstanceTypes probe.
 //
-// So each static row is emitted ONCE PER CONFIGURED REGION, stamped with that
-// region and its Available flag AND-ed with the region's live probe: a row survives
-// as available only if the catalog seeded it available AND that region currently
-// offers its instance type. Rows for types a region does not offer are still
-// returned (so the optimizer can see the price) but marked unavailable.
+// So each static row is emitted once PER REGION, with Available AND-ed against that
+// region's live probe. Rows for types a region does not offer are still returned, marked
+// unavailable, so the optimizer can still see the price.
 //
-// Per-region probe errors are tolerated like List's: a region that fails its probe
-// is skipped for this call rather than failing the whole Offerings (its rows simply
-// do not appear this time). Only if every region fails is an error returned.
+// A region that fails its probe is skipped rather than failing the whole call, as in List.
+// Only if every region fails is an error returned.
 func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 	rows := p.Catalog.Offerings(p.ProviderName)
 	if len(rows) == 0 {
@@ -482,23 +451,19 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 // Provision implements provider.Provider. The Pod is the source of truth for the
 // workload; req carries the claim identity, capacity tier, and region.
 //
-// The returned instance id is the RAW EC2 id ("i-..."), not region-qualified: the
-// id is what the NodeClaim ledger records and the user sees, so it stays a clean
-// EC2 id. Terminate/Get do not need the region encoded in it — they locate the
-// instance by sweeping the swept regions (the same set List covers), since a
-// wrong-region lookup is a harmless no-op (see Terminate/Get).
-// Every id this returns is RESERVED. RunInstance launches through a CreateFleet
-// *instant* request, which is synchronous: the response carries either an instance
-// id — meaning EC2 already found capacity in some (type, AZ) cell and the instance
-// is booting on real hardware — or the reason it could not launch, which becomes an
-// error driving AZ/region/tier failover. There is no queued state for an EC2
-// instance to sit in, so the reserved return is unconditionally true on success.
+// The returned id is the RAW EC2 id ("i-..."), not region-qualified: it is what the
+// NodeClaim ledger records and the user sees. Terminate/Get find the instance by sweeping
+// regions instead, since a wrong-region lookup is a harmless no-op.
 //
-// No connect credential is returned. EC2 has nothing to mint: an instance is reached
-// at its public DNS name or IP, which EC2 does not know until the instance boots, so
-// the address is reported the level-triggered way — observed by List/Get into
-// Instance.Endpoint — and access is authenticated by the key pair and security group,
-// not a bearer token.
+// Every id this returns is RESERVED. RunInstance goes through a CreateFleet *instant*
+// request, which is synchronous: the response either carries an id — EC2 found capacity in
+// some (type, AZ) cell and the instance is booting — or the reason it could not launch,
+// which becomes the error driving AZ/region/tier failover. An EC2 instance has no queued
+// state to sit in, so reserved is unconditionally true on success.
+//
+// No connect credential: an instance is reached at its public DNS name or IP, which EC2
+// does not know until boot, so the address is observed by List/Get into Instance.Endpoint
+// and access is authenticated by the key pair and security group, not a bearer token.
 func (p *Provider) Provision(
 	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
 ) (provider.ProvisionResult, error) {
@@ -642,16 +607,10 @@ func (p *Provider) Get(ctx context.Context, instanceID string) (*provider.Instan
 // see instances wherever they live — including regions this process never
 // provisioned into itself (a restart, or an instance placed by a prior leader).
 //
-// Per-region errors are TOLERATED, not fatal: one region throttling or briefly
-// unreachable must not blank the whole list (which the vnode poll loop would read
-// as "every tracked pod's instance vanished" and mark them Terminated). A region
-// that errors is logged and skipped for this tick; the regions that answered still
-// contribute. Only if EVERY region fails is an error returned, so a total outage
-// still surfaces rather than silently reporting an empty fleet.
-//
-// Each instance's ID is the raw EC2 id; a downstream Terminate/Get re-locates it by
-// sweeping the same regions (a wrong-region lookup is a harmless no-op), so the id
-// stays a clean EC2 id rather than a region-qualified token.
+// Per-region errors are TOLERATED: one region throttling must not blank the whole list,
+// which the poll loop would read as "every tracked pod's instance vanished". A failing
+// region is logged and skipped for this tick. Only if EVERY region fails is an error
+// returned, so a total outage still surfaces instead of reporting an empty fleet.
 func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	log := logf.FromContext(ctx).WithName("aws-list")
 
@@ -716,20 +675,13 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // sentinels), so this method supplies only what is EC2-specific. Two things set
 // AWS apart from the OnDemand-only NeoClouds:
 //
-//   - Both tiers exist, so the tier to stamp on an accelerator-scoped block is
-//     read from the wrapped sentinel: a Spot no-capacity error must block only
-//     Spot, leaving OnDemand serviceable. ClassifyError does not see the request,
-//     so we detect the Spot case here (ErrNoCapacity wrapped with the spot marker)
-//     and pass the right tier.
-//   - EC2 capacity is per-region and this adapter is multi-region, so an
-//     accelerator/capacity block is confined to the region that ACTUALLY FAILED
-//     (the region the failing request targeted) — a "no capacity in us-east-1"
-//     failure does not disqualify the same request in us-west-2. This includes
-//     quota: EC2 vCPU limits are regional (and per-instance-family, per-tier), so a
-//     VcpuLimitExceeded in one region must not fence off the others. Only a DenyAll
-//     block (auth) is left region-wide, since bad credentials fail in every region.
-//     The region is passed in because the error alone does not carry it and the
-//     adapter has no default region to assume.
+//   - Both tiers exist, so the tier stamped on an accelerator block comes from the wrapped
+//     sentinel: a Spot shortage must block only Spot, leaving OnDemand serviceable.
+//   - EC2 capacity is per-region, so a capacity or quota block is confined to the region
+//     that actually failed — a shortage in us-east-1 must not disqualify us-west-2, and
+//     vCPU limits are regional too. Only DenyAll (auth) stays region-wide, since bad
+//     credentials fail everywhere. The region is a parameter because the error does not
+//     carry it and there is no default region to assume.
 func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
 	if err == nil {
 		return provider.BlockScope{}

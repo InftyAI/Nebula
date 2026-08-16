@@ -14,33 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package cert provisions the webhook serving certificate in-process, so Nebula
-// has no cert-manager dependency and no out-of-band setup step.
+// Package cert provisions the webhook serving certificate in-process, so Nebula has
+// no cert-manager dependency and no out-of-band setup step.
 //
-// The webhook needs two things that must agree exactly: a TLS keypair the manager
-// serves from, and that cert's CA in the MutatingWebhookConfiguration's caBundle
-// so the API server trusts the webhook when it calls it. There were two prior ways
-// to get them, and both are worse:
+// Two things must agree exactly: the TLS keypair the manager serves, and that cert's
+// CA in the MutatingWebhookConfiguration's caBundle. Both prior options were worse —
+// cert-manager is a second operator to install first (and made the e2e suite need
+// network access), while hack/gen-webhook-cert.sh mints a cert at deploy time that
+// NEVER rotates, so its expiry is a time bomb that fires years later.
 //
-//   - cert-manager: rotates correctly, but is a whole second operator the user must
-//     install before Nebula works at all. It also made the e2e suite install
-//     cert-manager in BeforeSuite, which is why that suite could not run without
-//     network access to fetch its manifests.
-//   - hack/gen-webhook-cert.sh: no dependency, but the cert is minted by a shell
-//     script at deploy time and NEVER rotates. It is valid for CERT_DAYS (default
-//     3650) and renewing means re-running the script with FORCE_REGEN — i.e. the
-//     expiry is a silent time bomb that fires years later, when nobody remembers
-//     the script exists.
+// The rotator does both jobs in-process: mint the keypair into a Secret, patch the
+// caBundle, keep renewing before expiry. Patching the CA from the cert just written
+// is what keeps the served cert and the trusted CA from drifting.
 //
-// The rotator does both jobs in-process: it mints the keypair into a Secret, patches
-// the caBundle, and then keeps renewing before expiry. Because the CA is patched from
-// the same cert that was just written, the served cert and the trusted CA cannot drift.
-//
-// The Secret is the ONLY thing it writes. It never touches the filesystem — the
-// keypair reaches the webhook server's certDir because the manager projects that
-// Secret there as a volume, and the rotator merely polls the path to know when the
-// kubelet has done so. See certDir below; getting this backwards (an emptyDir at
-// certDir) silently prevents the whole manager from starting.
+// The Secret is the ONLY thing it writes; it never touches the filesystem. The
+// keypair reaches certDir because the manager projects that Secret there as a volume,
+// and the rotator only polls the path to know when the kubelet has. See certDir —
+// getting this backwards (an emptyDir) silently stops the manager from starting.
 package cert
 
 import (
@@ -73,13 +63,12 @@ const (
 	// webhook server reads it from. It is the controller-runtime default, and the path
 	// the manager projects the Secret above at.
 	//
-	// The rotator does NOT write here, despite the name: cert-controller performs no
-	// filesystem writes at all, and CertDir is a path it only os.Stat()s to decide
-	// readiness (ensureCertsMounted). The KUBELET puts the files here by projecting the
-	// Secret — so the volume must be that Secret, not an emptyDir. With an emptyDir the
-	// files never appear, IsReady never closes, and since controller and webhook
-	// registration waits on it (see CertsManager), nothing ever starts while the manager
-	// still reports Running.
+	// The rotator does NOT write here, despite the name: CertDir is a path it only
+	// os.Stat()s to decide readiness (ensureCertsMounted). The KUBELET puts the files
+	// here by projecting the Secret, so the volume must be that Secret, not an emptyDir.
+	// With an emptyDir the files never appear, IsReady never closes, and because
+	// controller and webhook registration wait on it (see CertsManager), nothing starts
+	// while the manager still reports Running.
 	certDir = "/tmp/k8s-webhook-server/serving-certs"
 
 	// mutatingWebhookConfName is the MutatingWebhookConfiguration whose caBundle

@@ -65,38 +65,27 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 //	        FOR each of that provider's regions:              // inner
 //	            skip if the candidate is blocklisted; else place here
 //
-// so every provider's Spot is tried (in every one of its regions) before ANY
-// provider's OnDemand — "capacity is the outer axis". Skipping blocklisted
-// candidates is what turns a single provision failure into failover: a region-
-// scoped block (a Spot limit in us-east-1) advances to the next region, then the
-// next tier, without hot-looping against the placement that just failed. The
-// adapter already handled the finer zone axis (sweeping a region's AZs) before the
-// failure ever reached the blocklist, so this loop only walks regions, not zones.
+// so every provider's Spot is tried, in every region, before ANY provider's OnDemand.
+// Skipping blocklisted candidates is what turns one provision failure into failover: a
+// region-scoped block advances to the next region, then the next tier, without hot-looping
+// against the placement that just failed. The adapter already swept the region's AZs before
+// the failure got here, so this loop walks regions, not zones.
 //
-// Returns ok=false when every (tier, provider, region) candidate is either
-// unservable (provider unregistered, does not offer the accelerator, or cannot
-// serve the tier — see servesCapacity) or blocked; the caller then leaves the Pod
-// gated for a later retry (a pool edit, a provider registering, or a block
-// expiring).
+// ok=false means every candidate is either unservable (provider unregistered, no such
+// accelerator, or cannot serve the tier) or blocked; the caller leaves the Pod gated for a
+// pool edit, a provider registering, or a block expiring.
 //
-// On ok=false it also returns retryAfter: the time until the SOONEST currently-
-// servable candidate (one skipped ONLY because it is blocklisted) frees, or 0 when
-// no candidate can ever be unblocked by a lapsing TTL (every candidate is
-// unservable for a reason no TTL can lapse). The caller requeues on a
-// positive hint so a Pod stuck purely on failover retries the moment a block
-// expires, rather than idling until the periodic resync — blocklist TTL expiry
-// emits no event of its own.
+// On ok=false, retryAfter is the time until the soonest servable-but-blocked candidate
+// frees, or 0 when no TTL can ever unblock anything. A positive hint requeues the Pod, since
+// a block expiring emits no event of its own.
 //
-// It also owns the placement metrics for everything it decides: a skip counter per
-// candidate passed over, and — on ok=false — the deferral reason, because this is the
-// only scope that can tell an invalid request from an all-blocked pool from a pool that
-// simply cannot serve the request. The caller files the two deferrals it owns instead
-// (no resolvable pool, and a stale NodeClaim).
+// It owns the placement metrics for what it decides — a skip counter per candidate, and the
+// deferral reason on ok=false — because only this scope can tell an invalid request from an
+// all-blocked pool from one that cannot serve the request. The caller files its own two
+// deferrals (no resolvable pool, stale NodeClaim).
 //
-// Strategy (LowestPrice/Weighted price-ranking) is a later swap-in for the inner
-// ordering; today the inner walk is listed order (Ordered), which the caller's
-// flow does not depend on — only that a (provider, capacityType, region) comes
-// back.
+// TODO: Strategy (LowestPrice/Weighted) will replace the inner listed order; nothing in the
+// caller depends on the ordering, only on a (provider, capacityType, region) coming back.
 func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool, time.Duration) {
 	log := logf.FromContext(ctx).WithName("placement-select").WithValues(
 		"pod", pod.Namespace+"/"+pod.Name, "pool", pool.Name)
@@ -215,20 +204,15 @@ func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType 
 	return pool.Spec.CapacityTypes
 }
 
-// servesCapacity reports whether prov can actually deliver the candidate's
-// capacity tier. Only Spot is ever refused: an OnDemand-only provider (Modal) has
-// no user-facing interruptible tier, so a Spot candidate there is unservable in
-// exactly the sense a missing accelerator is — the request cannot be honoured, and
-// pretending otherwise is worse than skipping. Placing it would stamp
-// CapacityType=Spot on the Pod, hand it to an adapter that drops the field, and
-// bill the user at OnDemand rates for capacity they explicitly asked to be cheap
-// and interruptible, with no error, event or status to reveal the substitution.
-// Skipping instead lets the pool's next tier take over ([Spot, OnDemand] still
-// lands on Modal as OnDemand, now truthfully labelled), and a Spot-only pool leaves
-// the Pod gated — visibly unplaceable rather than quietly overcharged.
+// servesCapacity reports whether prov can deliver the candidate's capacity tier. Only Spot
+// is ever refused: an OnDemand-only provider (Modal) has no interruptible tier, so placing a
+// Spot candidate there would stamp CapacityType=Spot on the Pod, hand it to an adapter that
+// drops the field, and bill OnDemand rates for capacity the user asked to be cheap — with no
+// error or event revealing the substitution. Skipping lets the pool's next tier take over
+// ([Spot, OnDemand] still lands on Modal, now truthfully labelled), and a Spot-only pool
+// leaves the Pod visibly unplaceable rather than quietly overcharged.
 //
-// The empty tier is "the provider's default", which every provider serves by
-// definition, so it passes.
+// The empty tier is "the provider's default", which every provider serves, so it passes.
 func servesCapacity(prov provider.Provider, tier nebulav1alpha1.CapacityType) bool {
 	if tier != nebulav1alpha1.CapacitySpot {
 		return true
@@ -242,17 +226,14 @@ func servesCapacity(prov provider.Provider, tier nebulav1alpha1.CapacityType) bo
 // literally — so only the provider can resolve it, and ExpandRegions does (see
 // provider.Provider for the three levels).
 //
-// The empty-string fallback survives for the case where expansion yields nothing: a
-// region-simple provider whose pool declared no regions (Modal returns nil unchanged)
-// still needs ONE candidate or `range` would run zero times and the provider would be
-// silently unplaceable. That empty candidate means "send no region; let the provider
-// place freely" — which for Modal is both its normal mode and its cheapest.
+// The empty-string fallback covers expansion yielding nothing: a region-simple provider
+// whose pool declared no regions still needs ONE candidate, or `range` runs zero times and
+// the provider is silently unplaceable. That candidate means "send no region, place freely" —
+// Modal's normal and cheapest mode.
 //
-// This and awsRegionSource (cmd/main.go) are the only two readers of
-// ProviderSpec.Regions and MUST expand it identically: a region placement provisions
-// into but the sweep does not cover is absent from List, and absence is reported as
-// Terminated on a live, billing instance. Routing both through ExpandRegions is what
-// makes divergence impossible.
+// This and awsRegionSource (cmd/main.go) are the only readers of ProviderSpec.Regions and
+// MUST expand it identically: a region provisioned into but not swept is absent from List,
+// and absence is reported as Terminated on a live, billing instance.
 func regionsFor(prov provider.Provider, ref nebulav1alpha1.ProviderSpec) []string {
 	regions := prov.ExpandRegions(ref.Regions)
 	if len(regions) == 0 {
