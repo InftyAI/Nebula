@@ -22,6 +22,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +53,12 @@ type fakeClient struct {
 	logs    string
 	logsErr error
 	logsFor string
+
+	// The exec path, recorded the same way: what the adapter passed down.
+	execErr  error
+	execFor  string
+	execCmd  []string
+	execOpts provider.ExecOptions
 }
 
 func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string, Credential, error) {
@@ -94,6 +101,25 @@ func (f *fakeClient) SandboxLogs(_ context.Context, id string) (io.ReadCloser, e
 	}
 	return io.NopCloser(strings.NewReader(f.logs)), nil
 }
+
+func (f *fakeClient) SandboxExec(
+	_ context.Context, id string, cmd []string, opts provider.ExecOptions,
+) (provider.Process, error) {
+	f.execFor, f.execCmd, f.execOpts = id, cmd, opts
+	if f.execErr != nil {
+		return nil, f.execErr
+	}
+	return fakeProcess{}, nil
+}
+
+// fakeProcess is a command that produced nothing and exited 0.
+type fakeProcess struct{}
+
+func (fakeProcess) Stdin() io.WriteCloser               { return nil }
+func (fakeProcess) Stdout() io.Reader                   { return strings.NewReader("") }
+func (fakeProcess) Stderr() io.Reader                   { return nil }
+func (fakeProcess) Wait(_ context.Context) (int, error) { return 0, nil }
+func (fakeProcess) Close() error                        { return nil }
 
 // fakeCatalog is a trivial provider.Catalog for tests.
 type fakeCatalog struct{ rows []provider.Offering }
@@ -1115,6 +1141,161 @@ func TestLogs_ClientErrorPropagates(t *testing.T) {
 	}
 }
 
-// The handler resolves LogStreamer by type assertion, so drift would compile fine and
-// silently revert `kubectl logs` to NotFound. Assert it here.
-var _ provider.LogStreamer = (*Provider)(nil)
+// Exec is the same shape of pass-through: the command, the TTY request and the id must all
+// reach the client unchanged, since the adapter decides nothing else here.
+func TestExec_PassesCommandThrough(t *testing.T) {
+	f := &fakeClient{}
+	p := newTestProvider(f)
+
+	proc, err := p.Exec(context.Background(), "sb-1", []string{"bash", "-lc", "ls /"},
+		provider.ExecOptions{TTY: true})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	defer func() { _ = proc.Close() }()
+
+	if f.execFor != "sb-1" {
+		t.Errorf("client asked for sandbox %q, want sb-1", f.execFor)
+	}
+	if !slices.Equal(f.execCmd, []string{"bash", "-lc", "ls /"}) {
+		t.Errorf("command = %v, want it passed through verbatim", f.execCmd)
+	}
+	if !f.execOpts.TTY {
+		t.Error("TTY was not passed through; an interactive shell needs it")
+	}
+}
+
+// An empty id is a Pod still inside Provision: there is no sandbox to run in, so this
+// fails here instead of reaching Modal.
+func TestExec_NoSandboxIDErrors(t *testing.T) {
+	f := &fakeClient{}
+	p := newTestProvider(f)
+
+	if _, err := p.Exec(context.Background(), "", []string{"sh"}, provider.ExecOptions{}); err == nil {
+		t.Fatal("Exec(\"\"): expected an error")
+	}
+	if f.execFor != "" {
+		t.Fatalf("client was called with %q; an empty id must not reach Modal", f.execFor)
+	}
+}
+
+// A sandbox that is gone, or still queued for a GPU (no task to exec into), must surface
+// as an error rather than a silent no-op.
+func TestExec_ClientErrorPropagates(t *testing.T) {
+	f := &fakeClient{execErr: fmt.Errorf("timed out waiting for task ID")}
+	p := newTestProvider(f)
+
+	if _, err := p.Exec(context.Background(), "sb-queued", []string{"sh"}, provider.ExecOptions{}); err == nil {
+		t.Fatal("expected the client error to propagate")
+	}
+}
+
+// The handler resolves both optional halves by type assertion, so drift would compile fine
+// and silently revert `kubectl logs`/`kubectl exec` to NotFound. Assert them here.
+var (
+	_ provider.LogStreamer = (*Provider)(nil)
+	_ provider.Executor    = (*Provider)(nil)
+)
+
+// --- mergeStreams -----------------------------------------------------------
+
+// errStream yields s, then fails. A Modal log stream that dies mid-poll looks like this.
+type errStream struct {
+	s   string
+	err error
+	n   int
+}
+
+func (e *errStream) Read(p []byte) (int, error) {
+	if e.n < len(e.s) {
+		n := copy(p, e.s[e.n:])
+		e.n += n
+		return n, nil
+	}
+	return 0, e.err
+}
+
+func (e *errStream) Close() error { return nil }
+
+// Modal serves only recent output, so an empty log is ORDINARY. A broken stream must
+// therefore say so: read as EOF, an outage is indistinguishable from a quiet workload.
+func TestMergeStreams_StreamFailureSurfaces(t *testing.T) {
+	boom := fmt.Errorf("error getting output stream: unavailable")
+	rc := mergeStreams(context.Background(), &errStream{s: "some output\n", err: boom})
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if err == nil {
+		t.Fatal("ReadAll: expected the stream failure to surface")
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("err = %v, want the provider's own message", err)
+	}
+	// Output already received is still delivered: the error explains the END of the log,
+	// it does not discard it.
+	if string(got) != "some output\n" {
+		t.Fatalf("logs = %q, want what arrived before the failure", got)
+	}
+}
+
+// One failed stream must not truncate its sibling — stdout is the interesting one, and a
+// stderr that breaks would otherwise cut it short.
+func TestMergeStreams_OneFailureKeepsTheOther(t *testing.T) {
+	ok := io.NopCloser(strings.NewReader("stdout line\n"))
+	bad := &errStream{err: fmt.Errorf("stderr gone")}
+
+	rc := mergeStreams(context.Background(), ok, bad)
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if string(got) != "stdout line\n" {
+		t.Fatalf("logs = %q, want the healthy stream in full", got)
+	}
+	if err == nil {
+		t.Fatal("expected the failure of the other stream to be reported")
+	}
+}
+
+// A clean end stays clean: both streams EOF, so `kubectl logs` must not report an error
+// for a workload that simply stopped logging.
+func TestMergeStreams_CleanEndIsEOF(t *testing.T) {
+	rc := mergeStreams(context.Background(),
+		io.NopCloser(strings.NewReader("a\n")), io.NopCloser(strings.NewReader("")))
+	defer func() { _ = rc.Close() }()
+
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatalf("ReadAll: %v, want a clean EOF", err)
+	}
+}
+
+// blockingStream is a following log stream: silent until closed, and then it reports a
+// failure — which is what a source WE closed looks like from the copier.
+type blockingStream struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blockingStream) Read([]byte) (int, error) {
+	<-b.closed
+	return 0, fmt.Errorf("stream closed by teardown")
+}
+
+func (b *blockingStream) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+// Our own teardown is not a provider failure: a client walking away from `kubectl logs -f`
+// closes the sources, and the read errors that follow must not be reported as an outage.
+func TestMergeStreams_TeardownIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	rc := mergeStreams(ctx, &blockingStream{closed: make(chan struct{})})
+	cancel()
+
+	// The context error or a clean EOF, never the source's own failure.
+	_, err := io.ReadAll(rc)
+	if err != nil && strings.Contains(err.Error(), "stream closed by teardown") {
+		t.Fatalf("err = %v, want teardown not to be reported as a provider failure", err)
+	}
+	_ = rc.Close()
+}

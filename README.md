@@ -92,9 +92,10 @@ the standard `nvidia.com/gpu` resource limit, so scheduling and provisioning rea
 the same number. Do not set `nodeName` or a provider `nodeSelector` yourself — the
 placement controller owns those.
 
-> `kubectl logs` works, `-f` and `--tail` included: the manager serves the one kubelet
-> route the API server proxies for logs. `--timestamps`/`--previous`/`--since` are
-> ignored, and `kubectl exec` still does not work — use the provider's shell for that.
+> `kubectl logs` and `kubectl exec` both work on Modal, `-f`/`--tail` and `-it`
+> included: the manager serves the two kubelet routes the API server proxies.
+> `--timestamps`/`--previous`/`--since` and `-c` are ignored, and a terminal resize is
+> not forwarded. On providers that do not support them yet, both answer NotFound.
 
 ## Getting started
 

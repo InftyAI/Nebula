@@ -55,14 +55,29 @@ const certValidity = 365 * 24 * time.Hour
 // starts. Short on purpose: it avoids cutting a response mid-write, it is not a drain.
 const kubeletShutdownGrace = 5 * time.Second
 
-// KubeletServer serves the one kubelet API route Nebula implements — container logs —
-// for every provider's virtual node.
+const (
+	// execIdleTimeout is how long an exec survives without a sign of life FROM THE CLIENT.
+	// Not a limit on silence: client-go pings every 5s and any frame resets the timer, so a
+	// shell parked at a prompt stays up while kubectl is attached, and only a client that
+	// vanished (laptop closed, network gone) expires. Short, because expiry is what frees
+	// our streams and the connection behind them.
+	//
+	// Expiry does NOT stop the command — no provider can kill one — so a disconnected
+	// exec keeps running until the instance goes away.
+	execIdleTimeout = 5 * time.Minute
+	// execCreationTimeout bounds setting the streams up, before any command runs.
+	execCreationTimeout = 30 * time.Second
+)
+
+// KubeletServer serves the kubelet API routes Nebula implements — container logs and exec
+// — for every provider's virtual node.
 //
-// Why it exists: `kubectl logs` is not a control-plane read. The API server proxies it to
-// the kubelet of the Pod's node, at that Node's addresses and daemonEndpoints. A virtual
-// node has no kubelet, so without a listener logs fail whatever the provider can serve.
+// Why it exists: `kubectl logs` and `kubectl exec` are not control-plane reads. The API
+// server proxies them to the kubelet of the Pod's node, at that Node's addresses and
+// daemonEndpoints. A virtual node has no kubelet, so without a listener both fail whatever
+// the provider can serve.
 //
-// One listener for all nodes: the route carries only namespace/pod/container, so a request
+// One listener for all nodes: the routes carry only namespace/pod/container, so a request
 // is resolved by asking each registered Handler whether it tracks that Pod — at most one
 // can. Cheaper than a port per provider, and than reading the Pod to learn its node.
 //
@@ -74,7 +89,8 @@ const kubeletShutdownGrace = 5 * time.Second
 // Client certs are verified only when ClientCAPath is set. Off by default because which CA
 // signs the API server's kubelet client cert is not portable (kubeadm uses the cluster CA,
 // EKS/GKE their own), so requiring it would break `kubectl logs` on managed control
-// planes. The cost: anything that can reach this port can read these Pods' logs — set the
+// planes. The cost is now larger than logs: anything that can reach this port can also RUN
+// COMMANDS in these Pods' instances, without passing through the API server's RBAC. Set the
 // CA if you can name it, else close the port with a NetworkPolicy.
 type KubeletServer struct {
 	// addr is the listen address, e.g. ":10250".
@@ -160,9 +176,17 @@ func (s *KubeletServer) Start(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	// Only GetContainerLogs is wired; the nil funcs make VK answer NotImplemented on
-	// exec/attach/portForward, which is the honest answer — see handler.go.
-	vkapi.AttachPodRoutes(vkapi.PodHandlerConfig{GetContainerLogs: s.getContainerLogs}, mux, false)
+	// Logs and exec are wired; the nil funcs make VK answer NotImplemented on
+	// attach/portForward, which is the honest answer — see handler.go.
+	vkapi.AttachPodRoutes(vkapi.PodHandlerConfig{
+		GetContainerLogs: s.getContainerLogs,
+		RunInContainer:   s.runInContainer,
+		// A real kubelet's --streaming-connection-idle-timeout, which an interactive shell
+		// needs: VK's own default is 30s, so `kubectl exec -it` would be cut off half a
+		// minute after the user stopped typing.
+		StreamIdleTimeout:     execIdleTimeout,
+		StreamCreationTimeout: execCreationTimeout,
+	}, mux, false)
 
 	srv := &http.Server{
 		Handler:   mux,
@@ -187,7 +211,7 @@ func (s *KubeletServer) Start(ctx context.Context) error {
 		}
 	}()
 
-	log.Info("serving kubelet api (container logs)",
+	log.Info("serving kubelet api (container logs, exec)",
 		"addr", s.addr, "advertisedIP", s.nodeIP, "clientCertRequired", s.clientCAPath != "")
 	// The cert and key are already in TLSConfig, hence the empty paths.
 	if err := srv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -197,29 +221,43 @@ func (s *KubeletServer) Start(ctx context.Context) error {
 	return nil
 }
 
-// getContainerLogs finds the Handler tracking the Pod and streams from it. NotFound
-// means "not my Pod", so the walk continues; any other error is a real failure to read
-// logs we could have served, and is returned as-is rather than hidden behind NotFound.
+// handlerFor finds the virtual node running this Pod. The routes carry only
+// namespace/pod/container, so the owner is found by asking each registered Handler — at
+// most one tracks a given Pod. nil means no node here runs it (the Pod is elsewhere, or
+// leadership moved and the Runners have not re-adopted it yet).
+func (s *KubeletServer) handlerFor(namespace, podName string) *Handler {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, h := range s.handlers {
+		if h.Tracks(namespace, podName) {
+			return h
+		}
+	}
+	return nil
+}
+
+// getContainerLogs serves the containerLogs route from the Handler that owns the Pod. Its
+// error is returned as-is: a provider that cannot read logs is a real failure, not an
+// unknown Pod.
 func (s *KubeletServer) getContainerLogs(
 	ctx context.Context, namespace, podName, containerName string, opts vkapi.ContainerLogOpts,
 ) (io.ReadCloser, error) {
-	s.mu.RLock()
-	handlers := make([]*Handler, 0, len(s.handlers))
-	for _, h := range s.handlers {
-		handlers = append(handlers, h)
+	h := s.handlerFor(namespace, podName)
+	if h == nil {
+		return nil, errdefs.NotFoundf("no Nebula virtual node is running pod %q", key(namespace, podName))
 	}
-	s.mu.RUnlock()
+	return h.GetContainerLogs(ctx, namespace, podName, containerName, opts)
+}
 
-	for _, h := range handlers {
-		rc, err := h.GetContainerLogs(ctx, namespace, podName, containerName, opts)
-		if err == nil {
-			return rc, nil
-		}
-		if !errdefs.IsNotFound(err) {
-			return nil, err
-		}
+// runInContainer serves the exec route, the same way.
+func (s *KubeletServer) runInContainer(
+	ctx context.Context, namespace, podName, containerName string, cmd []string, attach vkapi.AttachIO,
+) error {
+	h := s.handlerFor(namespace, podName)
+	if h == nil {
+		return errdefs.NotFoundf("no Nebula virtual node is running pod %q", key(namespace, podName))
 	}
-	return nil, errdefs.NotFoundf("no Nebula virtual node is running pod %q", key(namespace, podName))
+	return h.RunInContainer(ctx, namespace, podName, containerName, cmd, attach)
 }
 
 // tlsConfig: a fresh self-signed keypair, plus client verification if a CA is set.

@@ -892,6 +892,39 @@ func blocklistTTL(pod *corev1.Pod) time.Duration {
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }
 
+// Tracks reports whether this virtual node is the one running the Pod. The kubelet API
+// has one listener for every provider and its routes carry no node name, so this is how a
+// request finds its handler; see kubelet.go.
+func (h *Handler) Tracks(namespace, podName string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.tracked[key(namespace, podName)]
+	return ok
+}
+
+// instanceFor returns the external instance backing a Pod, for the kubelet routes that
+// need one. Both failures are NotFound, since both mean "there is nothing to read or run
+// against": the Pod is not tracked here, or it is but Provision has not returned an id
+// yet.
+func (h *Handler) instanceFor(namespace, podName string) (string, error) {
+	h.mu.Lock()
+	tp, tracked := h.tracked[key(namespace, podName)]
+	var instance string
+	if tracked {
+		instance = tp.instance
+	}
+	h.mu.Unlock()
+
+	if !tracked {
+		return "", errdefs.NotFoundf("pod %q is not known to virtual node %q",
+			key(namespace, podName), NodeName(h.prov.Name()))
+	}
+	if instance == "" {
+		return "", errdefs.NotFoundf("pod %q has no external instance yet", key(namespace, podName))
+	}
+	return instance, nil
+}
+
 // GetContainerLogs serves `kubectl logs` for a Pod on this virtual node (kubelet.go
 // carries the endpoint). Three things must line up, each failing as NotFound: the Pod is
 // TRACKED here, it has an instance id (one still inside Provision has nothing to read),
@@ -907,20 +940,9 @@ func (h *Handler) GetContainerLogs(
 		return nil, errdefs.NotFoundf("provider %q does not support container logs", h.prov.Name())
 	}
 
-	h.mu.Lock()
-	tp, tracked := h.tracked[key(namespace, podName)]
-	var instance string
-	if tracked {
-		instance = tp.instance
-	}
-	h.mu.Unlock()
-
-	if !tracked {
-		return nil, errdefs.NotFoundf("pod %q is not known to virtual node %q",
-			key(namespace, podName), NodeName(h.prov.Name()))
-	}
-	if instance == "" {
-		return nil, errdefs.NotFoundf("pod %q has no external instance yet", key(namespace, podName))
+	instance, err := h.instanceFor(namespace, podName)
+	if err != nil {
+		return nil, err
 	}
 
 	logf.FromContext(ctx).WithName("vnode-logs").V(1).Info("streaming container logs",
@@ -937,15 +959,54 @@ func (h *Handler) GetContainerLogs(
 	return kubeletLogStream(ctx, src, opts), nil
 }
 
+// RunInContainer serves `kubectl exec` for a Pod on this virtual node: it starts cmd in
+// the external instance and hands the streams to runExec, which owns the pumping.
+//
+// Same three preconditions as logs, each a NotFound: the Pod is tracked here, it has an
+// instance, and the provider implements provider.Executor (exec is optional — a backend
+// with no way into the box simply cannot serve it).
+//
+// containerName is IGNORED, as for logs: a Nebula Pod is one external instance, so there
+// is no second container to pick.
+func (h *Handler) RunInContainer(
+	ctx context.Context, namespace, podName, containerName string, cmd []string, attach vkapi.AttachIO,
+) error {
+	executor, ok := h.prov.(provider.Executor)
+	if !ok {
+		return errdefs.NotFoundf("provider %q does not support exec", h.prov.Name())
+	}
+	if len(cmd) == 0 {
+		return errdefs.InvalidInput("exec: no command given")
+	}
+
+	instance, err := h.instanceFor(namespace, podName)
+	if err != nil {
+		return err
+	}
+
+	logf.FromContext(ctx).WithName("vnode-exec").V(1).Info("running command in instance",
+		"provider", h.prov.Name(), "pod", key(namespace, podName), "container", containerName,
+		"instanceID", instance, "command", cmd, "tty", attach.TTY())
+
+	// Starting is bounded, running is not: a provider may wait for the instance to be
+	// ready (Modal polls for a task id for five minutes), and a client staring at a blank
+	// terminal that long is worse than being told the box is not ready. Only the start is
+	// capped — the command itself runs under ctx, for as long as the client stays.
+	startCtx, cancelStart := context.WithTimeout(ctx, execStartTimeout)
+	defer cancelStart()
+
+	proc, err := executor.Exec(startCtx, instance, cmd, provider.ExecOptions{TTY: attach.TTY()})
+	if err != nil {
+		return fmt.Errorf("start command in instance %s: %w", instance, err)
+	}
+	return runExec(ctx, proc, attach)
+}
+
 // --- Unused nodeutil.Provider surface --------------------------------------
 //
-// Exec/attach/stats/port-forward are out of v1 scope: beyond logs, Nebula does not proxy
+// Attach/stats/port-forward are out of scope: beyond logs and exec, Nebula does not proxy
 // a workload's console. These satisfy the nodeutil.Provider interface and return NotFound
 // so the VK core reports them cleanly rather than panicking.
-
-func (h *Handler) RunInContainer(context.Context, string, string, string, []string, vkapi.AttachIO) error {
-	return errdefs.NotFound("exec is not supported by the Nebula virtual node")
-}
 
 func (h *Handler) AttachToContainer(context.Context, string, string, string, vkapi.AttachIO) error {
 	return errdefs.NotFound("attach is not supported by the Nebula virtual node")

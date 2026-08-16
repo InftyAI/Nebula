@@ -239,15 +239,16 @@ paths without a real backend, so it has no boot or readiness phase to model.
 
 ---
 
-## Logs
+## Logs and exec
 
-`kubectl logs` works against a Nebula Pod, `-f` included. It is worth spelling out
-how, because none of the usual kubelet machinery is present.
+`kubectl logs` (`-f` included) and `kubectl exec` (`-it` included) both work against a
+Nebula Pod. It is worth spelling out how, because none of the usual kubelet machinery is
+present.
 
-**The transport.** `kubectl logs` is not a control-plane read: the API server proxies
-it to the kubelet of the node the Pod is on, dialing the address in the Node's
+**The transport.** Neither is a control-plane read: the API server proxies both to the
+kubelet of the node the Pod is on, dialing the address in the Node's
 `status.addresses` and the port in `status.daemonEndpoints`. A virtual node has no
-kubelet, so the manager serves that one route itself
+kubelet, so the manager serves those routes itself
 (`pkg/vnode/kubelet.go`) and every virtual node advertises the manager's Pod IP and
 that port. Consequences worth knowing:
 
@@ -258,19 +259,21 @@ that port. Consequences worth knowing:
   expects of a kubelet, which does not verify it unless
   `--kubelet-certificate-authority` is set. Client certificates are **not** verified
   by default, because which CA signs the API server's kubelet client cert is not
-  portable across distributions. Anything that can reach the port can therefore read
-  the logs of any Pod on these virtual nodes: keep it closed with a NetworkPolicy, or
-  pass `--kubelet-client-ca` to require mTLS.
-- No POD_IP (running the manager off-cluster) means no endpoint. Logs degrade to
-  unsupported; nothing else is affected.
+  portable across distributions. Anything that can reach the port can therefore read the
+  logs of, and **run commands in**, any Pod on these virtual nodes, with no RBAC check:
+  keep it closed with a NetworkPolicy, or pass `--kubelet-client-ca` to require mTLS.
+- No POD_IP (running the manager off-cluster) means no endpoint. Logs and exec degrade
+  to unsupported; nothing else is affected.
 
-**The provider seam.** Log support is optional: a provider opts in by implementing
-`provider.LogStreamer`, and one that does not answers `NotFound` rather than carrying
-a stub. The seam is deliberately option-free — one stream, from the instance's first
-byte, following until the instance exits, stdout and stderr merged — so every kubectl
-option is honoured once, for all providers, in `pkg/vnode/logs.go`.
+**The provider seam.** Both are optional: a provider opts in by implementing
+`provider.LogStreamer` and `provider.Executor`, and one that does not answers `NotFound`
+rather than carrying a stub. Modal implements both; AWS implements neither. Each seam is
+deliberately minimal — logs are one stream from the instance's first byte, stdout and
+stderr merged; exec only STARTS the command and hands back its streams — so every kubectl
+option is honoured once, for all providers, in `pkg/vnode/logs.go` and
+`pkg/vnode/exec.go`.
 
-**What is honoured, and the one heuristic.** A provider stream has no EOF while the
+**What logs honour, and the one heuristic.** A provider stream has no EOF while the
 instance lives and no marker for "you have now caught up", which the real kubelet gets
 for free from a file on disk. So:
 
@@ -297,13 +300,27 @@ per-container restart history and time-indexed storage that no provider exposes.
 are ignored rather than rejected so a habitual `--since=1h` prints the full stream
 instead of an error.
 
-**Containers are not addressable.** `-c` is accepted and ignored: a Nebula Pod maps to
-exactly one external instance with one console, so there is no per-container stream to
-select. Honouring the name would mean rejecting `kubectl logs pod` (which sends no
-container) or lying about a second container's output.
+**Containers are not addressable.** `-c` is accepted and ignored, for logs and exec
+alike: a Nebula Pod maps to exactly one external instance with one console, so there is
+no per-container stream to select or shell to enter. Honouring the name would mean
+rejecting `kubectl logs pod` (which sends no container) or lying about a second
+container's output.
 
-**`kubectl exec` still does not work.** It needs an agent inside the container, which
-is not part of the project today; the route answers `NotImplemented`.
+**Exec needs no agent in the image.** The provider's own worker starts the command, so
+`kubectl exec -it pod -- bash` works against an unmodified user image — including the
+`sleep infinity` placeholder a Sandbox runs. What the exec does need is a **running**
+instance: a sandbox still queued for capacity has no container to run in, and the attempt
+fails rather than waiting.
+
+Nebula only pumps bytes: stdin is forwarded and closed at EOF (so `exec -i -- cat < f`
+ends), stdout and stderr are copied back, and a non-zero exit reaches kubectl as
+`command terminated with exit code N` rather than a server error. Two gaps, both from the
+provider side:
+
+| behaviour | why |
+|---|---|
+| terminal **resize** is ignored | no provider exposes a window-size call, so `-it` opens at the remote default and stays there |
+| under `-t`, **stderr is merged into stdout** | a PTY is one stream; kubectl forbids asking for both anyway |
 
 ## What is not observable
 

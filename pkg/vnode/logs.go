@@ -19,7 +19,9 @@ package vnode
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"sync"
 	"time"
 
 	vkapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
@@ -90,6 +92,14 @@ func newLogStream(
 	done := make(chan struct{})
 	chunks := make(chan []byte, 8)
 
+	// A provider stream that BROKE, kept for the close below. Ending on it instead of at
+	// EOF is what stops an outage from printing as an empty log — the VK route turns a
+	// non-nil error into an HTTP error while no bytes have gone out yet.
+	var (
+		srcMu  sync.Mutex
+		srcErr error
+	)
+
 	// The only goroutine touching src. It cannot block forever on a full channel:
 	// teardown closes done, and src.Close unblocks the Read.
 	go func() {
@@ -107,13 +117,30 @@ func newLogStream(
 				}
 			}
 			if err != nil {
+				// EOF is the instance's log ending. Anything else is a failure worth
+				// reporting, unless we caused it by closing src in teardown.
+				if !errors.Is(err, io.EOF) {
+					select {
+					case <-done:
+					default:
+						srcMu.Lock()
+						srcErr = err
+						srcMu.Unlock()
+					}
+				}
 				return
 			}
 		}
 	}()
 
 	go func() {
-		defer func() { _ = pw.Close() }()
+		defer func() {
+			srcMu.Lock()
+			err := srcErr
+			srcMu.Unlock()
+			// CloseWithError(nil) is a plain EOF, so this covers both endings.
+			_ = pw.CloseWithError(err)
+		}()
 		copyLogs(ctx, pw, chunks, done, opts, t)
 	}()
 

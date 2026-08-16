@@ -521,3 +521,80 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// --- stream failures --------------------------------------------------------
+
+// failingLogSource yields s, then fails — a provider stream that died mid-poll.
+type failingLogSource struct {
+	s      string
+	err    error
+	n      int
+	closed bool
+}
+
+func (f *failingLogSource) Read(p []byte) (int, error) {
+	if f.n < len(f.s) {
+		n := copy(p, f.s[f.n:])
+		f.n += n
+		return n, nil
+	}
+	return 0, f.err
+}
+
+func (f *failingLogSource) Close() error { f.closed = true; return nil }
+
+// A stream that BROKE must not read as the end of the log. Providers serve only recent
+// output, so an empty result is ordinary — swallowing the error left an outage and a quiet
+// workload looking identical, which is how a working `kubectl logs` was read as broken.
+func TestKubeletLogStream_SourceFailureSurfaces(t *testing.T) {
+	src := &failingLogSource{s: "before the failure\n", err: errors.New("provider stream unavailable")}
+	rc := newLogStream(context.Background(), src, vkapi.ContainerLogOpts{Follow: true}, testTiming)
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if err == nil {
+		t.Fatal("ReadAll: expected the stream failure to surface")
+	}
+	if !strings.Contains(err.Error(), "provider stream unavailable") {
+		t.Fatalf("err = %v, want the provider's own message", err)
+	}
+	// What arrived is still delivered: the error ends the log, it does not discard it.
+	if string(got) != "before the failure\n" {
+		t.Fatalf("logs = %q, want the output that preceded the failure", got)
+	}
+}
+
+// EOF is the log ENDING, not a failure: an instance that exited must not make
+// `kubectl logs` report an error over its final output.
+func TestKubeletLogStream_EOFIsNotAnError(t *testing.T) {
+	src := &failingLogSource{s: "all of it\n", err: io.EOF}
+	rc := newLogStream(context.Background(), src, vkapi.ContainerLogOpts{Follow: true}, testTiming)
+	defer func() { _ = rc.Close() }()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v, want a clean EOF", err)
+	}
+	if string(got) != "all of it\n" {
+		t.Fatalf("logs = %q", got)
+	}
+}
+
+// Closing is OUR teardown — a `kubectl logs -f` client hanging up. The read errors it
+// causes must not be reported as a provider failure.
+func TestKubeletLogStream_CloseIsNotAFailure(t *testing.T) {
+	src := newFakeLogSource("first\n")
+	rc := newLogStream(context.Background(), src, vkapi.ContainerLogOpts{Follow: true}, testTiming)
+
+	if got := readN(t, rc, len("first\n")); got != "first\n" {
+		t.Fatalf("first read = %q", got)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The reader is closed either way; what matters is that nothing reports the closed
+	// source as an outage.
+	if _, err := io.ReadAll(rc); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("err = %v, want teardown to end the stream cleanly", err)
+	}
+}

@@ -18,6 +18,7 @@ package modal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -31,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
 
@@ -318,12 +320,134 @@ func (c *sdkClient) SandboxLogs(ctx context.Context, id string) (io.ReadCloser, 
 	return mergeStreams(ctx, sb.Stdout, sb.Stderr), nil
 }
 
+// SandboxExec implements Client: it starts cmd in the sandbox's running container and
+// hands back the process handle, which is what `kubectl exec` is pumped from.
+//
+// No agent is installed for this. Modal's own worker runs the command, so exec works on
+// any image — but it goes through the container's TASK, so the sandbox has to be running:
+// the SDK polls briefly for a task id and then errors, which is the honest answer for a
+// sandbox still queued for a GPU.
+//
+// A TTY is requested when the client asked for one, and Modal then multiplexes stderr into
+// stdout — the same thing a real terminal does. Its window size is Modal's fixed 24x80: the
+// SDK exposes no way to set it and the command router has no resize call.
+//
+// ctx bounds the start only, as provider.Executor requires. That holds because the SDK runs
+// the stdio streams and stdin writes on their own background contexts — the sandbox lookup,
+// the task-id wait and ExecStart are all this ctx covers, and those are exactly what a
+// caller wants to give up on.
+//
+// Setup is paid PER EXEC and dominates it (~16s cold: resolve the sandbox, poll for its
+// task id, dial a fresh TLS connection to that task's router). Caching the handle would
+// make later execs cheap, but the manager would hold one connection per sandbox with
+// nothing reliable to close it — a sandbox that dies on its own leaves Modal's list
+// (IncludeFinished: false) and is never observed again. A slow exec beats a leak here.
+//
+// No Timeout is set, so the command runs until it exits or the sandbox does. Any cap we
+// picked would truncate somebody's job — and, since it surfaces as a stream error rather
+// than an exit code, it would look like a network glitch. The cost is that a command whose
+// client disconnected keeps running: Modal has no "kill this exec" call, and closing the
+// connection leaves the process alive in the container. The sandbox's own lifetime is what
+// finally reaps it.
+func (c *sdkClient) SandboxExec(
+	ctx context.Context, id string, cmd []string, opts provider.ExecOptions,
+) (provider.Process, error) {
+	sb, err := c.mc.Sandboxes.FromID(ctx, id, &modal.SandboxFromIDParams{})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("modal: sandbox %s not found: %w", id, err)
+		}
+		return nil, err
+	}
+	cp, err := sb.Exec(ctx, cmd, &modal.SandboxExecParams{PTY: opts.TTY})
+	if err != nil {
+		return nil, fmt.Errorf("modal: exec in sandbox %s: %w", id, err)
+	}
+	return &sandboxProcess{sb: sb, cp: cp, tty: opts.TTY}, nil
+}
+
+// sandboxProcess adapts Modal's ContainerProcess to provider.Process.
+//
+// It holds the *modal.Sandbox as well as the process because Exec dialled a private gRPC
+// connection to the container's command router through it, and Detach is the only way to
+// close that — without it every exec would leak a connection for the manager's life.
+type sandboxProcess struct {
+	sb  *modal.Sandbox
+	cp  *modal.ContainerProcess
+	tty bool
+
+	closeOnce sync.Once
+}
+
+var _ provider.Process = (*sandboxProcess)(nil)
+
+func (p *sandboxProcess) Stdin() io.WriteCloser { return p.cp.Stdin }
+func (p *sandboxProcess) Stdout() io.Reader     { return p.cp.Stdout }
+
+// Stderr is nil under a TTY: Modal multiplexes both streams into stdout there, leaving
+// this one permanently empty, and reading it would just park a goroutine.
+func (p *sandboxProcess) Stderr() io.Reader {
+	if p.tty {
+		return nil
+	}
+	return p.cp.Stderr
+}
+
+// Wait blocks until the command exits and reports its exit code. Modal renders a signal
+// death as 128+signal, the shell convention, so ^C reads as 130.
+func (p *sandboxProcess) Wait(ctx context.Context) (int, error) {
+	return p.cp.Wait(ctx, &modal.ContainerProcessWaitParams{})
+}
+
+// Close releases the streams and the command-router connection. Idempotent, since the
+// caller may close after a teardown already ran. Errors are dropped: the exec is over
+// either way, and there is no caller left to act on them.
+func (p *sandboxProcess) Close() error {
+	p.closeOnce.Do(func() {
+		_ = p.cp.Stdin.Close()
+		_ = p.cp.Stdout.Close()
+		_ = p.cp.Stderr.Close()
+		_ = p.sb.Detach()
+	})
+	return nil
+}
+
 // mergeStreams fans log streams into one ReadCloser. Close tears everything down: it
 // closes the sources (unblocking the copiers) and the pipe (returning an in-flight
 // Read). ctx does the same, so a disconnected `kubectl logs -f` cannot leave
 // goroutines long-polling Modal forever.
+//
+// A stream that FAILS ends the merged stream with its error, not at EOF. Silence is the
+// normal answer here — Modal serves only recent output — so a swallowed error made an
+// outage look exactly like a workload that had logged nothing.
 func mergeStreams(ctx context.Context, streams ...io.ReadCloser) io.ReadCloser {
 	pr, pw := io.Pipe()
+
+	// Closed before the sources are, so a read that fails because WE tore down is not
+	// reported as Modal breaking.
+	tearing := make(chan struct{})
+
+	var (
+		mu       sync.Mutex
+		firstErr error
+	)
+	// io.Copy reports EOF as success, so anything arriving here is a real failure —
+	// except a closed pipe, which is the client having gone away.
+	fail := func(err error) {
+		if err == nil || errors.Is(err, io.ErrClosedPipe) {
+			return
+		}
+		select {
+		case <-tearing:
+			return
+		default:
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 
 	var wg sync.WaitGroup
 	for _, s := range streams {
@@ -333,16 +457,20 @@ func mergeStreams(ctx context.Context, streams ...io.ReadCloser) io.ReadCloser {
 		wg.Add(1)
 		go func(src io.ReadCloser) {
 			defer wg.Done()
-			// Copy errors are not reported: one stream ending must not truncate the other,
-			// and the shared failure (sandbox gone) already surfaces as EOF.
-			_, _ = io.Copy(pw, src)
+			// Held, not raised here: one stream ending must not truncate the other.
+			_, err := io.Copy(pw, src)
+			fail(err)
 		}(s)
 	}
 
 	// Only close the pipe once BOTH sources are done, so EOF means no more output.
 	go func() {
 		wg.Wait()
-		_ = pw.Close()
+		mu.Lock()
+		err := firstErr
+		mu.Unlock()
+		// CloseWithError(nil) is a plain EOF, so this covers both endings.
+		_ = pw.CloseWithError(err)
 	}()
 
 	closeAll := func() {
@@ -360,6 +488,7 @@ func mergeStreams(ctx context.Context, streams ...io.ReadCloser) io.ReadCloser {
 		case <-ctx.Done():
 		case <-stop:
 		}
+		close(tearing)
 		closeAll()
 		_ = pw.CloseWithError(ctx.Err())
 	}()
