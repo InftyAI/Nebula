@@ -39,6 +39,16 @@ func warnError(err error) {
 
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
+	return run(cmd, true)
+}
+
+// RunQuiet is Run without the "running: …" trace. For commands issued from a poll
+// loop, where echoing every invocation buries the output the test is there to show.
+func RunQuiet(cmd *exec.Cmd) (string, error) {
+	return run(cmd, false)
+}
+
+func run(cmd *exec.Cmd, trace bool) (string, error) {
 	// Isolate the working directory to the command via cmd.Dir rather than
 	// os.Chdir: os.Chdir mutates the process-wide cwd, which is not goroutine-safe
 	// and would corrupt parallel commands (and anything else relying on cwd).
@@ -55,7 +65,9 @@ func Run(cmd *exec.Cmd) (string, error) {
 		cmd.Env = append(cmd.Env, "KUBECONFIG="+kubeconfigPath)
 	}
 	command := strings.Join(cmd.Args, " ")
-	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
+	if trace {
+		_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(output), fmt.Errorf("%q failed with error %q: %w", command, string(output), err)

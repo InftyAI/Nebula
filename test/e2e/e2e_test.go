@@ -127,6 +127,13 @@ var _ = Describe("Manager", Ordered, func() {
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakePoolName, "--ignore-not-found=true"))
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", fakeWorkloadNS, "--ignore-not-found=true"))
 
+		By("cleaning up the sync-benchmark batch, pool, and namespace")
+		// The benchmark deletes its own batch, so this only covers the spec failing
+		// part-way — a leftover Pod here would keep a claim alive and block the drain
+		// below. Pods go with the namespace; the pool is cluster-scoped.
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", perfWorkloadNS, "--ignore-not-found=true"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", perfPoolName, "--ignore-not-found=true"))
+
 		By("waiting for NodeClaims to drain while the manager can still terminate instances")
 		drained := waitForNodeClaimsGone(2 * time.Minute)
 
@@ -426,6 +433,17 @@ spec:
 
 			By("cleaning up the fake workload")
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile, "--ignore-not-found=true"))
+		})
+
+		It("should sync a batch of workloads within the time budget", Label("perf"), func() {
+			// A benchmark, not a latency SLO: it scales one Deployment to N replicas and
+			// reports how long the whole sync path takes per workload, asserting only a
+			// loose ceiling so it catches a stalled path without flaking on a busy node.
+			//
+			// The perf label keeps it OUT of `make test-e2e` (which filters '!perf') and
+			// is what `make test-perf` selects, since the batch is slow enough that it
+			// does not belong in every e2e run. See perf_test.go.
+			benchmarkWorkloadSync()
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks

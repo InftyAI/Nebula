@@ -115,7 +115,13 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND_CLUSTER=$(KIND_CLUSTER) go test -tags e2e ./test/e2e/ -v -ginkgo.v
+	KIND_CLUSTER=$(KIND_CLUSTER) go test -tags e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter='!perf'
+	$(MAKE) cleanup-test-e2e
+
+.PHONY: test-perf
+test-perf: setup-test-e2e manifests generate fmt vet ## Run the workload-sync benchmark (Kind, PERF_WORKLOADS replicas).
+	KIND_CLUSTER=$(KIND_CLUSTER) \
+		go test -tags e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter=perf -timeout 40m
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
