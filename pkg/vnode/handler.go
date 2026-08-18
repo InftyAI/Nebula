@@ -233,6 +233,26 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "claim", claim)
 
+	// Resolve BEFORE anything is requested: the Pod's env may point at Secrets and ConfigMaps
+	// a provider cannot read (see resolveEnv), and nothing exists yet, so failing here is free.
+	//
+	// NON-TERMINAL, like the kubelet's CreateContainerConfigError. A referenced Secret is
+	// often written moments after the Pod (a bootstrap job, an external-secrets sync), so the
+	// Pod waits at ConfigError with the reason on it and VK retries with backoff. Failing it
+	// would reap a workload over a race, and would run recordBlock's failover machinery over
+	// a Pod-spec problem no other provider or region can fix.
+	//
+	// Deliberately NOT stored, as in the transport-failure branch below: a tracked pod with
+	// no instance id reads as absent from List and gets written Terminated.
+	env, err := resolveEnv(ctx, h.client, pod)
+	if err != nil {
+		log.Error(err, "cannot resolve the Pod's environment; nothing provisioned, retrying")
+		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
+		h.emit(pod)
+		return err
+	}
+	req.Env = env
+
 	// Bound the provision call so a wedged backend cannot pin this worker forever. A
 	// provider may raise the deadline via Capabilities.ProvisionTimeout (AWS does, for
 	// cross-zone failover).
@@ -248,8 +268,10 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	provisionCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// The env COUNT, never its content: a value here may have come from a Secret.
 	log.Info("provisioning external instance",
-		"capacityType", req.CapacityType, "region", req.Region, "timeout", timeout.String())
+		"capacityType", req.CapacityType, "region", req.Region,
+		"envVars", len(req.Env), "timeout", timeout.String())
 
 	// Two clocks for two different waits: provisionStart measures the end-to-end wait a
 	// user feels (until the instance reports Running; handed to store below), callStart

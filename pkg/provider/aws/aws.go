@@ -153,7 +153,9 @@ type InstanceSpec struct {
 	// Args is the Pod container's args, appended after the entrypoint just as CMD
 	// arguments. Empty means "use the image's own CMD".
 	Args []string
-	// Env is the environment, flattened from the Pod's container env.
+	// Env is the environment, taken whole from provider.ProvisionRequest.Env: literals plus
+	// everything envFrom/valueFrom referenced, already resolved by the caller. See where it is
+	// set for the user-data exposure this implies.
 	Env map[string]string
 	// Spot requests interruptible capacity when true (OnDemand otherwise).
 	Spot bool
@@ -749,15 +751,6 @@ func (p *Provider) instanceSpecFromPod(
 	}
 	c := pod.Spec.Containers[0]
 
-	env := make(map[string]string, len(c.Env))
-	for _, e := range c.Env {
-		// ValueFrom (secrets/configmaps) is not resolved here; the real Client
-		// wiring must project those. Plain values are copied through.
-		if e.ValueFrom == nil {
-			env[e.Name] = e.Value
-		}
-	}
-
 	// Accelerator type comes from the AcceleratorTypeLabel; the count rides on the
 	// nvidia.com/gpu resource. On EC2 both are lookup keys: the instance type is the
 	// one whose (accelerator_type, gpu_count) pair matches, since the GPU count is
@@ -784,10 +777,22 @@ func (p *Provider) instanceSpecFromPod(
 		Image:         c.Image,
 		Command:       append([]string{}, c.Command...),
 		Args:          append([]string{}, c.Args...),
-		Env:           env,
-		Spot:          req.CapacityType == nebulav1alpha1.CapacitySpot,
-		Region:        req.Region,
-		Tags:          map[string]string{ClaimTagKey: req.ClaimName},
+		// The caller's resolved environment, whole (provider.ProvisionRequest.Env). The Pod's
+		// own env is not read: it holds references this adapter cannot follow.
+		//
+		// CAVEAT, and the reason this is called out: buildUserData renders env into cloud-init
+		// user-data, which EC2 stores unencrypted and serves through IMDS and
+		// DescribeInstanceAttribute. A value resolved from a Secret therefore lands somewhere
+		// readable by anything on the instance and by any principal holding that IAM
+		// permission. Acceptable while nothing sensitive rides on it; not a place to put a
+		// long-lived credential.
+		// TODO: deliver Secret-derived values out-of-band — SSM Parameter Store / Secrets
+		// Manager under the claim, fetched at boot with the instance profile — and keep only
+		// non-sensitive values in user-data.
+		Env:    req.Env,
+		Spot:   req.CapacityType == nebulav1alpha1.CapacitySpot,
+		Region: req.Region,
+		Tags:   map[string]string{ClaimTagKey: req.ClaimName},
 	}, nil
 }
 

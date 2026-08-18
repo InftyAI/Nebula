@@ -193,6 +193,12 @@ const (
 	PodReasonRunning = "Running"
 	// PodReasonProvisionFailed: the provider rejected or failed the Provision call.
 	PodReasonProvisionFailed = "ProvisionFailed"
+	// PodReasonConfigError: the Pod references something unreadable — a missing Secret or
+	// ConfigMap behind an env var, or a downward-API field this node cannot answer — so
+	// nothing was requested from the provider. The kubelet's CreateContainerConfigError,
+	// and non-terminal for the same reason: the reference usually appears moments later, and
+	// waiting is free while nothing exists to bill.
+	PodReasonConfigError = "ConfigError"
 	// PodReasonFailed: the provider reports the instance in a failed state.
 	PodReasonFailed = "Failed"
 	// PodReasonTerminated: the instance is gone from the provider (torn down,

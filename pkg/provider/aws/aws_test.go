@@ -162,6 +162,39 @@ func gpuPod(accel string, count int64) *corev1.Pod {
 	return pod
 }
 
+// TestProvision_UsesResolvedEnv pins the env contract: the request's resolved map is the whole
+// environment, and the Pod's own env is not read — it holds references this adapter cannot
+// follow, so a caller that does not resolve gets nothing rather than half a workload.
+func TestProvision_UsesResolvedEnv(t *testing.T) {
+	f := &fakeClient{runID: "i-env"}
+	p := newTestProvider(f)
+	pod := gpuPod("H100", 8) // carries FOO=bar literally
+
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-env",
+		Region:    "us-west-2", // EC2 needs one; the test client is not configured with a default
+		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.Env; got["FOO"] != "bar" || got["TOKEN"] != "t0ken" || len(got) != 2 {
+		t.Fatalf("spec env = %v, want FOO=bar TOKEN=t0ken", got)
+	}
+
+	// No resolved map: nothing is set, even though the Pod carries FOO=bar literally.
+	f = &fakeClient{runID: "i-env-2"}
+	p = newTestProvider(f)
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-env",
+		Region:    "us-west-2",
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.Env; len(got) != 0 {
+		t.Fatalf("spec env = %v, want empty: the Pod's env is not a source here", got)
+	}
+}
+
 func TestProvision_MapsAcceleratorToInstanceType(t *testing.T) {
 	f := &fakeClient{runID: "i-1"}
 	p := newTestProvider(f)

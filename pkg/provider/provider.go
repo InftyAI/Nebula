@@ -22,6 +22,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -208,10 +210,10 @@ type Process interface {
 	Close() error
 }
 
-// ProvisionRequest carries only the placement decisions that are NOT already on the Pod.
-// Everything about the workload — image, command, env, ports, cpu/memory, accelerator type
-// and count — is read from the Pod, the single source of truth. That leaves the tier, the
-// region, and the claim identity.
+// ProvisionRequest carries what a provider cannot read off the Pod: the placement decisions
+// (tier, region), the claim identity, and the one part of the workload whose value is not in
+// the Pod — env behind a reference. Everything else — image, command, ports, cpu/memory,
+// accelerator type and count — comes from the Pod, the single source of truth.
 type ProvisionRequest struct {
 	// ClaimName is the NodeClaim name; providers without native tags encode it
 	// into the instance name so List/Terminate can find the instance later.
@@ -229,7 +231,31 @@ type ProvisionRequest struct {
 	// regions leaves it empty, which on Modal is the widest and cheapest option (pinning
 	// costs 1.5-1.75x). AWS cannot honour it, but its ExpandRegions never produces it.
 	Region string
+	// Env is the container's environment, fully RESOLVED: literals plus everything
+	// envFrom/valueFrom referenced, merged in kubelet precedence (envFrom in listed order,
+	// then env overriding it). A provider forwards it and never re-reads the Pod's env,
+	// which holds references it cannot follow.
+	//
+	// Resolved by the caller (pkg/vnode): reading a Secret needs cluster access an adapter
+	// deliberately lacks, and kubelet precedence should be implemented once.
+	//
+	// SECRET-BEARING, and why this struct redacts itself — a secretKeyRef's value lands here
+	// in the clear. Never log the map, never put it on the Pod, never in an error string,
+	// the same rule as ProvisionResult.ConnectToken. Nil is normal: no env, or an
+	// unresolving caller.
+	Env map[string]string
 }
+
+// String redacts Env so a ProvisionRequest can be logged safely — nothing stops a future
+// log.Info("...", "req", req). Key names print, since they are in the Pod spec already and
+// are what makes a "wrong env" report actionable; only values are withheld.
+func (r ProvisionRequest) String() string {
+	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Env:%s}",
+		r.ClaimName, r.CapacityType, r.Region, RedactedEnv(r.Env))
+}
+
+// GoString implements fmt.GoStringer so %#v is redacted too.
+func (r ProvisionRequest) GoString() string { return r.String() }
 
 // ProvisionResult is what one Provision call produced. A struct rather than more
 // positional returns because the credential below is delivered ONCE, and a value that can
@@ -321,6 +347,22 @@ func redacted(s string) string {
 		return ""
 	}
 	return "[REDACTED]"
+}
+
+// RedactedEnv renders an env map's shape — size and key names, sorted so two logs of the
+// same map read alike — with every value withheld: keys are in the Pod spec, values may
+// come from a Secret. Exported because every adapter carrying a resolved environment needs
+// this in its own String(), and a second implementation is a second chance to leak.
+func RedactedEnv(m map[string]string) string {
+	if len(m) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return fmt.Sprintf("{%d keys: %s}", len(keys), strings.Join(keys, ","))
 }
 
 // InstanceState is the provider-agnostic lifecycle state, normalized from each
