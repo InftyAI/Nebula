@@ -31,10 +31,9 @@ import (
 	"github.com/InftyAI/Nebula/test/utils"
 )
 
-// The HTML report is deliberately ONE self-contained file: no CDN, no JavaScript, and
-// the chart is inline SVG computed here. A perf report gets opened from a laptop with no
-// network, mailed around, and attached to CI artifacts, and any of those breaks the
-// moment it needs to fetch a charting library.
+// The HTML report is deliberately ONE self-contained file: no CDN, no JavaScript, the chart
+// inline SVG computed here. It gets opened offline, mailed around, and attached to CI
+// artifacts, and a fetched charting library breaks all three.
 const (
 	// perfReportDir sits under the repo root, which .gitignore already covers
 	// ("artifacts"), so reports cannot be committed by accident.
@@ -42,15 +41,15 @@ const (
 	perfReportFile = "perf-report.html"
 )
 
-// Stage colours are shared by the table swatches and the chart curves, so a row and its
-// curve are the same colour and the eye can move between them. Two colours do double duty,
-// once per section, so they never share a chart: colourCreated for "Pods creation" and "Pods
-// gone" (the Pod object moving at Kubernetes' own pace) and colourSync for the two derived
-// per-workload rows, which are the only rows that isolate Nebula's own cost.
+// Shared by the table swatches and the chart curves, so a row and its curve match. Two
+// reuses, both safe: colourCreated appears once per section and the sections never share a
+// chart, and the derived per-claim row takes colourClaims to sit beside the claims curve it
+// is computed from — a derived row draws no curve, so it cannot make two curves ambiguous.
 const (
 	colourCreated = "#94a3b8"
 	colourClaims  = "#f59e0b"
 	colourBound   = "#3b82f6"
+	colourReady   = "#8b5cf6"
 	colourSync    = "#10b981"
 	colourGone    = "#ef4444"
 )
@@ -125,18 +124,14 @@ type reportSeries struct {
 	Label  string
 	Colour string
 	Points string // SVG polyline "x,y x,y ..."
-	// Dash makes an exactly-covered curve visible without moving or fattening anything.
-	// Two stages CAN be identical, point for point — a Pod already bound the first time the
-	// poller sees it stamps "created" and "bound" from one timestamp — and the curve drawn
-	// first would otherwise vanish completely, which reads as missing data rather than as
-	// agreement. So the curve on TOP is dashed and the one underneath shows through the
-	// gaps: same width, same path, just interrupted.
+	// Dash makes an exactly-covered curve visible. Two stages CAN be identical point for point
+	// — a Pod already bound when first polled stamps created and bound from one timestamp — and
+	// the curve drawn first would then vanish, which reads as missing data rather than as
+	// agreement. So the curve on TOP is dashed and the one beneath shows through the gaps.
 	//
-	// Drawing the covered curve as a wide translucent band was the previous attempt. These
-	// curves are staircases, and a 9px stroke on a near-vertical run protrudes to both
-	// sides of the 2.25px line on top of it, which reads as a second line offset sideways —
-	// the width itself became a misleading signal. Nudging a curve off its real position was
-	// never an option: that would be a lie about the numbers.
+	// Never widen or nudge instead: on these staircases a 9px band protrudes either side of the
+	// 2.25px line and reads as a second, offset curve, and moving a curve would misstate the
+	// numbers.
 	Dash string // stroke-dasharray; empty for a solid curve
 	// Same names the curve this one duplicates, for the legend.
 	Same string
@@ -175,47 +170,46 @@ type reportPage struct {
 type reportCard struct {
 	Key   string
 	Value string
-	// Note becomes the card's tooltip. A six-card strip has no room for prose, but a
-	// two-word key does not say what the number covers — "total" alone does not reveal
-	// that cluster setup is outside it — so the definition has to live somewhere.
+	// Note becomes the card's tooltip: the strip has no room for prose, and a two-word key
+	// cannot say what the number covers ("total" does not reveal that setup is outside it).
 	Note string
 }
 
 func renderHTMLReport(
 	n int, s syncSamples, total, drainTotal time.Duration, d drainSamples,
 ) (string, error) {
-	// Measured from the apply. Ordered as the path runs, not by duration.
+	// Pods first, then the claim ledger; within each group the cumulative rows (from the apply,
+	// stamped only once the manager is ready — see waitForControllerReady) before the derived
+	// per-object one, which divides the arrival rate out and so survives a change of batch size.
 	syncStages := []stage{{
 		Label: "Pods creation", Colour: colourCreated, Samples: s.created, Total: n, Curve: true,
 		Note: "Kubernetes' own cost: how fast the Pods are created.",
 	}, {
 		Label: "Pods bound to " + fakeVirtualNode, Colour: colourBound, Samples: s.bound, Total: n, Curve: true,
-		Note: "Ungated and scheduled onto the virtual node — the workload is live.",
+		Note: "Ungated and scheduled onto the virtual node.",
+	}, {
+		Label: "Pods Ready", Colour: colourReady, Samples: s.ready, Total: n, Curve: true,
+		Note: "End to end: the workloads are usable. The batch is deleted only after this.",
+	}, {
+		Label: "Placement (Pod created → bound)", Colour: colourSync, Samples: s.placement,
+		Note: "Per Pod: the gate coming off plus the bind, arrival rate factored out.",
 	}, {
 		Label: "NodeClaims Bound", Colour: colourClaims, Samples: s.claims, Total: n, Curve: true,
 		Note: "The claim ledger catching up: placement decided and recorded.",
 	}, {
-		Label: "Per-Pod sync (created → bound)", Colour: colourSync, Samples: s.sync,
-		Note: "Nebula's own contribution, with the creation rate factored out.",
+		Label: "Provisioning (NodeClaim created → Bound)", Colour: colourClaims, Samples: s.provision,
+		Note: "Per claim: created until an instance exists. Contains the bind above, because a " +
+			"claim goes Bound off its Pod's status.",
 	}}
-	// Measured from the delete, so these get their own clock — and their own chart. Pods
-	// first because the delete lands on the workload first, not because they finish first:
-	// which curve trails is the result, and it has gone both ways.
+	// Measured from the delete, so these get their own clock and their own chart. Pods first
+	// because the delete lands there first, not because they finish first — which curve trails
+	// is the result, and it has gone both ways.
 	drainStages := []stage{{
 		Label: "Pods gone", Colour: colourCreated, Samples: d.podsGone, Total: d.podsKnown, Curve: true,
 		Note: "Graceful termination through the virtual kubelet.",
 	}, {
 		Label: "NodeClaims gone", Colour: colourGone, Samples: d.gone, Total: d.known, Curve: true,
-		Note: "Self-deleted once the served Pod is gone, then the terminate finalizer releases " +
-			"the instance. Both rows count against the batch the sync watch observed; anything " +
-			"already gone at the first drain poll is stamped there, an upper bound.",
-	}, {
-		Label: "Per-claim release (pod → claim gone)", Colour: colourSync, Samples: d.release,
-		Total: d.podsKnown,
-		Note: "Nebula's own contribution to teardown, with the Pod deletion rate factored out. " +
-			"The two curves above cannot show this: their percentiles are over different objects. " +
-			"Both stamps come from one snapshot, so most pairs land inside a single poll and read " +
-			"as 0. A count below the batch is pairs with no end yet, or a claim seen gone first.",
+		Note: "Self-deleted once its Pod is gone; the terminate finalizer then releases the instance.",
 	}}
 
 	page := reportPage{
@@ -223,18 +217,25 @@ func renderHTMLReport(
 		Generated: time.Now().Format("Mon, 02 Jan 2006 15:04:05 MST"),
 		Cards: []reportCard{
 			{Key: "total", Value: fmtDuration(total),
-				Note: "The whole benchmark: apply until the last NodeClaim was gone, so sync plus " +
-					"teardown plus the short gap where the sync numbers are reported and asserted. " +
-					"Cluster setup and the manager's deploy are outside it."},
-			{Key: "all synced", Value: lastOf(s.bound, n),
-				Note: "From the apply until the last Pod was bound to the virtual node. The apply " +
-					"itself is not reported: its round trip is the client's cost, not Nebula's."},
-			{Key: "teardown", Value: fmtDuration(drainTotal),
-				Note: "From the delete until every NodeClaim in the batch was gone."},
+				Note: "Apply until the last NodeClaim was gone: sync, teardown, and the gap where " +
+					"the sync numbers are asserted. Cluster setup and the deploy are outside it. On " +
+					"a run that gave up, apply until it gave up — read it against the verdict."},
 			{Key: "replicas", Value: fmt.Sprintf("%d", n),
 				Note: "Batch size. Override with NEBULA_E2E_PERF_WORKLOADS."},
-			{Key: "sync throughput", Value: rate(len(s.bound), n, lastSample(s.bound), "workloads/s"),
-				Note: "Replicas bound per second across that window."},
+			{Key: "all pods ready", Value: lastOf(s.ready, n),
+				Note: "Apply until the last Pod reported Ready: how long until N workloads are " +
+					"usable. Never ahead of all pods bound, and the batch is deleted only after this."},
+			// Named for the OBJECT: a Pod is bound to a node by the scheduler, while Bound is a
+			// NodeClaim PHASE already satisfied while the instance initializes (see desiredPhase).
+			{Key: "all pods bound", Value: lastOf(s.bound, n),
+				Note: "Apply until the last Pod was bound to the virtual node — the scheduling " +
+					"decision, not usability (all pods ready) and not the claim ledger " +
+					"(NodeClaims Bound)."},
+			{Key: "bind rate", Value: rate(len(s.bound), n, lastSample(s.bound), "workloads/s"),
+				Note: "Pods bound to the virtual node per second across that window."},
+			{Key: "teardown", Value: fmtDuration(drainTotal),
+				Note: "Delete until every NodeClaim in the batch was gone. Empty when the sync never " +
+					"finished, since nothing was deleted — unlike total, stamped either way."},
 			{Key: "drain rate", Value: rate(len(d.gone), len(d.gone), drainTotal, "claims/s"),
 				Note: "NodeClaims removed per second, finalizers included."},
 		},
@@ -254,9 +255,11 @@ func renderHTMLReport(
 	page.DrainChart = buildChart(drainStages, max(d.known, d.podsKnown), "elapsed since delete")
 
 	switch {
-	case len(s.bound) < n || len(s.claims) < n:
-		page.Verdict = fmt.Sprintf("INCOMPLETE — %d/%d pods bound, %d/%d claims Bound%s",
-			len(s.bound), n, len(s.claims), n, stalledSuffix(s.stalled))
+	case len(s.bound) < n || len(s.claims) < n || len(s.ready) < n:
+		// Ready named alongside the other two, not folded in: "bound but never Ready" is a
+		// provisioning or status problem, "never bound" is a placement one.
+		page.Verdict = fmt.Sprintf("INCOMPLETE — %d/%d pods bound, %d/%d claims Bound, %d/%d pods Ready%s",
+			len(s.bound), n, len(s.claims), n, len(s.ready), n, stalledSuffix(s.stalled))
 		page.VerdictBad = true
 	case d.remaining > 0:
 		page.Verdict = fmt.Sprintf("Synced, but %d claim(s) never drained%s",
@@ -305,9 +308,8 @@ func rate(count, want int, over time.Duration, unit string) string {
 }
 
 func buildRows(stages []stage) []reportRow {
-	// Bars are scaled within a table, never across the two: the sync stages and the
-	// drain are measured from different starts, so a shared scale would invite a
-	// comparison that means nothing.
+	// Bars scale within a table, never across the two: sync and teardown are measured from
+	// different starts, so a shared scale would invite a meaningless comparison.
 	scale := time.Duration(0)
 	for _, st := range stages {
 		if v := lastSample(st.Samples); v > scale {
@@ -322,8 +324,8 @@ func buildRows(stages []stage) []reportRow {
 		case len(st.Samples) == 0:
 			row.Count, row.P50, row.P95, row.Max, row.Muted = "—", "—", "—", "—", true
 		case lastSample(st.Samples) == 0:
-			// Same guard as the terminal report: all-zero means faster than one poll, and
-			// printing 0s would claim precision this measurement does not have.
+			// As in the terminal report: all-zero means faster than one poll, and printing 0s
+			// would claim precision this measurement does not have.
 			row.P50, row.P95, row.Max = "< 1 poll", "< 1 poll", "< 1 poll"
 		default:
 			row.P50 = fmtDuration(percentile(st.Samples, 50))
@@ -357,10 +359,10 @@ func fmtDuration(d time.Duration) string {
 	}
 }
 
-// buildChart turns the samples into cumulative-completion curves, or returns nil if
-// there is nothing to draw. Sorted ascending, sample i IS the moment the (i+1)-th
-// workload cleared that stage, so no bucketing is needed: steepness is the rate, a flat
-// stretch is a stall, and a curve hugging another means that stage is keeping up.
+// buildChart turns the samples into cumulative-completion curves, or nil if there is nothing
+// to draw. Sorted ascending, sample i IS the moment the (i+1)-th workload cleared the stage,
+// so no bucketing: steepness is the rate, a flat stretch is a stall, and a curve hugging
+// another means that stage is keeping up.
 func buildChart(stages []stage, want int, xLabel string) *chart {
 	const w, h, padL, padR, padT, padB = 880, 300, 54, 24, 16, 44
 	c := &chart{
@@ -393,8 +395,8 @@ func buildChart(stages []stage, want int, xLabel string) *chart {
 		if !st.Curve || len(st.Samples) == 0 {
 			continue
 		}
-		// Start at (first sample, 0) so a curve that begins late reads as beginning late
-		// rather than as rising out of the origin.
+		// Start at (first sample, 0) so a late curve reads as starting late rather than as
+		// rising out of the origin.
 		pts := make([]string, 0, len(st.Samples)+1)
 		pts = append(pts, fmt.Sprintf("%.1f,%.1f", x(st.Samples[0].Seconds()), y(0)))
 		for i, at := range st.Samples {
@@ -408,9 +410,8 @@ func buildChart(stages []stage, want int, xLabel string) *chart {
 		return nil
 	}
 
-	// Mark exact overlaps: dash the curve on top so the one beneath shows through it, and
-	// name the pairing in the legend, so "one line is missing" reads as "these two are the
-	// same line". Both curves keep the same width and position — see reportSeries.Dash.
+	// Mark exact overlaps: dash the curve on top so the one beneath shows through, so "a line
+	// is missing" reads as "these two are identical" — see reportSeries.Dash.
 	for i := range c.Series {
 		for j := 0; j < i; j++ {
 			if c.Series[i].Points == c.Series[j].Points {
@@ -433,27 +434,29 @@ func buildChart(stages []stage, want int, xLabel string) *chart {
 // diffed against another run without re-deriving anything.
 func plainSummary(n int, s syncSamples, total, drainTotal time.Duration, d drainSamples) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "replicas                         %d\n", n)
-	fmt.Fprintf(&b, "Pods created                     %s\n", stageLine(s.created, n))
-	fmt.Fprintf(&b, "NodeClaims Bound                 %s\n", stageLine(s.claims, n))
-	fmt.Fprintf(&b, "Pods bound to %-18s %s\n", fakeVirtualNode, stageLine(s.bound, n))
-	fmt.Fprintf(&b, "per-Pod sync (created → bound)   %s\n", spreadLine(s.sync))
-	fmt.Fprintf(&b, "teardown total                   %s\n", fmtDuration(drainTotal))
-	fmt.Fprintf(&b, "Pods gone                        %s\n", stageLine(d.podsGone, d.podsKnown))
-	fmt.Fprintf(&b, "NodeClaims gone                  %s\n", stageLine(d.gone, d.known))
-	fmt.Fprintf(&b, "per-claim release (pod → claim)  %s\n", releaseLine(d))
-	fmt.Fprintf(&b, "total (apply → drained)          %s\n", fmtDuration(total))
-	fmt.Fprintf(&b, "poll interval                    %s\n", perfPollInterval)
-	fmt.Fprintf(&b, "stall timeout                    %s\n", perfStallTimeout)
-	fmt.Fprintf(&b, "sync budget                      %s\n", perfBudget(n))
-	fmt.Fprintf(&b, "teardown budget                  %s\n", perfTeardownBudget(n))
+	// Literal spaces, never %-35s: Printf pads by BYTES and the arrow is three of them, so a
+	// width verb short-pads exactly the rows carrying one. Sized to the longest label.
+	fmt.Fprintf(&b, "replicas                           %d\n", n)
+	fmt.Fprintf(&b, "Pods created                       %s\n", stageLine(s.created, n))
+	fmt.Fprintf(&b, "Pods bound to %-18s   %s\n", fakeVirtualNode, stageLine(s.bound, n))
+	fmt.Fprintf(&b, "Pods Ready                         %s\n", stageLine(s.ready, n))
+	fmt.Fprintf(&b, "placement (Pod created → bound)    %s\n", spreadLine(s.placement))
+	fmt.Fprintf(&b, "NodeClaims Bound                   %s\n", stageLine(s.claims, n))
+	fmt.Fprintf(&b, "provisioning (NC created → Bound)  %s\n", spreadLine(s.provision))
+	fmt.Fprintf(&b, "teardown total                     %s\n", fmtDuration(drainTotal))
+	fmt.Fprintf(&b, "Pods gone                          %s\n", stageLine(d.podsGone, d.podsKnown))
+	fmt.Fprintf(&b, "NodeClaims gone                    %s\n", stageLine(d.gone, d.known))
+	fmt.Fprintf(&b, "total (apply → drained)            %s\n", fmtDuration(total))
+	fmt.Fprintf(&b, "poll interval                      %s\n", perfPollInterval)
+	fmt.Fprintf(&b, "stall timeout                      %s\n", perfStallTimeout)
+	fmt.Fprintf(&b, "sync budget                        %s\n", perfBudget(n))
+	fmt.Fprintf(&b, "teardown budget                    %s\n", perfTeardownBudget(n))
 	return b.String()
 }
 
-// html/template escapes every interpolation, so nothing computed above can break the
-// page even if a label or provider name ever carries markup. Two template blocks are
-// shared by the sync and teardown sections, which is what keeps the two honest about
-// being the same measurement on different clocks.
+// html/template escapes every interpolation, so no label or provider name can break the page.
+// The sync and teardown sections share both template blocks, which is what keeps them honest
+// about being the same measurement on different clocks.
 var reportTemplate = template.Must(template.New("perf").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -506,13 +509,22 @@ var reportTemplate = template.Must(template.New("perf").Parse(`<!DOCTYPE html>
   .verdict .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor;
                   flex: none; transform: translateY(-3px); }
   /* Hairline grid: 1px gaps filled by the container's background, so the cards read as one
-     block instead of six floating boxes. */
-  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+     block. Flex that GROWS, not fixed grid columns — a short last row's empty cells would
+     paint that hairline as a grey slab, while flex has the row share the width instead.
+
+     Two bases put THREE on the top row: the first three take 30% (3x30% + 22% > 100%, so the
+     fourth wraps), the rest 22% (4x22% < 100% < 5x22%). Seven cards land 3 + 4. */
+  .cards { display: flex; flex-wrap: wrap; gap: 1px;
            background: var(--line); border: 1px solid var(--line);
            border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow);
            margin-top: 18px; }
-  @media (max-width: 640px) { .cards { grid-template-columns: repeat(2, 1fr); } }
-  .card { background: var(--panel); padding: 12px 15px 14px; }
+  .card { flex: 1 1 22%; background: var(--panel); padding: 12px 15px 14px; }
+  .cards .card:nth-child(-n+3) { flex-basis: 30%; }
+  /* Two per row on a phone. Both selectors: the nth-child rule above outranks a bare .card,
+     and would otherwise hold the headline row at three. */
+  @media (max-width: 640px) {
+    .card, .cards .card:nth-child(-n+3) { flex-basis: 45%; }
+  }
   .card .k { color: var(--faint); font-size: 9.5px; font-weight: 580; text-transform: uppercase;
              letter-spacing: .08em; }
   .card .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums;
@@ -578,7 +590,7 @@ var reportTemplate = template.Must(template.New("perf").Parse(`<!DOCTYPE html>
 <body>
 <main>
   <header>
-    <h1>Workload sync benchmark</h1>
+    <h1>Workload Benchmark</h1>
     <span class="stamp">{{.Generated}}</span>
   </header>
   <p class="lede">Fake provider on Kind, so this is control-plane cost only: Pods bind to a
@@ -614,8 +626,7 @@ var reportTemplate = template.Must(template.New("perf").Parse(`<!DOCTYPE html>
   <footer>
     Generated by <code>make test-perf</code> (<code>test/e2e/perf_test.go</code>).
     Set <code>NEBULA_E2E_PERF_WORKLOADS</code> to change the batch size and
-    <code>NEBULA_E2E_PERF_REPORT</code> to move this file &mdash; two runs sharing the
-    default path overwrite each other.
+    <code>NEBULA_E2E_PERF_REPORT</code>.
   </footer>
 </main>
 </body>
@@ -652,7 +663,7 @@ var reportTemplate = template.Must(template.New("perf").Parse(`<!DOCTYPE html>
 {{define "chart"}}
   <div class="chart">
   <svg viewBox="0 0 {{.W}} {{.H}}" role="img"
-       aria-label="cumulative workloads completed per stage, {{.XLabel}}">
+       aria-label="cumulative Pods past each stage, {{.XLabel}}">
     {{range .YTicks}}
       <line class="grid" x1="{{$.PadL}}" y1="{{.Pos}}" x2="{{$.PlotR}}" y2="{{.Pos}}"/>
       <text class="tick" x="{{$.PadL}}" y="{{.Pos}}" dx="-9" dy="4" text-anchor="end">{{.Label}}</text>
@@ -662,14 +673,12 @@ var reportTemplate = template.Must(template.New("perf").Parse(`<!DOCTYPE html>
     {{end}}
     <line class="axis" x1="{{.PadL}}" y1="{{.PlotB}}" x2="{{.PlotR}}" y2="{{.PlotB}}"/>
     <text class="tick title" x="{{.PlotR}}" y="{{.PlotB}}" dy="34" text-anchor="end">{{.XLabel}}</text>
-    <!-- Axis titles sit outside the plot: the y title at the top-left corner, above the
-         tick column it labels, and the x title at the end of the x ticks. Right-aligning
-         the y title to the ticks would push it off the left edge of the panel. -->
-    <text class="tick title" x="0" y="{{.PadT}}" dy="-6">workloads</text>
-    <!-- Every curve is stroked identically; only stroke-dasharray ever differs, so a
-         difference in weight or position on this chart is always a difference in the
-         numbers. Butt caps rather than round: a round cap adds half the stroke width to
-         each end of every dash, which eats the gaps the dashes exist to leave. -->
+    <!-- Axis titles sit outside the plot: y at the top-left above its tick column, x at the
+         end of the x ticks. Right-aligning y to the ticks would push it off the panel. -->
+    <text class="tick title" x="0" y="{{.PadT}}" dy="-6">Pods</text>
+    <!-- Every curve is stroked identically and only stroke-dasharray differs, so any
+         difference in weight or position is a difference in the numbers. Butt caps, not round:
+         a round cap adds half the stroke width to each dash end and eats the gaps. -->
     {{range .Series}}
       <polyline fill="none" stroke="{{.Colour}}" stroke-width="2.25"
                 {{if .Dash}}stroke-dasharray="{{.Dash}}" {{end}}stroke-linecap="butt"

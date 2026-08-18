@@ -33,6 +33,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 // fakeProvider is a minimal provider.Provider. On the happy path the NodeClaim
@@ -145,6 +146,15 @@ func newPod(name, ns, uid string, phase corev1.PodPhase) *corev1.Pod {
 	}
 }
 
+// withInstanceID stamps the annotation the virtual kubelet writes once Provision returns,
+// which is where the claim controller reads the id from (see recordInstanceID).
+func withInstanceID(pod *corev1.Pod, id string) {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[nebulav1alpha1.InstanceIDAnnotation] = id
+}
+
 // newClaim builds a steady-state claim: it already carries the terminate
 // finalizer, since the normal reconcile adds that before doing anything else.
 // Use newClaimNoFinalizer to exercise the finalizer-addition path itself.
@@ -226,12 +236,9 @@ func TestReconcile_PendingPodDoesNotMarkBound(t *testing.T) {
 	// flip the claim to Bound — Bound is the teardown guard, earned only once the
 	// instance is actually running. The instance id is still captured early.
 	pod := newPod("p1", "default", "uid-1", corev1.PodPending)
+	withInstanceID(pod, "inst-1")
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
-	prov := &fakeProvider{
-		name: "fake",
-		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
-	}
-	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+	r, c := newClaimReconciler(t, []client.Object{pod, claim})
 
 	reconcileClaim(t, r, "c1")
 
@@ -257,12 +264,9 @@ func TestReconcile_BootingPodEarnsBound(t *testing.T) {
 	// immediately rather than waiting out the grace window.
 	pod := newPod("p1", "default", "uid-1", corev1.PodPending)
 	pod.Status.Reason = podReasonInitializing
+	withInstanceID(pod, "inst-1")
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
-	prov := &fakeProvider{
-		name: "fake",
-		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
-	}
-	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+	r, c := newClaimReconciler(t, []client.Object{pod, claim})
 
 	reconcileClaim(t, r, "c1")
 
@@ -324,15 +328,13 @@ func TestReconcile_BoundClaimDoesNotDowngradeOnStatusFlap(t *testing.T) {
 
 func TestReconcile_RecordsInstanceIDOnBound(t *testing.T) {
 	// When the served Pod is running, the claim is marked Bound AND its
-	// status.InstanceID is captured (resolved by claim name via List) so the
-	// teardown backstop can reclaim the instance even if VK forgets the id.
+	// status.InstanceID is copied off the Pod annotation VK stamped, so the teardown
+	// backstop can reclaim the instance even if VK forgets the id. No provider is
+	// registered here on purpose: the id must come from the Pod, not from a List.
 	pod := newPod("p1", "default", "uid-1", corev1.PodRunning)
+	withInstanceID(pod, "inst-1")
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
-	prov := &fakeProvider{
-		name: "fake",
-		list: []provider.Instance{{ID: "inst-1", ClaimName: "default-p1"}},
-	}
-	r, c := newClaimReconciler(t, []client.Object{pod, claim}, prov)
+	r, c := newClaimReconciler(t, []client.Object{pod, claim})
 
 	reconcileClaim(t, r, "c1")
 
@@ -381,6 +383,26 @@ func TestReconcile_BoundClaimWithGonePodSelfDeletes(t *testing.T) {
 	got := getClaim(t, c, "c1")
 	if got.DeletionTimestamp.IsZero() {
 		t.Fatal("expected a Bound claim with a gone Pod to be deleted")
+	}
+}
+
+func TestReconcile_ProvisioningPodGoneDeletesWithoutGrace(t *testing.T) {
+	// A claim at Provisioning has already reconciled on a live Pod, so an absent Pod is a
+	// real teardown, not cache lag: delete at once instead of sitting out the grace window.
+	claim := newClaim("c1", "pending", "default", "uid-1", "fake")
+	claim.CreationTimestamp = metav1.NewTime(time.Now())
+	claim.Status.Phase = nebulav1alpha1.NodeClaimProvisioning
+	prov := &fakeProvider{name: "fake"}
+	r, c := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	res := reconcileClaim(t, r, "c1")
+
+	if res.RequeueAfter > 0 {
+		t.Fatalf("expected no grace requeue for a claim that observed its Pod, got %+v", res)
+	}
+	got := getClaim(t, c, "c1")
+	if got.DeletionTimestamp.IsZero() {
+		t.Fatal("expected a Provisioning claim with a gone Pod to be deleted immediately")
 	}
 }
 
@@ -510,15 +532,16 @@ func TestReconcileDelete_ListErrorRetries(t *testing.T) {
 	}
 }
 
-func TestClaimsForPod_MapsByPodRef(t *testing.T) {
+func TestClaimsForPod_DerivesTheClaimName(t *testing.T) {
+	// One Pod event enqueues exactly one request, named the way ensureClaim named the
+	// claim — no cluster-wide List, so the cost does not grow with the number of claims.
 	pod := newPod("p1", "default", "uid-1", corev1.PodRunning)
-	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
-	other := newClaim("c2", "other", "default", "uid-2", "fake")
-	r, _ := newClaimReconciler(t, []client.Object{pod, claim, other})
+	other := newClaim(util.ClaimName("default", "other"), "other", "default", "uid-2", "fake")
+	r, _ := newClaimReconciler(t, []client.Object{pod, other})
 
 	reqs := r.claimsForPod(context.Background(), pod)
-	if len(reqs) != 1 || reqs[0].Name != "c1" {
-		t.Fatalf("expected only c1 enqueued for pod p1, got %+v", reqs)
+	if len(reqs) != 1 || reqs[0].Name != util.ClaimName("default", "p1") {
+		t.Fatalf("expected only the derived claim name for pod p1, got %+v", reqs)
 	}
 }
 

@@ -97,7 +97,7 @@ func perfReplicas() int {
 //
 // Neither is a latency SLO. Read the reported percentiles for that.
 func perfBudget(n int) time.Duration {
-	return 30*time.Second + time.Duration(n)*300*time.Millisecond
+	return 30*time.Second + time.Duration(n)*time.Second
 }
 
 // perfTeardownBudget is separate, and larger, because draining is measurably the
@@ -110,7 +110,11 @@ func perfTeardownBudget(n int) time.Duration {
 
 // benchmarkWorkloadSync creates ONE Deployment of N gated replicas and measures how
 // long the control plane takes to sync all of them: webhook gate → placement →
-// NodeClaim Bound → Pod bound to the virtual node.
+// NodeClaim Bound → Pod bound to the virtual node → Pod Ready.
+//
+// It runs to READY, not to bound, before deleting anything: bound is a scheduling
+// decision, while Ready is the vnode reporting the instance running, and only the second
+// one means a user could use the box (see syncSamples.ready).
 //
 // A Deployment rather than N Pod manifests, for two reasons: it is the shape a user
 // actually scales, and the replicas are then created in-cluster by the ReplicaSet
@@ -130,6 +134,9 @@ func benchmarkWorkloadSync() {
 	// the numbers are most worth reading.
 	var (
 		s syncSamples
+		// start is t0, the instant before the apply. Declared up here, not at the apply, so
+		// the cleanup below can price a run that never reached the end.
+		start time.Time
 		// total is the whole benchmark: apply until the last claim is gone. It is not
 		// drainTotal + the sync window — the gap where the sync numbers are reported and
 		// asserted falls inside it too, which is exactly why it is measured rather than
@@ -139,14 +146,25 @@ func benchmarkWorkloadSync() {
 		d          drainSamples
 	)
 	DeferCleanup(func() {
+		// A failed sync assertion aborts the spec before total is assigned, and a report
+		// whose headline number is an em dash reads as "the harness broke" rather than "the
+		// batch did not finish". So stamp what the run actually consumed: apply until it
+		// gave up. A zero start means it failed before t0 — nothing was measured, so the
+		// card stays empty rather than reporting cluster setup as a benchmark.
+		//
+		// drainTotal is deliberately left alone: no teardown ran, and a number there would
+		// invent a stage.
+		if total == 0 && !start.IsZero() {
+			total = time.Since(start)
+		}
 		writeHTMLReport(n, s, total, drainTotal, d)
 	})
 
-	By("waiting for the fake provider's virtual node to register")
-	Eventually(func(g Gomega) {
-		_, err := utils.Run(exec.Command("kubectl", "get", "node", fakeVirtualNode))
-		g.Expect(err).NotTo(HaveOccurred(), "fake virtual node not registered")
-	}).Should(Succeed())
+	// Everything the batch depends on, before t0 — the webhook that gates the Pods and the
+	// node they bind to. Nothing here is timed: waiting for the manager is setup, and
+	// folding it into the first stage would report the manager's boot as Nebula's placement
+	// cost. See waitForControllerReady for what a half-started manager does to the numbers.
+	waitForControllerReady()
 
 	// A claim left over from the placement spec would land in the teardown timing
 	// below, which waits on claims cluster-wide.
@@ -164,7 +182,7 @@ func benchmarkWorkloadSync() {
 	By(fmt.Sprintf("creating a NodePool and a Deployment of %d gated replicas", n))
 	// The clock starts before the create, so every sample includes the whole path from
 	// "the user asked" onward.
-	start := time.Now()
+	start = time.Now()
 	_, err = utils.Run(exec.Command("kubectl", "apply", "-f", perfManifestFile))
 	Expect(err).NotTo(HaveOccurred(), "Failed to apply the perf Deployment")
 	// The apply's own round trip is deliberately not reported: it is the client's cost,
@@ -182,10 +200,16 @@ func benchmarkWorkloadSync() {
 		gaveUp = fmt.Sprintf("before stalling (nothing advanced for %s)", perfStallTimeout)
 	}
 	Expect(s.bound).To(HaveLen(n), fmt.Sprintf(
-		"only %d/%d Pods bound to %s %s (%d/%d created, %d/%d claims Bound)",
-		len(s.bound), n, fakeVirtualNode, gaveUp, len(s.created), n, len(s.claims), n))
+		"only %d/%d Pods bound to %s %s (%d/%d created, %d/%d claims Bound, %d/%d Ready)",
+		len(s.bound), n, fakeVirtualNode, gaveUp, len(s.created), n, len(s.claims), n, len(s.ready), n))
 	Expect(s.claims).To(HaveLen(n), fmt.Sprintf(
 		"only %d/%d NodeClaims reached Bound %s", len(s.claims), n, gaveUp))
+	// Asserted BEFORE the delete below, and that order is the point: teardown timed while
+	// part of the batch is still booting measures a delete racing provisioning, which is a
+	// different thing from draining a settled fleet and cannot be told apart afterwards.
+	Expect(s.ready).To(HaveLen(n), fmt.Sprintf(
+		"only %d/%d Pods became Ready %s (%d/%d bound, so the rest were placed but never "+
+			"reported running)", len(s.ready), n, gaveUp, len(s.bound), n))
 
 	By("deleting the batch and timing the teardown")
 	teardownBudget := perfTeardownBudget(n)
@@ -214,9 +238,27 @@ type syncSamples struct {
 	created []time.Duration // Pod object exists
 	claims  []time.Duration // NodeClaim reached Bound
 	bound   []time.Duration // Pod bound to the virtual node
-	// sync is per Pod: bound − created, i.e. Nebula's own contribution, with the
-	// ReplicaSet's creation rate factored out.
-	sync []time.Duration
+	// ready is the Pod's Ready condition turning True, which is the only stage here that
+	// says the workload can actually be USED: bound means the scheduler is done with it,
+	// and a NodeClaim reaches Bound while the instance is merely known to exist (see
+	// desiredPhase — Initializing counts). So a batch can clear every other stage with
+	// every Pod still booting, and the teardown below would then be timing a delete that
+	// races provisioning rather than one against a settled fleet.
+	//
+	// It is also the stage most likely to be slow, because it is the only one that waits on
+	// a status write per Pod from the virtual kubelet rather than on a one-off decision.
+	ready []time.Duration
+	// placement and provision are the two PER-OBJECT windows, the only samples here not
+	// measured from the apply. Dividing the arrival rate out is what keeps them comparable
+	// between runs of different sizes.
+	//
+	// placement is per Pod, bound − created: the gate coming off plus the bind.
+	placement []time.Duration
+	// provision is per NodeClaim, Bound − created: created until an instance is known to
+	// exist. Not the provider call alone — a claim goes Bound off its served POD's status
+	// (desiredPhase: Running, or the Initializing reason the vnode sets), so this window
+	// contains the bind and overlaps placement rather than following it.
+	provision []time.Duration
 	// podNames is every Pod this batch was OBSERVED to have, which the teardown poll needs:
 	// deletion is fast at the head of the queue, so a Pod (and its claim) can be gone before
 	// the drain's first list, and an object discovered only by that list is invisible to it.
@@ -242,7 +284,11 @@ type syncSamples struct {
 func watchBatchSync(n int, start time.Time, budget time.Duration) syncSamples {
 	createdSeen := map[string]time.Duration{}
 	boundSeen := map[string]time.Duration{}
+	readySeen := map[string]time.Duration{}
 	claimSeen := map[string]time.Duration{}
+	// When each claim first EXISTED, whatever phase. Not a stage of its own, just the left
+	// edge of the per-claim provisioning window.
+	claimCreatedSeen := map[string]time.Duration{}
 	claimPrefix := perfWorkloadNS + "-" + perfDeployName
 
 	deadline := start.Add(budget)
@@ -262,28 +308,44 @@ func watchBatchSync(n int, start time.Time, budget time.Duration) syncSamples {
 		if err == nil {
 			at := time.Since(start)
 			for name, phase := range batchRows(out, claimPrefix) {
+				// Every row, whatever its phase: a claim is listed from the instant it exists
+				// (phase empty for the first tick, rendered "-"), and that is the window's start.
+				firstSeen(claimCreatedSeen, name, at)
 				if phase == "Bound" {
 					firstSeen(claimSeen, name, at)
 				}
 			}
 		}
 
+		// Node name and readiness in ONE token, joined by a separator, so this stays two
+		// list calls per poll and batchRows keeps its two-field contract (a third field
+		// would be dropped by its count check, and its <no value> collapse relies on the
+		// same rule). Both facts then also come off the same object at the same instant.
 		out, err = utils.RunQuiet(exec.Command("kubectl", "get", "pods", "-n", perfWorkloadNS,
-			"-o", "go-template={{range .items}}{{.metadata.name}} {{.spec.nodeName}}{{\"\\n\"}}{{end}}"))
+			"-o", "go-template={{range .items}}{{.metadata.name}} {{.spec.nodeName}}|"+
+				"{{range .status.conditions}}{{if eq .type \"Ready\"}}{{.status}}{{end}}{{end}}"+
+				"{{\"\\n\"}}{{end}}"))
 		if err == nil {
 			at := time.Since(start)
-			for name, node := range batchRows(out, perfDeployName) {
+			for name, val := range batchRows(out, perfDeployName) {
+				node, ready := podRow(val)
 				firstSeen(createdSeen, name, at)
 				if node == fakeVirtualNode {
 					firstSeen(boundSeen, name, at)
 				}
+				// The literal the Ready condition carries when the vnode has observed the
+				// instance running (see pkg/vnode setReady). A Pod with no conditions yet
+				// renders as empty, which matches nothing.
+				if ready == "True" {
+					firstSeen(readySeen, name, at)
+				}
 			}
 		}
 
-		if len(createdSeen) >= n && len(claimSeen) >= n && len(boundSeen) >= n {
+		if len(createdSeen) >= n && len(claimSeen) >= n && len(boundSeen) >= n && len(readySeen) >= n {
 			break
 		}
-		if got := len(createdSeen) + len(claimSeen) + len(boundSeen); got > progress {
+		if got := len(createdSeen) + len(claimSeen) + len(boundSeen) + len(readySeen); got > progress {
 			progress, lastProgress = got, time.Now()
 		}
 		if time.Since(lastProgress) > perfStallTimeout {
@@ -298,20 +360,27 @@ func watchBatchSync(n int, start time.Time, budget time.Duration) syncSamples {
 			// the Pod's .spec.nodeName are different objects reaching different states, and
 			// one line carrying "bound" for both reads as a single stage counted twice.
 			_, _ = fmt.Fprintf(GinkgoWriter,
-				"  t=%s  pods created %d/%d  claims Bound %d/%d  pods on %s %d/%d\n",
+				"  t=%s  pods created %d/%d  claims Bound %d/%d  pods on %s %d/%d  pods Ready %d/%d\n",
 				time.Since(start).Round(time.Second), len(createdSeen), n, len(claimSeen), n,
-				fakeVirtualNode, len(boundSeen), n)
+				fakeVirtualNode, len(boundSeen), n, len(readySeen), n)
 			nextLog = time.Now().Add(10 * time.Second)
 		}
 		time.Sleep(perfPollInterval)
 	}
 
-	// Only Pods observed at both ends contribute a sync sample; a Pod still unbound
-	// has no end yet, and counting it as zero would flatter the result.
-	sync := make([]time.Duration, 0, len(boundSeen))
+	// Only objects observed at BOTH ends contribute: one still short of its end has no window
+	// yet, and counting it as zero would flatter the result. So on a run that gave up these
+	// cover only the subset that finished, which is why the spread rows show no count.
+	placement := make([]time.Duration, 0, len(boundSeen))
 	for name, at := range boundSeen {
 		if c, ok := createdSeen[name]; ok {
-			sync = append(sync, at-c)
+			placement = append(placement, at-c)
+		}
+	}
+	provision := make([]time.Duration, 0, len(claimSeen))
+	for name, at := range claimSeen {
+		if c, ok := claimCreatedSeen[name]; ok {
+			provision = append(provision, at-c)
 		}
 	}
 
@@ -321,12 +390,14 @@ func watchBatchSync(n int, start time.Time, budget time.Duration) syncSamples {
 	}
 
 	return syncSamples{
-		created:  ascending(createdSeen),
-		claims:   ascending(claimSeen),
-		bound:    ascending(boundSeen),
-		sync:     sortDurations(sync),
-		podNames: names,
-		stalled:  stalled,
+		created:   ascending(createdSeen),
+		claims:    ascending(claimSeen),
+		bound:     ascending(boundSeen),
+		ready:     ascending(readySeen),
+		placement: sortDurations(placement),
+		provision: sortDurations(provision),
+		podNames:  names,
+		stalled:   stalled,
 	}
 }
 
@@ -345,28 +416,13 @@ type drainSamples struct {
 	// podsGone is the same measurement for this batch's Pods, on the same clock. It is what
 	// says how much of the teardown is Kubernetes' own: the Pod waits on graceful termination
 	// through the virtual kubelet, and the claim cannot go until that finishes, so this curve
-	// is the floor under the one above. Do not read the ORDER off the two curves — see
-	// release for that.
+	// is the floor under the one above. Do not read the ORDER off the two curves: their
+	// percentiles are over different objects, so a claim at p50 and a Pod at p50 are not the
+	// same workload.
 	//
 	// Counted against podsKnown, seeded and stamped exactly as gone is.
 	podsGone  []time.Duration
 	podsKnown int
-	// release pairs each Pod with its OWN claim: claim gone − pod gone, ascending, both stamped
-	// from the same snapshot. This is the teardown twin of syncSamples.sync, and the only number
-	// here that isolates Nebula: the two curves above are dominated by however fast the virtual
-	// kubelet processes 500 pod deletions, while this one says what the claim path costs on top
-	// of that. Expect most of it to read as 0 — the claim follows well inside one poll.
-	//
-	// Comparing the two distributions cannot answer that — their percentiles are over
-	// different objects, so a claim at p50 and a Pod at p50 are not the same workload, and a
-	// few missing Pod samples can make the claims look like they went first.
-	release []time.Duration
-	// releaseOutOfOrder counts pairs left OUT of release because the claim was seen absent while
-	// its Pod was still listed. With one snapshot per poll that is a genuine inversion rather
-	// than a sampling artifact, so it should read 0; anything else means a claim outran the Pod
-	// it serves. Dropped rather than kept as a negative sample, and counted rather than dropped
-	// quietly, because an inversion needs somewhere to show up.
-	releaseOutOfOrder int
 	// remaining is how many of this batch's claims were still present when the poll
 	// gave up; 0 means drained.
 	remaining int
@@ -379,13 +435,11 @@ type drainSamples struct {
 // above it fails fast on a stall — a count falling steadily is progress however slow,
 // while a count that stops falling is wedged.
 //
-// ONE list call per poll, covering Pods and claims together, unlike the sync watch. Two
-// calls made the per-workload pairing unmeasurable: a claim follows its Pod in tens of
-// milliseconds (see NodeClaimReconciler.Reconcile — it self-deletes once the served Pod
-// reads absent), which is no bigger than the gap between two kubectl invocations, so every
-// retained delta was measuring the harness rather than Nebula and roughly a third of the
-// batch came out inverted and dropped. One snapshot stamps a Pod and its claim from the same
-// instant. See pairRelease.
+// ONE list call per poll, covering Pods and claims together, unlike the sync watch. A claim
+// follows the Pod it serves in tens of milliseconds (see NodeClaimReconciler.Reconcile — it
+// self-deletes once the served Pod reads absent), which is smaller than the gap between two
+// kubectl invocations, so two calls put the two curves on measurably different clocks and made
+// their order unreadable. One snapshot stamps a Pod and its claim from the same instant.
 //
 // podNames is the batch the sync watch observed (syncSamples.podNames). Both ledgers are
 // seeded from it so the counts are against the batch that provably existed, not against
@@ -400,8 +454,8 @@ func drainPerfClaims(budget time.Duration, podNames []string) drainSamples {
 	start := time.Now()
 	deadline := start.Add(budget)
 
-	known := map[string]struct{}{}
-	goneSeen := map[string]time.Duration{}
+	claimsKnown := map[string]struct{}{}
+	claimsGoneSeen := map[string]time.Duration{}
 	podsKnown := map[string]struct{}{}
 	podsGoneSeen := map[string]time.Duration{}
 	// Seeding only asserts these objects EXISTED. The Pods were observed directly by the sync
@@ -411,7 +465,7 @@ func drainPerfClaims(budget time.Duration, podNames []string) drainSamples {
 	// first poll that fails to see it, the same rule every other name follows.
 	for _, pod := range podNames {
 		podsKnown[pod] = struct{}{}
-		known[nebulautil.ClaimName(perfWorkloadNS, pod)] = struct{}{}
+		claimsKnown[nebulautil.ClaimName(perfWorkloadNS, pod)] = struct{}{}
 	}
 	remaining := -1 // no observation yet, so the first one always counts as progress
 	lastProgress := start
@@ -433,21 +487,18 @@ func drainPerfClaims(budget time.Duration, podNames []string) drainSamples {
 		at := time.Since(start)
 		observeGone(podsKnown, podsGoneSeen, batchRows(out, perfDeployName), at)
 		claims := batchRows(out, claimPrefix)
-		observeGone(known, goneSeen, claims, at)
+		observeGone(claimsKnown, claimsGoneSeen, claims, at)
 		return len(claims), true
 	}
 
 	result := func(remaining int, stalled bool) drainSamples {
-		release, outOfOrder := pairRelease(podsGoneSeen, goneSeen)
 		return drainSamples{
-			gone:              ascending(goneSeen),
-			known:             len(known),
-			podsGone:          ascending(podsGoneSeen),
-			podsKnown:         len(podsKnown),
-			release:           release,
-			releaseOutOfOrder: outOfOrder,
-			remaining:         remaining,
-			stalled:           stalled,
+			gone:      ascending(claimsGoneSeen),
+			known:     len(claimsKnown),
+			podsGone:  ascending(podsGoneSeen),
+			podsKnown: len(podsKnown),
+			remaining: remaining,
+			stalled:   stalled,
 		}
 	}
 
@@ -473,44 +524,18 @@ func drainPerfClaims(budget time.Duration, podNames []string) drainSamples {
 	}
 }
 
-// pairRelease derives one sample per workload: how long after its Pod vanished the claim
-// serving it followed. Only workloads with BOTH stamps contribute — a claim still holding
-// its finalizer has no end yet, and counting it as zero would flatter the result, the same
-// rule syncSamples.sync follows at the other end.
+// batchRows parses "<name> <value>" lines, keeping those whose name carries prefix.
 //
-// Keyed through ClaimName rather than a hand-rolled join so this matches whatever the
-// controller derived, including the truncate-and-hash case for long names.
-//
-// On sign: both stamps come from the same snapshot (see drainPerfClaims), so a pair that
-// vanishes inside one poll reads as 0 rather than as the gap between two list calls, and
-// claimAt < podAt can only mean a genuine inversion — the claim was seen absent while its
-// Pod was still listed. Those are returned as a count instead of as negative samples, so the
-// distribution stays interpretable while nothing is silently discarded. Nothing is clamped: a
-// clamp would make a real inversion look like 0.
-func pairRelease(podsGoneSeen, goneSeen map[string]time.Duration) ([]time.Duration, int) {
-	out := make([]time.Duration, 0, len(podsGoneSeen))
-	outOfOrder := 0
-	for pod, podAt := range podsGoneSeen {
-		claimAt, ok := goneSeen[nebulautil.ClaimName(perfWorkloadNS, pod)]
-		switch {
-		case !ok:
-			// The claim has no end yet: still holding its finalizer, or the poll gave up first.
-			// Counting it as zero would flatter the result, the same rule syncSamples.sync follows.
-		case claimAt < podAt:
-			outOfOrder++
-		default:
-			out = append(out, claimAt-podAt)
-		}
-	}
-	return sortDurations(out), outOfOrder
-}
-
-// batchRows parses "<name> <value>" lines, keeping those whose name carries prefix. An
-// unset field renders as "<no value>", which simply never matches a caller's wanted
-// value.
+// The placeholder is collapsed FIRST, and that one substitution is load-bearing:
+// go-template renders an unset field as "<no value>", which is TWO space-separated tokens,
+// so such a row has three fields and the count check below silently DROPS it. That is not
+// "the value never matches" — an unscheduled Pod has no .spec.nodeName, so it was missing
+// from the parse entirely and the "created" stage could not stamp it until the scheduler
+// had already bound it, which is why creation and binding used to report identical
+// percentiles. One token keeps the row, with a value no caller looks for.
 func batchRows(out, prefix string) map[string]string {
 	rows := map[string]string{}
-	for _, line := range utils.GetNonEmptyLines(out) {
+	for _, line := range utils.GetNonEmptyLines(strings.ReplaceAll(out, "<no value>", "-")) {
 		fields := strings.Fields(line)
 		if len(fields) != 2 || !strings.HasPrefix(fields[0], prefix) {
 			continue
@@ -518,6 +543,14 @@ func batchRows(out, prefix string) map[string]string {
 		rows[fields[0]] = fields[1]
 	}
 	return rows
+}
+
+// podRow splits the composite value the Pods poll asks for into the node the Pod is
+// bound to and its Ready condition. Either half can be empty — an unscheduled Pod has
+// no nodeName (rendered "-", see batchRows) and a fresh one has no conditions.
+func podRow(v string) (node, ready string) {
+	node, ready, _ = strings.Cut(v, "|")
+	return node, ready
 }
 
 // firstSeen keeps the earliest observation of a name; later polls are ignored.
@@ -567,11 +600,16 @@ func reportBatchSync(n int, s syncSamples) {
 		perfDeployName, n)
 	// Not "by the ReplicaSet": that is only true while the batch is a Deployment, and the
 	// stage means the same thing for any workload shape.
+	// Pods first, then the claim ledger, and each group's derived per-object row last: it is
+	// computed from the cumulative ones above it, and unlike them it does not move with how
+	// fast the replicas were created. Ready ends the Pod group because it is the one the
+	// others are only a step toward — this is when the workloads were usable.
 	_, _ = fmt.Fprintf(GinkgoWriter, "  Pods created                         %s\n", stageLine(s.created, n))
-	_, _ = fmt.Fprintf(GinkgoWriter, "  NodeClaims Bound                     %s\n", stageLine(s.claims, n))
 	_, _ = fmt.Fprintf(GinkgoWriter, "  Pods bound to %-22s %s\n", fakeVirtualNode, stageLine(s.bound, n))
-	// The one column that does not move with how fast the replicas were created.
-	_, _ = fmt.Fprintf(GinkgoWriter, "  per-Pod sync (created → bound)       %s\n", spreadLine(s.sync))
+	_, _ = fmt.Fprintf(GinkgoWriter, "  Pods Ready                           %s\n", stageLine(s.ready, n))
+	_, _ = fmt.Fprintf(GinkgoWriter, "  placement (Pod created → bound)      %s\n", spreadLine(s.placement))
+	_, _ = fmt.Fprintf(GinkgoWriter, "  NodeClaims Bound                     %s\n", stageLine(s.claims, n))
+	_, _ = fmt.Fprintf(GinkgoWriter, "  provisioning (NC created → Bound)    %s\n", spreadLine(s.provision))
 	if len(s.bound) == n && s.bound[n-1] > 0 {
 		_, _ = fmt.Fprintf(GinkgoWriter, "  throughput                           %.1f workloads/s\n",
 			float64(n)/s.bound[n-1].Seconds())
@@ -590,24 +628,12 @@ func reportDrain(total, drainTotal time.Duration, d drainSamples) {
 		stageLine(d.podsGone, d.podsKnown))
 	_, _ = fmt.Fprintf(GinkgoWriter, "  NodeClaims gone                      %s\n",
 		stageLine(d.gone, d.known))
-	// The one column here that is not dominated by how fast the virtual kubelet deletes Pods.
-	_, _ = fmt.Fprintf(GinkgoWriter, "  per-claim release (pod → claim gone) %s\n", releaseLine(d))
 	if len(d.gone) > 0 && drainTotal > 0 {
 		_, _ = fmt.Fprintf(GinkgoWriter, "  drain rate                           %.1f claims/s\n",
 			float64(len(d.gone))/drainTotal.Seconds())
 	}
 	// Measured, not summed: see the note on total in benchmarkWorkloadSync.
 	_, _ = fmt.Fprintf(GinkgoWriter, "  total (apply → all claims gone)      %s\n", fmtDuration(total))
-}
-
-// releaseLine is the per-claim spread plus the pairs left out of it, so a run never presents
-// the distribution without saying what is missing from it.
-func releaseLine(d drainSamples) string {
-	line := fmt.Sprintf("%d/%d  %s", len(d.release), d.podsKnown, spreadLine(d.release))
-	if d.releaseOutOfOrder > 0 {
-		line += fmt.Sprintf("  (%d dropped: claim seen gone before its Pod)", d.releaseOutOfOrder)
-	}
-	return line
 }
 
 // stageLine formats one stage: how many got there, and the spread of when.

@@ -130,6 +130,24 @@ const (
 	// This one flows outward — VK writes, operators read.
 	EndpointAnnotation = "nebula.inftyai.com/endpoint"
 
+	// InstanceIDAnnotation carries the provider's id for the external instance backing
+	// this Pod. Written by the virtual kubelet as soon as Provision returns an id — which
+	// is the only place it is ever learned, since VK otherwise holds it in memory — and
+	// never cleared.
+	//
+	// It exists so the NodeClaim controller can record status.InstanceID from the Pod it
+	// has already fetched. Before this it asked the PROVIDER, listing every instance and
+	// matching on claim name, on every reconcile until the id resolved: correct, but a
+	// provider API call per reconcile per claim, which against a real backend means
+	// hundreds of DescribeInstances/list calls for one large batch, into APIs that rate
+	// limit. The id is a fact VK already knows, so it flows outward on the Pod like the
+	// endpoint does rather than being searched for.
+	//
+	// The claim's own copy is still the durable one: teardown runs after the Pod is gone,
+	// so it reads status.InstanceID, falling back to List-by-claim-name when the id never
+	// made it across.
+	InstanceIDAnnotation = "nebula.inftyai.com/instance-id"
+
 	// TerminateInstanceFinalizer is held by every NodeClaim to guarantee teardown. VK
 	// owns the happy path (DeletePod → provider.Terminate), but its teardown is
 	// edge-triggered and its tracking in-memory, so a Pod force-deleted during a VK

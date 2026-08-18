@@ -518,6 +518,61 @@ type tokenRequest struct {
 	} `json:"status"`
 }
 
+// waitForControllerReady blocks until the manager can serve the whole path a new Pod
+// takes: the Deployment reports Available, the mutating webhook carries the CA bundle the
+// manager mints for itself, and the fake provider's virtual node reports Ready.
+//
+// It exists because `make test-perf` filters the suite to the perf label, so the specs that
+// assert the manager came up ("should run successfully", "should have CA injection") never
+// run — and a batch applied against a half-started manager is not a failed run, it is a
+// WRONG one. Both gaps inflate a stage that then reads as Nebula being slow:
+//
+//   - the webhook is failurePolicy=Fail on Pod CREATE, so until pkg/cert has patched its
+//     caBundle from inside the manager, every replica create is REJECTED and the ReplicaSet
+//     retries with backoff. That lands in "Pods creation".
+//   - the Node object exists a moment before the node controller marks it Ready, and while
+//     it is NotReady the node lifecycle controller taints it NoSchedule, so an ungated Pod
+//     cannot bind. That lands in "Pods bound".
+//
+// Waiting on the CONDITION rather than on the pod phase for the first check: Running is
+// true of a manager whose probes have not passed and which has not won leader election, and
+// leader election is what gates every reconcile the benchmark measures.
+func waitForControllerReady() {
+	By("waiting for the controller-manager Deployment to report Available")
+	// By label, not by name, so this does not have to know the kustomize name prefix. An
+	// Eventually over `get` rather than `kubectl wait`, because `wait` on a selector that
+	// matches nothing yet fails outright instead of retrying.
+	Eventually(func(g Gomega) {
+		out, err := utils.Run(exec.Command("kubectl", "get", "deployment",
+			"-l", "control-plane=controller-manager", "-n", namespace,
+			"-o", "go-template={{range .items}}{{range .status.conditions}}"+
+				"{{if eq .type \"Available\"}}{{.status}}{{end}}{{end}}{{end}}"))
+		g.Expect(err).NotTo(HaveOccurred(), "Failed to read the controller-manager Deployment")
+		g.Expect(out).To(Equal("True"), "the controller-manager is not Available yet")
+	}).Should(Succeed())
+
+	By("waiting for the mutating webhook's CA bundle to be injected")
+	Eventually(func(g Gomega) {
+		out, err := utils.Run(exec.Command("kubectl", "get",
+			"mutatingwebhookconfigurations.admissionregistration.k8s.io",
+			"nebula-mutating-webhook-configuration",
+			"-o", "go-template={{range .webhooks}}{{.clientConfig.caBundle}}{{end}}"))
+		g.Expect(err).NotTo(HaveOccurred())
+		// Same threshold as the CA-injection spec: enough to tell a real bundle from an
+		// empty field, without pinning the cert's size.
+		g.Expect(len(out)).To(BeNumerically(">", 10), "the webhook caBundle is not injected yet")
+	}).Should(Succeed())
+
+	By("waiting for the fake provider's virtual node to report Ready")
+	Eventually(func(g Gomega) {
+		out, err := utils.Run(exec.Command("kubectl", "get", "node", fakeVirtualNode,
+			"-o", "go-template={{range .status.conditions}}"+
+				"{{if eq .type \"Ready\"}}{{.status}}{{end}}{{end}}"))
+		g.Expect(err).NotTo(HaveOccurred(), "fake virtual node not registered")
+		g.Expect(out).To(Equal("True"), "fake virtual node registered but not Ready")
+	}).Should(Succeed())
+}
+
 // waitForNodeClaimsGone polls until no NodeClaim is left, reporting whether they
 // drained within timeout. A leftover claim means its terminate finalizer never ran, so
 // the caller must not delete the CRD (it would wedge) and an instance may be leaking.

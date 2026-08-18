@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -71,8 +72,8 @@ const podReasonInitializing = nebulav1alpha1.PodReasonInitializing
 // the served Pod is gone it self-deletes, and its finalizer reclaims the instance (resolve
 // provider → find by claim name via List → Terminate) independent of VK liveness.
 //
-// Self-delete is guarded by placementGracePeriod so cache lag never tears down a live
-// workload.
+// Self-delete is guarded by placementGracePeriod, but only for a claim that has never
+// observed its Pod, so cache lag never tears down a live workload.
 type NodeClaimReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -125,32 +126,30 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if pod != nil {
 		// The workload is present. We do not mirror the Pod's fine-grained runtime
 		// status, but we DO reflect the coarse phase that matters to the ledger.
-		// desiredPhase maps the served Pod onto the claim phase (Terminated /
-		// Terminating / Bound / Provisioning); markPhase persists it (and the instance
-		// id) idempotently. An empty desiredPhase means "hold the current phase, just
-		// keep the id fresh" — the Bound hold (see desiredPhase).
-		return ctrl.Result{}, r.markPhase(ctx, &nc, r.desiredPhase(&nc, pod))
+		// markPhase maps the Pod onto that phase (Terminated / Terminating / Bound /
+		// Provisioning, see desiredPhase) and persists it, together with the instance id
+		// the Pod carries, idempotently.
+		return ctrl.Result{}, r.markPhase(ctx, &nc, pod)
 	}
 
 	// The served Pod is absent. Decide whether this is a real teardown or a
 	// transient cache-lag false-negative.
-	if r.wasBound(&nc) || nc.Status.Phase == nebulav1alpha1.NodeClaimTerminating {
-		// We previously observed the Pod, so its disappearance is real: this is a
-		// teardown (normal delete, or a force-delete during a VK outage). A
-		// Terminating claim counts too — it was set only from a Pod carrying a
-		// DeletionTimestamp, so that Pod provably existed and its disappearance is
-		// the delete completing, not cache lag. Delete the claim so its finalizer
-		// fires the backstop.
+	if nc.Status.Phase != "" {
+		// Any phase proves this controller already saw the Pod alive: markPhase is the only
+		// writer of status.phase and runs only from the pod != nil branch above, while
+		// ensureClaim creates the claim with no status. So this is a real teardown — delete
+		// the claim so its finalizer fires the backstop. Provisioning counts too: waiting
+		// on it delayed every workload deleted while its instance was still booting.
 		log.Info("served Pod is gone after being observed placed; deleting claim to trigger teardown",
-			"pod", nc.Spec.PodRef.Name)
+			"pod", nc.Spec.PodRef.Name, "phase", nc.Status.Phase)
 		return ctrl.Result{}, r.deleteSelf(ctx, &nc)
 	}
 
-	// Never observed the Pod running, and the cached read says it is absent. Since
-	// the claim is always created after its Pod, the Pod exists at the API server;
-	// an "absent" this early is almost certainly the informer cache lagging, not a
-	// real teardown. Wait out the short grace window (a Pod watch re-enqueues us as
-	// soon as the cache catches up) rather than tearing down a live instance.
+	// No phase yet, so the claim has no evidence of its own and the cached read is all
+	// there is. Since the claim is always created after its Pod, the Pod exists at the API
+	// server; an "absent" this early is almost certainly the informer cache lagging, not a
+	// real teardown. Wait out the short grace window (a Pod watch re-enqueues us as soon
+	// as the cache catches up) rather than tearing down a live instance.
 	if age := time.Since(nc.CreationTimestamp.Time); age < placementGracePeriod {
 		return ctrl.Result{RequeueAfter: placementGracePeriod - age}, nil
 	}
@@ -300,20 +299,20 @@ func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *co
 	}
 }
 
-// markPhase persists the claim's coarse phase and best-effort records
-// status.InstanceID, in one idempotent status write. An empty phase means "leave
-// the phase as-is" (the Bound-flap hold, see desiredPhase); the id is still
-// refreshed. The provider id is the one datum that must not be lost — the teardown
-// backstop reclaims the instance by it even if VK (which otherwise holds it only
-// in memory) has died — so it is captured as soon as it resolves, regardless of
-// phase. A no-op (phase unchanged and id already set) writes nothing.
-func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.NodeClaim, phase nebulav1alpha1.NodeClaimPhase) error {
+// markPhase reflects the served Pod into the claim's status: the coarse phase
+// desiredPhase maps it to, plus best-effort status.InstanceID, in one idempotent
+// write. An empty desiredPhase means "leave the phase as-is" (the Bound-flap hold);
+// the id is still refreshed. The provider id is the one datum that must not be lost —
+// the teardown backstop reclaims the instance by it even if VK (which otherwise holds
+// it only in memory) has died — so it is captured as soon as the Pod carries it,
+// regardless of phase. A no-op (phase unchanged and id already set) writes nothing.
+func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) error {
 	changed := false
-	if phase != "" && nc.Status.Phase != phase {
+	if phase := r.desiredPhase(nc, pod); phase != "" && nc.Status.Phase != phase {
 		nc.Status.Phase = phase
 		changed = true
 	}
-	if r.recordInstanceID(ctx, nc) {
+	if recordInstanceID(nc, pod) {
 		changed = true
 	}
 	if !changed {
@@ -322,21 +321,23 @@ func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.
 	return r.patchStatus(ctx, nc)
 }
 
-// recordInstanceID resolves and stores status.InstanceID when it is not already
-// set, returning whether it mutated the claim. Best-effort: an unregistered
-// provider or a List error leaves the id empty (the backstop re-derives it by
-// claim name), so this never fails the caller.
-func (r *NodeClaimReconciler) recordInstanceID(ctx context.Context, nc *nebulav1alpha1.NodeClaim) bool {
-	if nc.Status.InstanceID != "" {
+// recordInstanceID copies the instance id off the served Pod into status.InstanceID when it
+// is not already set, returning whether it mutated the claim.
+//
+// The id comes from the Pod the caller already holds, not from the provider: VK stamps it
+// the moment Provision returns (see InstanceIDAnnotation). Asking the provider instead
+// meant listing every instance and matching on claim name on EVERY reconcile until the id
+// resolved — a remote API call per claim per reconcile, into APIs that rate limit.
+//
+// Best-effort: an absent annotation means the Pod has not been provisioned yet, or the
+// endpoint patch has not landed, so this is a no-op and the Pod watch brings us back when
+// it does. Even if the id never arrives, the teardown backstop re-derives it by claim name.
+func recordInstanceID(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) bool {
+	if nc.Status.InstanceID != "" || pod == nil {
 		return false
 	}
-	prov, ok := r.provider(nc.Spec.Provider)
-	if !ok {
-		return false
-	}
-	claim := util.ClaimName(nc.Spec.PodRef.Namespace, nc.Spec.PodRef.Name)
-	id, err := r.findInstanceID(ctx, prov, claim, "")
-	if err != nil || id == "" {
+	id := pod.Annotations[nebulav1alpha1.InstanceIDAnnotation]
+	if id == "" {
 		return false
 	}
 	nc.Status.InstanceID = id
@@ -400,27 +401,32 @@ func (r *NodeClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&nebulav1alpha1.NodeClaim{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.claimsForPod)).
 		Named("nodeclaim").
+		// One claim per Pod, and the teardown path is the expensive one: per claim a
+		// self-delete, a provider call to reclaim the instance, and a finalizer update,
+		// each a round trip. Serialized, that made drain the slowest stage of the
+		// benchmark by a wide margin (see concurrentReconciles).
+		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).
 		Complete(r)
 }
 
-// claimsForPod maps a Pod event to the NodeClaims that serve it (by PodRef).
-func (r *NodeClaimReconciler) claimsForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+// claimsForPod maps a Pod event to the claim that serves it. The name is DERIVED rather
+// than searched for: util.ClaimName is what ensureClaim named the claim, so the same
+// namespace/name yields the same token, truncate-and-hash case included.
+//
+// This used to List every NodeClaim and filter on PodRef, which cost a full cluster-wide
+// list plus a deep copy per claim on EVERY Pod event — and the poll loop re-emits every
+// tracked pod each tick, so at 500 replicas that was 500 events × 500 copies per tick,
+// all of it in this event-handler goroutine, ahead of the workqueue where extra workers
+// cannot help. Deriving the name is O(1).
+//
+// Reconcile still verifies PodRef and the UID pin, so enqueueing a claim that turns out
+// to name a different Pod incarnation is harmless.
+func (r *NodeClaimReconciler) claimsForPod(_ context.Context, obj client.Object) []reconcile.Request {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return nil
 	}
-	var claims nebulav1alpha1.NodeClaimList
-	if err := r.List(ctx, &claims); err != nil {
-		return nil
-	}
-	var reqs []reconcile.Request
-	for i := range claims.Items {
-		ref := claims.Items[i].Spec.PodRef
-		if ref.Namespace == pod.Namespace && ref.Name == pod.Name {
-			reqs = append(reqs, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: claims.Items[i].Name},
-			})
-		}
-	}
-	return reqs
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Name: util.ClaimName(pod.Namespace, pod.Name)},
+	}}
 }

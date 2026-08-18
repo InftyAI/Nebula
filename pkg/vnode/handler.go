@@ -121,13 +121,16 @@ type trackedPod struct {
 	pod       *corev1.Pod
 	claimName string
 	instance  string
-	// connectEndpoint is the endpoint last patched onto the Pod. notify fires every poll
-	// tick, so this narrows the patch to the ticks where the address actually changed.
+	// patchedMeta is what VK has already patched onto the Pod in the API server. notify
+	// fires every poll tick for the pod's whole life, and the pod it hands us is our own
+	// stamped copy — which always carries these values, so it cannot say whether they ever
+	// reached etcd. This is that answer, narrowing the patch to the ticks where one
+	// actually changed (see persistMetadata).
 	//
 	// A cache, not a record: losing it on a restart costs one redundant patch, never a
-	// lost value, since the annotation lives in etcd. Holds no credential — see
+	// lost value, since the annotations live in etcd. Holds no credential — see
 	// persistCredential.
-	connectEndpoint string
+	patchedMeta podMeta
 
 	// provisionStart is when THIS process began provisioning. It arms the one
 	// metrics.InstanceReadyDuration observation the poll loop makes on the first
@@ -144,6 +147,47 @@ type trackedPod struct {
 	// histogram under-samples the slowest boots. Fixing it means persisting the start
 	// time, a write on the provisioning path we have not taken.
 	provisionStart time.Time
+}
+
+// podMeta is the Pod metadata the virtual kubelet owns: the annotations it is the sole
+// writer of, both flowing outward to readers (operators, the NodeClaim controller) rather
+// than in. Named fields rather than a map keyed by annotation because the set is fixed and
+// small, and the compiler should be the one that knows it.
+//
+// Every field is optional and "" means "VK does not know this yet" — never "clear it". The
+// two are learned independently: a provider that mints an address at create knows both at
+// once, while one whose address only exists after boot learns the id at create and the
+// endpoint from a later poll.
+type podMeta struct {
+	endpoint   string
+	instanceID string
+}
+
+// annotations renders the set fields as a merge-patch body. Unset ones are omitted, so a
+// patch can only ever add or update — the annotations are never cleared from here.
+func (m podMeta) annotations() map[string]string {
+	out := make(map[string]string, 2)
+	if m.endpoint != "" {
+		out[nebulav1alpha1.EndpointAnnotation] = m.endpoint
+	}
+	if m.instanceID != "" {
+		out[nebulav1alpha1.InstanceIDAnnotation] = m.instanceID
+	}
+	return out
+}
+
+// empty reports whether m carries nothing worth writing.
+func (m podMeta) empty() bool { return m.endpoint == "" && m.instanceID == "" }
+
+// minus drops the fields done already holds, leaving only what a patch still has to say.
+func (m podMeta) minus(done podMeta) podMeta {
+	if m.endpoint == done.endpoint {
+		m.endpoint = ""
+	}
+	if m.instanceID == done.instanceID {
+		m.instanceID = ""
+	}
+	return m
 }
 
 // NewHandler builds a Handler for one provider backend. The poll cadence comes from
@@ -278,6 +322,10 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// copy is what the poll loop re-emits. The emit below publishes it, and every later
 	// tick re-offers it until a write lands. No lock: the Pod is not shared until store.
 	setEndpoint(pod, res.ConnectURL)
+	// The id travels the same way and for the same reason: stamped before store so the
+	// tracked copy carries it, published by the emit below, re-offered every tick until a
+	// write lands. Its reader is the NodeClaim controller (see InstanceIDAnnotation).
+	setInstanceID(pod, res.InstanceID)
 	h.store(pod, claim, res.InstanceID, provisionStart)
 
 	// The TOKEN cannot ride the Pod (readable with `get pod`, unencrypted in etcd), so it
@@ -472,13 +520,13 @@ func (h *Handler) GetPods(_ context.Context) ([]*corev1.Pod, error) {
 //
 // We WRAP VK's callback: its status path writes only the /status subresource and
 // silently drops metadata changes on the same object, but the endpoint has to live on
-// metadata (PodIP cannot hold a DNS name — see applyState). So the wrapper writes the
-// access details first, then hands the same Pod to VK. Every status push therefore also
-// reconciles how the workload is reached.
+// metadata (PodIP cannot hold a DNS name — see applyState) and so does the instance id. So
+// the wrapper writes that metadata first, then hands the same Pod to VK. Every status push
+// therefore also reconciles how the workload is reached and which instance backs it.
 func (h *Handler) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	h.mu.Lock()
 	h.notify = func(pod *corev1.Pod) {
-		h.persistEndpoint(ctx, pod)
+		h.persistMetadata(ctx, pod)
 		cb(pod)
 	}
 	h.mu.Unlock()
@@ -564,6 +612,10 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	// Pending). Re-handing the unchanged status is cheap (dedup, no API write) and arms
 	// VK's own drift correction: the dedup sets lastPodStatusUpdateSkipped, so the next
 	// resync notices the API server disagrees and re-issues the write.
+	//
+	// It is NOT free at fleet scale, though: each emit is one rate-limited Enqueue on VK's
+	// status queue, so N tracked pods offer N items per tick and the queue has to be sized
+	// above that (see podQueueRate).
 	if notify != nil {
 		for _, p := range emit {
 			notify(p)
@@ -590,7 +642,7 @@ func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
 }
 
 // setEndpoint stamps a reachable address onto the Pod's annotation — the one assignment
-// site, wherever the address came from. persistEndpoint then patches it to the API
+// site, wherever the address came from. persistMetadata then patches it to the API
 // server (PodIP cannot hold a DNS name — see applyState).
 //
 // Callers, and what each knows:
@@ -607,13 +659,31 @@ func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
 //
 // Callers stamping a tracked pod's own Pod must hold h.mu.
 func setEndpoint(pod *corev1.Pod, endpoint string) {
-	if endpoint == "" || pod.Annotations[nebulav1alpha1.EndpointAnnotation] == endpoint {
+	setAnnotation(pod, nebulav1alpha1.EndpointAnnotation, endpoint)
+}
+
+// setInstanceID stamps the provider's instance id on the Pod. One writer only —
+// CreatePod, the moment Provision returns it — because that is the only place it is
+// learned; the poll loop matches instances by CLAIM NAME and never re-derives the id.
+//
+// It rides the Pod so the NodeClaim controller can record it from an object it already
+// has, instead of asking the provider for a full instance list on every reconcile (see
+// InstanceIDAnnotation). Same never-cleared rule as the endpoint.
+func setInstanceID(pod *corev1.Pod, id string) {
+	setAnnotation(pod, nebulav1alpha1.InstanceIDAnnotation, id)
+}
+
+// setAnnotation writes one annotation on the Pod, ignoring an empty value rather than
+// clearing what is there, and skipping a value already current. Callers stamping a tracked
+// pod's own Pod must hold h.mu.
+func setAnnotation(pod *corev1.Pod, key, value string) {
+	if value == "" || pod.Annotations[key] == value {
 		return
 	}
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
-	pod.Annotations[nebulav1alpha1.EndpointAnnotation] = endpoint
+	pod.Annotations[key] = value
 }
 
 // statusSignature is a compact rendering of the status fields the poll loop reports,
@@ -672,79 +742,88 @@ func (h *Handler) emit(pod *corev1.Pod) {
 	}
 }
 
-// persistEndpoint writes the address on the emitted Pod to the API server — the write
-// half for whichever path stamped it (see setEndpoint). It runs inside the notify wrapper,
-// just before VK's status callback, which would drop this metadata change.
+// persistMetadata writes the annotations VK owns — the address and the instance id — from
+// the emitted Pod to the API server. It is the write half for whichever path stamped them
+// (see setEndpoint, setInstanceID), and runs inside the notify wrapper, just before VK's
+// status callback, which would drop these metadata changes.
 //
-// Because the poll loop re-emits every pod each tick, this is also the retry for any
-// failed patch. It carries no credential — a token is written once on the create path.
+// Both in ONE patch: they are usually stamped together by CreatePod, and a second write per
+// Pod would be a second round trip on the provisioning path for a value that fits beside
+// the first.
+//
+// Because the poll loop re-emits every pod each tick, this is also the retry for any failed
+// patch. It carries no credential — a token is written once on the create path.
 //
 // It runs per pod per tick, so anything unconditional is multiplied by the whole fleet;
 // hence the dedup below.
 //
 // Best-effort: a nil client (tests) is a no-op, and a failure is retried next tick.
-func (h *Handler) persistEndpoint(ctx context.Context, pod *corev1.Pod) {
+func (h *Handler) persistMetadata(ctx context.Context, pod *corev1.Pod) {
 	if h.client == nil {
 		return
 	}
-	endpoint := pod.Annotations[nebulav1alpha1.EndpointAnnotation]
-	if endpoint == "" {
-		return
+
+	want := podMeta{
+		endpoint:   pod.Annotations[nebulav1alpha1.EndpointAnnotation],
+		instanceID: pod.Annotations[nebulav1alpha1.InstanceIDAnnotation],
 	}
 
 	h.mu.Lock()
-	tp, tracked := h.tracked[key(pod.Namespace, pod.Name)]
-	// An untracked pod has nothing to dedup against, so patch unconditionally: the
-	// annotation is the only place the address is published.
-	patched := false
-	if tracked {
-		patched = tp.connectEndpoint == endpoint
+	// An untracked pod has nothing to compare against, so everything it carries is
+	// patched: these annotations are the only place those values reach a reader.
+	if tp, tracked := h.tracked[key(pod.Namespace, pod.Name)]; tracked {
+		want = want.minus(tp.patchedMeta)
 	}
 	h.mu.Unlock()
 
-	if !patched {
-		h.patchEndpoint(ctx, pod, endpoint)
+	if !want.empty() {
+		h.patchMeta(ctx, pod, want)
 	}
 }
 
-// patchEndpoint merge-patches the endpoint annotation onto the Pod metadata, which needs
-// its own write since VK's status callback drops metadata. Scoped to the single
-// annotation, so it does not collide with the status write that follows.
+// patchMeta merge-patches VK's metadata onto the Pod, which needs its own write since VK's
+// status callback drops metadata. Scoped to the annotations want actually carries, so it
+// does not collide with the status write that follows.
 //
-// The ONLY write of this annotation, and persistEndpoint its only caller, so every
-// address — minted at create or observed at boot — reaches etcd through here. It is never
-// called with an empty value, so nothing ever clears it: the annotation is where the
-// address lives for the Pod's life.
+// The ONLY write of these annotations, and persistMetadata its only caller, so every
+// address — minted at create or observed at boot — and every instance id reaches etcd
+// through here. Unset fields are omitted rather than sent empty, so nothing here ever
+// clears a value: the annotations are where those facts live for the Pod's life.
 //
-// connectEndpoint advances only on success, so a failed patch retries next tick. NotFound
-// is ignored — the Pod is gone.
-func (h *Handler) patchEndpoint(ctx context.Context, pod *corev1.Pod, endpoint string) {
+// patchedMeta advances only on success, so a failed patch retries next tick. NotFound is
+// ignored — the Pod is gone.
+func (h *Handler) patchMeta(ctx context.Context, pod *corev1.Pod, want podMeta) {
 	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{
-			"annotations": map[string]string{nebulav1alpha1.EndpointAnnotation: endpoint},
-		},
+		"metadata": map[string]any{"annotations": want.annotations()},
 	})
 	if err != nil {
 		// A fixed-shape map cannot realistically fail to marshal; guard anyway so a future
 		// change surfaces rather than panics.
 		logf.FromContext(ctx).WithName("vnode-handler").Error(err,
-			"marshal endpoint annotation patch", "pod", key(pod.Namespace, pod.Name))
+			"marshal pod annotation patch", "pod", key(pod.Namespace, pod.Name))
 		return
 	}
 	if _, err := h.client.CoreV1().Pods(pod.Namespace).Patch(
 		ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		if !apierrors.IsNotFound(err) {
 			logf.FromContext(ctx).WithName("vnode-handler").Error(err,
-				"persist endpoint annotation; the poll loop retries next tick",
-				"pod", key(pod.Namespace, pod.Name), "endpoint", endpoint)
+				"persist pod annotations; the poll loop retries next tick",
+				"pod", key(pod.Namespace, pod.Name), "endpoint", want.endpoint,
+				"instanceID", want.instanceID)
 		}
-		return // leave connectEndpoint unchanged so the next tick retries
+		return // leave patchedMeta unchanged so the next tick retries
 	}
 
-	// Record success so subsequent ticks skip the patch until the endpoint changes.
+	// Record success so subsequent ticks skip the patch until a value changes. Only the
+	// fields this patch carried: an unset one says nothing about what is already there.
 	h.mu.Lock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		tp.connectEndpoint = endpoint
+		if want.endpoint != "" {
+			tp.patchedMeta.endpoint = want.endpoint
+		}
+		if want.instanceID != "" {
+			tp.patchedMeta.instanceID = want.instanceID
+		}
 	}
 	h.mu.Unlock()
 }

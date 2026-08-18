@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -435,6 +436,9 @@ func (r *PodPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&corev1.Pod{}).
 		Watches(&nebulav1alpha1.NodePool{}, handler.EnqueueRequestsFromMapFunc(r.podsForPool)).
 		Named("pod-placement").
+		// Every opted-in Pod passes through here before the scheduler may touch it, so this
+		// controller's throughput is the fleet's admission rate (see concurrentReconciles).
+		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).
 		Complete(r)
 }
 
