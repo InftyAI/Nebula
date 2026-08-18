@@ -22,6 +22,7 @@ import (
 	"time"
 
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -45,7 +47,54 @@ const informerResync = time.Minute
 // work per pod key, so distinct pods provision in parallel while one key never runs
 // twice — without this, a single slow provision blocks pods that would succeed
 // instantly. Modest, to bound concurrent bursts against a provider's rate limits.
+//
+// Worthless on its own: the workers pull from queues whose ADMISSION is rate limited, so
+// the ceiling is podQueueRate below, not this. See podQueueRateLimiter.
 const podSyncWorkers = 8
+
+// podQueueRate and podQueueBurst size the token bucket that admits work into each of the
+// pod controller's queues.
+//
+// This is the single most important number in this file at fleet scale. VK's default,
+// which applies whenever the config leaves a limiter nil, is
+// workqueue.DefaultControllerRateLimiter(): a bucket of 10 items/s, burst 100, shared by
+// EVERY key in the queue. Every Pod event goes in through the rate-limited Enqueue, so
+// that default caps the whole node's pod pipeline at 10 events/s no matter how many
+// workers run or how much CPU the manager has — and a Pod costs two or three events on
+// its way through (the delete, the terminal status it produces, the final removal), so a
+// batch teardown measured 3.4-6 Pods/s and did not move when the CPU limit doubled.
+//
+// 200/s sustained with a 400 burst is deliberately still a ceiling rather than none: the
+// queues exist to protect the API server from a fleet-sized burst, and each admitted item
+// is a status write. It buys 20x headroom over the default while leaving something in
+// place if a bug ever turns into an emit storm.
+//
+// The floor it has to clear is the poll loop, which re-emits every tracked pod on every
+// tick to keep status propagation level-triggered (see reconcileOnce): N pods on the
+// default 15s cadence offer N/15 items per second all by themselves — 66/s at a thousand
+// pods, which is why the default bucket was permanently saturated at that size.
+const (
+	podQueueRate  = 200
+	podQueueBurst = 400
+)
+
+// podQueueRateLimiter returns the limiter for ONE of the pod controller's queues.
+//
+// A fresh instance per call, never a shared one: the bucket is per limiter, so handing the
+// same value to two queues would make them compete for one budget — the exact coupling
+// (status pushes starving deletes) that makes a stall hard to read.
+//
+// The per-key exponential half is kept exactly as VK's default has it. It only fires after
+// a FAILED sync, and it is what stops one pod whose write keeps erroring from spinning; it
+// was never the throughput limit, so there is nothing to gain by touching it.
+func podQueueRateLimiter() workqueue.RateLimiter {
+	return workqueue.NewTypedMaxOfRateLimiter[any](
+		workqueue.NewTypedItemExponentialFailureRateLimiter[any](5*time.Millisecond, 1000*time.Second),
+		&workqueue.TypedBucketRateLimiter[any]{
+			Limiter: rate.NewLimiter(rate.Limit(podQueueRate), podQueueBurst),
+		},
+	)
+}
 
 // NodeName returns the virtual node name for a provider: "nebula-<provider>".
 // One static node per provider (see docs/architecture.md §3); the scheduler
@@ -146,6 +195,13 @@ func (r *Runner) Start(ctx context.Context) error {
 		SecretInformer:    secretInformer,
 		ConfigMapInformer: configMapInformer,
 		ServiceInformer:   serviceInformer,
+		// All three set EXPLICITLY, because a nil one silently gets a 10 items/s bucket
+		// (see podQueueRateLimiter). Each gets its own limiter so the three cannot starve
+		// each other: work arrives here from Kubernetes, status arrives from the provider,
+		// and the deletes are what a teardown waits on.
+		SyncPodsFromKubernetesRateLimiter:    podQueueRateLimiter(),
+		SyncPodStatusFromProviderRateLimiter: podQueueRateLimiter(),
+		DeletePodsFromKubernetesRateLimiter:  podQueueRateLimiter(),
 	})
 	if err != nil {
 		return fmt.Errorf("build pod controller for %q: %w", r.nodeName, err)

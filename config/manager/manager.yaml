@@ -149,15 +149,25 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
+        # The manager is not a leaf controller: it runs one virtual kubelet per provider,
+        # each with its own pod-sync workers and poll loop, plus the placement and claim
+        # controllers, so its cost scales with the FLEET, not with the number of CRDs. The
+        # kubebuilder default (500m / 128Mi) is a scaffold value — at a few hundred Pods it
+        # is a CFS throttle on the very loops that are supposed to keep up.
+        #
+        # Requests EQUAL limits, which is Guaranteed QoS: no CFS throttling of the sync
+        # loops, and the kubelet evicts this Pod last under node pressure — the manager
+        # going down takes provisioning and teardown with it. The cost is that the whole
+        # amount must be allocatable on one node for the Pod to schedule at all, so a small
+        # dev cluster (Kind on a laptop with a modest Docker VM) may need these lowered.
         # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
         resources:
           limits:
-            cpu: 500m
-            memory: 128Mi
+            cpu: "1"
+            memory: 1Gi
           requests:
-            cpu: 10m
-            memory: 64Mi
+            cpu: "1"
+            memory: 1Gi
         volumeMounts:
           - name: catalog
             mountPath: /etc/nebula/catalog

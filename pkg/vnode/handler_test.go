@@ -622,7 +622,7 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
 	h := NewHandler(fp, client, nil)
 	_ = h.CreatePod(context.Background(), pod)
-	// Register the notify wrapper (this is where persistEndpoint is injected).
+	// Register the notify wrapper (this is where persistMetadata is injected).
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
 
 	fp.list = []provider.Instance{{
@@ -648,6 +648,55 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 	h.reconcileOnce(context.Background())
 	if patches != 1 {
 		t.Fatalf("an unchanged endpoint must not re-patch; got %d patches", patches)
+	}
+}
+
+func TestCreatePod_PersistsInstanceIDAlongsideEndpoint(t *testing.T) {
+	// The instance id is VK's alone — Provision returns it and nothing re-derives it — so
+	// it has to reach the Pod for the NodeClaim controller to record status.InstanceID
+	// without asking the provider for a full instance list on every reconcile.
+	//
+	// It rides the SAME patch as the endpoint: both are known the moment Provision returns
+	// for a provider that mints an address at create, and a second write here would be a
+	// second round trip per Pod on the provisioning path.
+	const url = "https://sb-1.modal.host"
+	pod := testPod("default", "p1")
+	client := fake.NewSimpleClientset(pod)
+
+	var patches int
+	client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		patches++
+		return false, nil, nil // fall through to the tracker so the object updates
+	})
+
+	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: "tok-abc"}
+	h := NewHandler(fp, client, nil)
+	// Wrapper registered BEFORE the create, so the create-path emit is the write.
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get patched pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.InstanceIDAnnotation]; got != "inst-1" {
+		t.Fatalf("instance id annotation = %q, want inst-1", got)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != url {
+		t.Fatalf("endpoint annotation = %q, want %q", got, url)
+	}
+	if patches != 1 {
+		t.Fatalf("endpoint and instance id must ride one patch, got %d patches", patches)
+	}
+
+	// A steady pod is re-emitted every tick with both values unchanged: no further write.
+	fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning}}
+	h.reconcileOnce(context.Background())
+	if patches != 1 {
+		t.Fatalf("unchanged metadata must not re-patch; got %d patches", patches)
 	}
 }
 
@@ -895,7 +944,7 @@ func TestReconcileOnce_EmptyObservedEndpointDoesNotClearAnnotation(t *testing.T)
 // A create-time URL comes from the provider ONCE and is never re-observed (Modal
 // reports no endpoint on the read path), so a failed patch cannot be recovered from the
 // provider. It is recovered from the tracked Pod instead: CreatePod stamps the address
-// there, and every poll tick re-emits it, so persistEndpoint keeps patching until one
+// there, and every poll tick re-emits it, so persistMetadata keeps patching until one
 // write lands — then dedups. Without that, one transient 500 at create leaves the
 // workload permanently unreachable.
 func TestCreatePod_FailedEndpointPatchIsRetriedByPollLoop(t *testing.T) {
