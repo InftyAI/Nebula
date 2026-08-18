@@ -1299,3 +1299,54 @@ func TestMergeStreams_TeardownIsNotAFailure(t *testing.T) {
 	}
 	_ = rc.Close()
 }
+
+// TestProvision_UsesResolvedEnv pins the env contract here: the request's resolved map is the
+// whole environment, and the Pod's own env is not read — it holds references this adapter
+// cannot follow, so a caller that does not resolve gets nothing rather than half a workload.
+func TestProvision_UsesResolvedEnv(t *testing.T) {
+	f := &fakeClient{createID: "sb-env"}
+	p := newTestProvider(f)
+	pod := gpuPod("claim-env", "H100", 1) // carries FOO=bar literally
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TOKEN", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "sec"}, Key: "K"},
+		}})
+
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-env",
+		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.Env; got["FOO"] != "bar" || got["TOKEN"] != "t0ken" || len(got) != 2 {
+		t.Fatalf("spec env = %v, want FOO=bar TOKEN=t0ken", got)
+	}
+
+	// No resolved map: nothing is set, even though the Pod carries FOO=bar literally. A fresh
+	// client, because Provision is idempotent on ClaimName and would otherwise adopt the
+	// sandbox above instead of creating one.
+	f = &fakeClient{createID: "sb-env-2"}
+	p = newTestProvider(f)
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-env",
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.Env; len(got) != 0 {
+		t.Fatalf("spec env = %v, want empty: the Pod's env is not a source here", got)
+	}
+}
+
+// TestSandboxSpec_StringRedactsEnv is the guard on the leak: the spec now carries Secret
+// values, so any %v of it — a log line, an error wrap — must print key names only.
+func TestSandboxSpec_StringRedactsEnv(t *testing.T) {
+	spec := SandboxSpec{Image: "img", Env: map[string]string{"TOKEN": "t0ken", "FOO": "bar"}}
+	got := fmt.Sprintf("%v %s %#v", spec, spec, spec)
+	if strings.Contains(got, "t0ken") || strings.Contains(got, "bar") {
+		t.Fatalf("spec rendering leaked a value: %s", got)
+	}
+	if !strings.Contains(got, "TOKEN") || !strings.Contains(got, "FOO") {
+		t.Fatalf("expected key names to survive redaction: %s", got)
+	}
+}

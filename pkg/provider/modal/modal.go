@@ -110,7 +110,11 @@ type SandboxSpec struct {
 	Image string
 	// Command is the container command+args, from the Pod.
 	Command []string
-	// Env is the environment, flattened from the Pod's container env.
+	// Env is the environment, taken whole from provider.ProvisionRequest.Env: literals plus
+	// everything envFrom/valueFrom referenced, already resolved by the caller.
+	//
+	// SECRET-BEARING, hence the redacting String below. Needs no Modal Secret of its own —
+	// the SDK hydrates it into an ephemeral server-side one (mergeEnvIntoSecrets).
 	Env map[string]string
 	// GPU is Modal's accelerator identifier (e.g. "H100", "A100-80GB"), or ""
 	// for a CPU-only sandbox.
@@ -159,6 +163,19 @@ type SandboxSpec struct {
 	// We only ever pass a user-supplied probe; the adapter never fabricates one.
 	ReadinessProbe *corev1.Probe
 }
+
+// String redacts Env so a spec can be logged or wrapped in an error safely: key names print
+// (they are in the Pod spec already), values never do. The probe renders as set/unset — it is
+// a pointer, so %v would print an address, and only its presence matters.
+func (s SandboxSpec) String() string {
+	return fmt.Sprintf("SandboxSpec{Image:%s Command:%v Env:%s GPU:%s GPUCount:%d CPU:%g "+
+		"MemoryMiB:%d Ports:%v Regions:%v Timeout:%s Tags:%v ReadinessProbe:%t}",
+		s.Image, s.Command, provider.RedactedEnv(s.Env), s.GPU, s.GPUCount, s.CPU,
+		s.MemoryMiB, s.Ports, s.Regions, s.Timeout, s.Tags, s.ReadinessProbe != nil)
+}
+
+// GoString implements fmt.GoStringer so %#v is redacted too.
+func (s SandboxSpec) GoString() string { return s.String() }
 
 // Sandbox is the adapter-level view of a Modal sandbox as observed.
 //
@@ -456,15 +473,6 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 	}
 	c := pod.Spec.Containers[0]
 
-	env := make(map[string]string, len(c.Env))
-	for _, e := range c.Env {
-		// ValueFrom (secrets/configmaps) is not resolved here; the real Client
-		// wiring must project those. Plain values are copied through.
-		if e.ValueFrom == nil {
-			env[e.Name] = e.Value
-		}
-	}
-
 	tags := map[string]string{ClaimTagKey: req.ClaimName}
 	// Record probe-ness alongside identity so observe can recover it later; see
 	// ProbeTagKey for why this cannot be re-derived at observation time. The tag
@@ -477,9 +485,13 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 	}
 
 	spec := SandboxSpec{
-		Image:     c.Image,
-		Command:   append(append([]string{}, c.Command...), c.Args...),
-		Env:       env,
+		Image:   c.Image,
+		Command: append(append([]string{}, c.Command...), c.Args...),
+		// The caller's resolved map is the whole environment — the Pod's literals plus
+		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
+		// here: it holds references this adapter has no cluster access to follow. See
+		// provider.ProvisionRequest.Env.
+		Env:       req.Env,
 		CPU:       cpuCores(&c),
 		MemoryMiB: memoryMiB(&c),
 		Ports:     containerPorts(&c),

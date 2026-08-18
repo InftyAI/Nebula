@@ -35,6 +35,7 @@ const (
 	reasonInitializing    = nebulav1alpha1.PodReasonInitializing
 	reasonRunning         = nebulav1alpha1.PodReasonRunning
 	reasonProvisionFailed = nebulav1alpha1.PodReasonProvisionFailed
+	reasonConfigError     = nebulav1alpha1.PodReasonConfigError
 	reasonFailed          = nebulav1alpha1.PodReasonFailed
 	reasonTerminated      = nebulav1alpha1.PodReasonTerminated
 )
