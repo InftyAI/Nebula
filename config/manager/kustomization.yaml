@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: inftyai/nebula-controller
-  newTag: 0818-02
+  newTag: latest

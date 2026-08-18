@@ -7,13 +7,13 @@ metadata:
 spec:
   # strategy (the inner, provider-ranking axis).
   providers:
-  # - name: aws
-  #   regions:
-  #   - us
-  #   - eu
-  #   - ap
-  #   - ca-central-1
-  #   - sa-east-1
+  - name: aws
+    regions:
+    - us
+    - eu
+    - ap
+    - ca-central-1
+    - sa-east-1
   - name: modal
     regions:
     - us

@@ -87,7 +87,10 @@ const (
 // The per-key exponential half is kept exactly as VK's default has it. It only fires after
 // a FAILED sync, and it is what stops one pod whose write keeps erroring from spinning; it
 // was never the throughput limit, so there is nothing to gain by touching it.
-func podQueueRateLimiter() workqueue.RateLimiter {
+// The TYPED interface, though VK's config field is the untyped workqueue.RateLimiter:
+// client-go 0.33 deprecates the latter, and since it is defined as TypedRateLimiter[any] the
+// value returned here still assigns to that field.
+func podQueueRateLimiter() workqueue.TypedRateLimiter[any] {
 	return workqueue.NewTypedMaxOfRateLimiter[any](
 		workqueue.NewTypedItemExponentialFailureRateLimiter[any](5*time.Millisecond, 1000*time.Second),
 		&workqueue.TypedBucketRateLimiter[any]{
