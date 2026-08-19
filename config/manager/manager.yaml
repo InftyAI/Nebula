@@ -128,6 +128,11 @@ spec:
         # portable — requiring it would break logs on managed control planes. So
         # anything able to reach this port can read any Nebula pod's logs: restrict it
         # with a NetworkPolicy, or set --kubelet-client-ca to require mTLS.
+        #
+        # The self-signed cert is only accepted by an API server that does not verify it.
+        # If logs fail with "certificate signed by unknown authority", the control plane
+        # sets --kubelet-certificate-authority: add --kubelet-serving-csr and uncomment
+        # kubelet_serving_role.yaml in config/rbac/kustomization.yaml.
         - name: kubelet-api
           containerPort: 10250
           protocol: TCP

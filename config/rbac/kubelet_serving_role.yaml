@@ -1,0 +1,46 @@
+# Opt-in RBAC for --kubelet-serving-csr. Not generated from kubebuilder markers and not
+# applied by default, on purpose: `approve` on the kubelet-serving signer lets the holder
+# obtain a serving certificate for ANY node's kubelet endpoint, so granting it has to be a
+# deliberate act.
+#
+# Needed only where the API server runs with --kubelet-certificate-authority, which makes
+# it verify the certificate the kubelet API presents. Without these rules the manager logs
+# the failure and serves a self-signed certificate, which such an API server rejects — so
+# `kubectl logs` and `kubectl exec` on Nebula pods keep failing.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: nebula
+    app.kubernetes.io/managed-by: kustomize
+  name: kubelet-serving-role
+rules:
+# No update: the request is immutable once created, and a stale one (previous pod IP) is
+# replaced by delete-then-create.
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - certificatesigningrequests
+  verbs:
+  - get
+  - create
+  - delete
+# kube-controller-manager auto-approves node CLIENT certificates only, never serving ones,
+# because an approver cannot verify that a requester owns the SANs it asks for. This is the
+# manager asserting that about itself.
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - certificatesigningrequests/approval
+  verbs:
+  - update
+# Approval is scoped to one signer: it authorizes nothing about client certificates, which
+# are identities the API server would authenticate.
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - signers
+  resourceNames:
+  - kubernetes.io/kubelet-serving
+  verbs:
+  - approve
