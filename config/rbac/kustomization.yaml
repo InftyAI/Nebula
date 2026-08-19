@@ -9,6 +9,12 @@ resources:
 - role_binding.yaml
 - leader_election_role.yaml
 - leader_election_role_binding.yaml
+# Uncomment these two together with the manager's --kubelet-serving-csr flag, which is
+# needed when the API server runs with --kubelet-certificate-authority. Left out by
+# default because approving on the kubelet-serving signer is a privileged grant — see
+# kubelet_serving_role.yaml.
+#- kubelet_serving_role.yaml
+#- kubelet_serving_role_binding.yaml
 # The following RBAC configurations are used to protect
 # the metrics endpoint with authn/authz. These configurations
 # ensure that only authorized users and service accounts
