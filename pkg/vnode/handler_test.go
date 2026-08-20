@@ -1320,3 +1320,57 @@ func TestGetPods_ReturnsTracked(t *testing.T) {
 		t.Fatalf("expected 2 tracked pods, got %d", len(pods))
 	}
 }
+
+// TestCreatePod_ReadsEgressPolicyFromAnnotations covers the second half of the pinning
+// decision behind EgressAnnotation: the handler never reads the NodePool, so if it does not
+// reconstruct the policy from these annotations the adapter gets nil and provisions a
+// workload with open egress under a pool that asked for containment.
+func TestCreatePod_ReadsEgressPolicyFromAnnotations(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		wantMode    nebulav1alpha1.EgressMode
+		wantTargets []string
+	}{{
+		// Absence is Open, which is what every Pod placed by a pool without the field
+		// carries — so nil here must not be mistaken for a missing value.
+		name:        "no annotation is Open",
+		annotations: nil,
+		wantMode:    nebulav1alpha1.EgressOpen,
+	}, {
+		name:        "blocked needs no targets",
+		annotations: map[string]string{nebulav1alpha1.EgressAnnotation: string(nebulav1alpha1.EgressBlocked)},
+		wantMode:    nebulav1alpha1.EgressBlocked,
+	}, {
+		name: "target entries are split back out",
+		annotations: map[string]string{
+			nebulav1alpha1.EgressAnnotation:        string(nebulav1alpha1.EgressAllowlist),
+			nebulav1alpha1.EgressTargetsAnnotation: "10.0.0.0/8,*.huggingface.co",
+		},
+		wantMode:    nebulav1alpha1.EgressAllowlist,
+		wantTargets: []string{"10.0.0.0/8", "*.huggingface.co"},
+	}, {
+		// The mode is authoritative: a list with no mode cannot narrow anything on its
+		// own, so it is ignored rather than treated as an implicit Allowlist.
+		name:        "targets without a mode are ignored",
+		annotations: map[string]string{nebulav1alpha1.EgressTargetsAnnotation: "10.0.0.0/8"},
+		wantMode:    nebulav1alpha1.EgressOpen,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeProvider{provisionID: "inst-1"}
+			h := NewHandler(fp, nil, nil)
+			pod := testPod("default", "p1")
+			pod.Annotations = tc.annotations
+
+			if err := h.CreatePod(context.Background(), pod); err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			if got := fp.lastReq.Egress.ModeOrOpen(); got != tc.wantMode {
+				t.Errorf("req.Egress mode = %q, want %q", got, tc.wantMode)
+			}
+			if got := fp.lastReq.Egress.GetTargets(); !slices.Equal(got, tc.wantTargets) {
+				t.Errorf("req.Egress allow = %v, want %v", got, tc.wantTargets)
+			}
+		})
+	}
+}

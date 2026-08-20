@@ -94,6 +94,40 @@ spec:
                   type: string
                 minItems: 1
                 type: array
+              egress:
+                description: |-
+                  Egress restricts OUTBOUND connections from this pool's workloads; omitted means
+                  Open. Inbound is never affected — a Blocked sandbox still serves its consumer's
+                  tunnel and connect token, it just cannot call out.
+                properties:
+                  mode:
+                    description: |-
+                      Mode is required once spec.egress is set, so a half-written policy is rejected
+                      rather than defaulted into a weaker one.
+                    enum:
+                    - Open
+                    - Blocked
+                    - Allowlist
+                    type: string
+                  targets:
+                    description: |-
+                      Targets is what mode Allowlist permits: CIDRs, bare IPs and domain names with an
+                      optional wildcard, mixed in one list, e.g. ["10.0.0.0/8", "*.huggingface.co"].
+                    items:
+                      maxLength: 253
+                      type: string
+                    maxItems: 64
+                    type: array
+                required:
+                - mode
+                type: object
+                x-kubernetes-validations:
+                - message: targets is only valid with mode Allowlist
+                  rule: self.mode == 'Allowlist' || !has(self.targets)
+                - message: mode Allowlist requires at least one target; use mode Blocked
+                    to permit nothing
+                  rule: self.mode != 'Allowlist' || (has(self.targets) && self.targets.size()
+                    > 0)
               failover:
                 description: |-
                   Failover controls how a provider that fails at provision time (e.g.

@@ -69,6 +69,65 @@ type NodePoolSpec struct {
 	// RunPod reports no capacity) is temporarily excluded and re-tried.
 	// +optional
 	Failover *FailoverPolicy `json:"failover,omitempty"`
+
+	// Egress restricts OUTBOUND connections from this pool's workloads; omitted means
+	// Open. Inbound is never affected — a Blocked sandbox still serves its consumer's
+	// tunnel and connect token, it just cannot call out.
+	//
+	// +optional
+	Egress *EgressPolicy `json:"egress,omitempty"`
+}
+
+// EgressPolicy is a pool's outbound network policy. The rules below keep Blocked and
+// Allowlist disjoint, so "no egress" has one spelling instead of three.
+// +kubebuilder:validation:XValidation:rule="self.mode == 'Allowlist' || !has(self.targets)",message="targets is only valid with mode Allowlist"
+// +kubebuilder:validation:XValidation:rule="self.mode != 'Allowlist' || (has(self.targets) && self.targets.size() > 0)",message="mode Allowlist requires at least one target; use mode Blocked to permit nothing"
+type EgressPolicy struct {
+	// Mode is required once spec.egress is set, so a half-written policy is rejected
+	// rather than defaulted into a weaker one.
+	Mode EgressMode `json:"mode"`
+
+	// Targets is what mode Allowlist permits: CIDRs, bare IPs and domain names with an
+	// optional wildcard, mixed in one list, e.g. ["10.0.0.0/8", "*.huggingface.co"].
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=253
+	Targets []string `json:"targets,omitempty"`
+}
+
+// EgressMode is how a pool treats outbound traffic. No mode restricts inbound.
+// +kubebuilder:validation:Enum=Open;Blocked;Allowlist
+type EgressMode string
+
+const (
+	// EgressOpen places no restriction, and is what an omitted spec.egress means.
+	EgressOpen EgressMode = "Open"
+	// EgressBlocked permits no outbound connection at all.
+	EgressBlocked EgressMode = "Blocked"
+	// EgressAllowlist permits EgressPolicy.Targets and nothing else.
+	EgressAllowlist EgressMode = "Allowlist"
+)
+
+// ModeOrOpen reads a nil policy as Open, since an omitted spec.egress and an explicit
+// Open are the same thing and no caller should nil-check for it.
+func (p *EgressPolicy) ModeOrOpen() EgressMode {
+	if p == nil || p.Mode == "" {
+		return EgressOpen
+	}
+	return p.Mode
+}
+
+// GetTargets reads Targets off a possibly-nil policy, for the same reason as ModeOrOpen.
+func (p *EgressPolicy) GetTargets() []string {
+	if p == nil {
+		return nil
+	}
+	return p.Targets
+}
+
+// RestrictsEgress reports whether the policy needs a provider to enforce anything.
+func (p *EgressPolicy) RestrictsEgress() bool {
+	return p.ModeOrOpen() != EgressOpen
 }
 
 // ProviderSpec is one provider's entry in a pool: which provider, and the

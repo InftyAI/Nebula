@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"hash/fnv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -116,10 +117,16 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
 			}
-			if !servesCapacity(prov, tier) {
+			if !servesCapacityTier(prov, tier) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipCapacityUnsupported)
 				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
 					"provider", ref.Name, "capacityType", tier)
+				continue
+			}
+			if !servesEgress(prov, pool.Spec.Egress) {
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipEgressUnsupported)
+				log.V(1).Info("skipping candidate: provider cannot enforce the pool's egress policy",
+					"provider", ref.Name, "egressMode", pool.Spec.Egress.ModeOrOpen())
 				continue
 			}
 			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
@@ -205,7 +212,7 @@ func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType 
 	return pool.Spec.CapacityTypes
 }
 
-// servesCapacity reports whether prov can deliver the candidate's capacity tier. Only Spot
+// servesCapacityTier reports whether prov can deliver the candidate's capacity tier. Only Spot
 // is ever refused: an OnDemand-only provider (Modal) has no interruptible tier, so placing a
 // Spot candidate there would stamp CapacityType=Spot on the Pod, hand it to an adapter that
 // drops the field, and bill OnDemand rates for capacity the user asked to be cheap — with no
@@ -214,11 +221,25 @@ func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType 
 // leaves the Pod visibly unplaceable rather than quietly overcharged.
 //
 // The empty tier is "the provider's default", which every provider serves, so it passes.
-func servesCapacity(prov provider.Provider, tier nebulav1alpha1.CapacityType) bool {
+func servesCapacityTier(prov provider.Provider, tier nebulav1alpha1.CapacityType) bool {
 	if tier != nebulav1alpha1.CapacitySpot {
 		return true
 	}
 	return prov.Capabilities().SupportsSpot
+}
+
+// servesEgress reports whether prov can enforce the pool's egress policy. Open needs no
+// enforcement, so every provider serves it; anything else needs SupportsEgressPolicy.
+//
+// Same reasoning as servesCapacity, and load-bearing for a different reason: a provider
+// that drops the field would put the workload on the open internet while the pool claims
+// containment. Skipping makes that visible — an AWS-only pool asking for Blocked leaves the
+// Pod unplaceable instead of silently unprotected.
+func servesEgress(prov provider.Provider, policy *nebulav1alpha1.EgressPolicy) bool {
+	if !policy.RestrictsEgress() {
+		return true
+	}
+	return prov.Capabilities().SupportsEgressPolicy
 }
 
 // regionsFor is the inner axis for one provider ref: the concrete regions to try, in
@@ -357,6 +378,15 @@ func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, poo
 	// policy value; an unset policy leaves the handler on its own default.
 	if pool.Spec.Failover != nil && pool.Spec.Failover.BlocklistTTL.Duration > 0 {
 		setAnnotation(pod, nebulav1alpha1.BlocklistTTLAnnotation, pool.Spec.Failover.BlocklistTTL.Duration.String())
+	}
+	// Same for the egress policy. Stamped only when it restricts something: the absence of
+	// the annotation IS Open, and selectPlacement has already ensured p.provider can enforce
+	// whatever is written here.
+	if pool.Spec.Egress.RestrictsEgress() {
+		setAnnotation(pod, nebulav1alpha1.EgressAnnotation, string(pool.Spec.Egress.ModeOrOpen()))
+		if len(pool.Spec.Egress.Targets) > 0 {
+			setAnnotation(pod, nebulav1alpha1.EgressTargetsAnnotation, strings.Join(pool.Spec.Egress.Targets, ","))
+		}
 	}
 
 	// Remove our gate, releasing the Pod to the scheduler. Preserve any other

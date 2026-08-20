@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -228,6 +229,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		ClaimName:    claim,
 		CapacityType: nebulav1alpha1.CapacityType(pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation]),
 		Region:       pod.Annotations[nebulav1alpha1.RegionAnnotation],
+		Egress:       egressFromPod(pod),
 	}
 
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
@@ -989,6 +991,28 @@ func blocklistTTL(pod *corev1.Pod) time.Duration {
 		return defaultBlocklistTTL
 	}
 	return d
+}
+
+// egressFromPod reads the pool's egress policy off the annotations placement stamped. nil
+// (no annotation) means Open, which is what every pool that never set the field gets.
+//
+// The mode is taken verbatim rather than validated against the enum: admission already
+// rejected anything else, and an unknown value must not silently become Open — the adapter
+// fails the Provision instead, which is the safe direction for a containment policy.
+func egressFromPod(pod *corev1.Pod) *nebulav1alpha1.EgressPolicy {
+	mode := pod.Annotations[nebulav1alpha1.EgressAnnotation]
+	if mode == "" {
+		return nil
+	}
+	policy := &nebulav1alpha1.EgressPolicy{Mode: nebulav1alpha1.EgressMode(mode)}
+	if raw := pod.Annotations[nebulav1alpha1.EgressTargetsAnnotation]; raw != "" {
+		for _, e := range strings.Split(raw, ",") {
+			if e = strings.TrimSpace(e); e != "" {
+				policy.Targets = append(policy.Targets, e)
+			}
+		}
+	}
+	return policy
 }
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }

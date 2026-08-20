@@ -32,8 +32,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 // sdkClient is the real Client, backed by Modal's official Go SDK (beta). Every
@@ -123,6 +125,11 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		return "", Credential{}, fmt.Errorf("modal: readiness probe: %w", err)
 	}
 
+	outCIDRs, outDomains, err := outboundAllowlists(spec)
+	if err != nil {
+		return "", Credential{}, err
+	}
+
 	sb, err := c.mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 		Command: spec.Command,
 		// Env is the whole environment, including values resolved from this cluster's
@@ -136,10 +143,17 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		EncryptedPorts: spec.Ports,
 		// Nil leaves Modal's SchedulerPlacement unset entirely (the SDK only builds one
 		// when Regions is non-empty), which is the unconstrained, un-multiplied case.
-		Regions:        spec.Regions,
-		Timeout:        spec.Timeout,
-		Tags:           spec.Tags,
-		ReadinessProbe: probe,
+		Regions: spec.Regions,
+		// Egress policy. Non-nil selects Modal's ALLOWLIST mode and the entries are then the
+		// complete permitted set, so an empty pair blocks all outbound traffic; nil leaves
+		// the sandbox OPEN. Both are set together whenever either is, because
+		// UpdateNetworkPolicy requires both and a later policy change should need no
+		// reshaping here.
+		OutboundCIDRAllowlist:   outCIDRs,
+		OutboundDomainAllowlist: outDomains,
+		Timeout:                 spec.Timeout,
+		Tags:                    spec.Tags,
+		ReadinessProbe:          probe,
 	})
 	if err != nil {
 		return "", Credential{}, err
@@ -703,6 +717,26 @@ func (c *sdkClient) forgetReady(id string) {
 	defer c.readyMu.Unlock()
 	delete(c.ready, id)
 	delete(c.waiting, id)
+}
+
+// outboundAllowlists renders the spec's egress policy as Modal's two outbound allowlists.
+// Both nil means OPEN. Both non-nil selects ALLOWLIST, where the entries are the COMPLETE
+// permitted set — so the empty pair is what blocks everything, and nil vs empty is the whole
+// signal (see SandboxCreateParams.OutboundCIDRAllowlist).
+//
+// An unrecognized mode fails the Provision rather than defaulting to open.
+func outboundAllowlists(spec SandboxSpec) (cidrs, domains *modal.Allowlist, err error) {
+	switch spec.EgressMode {
+	case "", nebulav1alpha1.EgressOpen:
+		return nil, nil, nil
+	case nebulav1alpha1.EgressBlocked:
+		return &modal.Allowlist{}, &modal.Allowlist{}, nil
+	case nebulav1alpha1.EgressAllowlist:
+		c, d := util.SplitEgressTargets(spec.EgressTargets)
+		return &modal.Allowlist{Entries: c}, &modal.Allowlist{Entries: d}, nil
+	default:
+		return nil, nil, fmt.Errorf("modal: unsupported egress mode %q", spec.EgressMode)
+	}
 }
 
 // gpuReservation renders Modal's GPU reservation string. Modal expresses count

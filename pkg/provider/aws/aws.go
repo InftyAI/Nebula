@@ -390,12 +390,16 @@ func (p *Provider) clientFor(ctx context.Context, region string) (Client, error)
 // trait is set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:     true,             // EC2 instances stop/start
-		SupportsSpot:     true,             // real interruptible tier
-		NativeTags:       true,             // EC2 tags carry identity
-		PreemptionNotice: preemptionNotice, // Spot 2-minute warning
-		PollInterval:     spotPollInterval, // Spot reclaims are abrupt; poll faster than default
-		ProvisionTimeout: provisionTimeout, // caps the per-zone capacity failover loop
+		SupportsStop: true, // EC2 instances stop/start
+		SupportsSpot: true, // real interruptible tier
+		// Instances launch into the default VPC, whose security group allows all egress and
+		// which routes to an internet gateway. Enforcing a pool's policy means managing SG
+		// egress rules (and no NAT for the Blocked case), so it is unsupported until then.
+		SupportsEgressPolicy: false,
+		NativeTags:           true,             // EC2 tags carry identity
+		PreemptionNotice:     preemptionNotice, // Spot 2-minute warning
+		PollInterval:         spotPollInterval, // Spot reclaims are abrupt; poll faster than default
+		ProvisionTimeout:     provisionTimeout, // caps the per-zone capacity failover loop
 	}
 }
 
