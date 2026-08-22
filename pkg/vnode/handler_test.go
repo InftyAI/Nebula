@@ -52,17 +52,18 @@ type fakeProvider struct {
 	provisionReserved bool
 	// provisionURL/provisionToken are the connect credential Provision returns — the
 	// one-shot value the handler must persist, since it can never be re-read.
-	provisionURL   string
-	provisionToken string
-	provisionErr   error
-	provisionCnt   int
-	lastReq        provider.ProvisionRequest
-	terminateCnt   int
-	terminateID    string
-	terminateErr   error
-	list           []provider.Instance
-	listErr        error
-	capabilities   provider.Capabilities
+	provisionURL    string
+	provisionToken  string
+	provisionErr    error
+	provisionCnt    int
+	lastReq         provider.ProvisionRequest
+	terminateCnt    int
+	terminateID     string
+	terminateRegion string
+	terminateErr    error
+	list            []provider.Instance
+	listErr         error
+	capabilities    provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
 	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
 	// record what the handler passed in, so a test can assert it resolved them off the
@@ -109,11 +110,12 @@ func (f *fakeProvider) Provision(
 	}, nil
 }
 
-func (f *fakeProvider) Terminate(_ context.Context, id string) error {
+func (f *fakeProvider) Terminate(_ context.Context, id, region string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.terminateCnt++
 	f.terminateID = id
+	f.terminateRegion = region
 	return f.terminateErr
 }
 
@@ -659,6 +661,56 @@ func TestDeletePod_Idempotent(t *testing.T) {
 	// idempotent and there is no longer a tracked instance id.
 	if err := h.DeletePod(context.Background(), pod); err != nil {
 		t.Fatalf("second DeletePod: %v", err)
+	}
+}
+
+// Teardown must name the region the instance was provisioned in: on a region-partitioned
+// provider the id alone does not say which endpoint owns the instance. For a pod this
+// process provisioned, that comes from the tracked placement — no re-read of the claim,
+// which by then may already be deleted (the claim controller races the Pod's deletion).
+func TestDeletePod_TerminatesInTheProvisionedRegion(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	cluster := clusterWithPlacement(nebulav1alpha1.CapacitySpot, "eu-west-1")
+	h := NewHandler(fp, nil, nil, cluster)
+	pod := testPod("default", "p1")
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	reads := cluster.claimCalls
+	if err := h.DeletePod(context.Background(), pod); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	if fp.terminateRegion != "eu-west-1" {
+		t.Fatalf("terminate region = %q, want eu-west-1", fp.terminateRegion)
+	}
+	if cluster.claimCalls != reads {
+		t.Fatalf("claim reads = %d, want %d (the tracked region is enough)", cluster.claimCalls, reads)
+	}
+}
+
+// A pod re-adopted after a restart lost the tracked region with the process, so teardown
+// reads it back off the NodeClaim — the durable record. Without it the provider would have
+// to search for the instance, which can silently miss (see provider.Terminate).
+func TestDeletePod_ReAdoptedPodReadsRegionFromClaim(t *testing.T) {
+	fp := &fakeProvider{list: []provider.Instance{{
+		ID: "inst-9", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}}
+	h := NewHandler(fp, nil, nil, clusterWithPlacement(nebulav1alpha1.CapacitySpot, "ap-south-1"))
+	pod := testPod("default", "p1")
+
+	// Cold map: GetPod re-adopts the live instance, with no placement to inherit.
+	if _, err := h.GetPod(context.Background(), "default", "p1"); err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if err := h.DeletePod(context.Background(), pod); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	if fp.terminateID != "inst-9" {
+		t.Fatalf("terminate id = %q, want inst-9", fp.terminateID)
+	}
+	if fp.terminateRegion != "ap-south-1" {
+		t.Fatalf("terminate region = %q, want ap-south-1 (read from the claim)", fp.terminateRegion)
 	}
 }
 

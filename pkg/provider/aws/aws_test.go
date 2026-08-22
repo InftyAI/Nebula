@@ -478,34 +478,50 @@ func TestTerminate_Idempotent(t *testing.T) {
 	p := newTestProvider(f)
 
 	// Empty id: nothing was provisioned; treat as already gone (no client call).
-	if err := p.Terminate(context.Background(), ""); err != nil {
+	if err := p.Terminate(context.Background(), "", testRegion); err != nil {
 		t.Fatalf("Terminate(\"\"): %v", err)
 	}
 	if len(f.terminated) != 0 {
 		t.Fatalf("Terminate(\"\") called client, want no-op")
 	}
-	// A raw EC2 id: Terminate sweeps regions, confirms the instance lives in one, and
-	// terminates it there.
-	if err := p.Terminate(context.Background(), "i-1"); err != nil {
+	// With a region: straight to that region's client.
+	if err := p.Terminate(context.Background(), "i-1", testRegion); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}
 	if len(f.terminated) != 1 || f.terminated[0] != "i-1" {
 		t.Fatalf("terminated = %v, want [i-1]", f.terminated)
 	}
+	// Without one: sweep the regions, confirm the instance lives in one, terminate there.
+	if err := p.Terminate(context.Background(), "i-1", ""); err != nil {
+		t.Fatalf("Terminate(no region): %v", err)
+	}
+	if len(f.terminated) != 2 {
+		t.Fatalf("terminated = %v, want a second [i-1] from the sweep", f.terminated)
+	}
 }
 
-// TestTerminate_LegacyQualifiedID covers the back-compat path: an id persisted in the
-// old "<region>/i-..." form (before the id stopped being region-qualified) still
-// routes straight to that region and terminates the raw id, no sweep needed.
-func TestTerminate_LegacyQualifiedID(t *testing.T) {
-	f := &fakeClient{}
-	p := newTestProvider(f)
-
-	if err := p.Terminate(context.Background(), testRegion+"/i-legacy"); err != nil {
-		t.Fatalf("Terminate(legacy): %v", err)
+// The region is what makes teardown reliable. An instance in a region the sweep does not
+// visit — no pool declares it and nothing is in the client cache, the state of a freshly
+// restarted process — is invisible to the sweep, which then reports success having
+// terminated nothing and leaves the instance billing. The region reaches it regardless.
+func TestTerminate_RegionOutsideTheSweep(t *testing.T) {
+	f := &fakeClient{
+		instances: []EC2Instance{{ID: "i-2", State: stateRunning, Region: "eu-west-1"}},
 	}
-	if len(f.terminated) != 1 || f.terminated[0] != "i-legacy" {
-		t.Fatalf("terminated = %v, want [i-legacy]", f.terminated)
+	p := New(
+		func(context.Context, string) (Client, error) { return f, nil },
+		fakeCatalog{},
+		func() []string { return nil }, // no pool declares a region
+	)
+
+	if regions := p.sweepRegions(); len(regions) != 0 {
+		t.Fatalf("sweepRegions = %v, want none (the premise of this test)", regions)
+	}
+	if err := p.Terminate(context.Background(), "i-2", "eu-west-1"); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if len(f.terminated) != 1 || f.terminated[0] != "i-2" {
+		t.Fatalf("terminated = %v, want [i-2]", f.terminated)
 	}
 }
 

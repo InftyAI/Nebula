@@ -72,7 +72,9 @@ type Provider interface {
 	// Terminate destroys the instance by id. Must be idempotent — terminating an
 	// already-gone instance returns nil, so the finalizer that guarantees no paid instance
 	// leaks can retry safely.
-	Terminate(ctx context.Context, instanceID string) error
+	//
+	// region is needed for providers that cannot infer it from the instance id (AWS) only.
+	Terminate(ctx context.Context, instanceID, region string) error
 
 	// Get returns the current state of one instance, or (nil, nil) if it no
 	// longer exists (treat absence as terminated).

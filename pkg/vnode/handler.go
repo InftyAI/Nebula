@@ -154,20 +154,21 @@ type trackedPod struct {
 	// time, a write on the provisioning path we have not taken.
 	provisionStart time.Time
 
-	// placement is what this pod was provisioned against, so the poll loop can file its
-	// ready duration under the same dimensions as the provision counters. Set only where
-	// provisionStart is armed, which is the only path that observes.
+	// placement is what this pod was provisioned against. Two readers: the poll loop files
+	// the ready duration under the same dimensions as the provision counters, and DeletePod
+	// takes the region the instance is reachable in. Set only where provisionStart is armed.
 	placement
 }
 
-// placement is the decision one provision was issued against: the two metric dimensions
-// the Pod itself cannot supply, read from the NodeClaim at create (see claimFor). Carried
-// per attempt rather than re-read at observation, because placement may write a newer
-// decision onto the same claim on a re-provision, and because the poll loop holds h.mu
-// while it observes — the NodeClaim stays the durable record, this is the historical one.
+// placement is the decision one provision was issued against: the two facts the Pod itself
+// cannot supply, read from the NodeClaim at create (see claimFor). Kept per attempt rather
+// than re-read where it is used, because the poll loop holds h.mu while it observes, and
+// because the claim can be deleted while its instance is still tracked. The NodeClaim
+// stays the durable record; this is the historical one.
 //
-// The zero value means "unknown" and is what every path that never provisioned stores.
-// Nothing is filed under it: those paths leave provisionStart zero, so they never observe.
+// The zero value means "unknown" and is what every path that never provisioned stores. Its
+// readers degrade rather than guess: no ready sample is filed (provisionStart is zero on
+// those same paths), and teardown falls back to reading the claim.
 type placement struct {
 	region string
 	tier   nebulav1alpha1.CapacityType
@@ -468,17 +469,31 @@ func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 func (h *Handler) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	tp, ok := h.tracked[key(pod.Namespace, pod.Name)]
-	instance := ""
+	instance, region := "", ""
 	if ok {
 		instance = tp.instance
+		region = tp.region
 	}
 	h.mu.Unlock()
 
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "instanceID", instance)
 
-	log.Info("terminating external instance")
-	if err := h.prov.Terminate(ctx, instance); err != nil {
+	// Only a pod THIS process provisioned has a tracked region; one re-adopted after a
+	// restart has none, so fall back to the NodeClaim, the durable record. Without a region
+	// the provider can only search for the instance (see provider.Terminate).
+	if region == "" {
+		claimName := util.ClaimName(pod.Namespace, pod.Name)
+		if claim, err := h.claimFor(ctx, pod, claimName); err != nil {
+			log.Info("no recorded region for teardown; the provider must search for the instance",
+				"claim", claimName, "reason", err.Error())
+		} else {
+			region = claim.Spec.Region
+		}
+	}
+
+	log.Info("terminating external instance", "region", region)
+	if err := h.prov.Terminate(ctx, instance, region); err != nil {
 		// The leak-risk path: VK retries DeletePod, and if that never succeeds the
 		// NodeClaim backstop is the last line of defense. Log loudly.
 		log.Error(err, "terminate failed; external instance may still be running (NodeClaim backstop will retry)")
@@ -1012,20 +1027,7 @@ func (h *Handler) recordBlock(
 	if h.blocklist == nil {
 		return
 	}
-	// Accelerator and region are properties of the REQUEST, not the error: the accelerator
-	// is resolved off the Pod (it is the shape being asked for), the region comes in from the
-	// claim the request was built from — never from the Pod, since a block is process-wide
-	// and a patched region would let one tenant fence off a candidate for everyone.
-	//
-	// The key is the POOL identity (type:count, e.g. "H100:8") — the same key placement
-	// queries a candidate by, since a block filed under any other key would never be read
-	// and failover would re-place onto the candidate that just failed.
-	//
-	// The pool, NOT the provider's resolved SKU, because one launch may span several
-	// interchangeable instance types (AWS fleets) and only fails when every one is dry, so
-	// the pool truthfully names the request whichever alternate was tried. Distinct
-	// (type, count) pools stay on distinct keys, so an H100:8 shortage never excludes
-	// H100:1. "" means "not applicable" — a CPU-only Pod, or a region-simple provider.
+
 	accel, count, _ := util.AcceleratorRequest(pod)
 	accelerator := util.AcceleratorPool(accel, count)
 	scope := h.prov.ClassifyProvisionError(err, accelerator, region)

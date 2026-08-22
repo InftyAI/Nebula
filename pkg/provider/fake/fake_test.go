@@ -115,7 +115,8 @@ func TestTerminateIsIdempotent(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	id := res.InstanceID
-	if err := p.Terminate(ctx, id); err != nil {
+	// The fake keeps one flat map, so the region argument is irrelevant to it.
+	if err := p.Terminate(ctx, id, ""); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}
 	// Gone from Get/List.
@@ -123,10 +124,10 @@ func TestTerminateIsIdempotent(t *testing.T) {
 		t.Fatalf("Get after Terminate = %v, want nil (terminated)", inst)
 	}
 	// A repeat Terminate (and terminating an unknown id) is a no-op, not an error.
-	if err := p.Terminate(ctx, id); err != nil {
+	if err := p.Terminate(ctx, id, ""); err != nil {
 		t.Fatalf("repeat Terminate: %v", err)
 	}
-	if err := p.Terminate(ctx, "never-existed"); err != nil {
+	if err := p.Terminate(ctx, "never-existed", ""); err != nil {
 		t.Fatalf("Terminate unknown id: %v", err)
 	}
 }

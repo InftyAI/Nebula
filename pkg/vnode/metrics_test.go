@@ -197,11 +197,6 @@ func TestReconcileOnce_ObservesReadyDurationExactlyOnce(t *testing.T) {
 // minutes as microseconds and bias the histogram fast. A missing sample beats a wrong
 // one.
 func TestGetPod_ReAdoptedPodIsNotReadyObserved(t *testing.T) {
-	// A re-adopted pod is tracked with no placement and a synthesized Pod carrying no
-	// accelerator request, so a wrongly taken observation would land on the series below:
-	// the provider is known, everything the lost provision knew reads "none". That, not the
-	// fully-labelled one, is the assertion carrying this test. Both are deltas because other
-	// specs in this package write to both series.
 	ready := labelsFor("", "")
 	none := prometheus.Labels{
 		"provider": "fake", "region": "none", "capacity_type": "none",

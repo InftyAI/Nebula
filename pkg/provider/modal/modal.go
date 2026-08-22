@@ -370,8 +370,10 @@ func (p *Provider) Provision(
 	}, nil
 }
 
-// Terminate implements provider.Provider. Idempotent by the Client contract.
-func (p *Provider) Terminate(ctx context.Context, instanceID string) error {
+// Terminate implements provider.Provider. Idempotent by the Client contract. The region
+// is ignored: Modal's API is global, and a sandbox id addresses it from anywhere (region
+// is only ever a placement input, see Provision).
+func (p *Provider) Terminate(ctx context.Context, instanceID, _ string) error {
 	if instanceID == "" {
 		return nil // nothing provisioned yet; treat as already gone
 	}
