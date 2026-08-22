@@ -48,9 +48,8 @@ import (
 // signal. A provider can override the cadence via Capabilities.PollInterval.
 const defaultPollInterval = 15 * time.Second
 
-// defaultBlocklistTTL is the base exclusion for a failed placement when the Pod
-// carries no BlocklistTTLAnnotation. Short on purpose: the jitter added in
-// recordBlock, not a long floor, is what spreads retries.
+// defaultBlocklistTTL is the base exclusion for a failed placement when the pool sets no
+// positive FailoverPolicy.BlocklistTTL (see blocklistTTLOf).
 const defaultBlocklistTTL = 30 * time.Second
 
 // blocklistJitter is the largest random delay added to a block's base TTL. Without
@@ -95,7 +94,7 @@ type Handler struct {
 	// pools resolves the NodePool backing a Pod, which is where pool POLICY is read from
 	// rather than from the Pod carrying a copy of it. Unlike blocklist, nil is NOT a no-op:
 	// provisioning refuses without it, because the alternative is enforcing a containment
-	// policy nobody has read (see egressFor).
+	// policy nobody has read (see poolFor).
 	pools PoolReader
 
 	mu sync.Mutex
@@ -199,7 +198,7 @@ func (m podMeta) minus(done podMeta) podMeta {
 // NewHandler builds a Handler for one provider backend. The poll cadence comes from
 // Capabilities.PollInterval, falling back to defaultPollInterval. blocklist (failover
 // recording) and client (the endpoint patch) may both be nil; pools may not, for anything
-// that provisions — see egressFor.
+// that provisions — see poolFor.
 func NewHandler(
 	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister, pools PoolReader,
 ) *Handler {
@@ -232,7 +231,7 @@ func key(namespace, name string) string { return namespace + "/" + name }
 // CreatePod provisions an external instance for the Pod through the provider.
 // The Pod carries the whole workload shape, and placement's choices (capacity tier, region)
 // ride on annotations. The egress policy is the exception: it is read from the NodePool,
-// because it constrains the Pod rather than describing it (see egressFor).
+// because it constrains the Pod rather than describing it (see poolFor).
 func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	claim := util.ClaimName(pod.Namespace, pod.Name)
 	req := provider.ProvisionRequest{
@@ -244,17 +243,18 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "claim", claim)
 
-	// The containment policy, from the pool. Resolved before anything is requested and with
-	// the same non-terminal treatment as the env below, so a policy we cannot read costs a
-	// retry rather than an unrestricted instance.
-	egress, err := h.egressFor(ctx, pod)
+	// The pool, which is the trusted source for every policy below: the containment policy
+	// here, and the TTL of any block this provision's failure records. Resolved before
+	// anything is requested and with the same non-terminal treatment as the env below, so a
+	// pool we cannot read costs a retry rather than an unrestricted instance.
+	pool, err := h.poolFor(ctx, pod)
 	if err != nil {
-		log.Error(err, "cannot establish the pool's egress policy; nothing provisioned, retrying")
+		log.Error(err, "cannot establish the pool's policy; nothing provisioned, retrying")
 		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
 		h.emit(pod)
 		return err
 	}
-	req.Egress = egress
+	req.Egress = pool.Spec.Egress
 
 	// Resolve BEFORE anything is requested: the Pod's env may point at Secrets and ConfigMaps
 	// a provider cannot read (see resolveEnv), and nothing exists yet, so failing here is free.
@@ -341,8 +341,8 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		// Record the failure so placement fails over to the next candidate (zone → region
 		// → tier) instead of hot-looping here. The provider narrows its own error into a
 		// BlockScope (a Spot shortage in one region blocks only that; auth/quota blocks
-		// the whole provider); the TTL rides on the Pod from the pool's FailoverPolicy.
-		h.recordBlock(ctx, pod, err)
+		// the whole provider); the TTL comes from the pool read at the top of this call.
+		h.recordBlock(ctx, pod, pool, err)
 		// Surface the failure so placement can fail over, and return the error so the pod
 		// controller retries with backoff.
 		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, err.Error())
@@ -961,7 +961,7 @@ func (h *Handler) markStatus(pod *corev1.Pod, phase corev1.PodPhase, reason, msg
 // from an instance-type shortage. The cost is one wasted re-probe by a sibling
 // accelerator, which is the right trade — over-broad would exclude serviceable
 // accelerators. DenyAll (auth/quota) ignores the accelerator: it fails for all.
-func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, err error) {
+func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, err error) {
 	if h.blocklist == nil {
 		return
 	}
@@ -989,7 +989,7 @@ func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, err error) {
 	// TTL = base (pool policy or default) + jitter, so Pods that failed for the SAME scope
 	// do not all re-probe the just-freed candidate at once. Coalescing keeps the latest
 	// expiry, so jittered records spread the shared deadline instead of pinning it.
-	ttl := blocklistTTL(pod) + h.jitterFn()
+	ttl := blocklistTTLOf(pool) + h.jitterFn()
 	// The ctx logger, because it carries the virtualNode/provider values attached
 	// upstream; a fresh context.Background() would fall back to the global delegate and
 	// could be dropped before the real sink is installed.
@@ -997,21 +997,6 @@ func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, err error) {
 		"recording blocklist entry for failed placement",
 		"provider", h.prov.Name(), "scope", scope, "ttl", ttl.String(), "error", err.Error())
 	h.blocklist.Record(h.prov.Name(), scope, ttl)
-}
-
-// blocklistTTL reads the pool's BlocklistTTL off the annotation placement stamped,
-// falling back to defaultBlocklistTTL when it is absent or unparseable — including a
-// non-positive value, which would otherwise install a permanent block.
-func blocklistTTL(pod *corev1.Pod) time.Duration {
-	raw := pod.Annotations[nebulav1alpha1.BlocklistTTLAnnotation]
-	if raw == "" {
-		return defaultBlocklistTTL
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		return defaultBlocklistTTL
-	}
-	return d
 }
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }

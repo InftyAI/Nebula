@@ -195,6 +195,16 @@ func testPools(egress *nebulav1alpha1.EgressPolicy) *fakePools {
 // openPools is the default for the many tests that provision without caring about egress.
 func openPools() *fakePools { return testPools(nil) }
 
+// poolsWithTTL serves testPoolName with an explicit failover TTL and no egress policy, for
+// the blocklist tests: the TTL is pool policy, read when a block is recorded.
+func poolsWithTTL(ttl time.Duration) *fakePools {
+	pools := openPools()
+	pools.pools[testPoolName].Spec.Failover = &nebulav1alpha1.FailoverPolicy{
+		BlocklistTTL: metav1.Duration{Duration: ttl},
+	}
+	return pools
+}
+
 func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
 	h := NewHandler(fp, nil, nil, openPools())
@@ -444,13 +454,12 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	}
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, openPools())
+	// A non-default TTL on the POOL, so this asserts the pool's policy is honored rather
+	// than that it happens to equal defaultBlocklistTTL.
+	h := NewHandler(fp, nil, bl, poolsWithTTL(7*time.Minute))
 	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base TTL is asserted exactly
 
 	pod := testPod("default", "p1")
-	// A non-default TTL so this asserts the annotation is honored, not that it
-	// happens to equal defaultBlocklistTTL.
-	pod.Annotations = map[string]string{nebulav1alpha1.BlocklistTTLAnnotation: "7m"}
 	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = "H100"
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
@@ -471,9 +480,9 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	if bl.scope != scope {
 		t.Fatalf("recorded scope = %+v, want %+v", bl.scope, scope)
 	}
-	// TTL comes from the Pod annotation the placement controller stamped.
+	// TTL comes from the pool's FailoverPolicy, read at the moment the block is recorded.
 	if bl.ttl != 7*time.Minute {
-		t.Fatalf("recorded ttl = %v, want 7m from the annotation", bl.ttl)
+		t.Fatalf("recorded ttl = %v, want 7m from the pool", bl.ttl)
 	}
 }
 
@@ -492,32 +501,70 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 	}
 }
 
-func TestCreatePod_MissingTTLAnnotationUsesDefault(t *testing.T) {
-	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
-	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, openPools())
-	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is asserted exactly
+// TestCreatePod_BlocklistTTLFallsBackToDefault covers the two ways a READABLE pool can fail
+// to supply a usable TTL. An unreadable pool is not among them: poolFor fails closed before
+// Provision is ever called, so there is no failure to blocklist — which is why the fallback
+// is a pure function of the pool rather than a second read that would have to decide.
+func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pools PoolReader
+	}{{
+		name:  "pool sets no failover policy",
+		pools: openPools(),
+	}, {
+		// Zero would install a PERMANENT block, so it has to read as "unset".
+		name:  "pool sets a zero TTL",
+		pools: poolsWithTTL(0),
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+			bl := &recordingBlocklist{}
+			h := NewHandler(fp, nil, bl, tc.pools)
+			h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is exact
 
-	// No BlocklistTTLAnnotation on the Pod => the handler's built-in default.
-	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
-		t.Fatal("expected CreatePod to return the provision error")
-	}
-	if bl.ttl != defaultBlocklistTTL {
-		t.Fatalf("recorded ttl = %v, want default %v", bl.ttl, defaultBlocklistTTL)
+			if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
+				t.Fatal("expected CreatePod to return the provision error")
+			}
+			if bl.calls != 1 {
+				t.Fatalf("expected the block to be recorded anyway, got %d Record calls", bl.calls)
+			}
+			if bl.ttl != defaultBlocklistTTL {
+				t.Fatalf("recorded ttl = %v, want default %v", bl.ttl, defaultBlocklistTTL)
+			}
+		})
 	}
 }
 
-// The recorded TTL is the base (annotation or default) PLUS the handler's jitter,
-// so Pods failing for one scope do not re-probe the freed candidate in lockstep.
+// TestCreatePod_UnreadablePoolBlocksNothing is the other half: a pool that cannot be read
+// fails closed, so no instance is requested and — the part worth pinning — no blocklist entry
+// is filed either. Blocking a candidate over OUR failure to read a pool would exclude
+// serviceable capacity for every tenant sharing the blocklist.
+func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
+	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl, &fakePools{err: errors.New("cache not synced")})
+
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
+		t.Fatal("expected CreatePod to fail closed on an unreadable pool")
+	}
+	if fp.provisionCnt != 0 {
+		t.Errorf("provision calls = %d, want 0", fp.provisionCnt)
+	}
+	if bl.calls != 0 {
+		t.Errorf("Record calls = %d, want 0; our own read failure must not blocklist a candidate", bl.calls)
+	}
+}
+
+// The recorded TTL is the base (the pool's, or the default) PLUS the handler's jitter, so
+// Pods failing for one scope do not re-probe the freed candidate in lockstep.
 func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, openPools())
+	h := NewHandler(fp, nil, bl, poolsWithTTL(30*time.Second))
 	h.jitterFn = func() time.Duration { return 20 * time.Second } // deterministic jitter
 
-	pod := testPod("default", "p1")
-	pod.Annotations = map[string]string{nebulav1alpha1.BlocklistTTLAnnotation: "30s"}
-	if err := h.CreatePod(context.Background(), pod); err == nil {
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 		t.Fatal("expected CreatePod to return the provision error")
 	}
 	if want := 30*time.Second + 20*time.Second; bl.ttl != want {

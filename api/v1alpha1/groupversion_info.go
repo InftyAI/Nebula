@@ -112,13 +112,6 @@ const (
 	// region-simple providers (Modal, RunPod) ignore it.
 	RegionAnnotation = "nebula.inftyai.com/region"
 
-	// BlocklistTTLAnnotation carries the pool's FailoverPolicy.BlocklistTTL down to the
-	// virtual kubelet. The TTL is NodePool policy, but the VK handler provisions per-Pod
-	// and never sees the pool, so it needs the value here to bound the block it records
-	// after a Provision failure. Stamped at ungate; absent/unparseable means the
-	// handler's built-in default.
-	BlocklistTTLAnnotation = "nebula.inftyai.com/blocklist-ttl"
-
 	// EndpointAnnotation carries the reachable address of the external instance (a DNS
 	// name, an IP, or a URL, in the provider's own form). It is the only way to reach
 	// the workload, and PodIP cannot hold it — the API server validates PodIP as a

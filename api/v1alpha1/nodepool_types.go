@@ -91,10 +91,6 @@ type EgressPolicy struct {
 	// Targets is what mode Allowlist permits: CIDRs, bare IPs and domain names with an
 	// optional wildcard, mixed in one list, e.g. ["10.0.0.0/8", "*.huggingface.co"].
 	//
-	// One entry is exactly one target; the rule above rejects a comma, which appears in no
-	// CIDR or hostname. Nothing joins this list into one string today, but a comma inside an
-	// entry is meaningless to every provider that has to enforce it, and rejecting it here
-	// keeps the next thing that renders the list from having to guess.
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=253
@@ -222,6 +218,7 @@ type FailoverPolicy struct {
 	// (up to 30s) on top so Pods that failed for the same reason do not all retry the
 	// just-freed candidate in lockstep, so the effective exclusion is this value plus
 	// that jitter.
+	//
 	// +kubebuilder:default="30s"
 	BlocklistTTL metav1.Duration `json:"blocklistTTL,omitempty"`
 }

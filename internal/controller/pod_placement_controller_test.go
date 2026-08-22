@@ -747,23 +747,6 @@ func TestPlacement_NoServableCandidateDoesNotRequeue(t *testing.T) {
 	}
 }
 
-func TestPlacement_StampsBlocklistTTLAnnotation(t *testing.T) {
-	// The pool's FailoverPolicy.BlocklistTTL must reach the Pod so the VK handler
-	// knows how long to blocklist a placement that fails.
-	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
-	pool.Spec.Failover = &nebulav1alpha1.FailoverPolicy{BlocklistTTL: metav1.Duration{Duration: 7 * time.Minute}}
-	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
-	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
-
-	reconcilePod(t, r, "default", "p1")
-
-	got := getPod(t, c, "default", "p1")
-	if got.Annotations[nebulav1alpha1.BlocklistTTLAnnotation] != "7m0s" {
-		t.Fatalf("expected blocklist-ttl annotation 7m0s, got %q", got.Annotations[nebulav1alpha1.BlocklistTTLAnnotation])
-	}
-}
-
 // terminalOwnedPod builds an opted-in Pod in a terminal phase. When ownedByRS is
 // true it carries a controlling ReplicaSet ownerReference (so a controller would
 // recreate it); otherwise it is a bare Pod.
