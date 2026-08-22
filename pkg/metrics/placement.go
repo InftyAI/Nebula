@@ -51,6 +51,7 @@ const (
 	SkipProviderUnregistered   = "provider_unregistered"
 	SkipCapacityUnsupported    = "capacity_type_unsupported"
 	SkipAcceleratorUnsupported = "accelerator_unsupported"
+	SkipEgressUnsupported      = "egress_policy_unsupported"
 	SkipBlocked                = "blocked"
 )
 

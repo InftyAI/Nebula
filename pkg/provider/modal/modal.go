@@ -155,6 +155,14 @@ type SandboxSpec struct {
 	Timeout time.Duration
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// EgressMode is the pool's outbound policy, from provider.ProvisionRequest.Egress.
+	// Empty and Open both mean unrestricted. Blocked and Allowlist both reach Modal as an
+	// outbound ALLOWLIST, Blocked being the allowlist of nothing — never as BlockNetwork,
+	// which severs inbound too and would kill the connect URL (see CreateSandbox).
+	EgressMode nebulav1alpha1.EgressMode
+	// EgressTargets is what Allowlist permits: CIDRs, bare IPs and domain names mixed in one
+	// list, which util.SplitEgressTargets sorts into Modal's two separate allowlist fields.
+	EgressTargets []string
 	// ReadinessProbe, when non-nil, is the Pod's first-container readinessProbe
 	// carried through so the Client can configure Modal's own readiness probe at
 	// create time. Modal enforces the probe internally (it gates its own traffic
@@ -169,9 +177,10 @@ type SandboxSpec struct {
 // a pointer, so %v would print an address, and only its presence matters.
 func (s SandboxSpec) String() string {
 	return fmt.Sprintf("SandboxSpec{Image:%s Command:%v Env:%s GPU:%s GPUCount:%d CPU:%g "+
-		"MemoryMiB:%d Ports:%v Regions:%v Timeout:%s Tags:%v ReadinessProbe:%t}",
+		"MemoryMiB:%d Ports:%v Regions:%v Egress:%s EgressTargets:%v Timeout:%s Tags:%v ReadinessProbe:%t}",
 		s.Image, s.Command, provider.RedactedEnv(s.Env), s.GPU, s.GPUCount, s.CPU,
-		s.MemoryMiB, s.Ports, s.Regions, s.Timeout, s.Tags, s.ReadinessProbe != nil)
+		s.MemoryMiB, s.Ports, s.Regions, s.EgressMode, s.EgressTargets,
+		s.Timeout, s.Tags, s.ReadinessProbe != nil)
 }
 
 // GoString implements fmt.GoStringer so %#v is redacted too.
@@ -294,11 +303,12 @@ func (p *Provider) ExpandRegions(declared []string) []string {
 // trait is set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:     false, // create/terminate only
-		SupportsSpot:     false, // no user-facing preemptible tier
-		NativeTags:       true,  // sandbox tags carry identity
-		PreemptionNotice: 0,     // no push; poll-based detection
-		PollInterval:     0,     // OnDemand-only (never preempts) → the default cadence is fine
+		SupportsStop:         false, // create/terminate only
+		SupportsSpot:         false, // no user-facing preemptible tier
+		SupportsEgressPolicy: true,  // outbound allowlists on the sandbox itself
+		NativeTags:           true,  // sandbox tags carry identity
+		PreemptionNotice:     0,     // no push; poll-based detection
+		PollInterval:         0,     // OnDemand-only (never preempts) → the default cadence is fine
 	}
 }
 
@@ -500,6 +510,8 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		// reach Modal as "no placement constraint" — its widest pool and its
 		// un-multiplied price. See SandboxSpec.Regions.
 		Regions:        regionsOf(req.Region),
+		EgressMode:     req.Egress.ModeOrOpen(),
+		EgressTargets:  req.Egress.GetTargets(),
 		Timeout:        sandboxTimeout(pod),
 		Tags:           tags,
 		ReadinessProbe: c.ReadinessProbe,

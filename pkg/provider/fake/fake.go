@@ -73,11 +73,12 @@ func New() *Provider {
 // paths.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:     false,
-		SupportsSpot:     false,
-		NativeTags:       true,
-		PreemptionNotice: 0,
-		PollInterval:     0, // use the vnode default cadence
+		SupportsStop:         false,
+		SupportsSpot:         false,
+		SupportsEgressPolicy: false, // nothing to enforce against; egress pools skip it
+		NativeTags:           true,
+		PreemptionNotice:     0,
+		PollInterval:         0, // use the vnode default cadence
 	}
 }
 

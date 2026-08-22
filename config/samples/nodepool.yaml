@@ -28,3 +28,19 @@ spec:
   strategy: Ordered
   failover:
     blocklistTTL: 30s
+  # Outbound network policy. Omitted (as here) means Open. Inbound is never restricted, so a
+  # sandbox stays reachable through its connect URL and token under every mode — it just
+  # cannot call out.
+  #
+  # Blocked permits nothing:
+  # egress:
+  #   mode: Blocked
+  #
+  # Allowlist permits only what it lists — CIDRs, bare IPs and domain names (wildcards
+  # allowed) in ONE list; the adapter sorts them by kind. Use this when the workload pulls
+  # model weights at startup, which hangs under Blocked:
+  # egress:
+  #   mode: Allowlist
+  #   targets:
+  #   - "*.huggingface.co"
+  #   - 10.0.0.0/8

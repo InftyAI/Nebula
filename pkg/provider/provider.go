@@ -231,6 +231,12 @@ type ProvisionRequest struct {
 	// regions leaves it empty, which on Modal is the widest and cheapest option (pinning
 	// costs 1.5-1.75x). AWS cannot honour it, but its ExpandRegions never produces it.
 	Region string
+	// Egress is the pool's outbound policy, or nil for Open. Placement has already checked
+	// that this provider can enforce it (Capabilities.SupportsEgressPolicy), so an adapter
+	// receiving a restrictive policy must apply it or fail the Provision — never silently
+	// drop it, which would leave the workload on the open internet under a policy that says
+	// otherwise. Read off the Pod's annotations, not the pool; see EgressAnnotation.
+	Egress *nebulav1alpha1.EgressPolicy
 	// Env is the container's environment, fully RESOLVED: literals plus everything
 	// envFrom/valueFrom referenced, merged in kubelet precedence (envFrom in listed order,
 	// then env overriding it). A provider forwards it and never re-reads the Pod's env,
@@ -250,8 +256,8 @@ type ProvisionRequest struct {
 // log.Info("...", "req", req). Key names print, since they are in the Pod spec already and
 // are what makes a "wrong env" report actionable; only values are withheld.
 func (r ProvisionRequest) String() string {
-	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Env:%s}",
-		r.ClaimName, r.CapacityType, r.Region, RedactedEnv(r.Env))
+	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Egress:%s Env:%s}",
+		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), RedactedEnv(r.Env))
 }
 
 // GoString implements fmt.GoStringer so %#v is redacted too.
@@ -306,6 +312,12 @@ type Capabilities struct {
 	SupportsStop bool
 	// SupportsSpot is true if the provider offers interruptible capacity.
 	SupportsSpot bool
+	// SupportsEgressPolicy is true if the provider can enforce NodePoolSpec.Egress on the
+	// instances it creates. False means placement SKIPS this provider for any pool that
+	// restricts egress, rather than provisioning something with open internet access under
+	// a policy that says otherwise (AWS: false — its instances land in the default VPC, so
+	// enforcement needs security-group egress rules and no NAT, not one API field).
+	SupportsEgressPolicy bool
 	// NativeTags is true if the provider has real instance tags/labels; when
 	// false, identity is encoded in the instance name (RunPod: false).
 	NativeTags bool

@@ -1350,3 +1350,95 @@ func TestSandboxSpec_StringRedactsEnv(t *testing.T) {
 		t.Fatalf("expected key names to survive redaction: %s", got)
 	}
 }
+
+// TestOutboundAllowlists pins the nil-versus-empty distinction the whole feature rests on:
+// a nil allowlist leaves Modal in OPEN mode, while a non-nil empty one selects ALLOWLIST
+// with nothing permitted. Getting these confused silently either blocks an open pool or
+// opens a Blocked one, and neither shows up as an error.
+func TestOutboundAllowlists(t *testing.T) {
+	t.Run("open sends nil, leaving Modal in OPEN mode", func(t *testing.T) {
+		for _, mode := range []nebulav1alpha1.EgressMode{"", nebulav1alpha1.EgressOpen} {
+			cidrs, domains, err := outboundAllowlists(SandboxSpec{EgressMode: mode})
+			if err != nil {
+				t.Fatalf("mode %q: %v", mode, err)
+			}
+			if cidrs != nil || domains != nil {
+				t.Errorf("mode %q: got %v/%v, want nil pair (non-nil would select ALLOWLIST)",
+					mode, cidrs, domains)
+			}
+		}
+	})
+
+	t.Run("blocked sends an empty pair, permitting nothing", func(t *testing.T) {
+		cidrs, domains, err := outboundAllowlists(SandboxSpec{EgressMode: nebulav1alpha1.EgressBlocked})
+		if err != nil {
+			t.Fatalf("outboundAllowlists: %v", err)
+		}
+		if cidrs == nil || domains == nil {
+			t.Fatal("got a nil allowlist for Blocked, which is Modal's OPEN mode")
+		}
+		if len(cidrs.Entries) != 0 || len(domains.Entries) != 0 {
+			t.Errorf("got entries %v/%v, want both empty", cidrs.Entries, domains.Entries)
+		}
+	})
+
+	t.Run("allowlist carries the split entries", func(t *testing.T) {
+		cidrs, domains, err := outboundAllowlists(SandboxSpec{
+			EgressMode:    nebulav1alpha1.EgressAllowlist,
+			EgressTargets: []string{"10.0.0.0/8", "*.huggingface.co"},
+		})
+		if err != nil {
+			t.Fatalf("outboundAllowlists: %v", err)
+		}
+		if !slices.Equal(cidrs.Entries, []string{"10.0.0.0/8"}) {
+			t.Errorf("cidrs = %v", cidrs.Entries)
+		}
+		if !slices.Equal(domains.Entries, []string{"*.huggingface.co"}) {
+			t.Errorf("domains = %v", domains.Entries)
+		}
+	})
+
+	// Failing beats defaulting: a mode this adapter does not know means it and placement
+	// have drifted, and guessing "open" would hand back the internet access the pool asked
+	// to remove.
+	t.Run("an unknown mode fails rather than opening up", func(t *testing.T) {
+		if _, _, err := outboundAllowlists(SandboxSpec{EgressMode: "Sideways"}); err == nil {
+			t.Fatal("expected an error for an unknown egress mode")
+		}
+	})
+}
+
+// TestProvision_CarriesEgressPolicy is the end-to-end half: the policy has to survive the
+// ProvisionRequest → SandboxSpec hop, since that is where the annotation the placement
+// controller stamped turns into something Modal can enforce.
+func TestProvision_CarriesEgressPolicy(t *testing.T) {
+	f := &fakeClient{createID: "sb-1"}
+	p := newTestProvider(f)
+	req := provider.ProvisionRequest{
+		ClaimName: "claim-a",
+		Egress: &nebulav1alpha1.EgressPolicy{
+			Mode:    nebulav1alpha1.EgressAllowlist,
+			Targets: []string{"*.huggingface.co"},
+		},
+	}
+	if _, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1), req); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.EgressMode; got != nebulav1alpha1.EgressAllowlist {
+		t.Errorf("spec.EgressMode = %q, want %q", got, nebulav1alpha1.EgressAllowlist)
+	}
+	if !slices.Equal(f.lastSpec.EgressTargets, []string{"*.huggingface.co"}) {
+		t.Errorf("spec.EgressTargets = %v", f.lastSpec.EgressTargets)
+	}
+
+	// A nil policy is Open, which is what every pool that never set the field sends.
+	f = &fakeClient{createID: "sb-2"}
+	p = newTestProvider(f)
+	if _, err := p.Provision(context.Background(), gpuPod("claim-b", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-b"}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.EgressMode; got != nebulav1alpha1.EgressOpen {
+		t.Errorf("spec.EgressMode = %q, want %q for a nil policy", got, nebulav1alpha1.EgressOpen)
+	}
+}

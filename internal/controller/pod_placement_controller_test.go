@@ -597,6 +597,83 @@ func TestPlacement_SpotOnlyPoolStaysGatedOnOnDemandOnlyProvider(t *testing.T) {
 	}
 }
 
+func TestPlacement_StampsEgressAnnotationsFromPool(t *testing.T) {
+	// The VK handler never sees the pool, so the policy has to ride the Pod. Both
+	// annotations must land: the mode alone is authoritative, and without the targets
+	// an Allowlist pool would reach the adapter as "permit nothing" — silently Blocked.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	pool.Spec.Egress = &nebulav1alpha1.EgressPolicy{
+		Mode:    nebulav1alpha1.EgressAllowlist,
+		Targets: []string{"10.0.0.0/8", "*.huggingface.co"},
+	}
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}, egress: true}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if hasGateNamed(got) {
+		t.Fatal("expected the Pod placed on a provider that enforces egress")
+	}
+	if v := got.Annotations[nebulav1alpha1.EgressAnnotation]; v != string(nebulav1alpha1.EgressAllowlist) {
+		t.Errorf("egress annotation = %q, want %q", v, nebulav1alpha1.EgressAllowlist)
+	}
+	if v := got.Annotations[nebulav1alpha1.EgressTargetsAnnotation]; v != "10.0.0.0/8,*.huggingface.co" {
+		t.Errorf("egress-targets annotation = %q, want the comma-joined list", v)
+	}
+}
+
+func TestPlacement_OpenPoolStampsNoEgressAnnotation(t *testing.T) {
+	// Absence IS Open (see EgressAnnotation), so an unrestricted pool must leave the Pod
+	// clean rather than stamping "Open" — otherwise every Pod in the cluster grows an
+	// annotation that means nothing.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	// No egress on the pool at all, which is the common case.
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}} // egress: false
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if hasGateNamed(got) {
+		t.Fatal("expected an Open pool to place on a provider without egress support")
+	}
+	if _, ok := got.Annotations[nebulav1alpha1.EgressAnnotation]; ok {
+		t.Errorf("expected no egress annotation for an Open pool, got %q",
+			got.Annotations[nebulav1alpha1.EgressAnnotation])
+	}
+}
+
+func TestPlacement_RestrictedPoolStaysGatedWhenNoProviderEnforcesEgress(t *testing.T) {
+	// The provider cannot enforce the policy, so there is no candidate and the Pod stays
+	// visibly unplaceable. This is the whole point of the capability gate: placing it
+	// anyway would provision a workload with open internet access under a pool that says
+	// Blocked, with nothing to reveal the substitution. No requeue hint — only a pool edit
+	// or a provider gaining support fixes it, and both emit their own event.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
+	pool.Spec.Egress = &nebulav1alpha1.EgressPolicy{Mode: nebulav1alpha1.EgressBlocked}
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}} // egress: false
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	res, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "p1"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected no requeue hint for a capability gap, got %v", res.RequeueAfter)
+	}
+
+	got := getPod(t, c, "default", "p1")
+	if !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when no provider can enforce the egress policy")
+	}
+}
+
 func TestPlacement_AllCandidatesBlockedRequeuesForBlockExpiry(t *testing.T) {
 	// Every (tier, provider, region) candidate is blocked (DenyAll on the provider),
 	// but the candidates are servable — the block is a transient failover exclusion.
