@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"hash/fnv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -378,15 +377,6 @@ func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, poo
 	// policy value; an unset policy leaves the handler on its own default.
 	if pool.Spec.Failover != nil && pool.Spec.Failover.BlocklistTTL.Duration > 0 {
 		setAnnotation(pod, nebulav1alpha1.BlocklistTTLAnnotation, pool.Spec.Failover.BlocklistTTL.Duration.String())
-	}
-	// Same for the egress policy. Stamped only when it restricts something: the absence of
-	// the annotation IS Open, and selectPlacement has already ensured p.provider can enforce
-	// whatever is written here.
-	if pool.Spec.Egress.RestrictsEgress() {
-		setAnnotation(pod, nebulav1alpha1.EgressAnnotation, string(pool.Spec.Egress.ModeOrOpen()))
-		if len(pool.Spec.Egress.Targets) > 0 {
-			setAnnotation(pod, nebulav1alpha1.EgressTargetsAnnotation, strings.Join(pool.Spec.Egress.Targets, ","))
-		}
 	}
 
 	// Remove our gate, releasing the Pod to the scheduler. Preserve any other

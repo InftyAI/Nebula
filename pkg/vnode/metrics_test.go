@@ -64,7 +64,7 @@ func metricPod(ns, name string) *corev1.Pod {
 		nebulav1alpha1.CapacityTypeAnnotation: string(nebulav1alpha1.CapacitySpot),
 		nebulav1alpha1.RegionAnnotation:       "us-east-1",
 	}
-	pod.Labels = map[string]string{nebulav1alpha1.AcceleratorTypeLabel: "H100"}
+	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = "H100"
 	return pod
 }
 
@@ -90,7 +90,7 @@ func TestCreatePod_RecordsSuccessfulProvisionAttempt(t *testing.T) {
 	beforeAttempts := testutil.ToFloat64(metrics.ProvisionAttempts.With(success))
 	beforeDuration := histCount(t, metrics.ProvisionDuration, success)
 
-	h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil)
+	h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, openPools())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestCreatePod_RecordsRejectionReason(t *testing.T) {
 	beforeFailures := testutil.ToFloat64(metrics.ProvisionFailures.With(capacity))
 
 	fp := &fakeProvider{provisionErr: provider.ErrNoCapacity}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, openPools())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m2")); err == nil {
 		t.Fatal("expected the provision error")
 	}
@@ -138,7 +138,7 @@ func TestCreatePod_UnreachableProviderCountedSeparately(t *testing.T) {
 	beforeCapacity := testutil.ToFloat64(metrics.ProvisionFailures.With(capacity))
 
 	fp := &fakeProvider{provisionErr: errors.New("rpc error: code = Unavailable desc = transport is closing")}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, openPools())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m3")); err == nil {
 		t.Fatal("expected the provision error")
 	}
@@ -163,7 +163,7 @@ func TestReconcileOnce_ObservesReadyDurationExactlyOnce(t *testing.T) {
 	before := histCount(t, metrics.InstanceReadyDuration, ready)
 
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, openPools())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m4")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestGetPod_ReAdoptedPodIsNotReadyObserved(t *testing.T) {
 	fp := &fakeProvider{list: []provider.Instance{{
 		ID: "inst-9", ClaimName: "default-m5", State: provider.InstanceRunning,
 	}}}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, openPools())
 	if _, err := h.GetPod(context.Background(), "default", "m5"); err != nil {
 		t.Fatalf("GetPod: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestObserveReady_IndependentOfPinnedStatusClock(t *testing.T) {
 	before := histCount(t, metrics.InstanceReadyDuration, ready)
 
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil)
+	h := NewHandler(fp, nil, nil, openPools())
 	// A status clock pinned far in the PAST: reusing it to measure would go negative.
 	pinned := metav1.NewTime(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
 	h.nowFn = func() metav1.Time { return pinned }

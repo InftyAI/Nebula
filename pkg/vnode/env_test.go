@@ -247,7 +247,7 @@ func TestResolveEnv_MemoizesMisses(t *testing.T) {
 func TestResolveEnv_FieldRef(t *testing.T) {
 	pod := envPod(nil, nil)
 	pod.UID = "uid-1"
-	pod.Labels = map[string]string{"app": "vllm"}
+	pod.Labels["app"] = "vllm"
 	pod.Annotations = map[string]string{"team": "infra"}
 	pod.Spec.NodeName = "nebula-fake"
 	pod.Spec.ServiceAccountName = "sa"
@@ -368,7 +368,7 @@ func TestCreatePod_PassesResolvedEnvToProvider(t *testing.T) {
 			LocalObjectReference: corev1.LocalObjectReference{Name: "sec"}, Key: "K"}}},
 	})
 	client := fake.NewSimpleClientset(pod, secretObj("sec", map[string]string{"K": "t0ken"}))
-	h := NewHandler(fp, client, nil)
+	h := NewHandler(fp, client, nil, openPools())
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -393,7 +393,7 @@ func TestCreatePod_UnresolvableEnvIsNonTerminal(t *testing.T) {
 			LocalObjectReference: corev1.LocalObjectReference{Name: "not-yet"}, Key: "K"},
 	}}})
 	client := fake.NewSimpleClientset(pod)
-	h := NewHandler(fp, client, bl)
+	h := NewHandler(fp, client, bl, openPools())
 
 	err := h.CreatePod(context.Background(), pod)
 	if err == nil {

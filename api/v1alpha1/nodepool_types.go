@@ -82,6 +82,7 @@ type NodePoolSpec struct {
 // Allowlist disjoint, so "no egress" has one spelling instead of three.
 // +kubebuilder:validation:XValidation:rule="self.mode == 'Allowlist' || !has(self.targets)",message="targets is only valid with mode Allowlist"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Allowlist' || (has(self.targets) && self.targets.size() > 0)",message="mode Allowlist requires at least one target; use mode Blocked to permit nothing"
+// +kubebuilder:validation:XValidation:rule="!has(self.targets) || self.targets.all(t, !t.contains(','))",message="a target must not contain a comma; list each target as its own entry"
 type EgressPolicy struct {
 	// Mode is required once spec.egress is set, so a half-written policy is rejected
 	// rather than defaulted into a weaker one.
@@ -89,6 +90,11 @@ type EgressPolicy struct {
 
 	// Targets is what mode Allowlist permits: CIDRs, bare IPs and domain names with an
 	// optional wildcard, mixed in one list, e.g. ["10.0.0.0/8", "*.huggingface.co"].
+	//
+	// One entry is exactly one target; the rule above rejects a comma, which appears in no
+	// CIDR or hostname. Nothing joins this list into one string today, but a comma inside an
+	// entry is meaningless to every provider that has to enforce it, and rejecting it here
+	// keeps the next thing that renders the list from having to guess.
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=253

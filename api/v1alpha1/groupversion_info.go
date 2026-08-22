@@ -119,15 +119,6 @@ const (
 	// handler's built-in default.
 	BlocklistTTLAnnotation = "nebula.inftyai.com/blocklist-ttl"
 
-	// EgressAnnotation carries the pool's EgressPolicy.Mode and EgressTargetsAnnotation its
-	// Targets, comma-separated (no CIDR or hostname contains one). Same flow and
-	// reason as BlocklistTTLAnnotation: pool policy the VK handler must honour but never
-	// sees the pool to read.
-	//
-	// Absent means Open. Mode is authoritative — without it the target list is ignored.
-	EgressAnnotation        = "nebula.inftyai.com/egress"
-	EgressTargetsAnnotation = "nebula.inftyai.com/egress-targets"
-
 	// EndpointAnnotation carries the reachable address of the external instance (a DNS
 	// name, an IP, or a URL, in the provider's own form). It is the only way to reach
 	// the workload, and PodIP cannot hold it — the API server validates PodIP as a

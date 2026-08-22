@@ -117,6 +117,60 @@ var _ = Describe("NodePool spec validation", func() {
 		Expect(err.Error()).To(ContainSubstring("Unsupported value: \"Reserved\""))
 	})
 
+	// The egress rules. The comma one is the load-bearing case: Targets rides to the VK
+	// handler as ONE comma-separated annotation, so an entry containing a comma would be
+	// decoded as several permitted targets rather than the single invalid one the author
+	// wrote — a policy wider than the pool declares, which is the wrong way for a
+	// containment control to fail. Admission is the only thing standing between the two.
+	newEgressPool := func(name string, egress *nebulav1alpha1.EgressPolicy) *nebulav1alpha1.NodePool {
+		return &nebulav1alpha1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: nebulav1alpha1.NodePoolSpec{
+				Providers: []nebulav1alpha1.ProviderSpec{{Name: "modal"}},
+				Strategy:  nebulav1alpha1.StrategyOrdered,
+				Egress:    egress,
+			},
+		}
+	}
+
+	It("rejects a target containing a comma", func() {
+		pool := newEgressPool("egress-packed-target", &nebulav1alpha1.EgressPolicy{
+			Mode:    nebulav1alpha1.EgressAllowlist,
+			Targets: []string{"10.0.0.0/8,api.openai.com"},
+		})
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("must not contain a comma"))
+	})
+
+	It("admits the same two targets listed separately", func() {
+		pool := newEgressPool("egress-split-targets", &nebulav1alpha1.EgressPolicy{
+			Mode:    nebulav1alpha1.EgressAllowlist,
+			Targets: []string{"10.0.0.0/8", "*.huggingface.co"},
+		})
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+	})
+
+	It("rejects targets without mode Allowlist", func() {
+		pool := newEgressPool("egress-blocked-with-targets", &nebulav1alpha1.EgressPolicy{
+			Mode:    nebulav1alpha1.EgressBlocked,
+			Targets: []string{"10.0.0.0/8"},
+		})
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("targets is only valid with mode Allowlist"))
+	})
+
+	It("rejects mode Allowlist with no targets", func() {
+		pool := newEgressPool("egress-allowlist-empty", &nebulav1alpha1.EgressPolicy{
+			Mode: nebulav1alpha1.EgressAllowlist,
+		})
+		err := k8sClient.Create(ctx, pool)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("requires at least one target"))
+	})
+
 	It("admits the Spot and OnDemand capacity tiers", func() {
 		pool := &nebulav1alpha1.NodePool{
 			ObjectMeta: metav1.ObjectMeta{Name: "ok-capacity-types"},

@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"strings"
 	"sync"
 	"time"
 
@@ -92,6 +91,12 @@ type Handler struct {
 	// tier). Shared with every other handler and the placement controller. Nil is a
 	// no-op.
 	blocklist Blocklister
+
+	// pools resolves the NodePool backing a Pod, which is where pool POLICY is read from
+	// rather than from the Pod carrying a copy of it. Unlike blocklist, nil is NOT a no-op:
+	// provisioning refuses without it, because the alternative is enforcing a containment
+	// policy nobody has read (see egressFor).
+	pools PoolReader
 
 	mu sync.Mutex
 
@@ -193,8 +198,11 @@ func (m podMeta) minus(done podMeta) podMeta {
 
 // NewHandler builds a Handler for one provider backend. The poll cadence comes from
 // Capabilities.PollInterval, falling back to defaultPollInterval. blocklist (failover
-// recording) and client (the endpoint patch) may both be nil.
-func NewHandler(prov provider.Provider, client kubernetes.Interface, blocklist Blocklister) *Handler {
+// recording) and client (the endpoint patch) may both be nil; pools may not, for anything
+// that provisions — see egressFor.
+func NewHandler(
+	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister, pools PoolReader,
+) *Handler {
 	poll := prov.Capabilities().PollInterval
 	if poll <= 0 {
 		poll = defaultPollInterval
@@ -203,6 +211,7 @@ func NewHandler(prov provider.Provider, client kubernetes.Interface, blocklist B
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
+		pools:     pools,
 		tracked:   make(map[string]*trackedPod),
 		nowFn:     metav1.Now,
 		pollEvery: poll,
@@ -221,19 +230,31 @@ var (
 func key(namespace, name string) string { return namespace + "/" + name }
 
 // CreatePod provisions an external instance for the Pod through the provider.
-// The Pod carries the whole workload shape; the only out-of-band input, the
-// optimizer's capacity tier, rides on CapacityTypeAnnotation.
+// The Pod carries the whole workload shape, and placement's choices (capacity tier, region)
+// ride on annotations. The egress policy is the exception: it is read from the NodePool,
+// because it constrains the Pod rather than describing it (see egressFor).
 func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	claim := util.ClaimName(pod.Namespace, pod.Name)
 	req := provider.ProvisionRequest{
 		ClaimName:    claim,
 		CapacityType: nebulav1alpha1.CapacityType(pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation]),
 		Region:       pod.Annotations[nebulav1alpha1.RegionAnnotation],
-		Egress:       egressFromPod(pod),
 	}
 
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "claim", claim)
+
+	// The containment policy, from the pool. Resolved before anything is requested and with
+	// the same non-terminal treatment as the env below, so a policy we cannot read costs a
+	// retry rather than an unrestricted instance.
+	egress, err := h.egressFor(ctx, pod)
+	if err != nil {
+		log.Error(err, "cannot establish the pool's egress policy; nothing provisioned, retrying")
+		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
+		h.emit(pod)
+		return err
+	}
+	req.Egress = egress
 
 	// Resolve BEFORE anything is requested: the Pod's env may point at Secrets and ConfigMaps
 	// a provider cannot read (see resolveEnv), and nothing exists yet, so failing here is free.
@@ -991,28 +1012,6 @@ func blocklistTTL(pod *corev1.Pod) time.Duration {
 		return defaultBlocklistTTL
 	}
 	return d
-}
-
-// egressFromPod reads the pool's egress policy off the annotations placement stamped. nil
-// (no annotation) means Open, which is what every pool that never set the field gets.
-//
-// The mode is taken verbatim rather than validated against the enum: admission already
-// rejected anything else, and an unknown value must not silently become Open — the adapter
-// fails the Provision instead, which is the safe direction for a containment policy.
-func egressFromPod(pod *corev1.Pod) *nebulav1alpha1.EgressPolicy {
-	mode := pod.Annotations[nebulav1alpha1.EgressAnnotation]
-	if mode == "" {
-		return nil
-	}
-	policy := &nebulav1alpha1.EgressPolicy{Mode: nebulav1alpha1.EgressMode(mode)}
-	if raw := pod.Annotations[nebulav1alpha1.EgressTargetsAnnotation]; raw != "" {
-		for _, e := range strings.Split(raw, ",") {
-			if e = strings.TrimSpace(e); e != "" {
-				policy.Targets = append(policy.Targets, e)
-			}
-		}
-	}
-	return policy
 }
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }

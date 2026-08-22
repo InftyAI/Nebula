@@ -108,7 +108,9 @@ func NodeName(providerName string) string {
 
 // RBAC for the virtual kubelet: the pod controller reports Pod status and reads the
 // config/secret/service objects a Pod references; the node controller maintains the
-// Node, its lease, and events.
+// Node, its lease, and events. NodePools are read because pool policy is resolved from the
+// pool at provision time rather than from the Pod (see Handler.egressFor).
+// +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;create;update;patch;delete
@@ -129,6 +131,7 @@ type Runner struct {
 	prov      provider.Provider
 	client    kubernetes.Interface
 	blocklist Blocklister
+	pools     PoolReader
 	nodeName  string
 
 	// kubelet is the shared endpoint serving `kubectl logs` for every node. Nil is
@@ -138,14 +141,18 @@ type Runner struct {
 }
 
 // NewRunner builds the virtual-node runner for one provider. blocklist (Provision
-// failures) and kubelet (the log endpoint) are both shared, and both may be nil.
+// failures) and kubelet (the log endpoint) are both shared, and both may be nil. pools is
+// how the handler reads pool policy from the pool instead of from the Pod, so a nil one
+// leaves this node unable to provision at all (see Handler.egressFor).
 func NewRunner(
-	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister, kubelet *KubeletServer,
+	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister,
+	kubelet *KubeletServer, pools PoolReader,
 ) *Runner {
 	return &Runner{
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
+		pools:     pools,
 		nodeName:  NodeName(prov.Name()),
 		kubelet:   kubelet,
 	}
@@ -158,7 +165,7 @@ var _ manager.Runnable = (*Runner)(nil)
 func (r *Runner) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithValues("virtualNode", r.nodeName, "provider", r.prov.Name())
 
-	handler := NewHandler(r.prov, r.client, r.blocklist)
+	handler := NewHandler(r.prov, r.client, r.blocklist, r.pools)
 	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
 
 	// Register on the endpoint AND advertise it, so the API server can proxy `kubectl
