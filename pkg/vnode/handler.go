@@ -374,8 +374,8 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		// Record the failure so placement fails over to the next candidate (zone → region
 		// → tier) instead of hot-looping here. The provider narrows its own error into a
 		// BlockScope (a Spot shortage in one region blocks only that; auth/quota blocks
-		// the whole provider); the TTL comes from the pool read at the top of this call.
-		h.recordBlock(ctx, pod, pool, req.Region, err)
+		// the whole provider).
+		h.recordBlock(ctx, pod, req.Region, blocklistTTLOf(pool), err)
 		// Surface the failure so placement can fail over, and return the error so the pod
 		// controller retries with backoff.
 		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, err.Error())
@@ -993,9 +993,9 @@ func (h *Handler) markStatus(pod *corev1.Pod, phase corev1.PodPhase, reason, msg
 	setPhase(pod, phase, reason, msg, h.nowFn())
 }
 
-// recordBlock classifies a Provision failure into a BlockScope and records it for the
-// pool's BlocklistTTL, so placement fails over instead of retrying the same candidate.
-// A no-op with no blocklist wired, or when the error yields an empty scope.
+// recordBlock classifies a Provision failure into a BlockScope and records it for baseTTL
+// plus jitter, so placement fails over instead of retrying the same candidate. A no-op with
+// no blocklist wired, or when the error yields an empty scope.
 //
 // The provider owns the scope: the handler resolves the requested accelerator off the Pod
 // (the error does not carry it) and passes it in, but never assembles the scope itself, so
@@ -1007,7 +1007,7 @@ func (h *Handler) markStatus(pod *corev1.Pod, phase corev1.PodPhase, reason, msg
 // accelerator, which is the right trade — over-broad would exclude serviceable
 // accelerators. DenyAll (auth/quota) ignores the accelerator: it fails for all.
 func (h *Handler) recordBlock(
-	ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, region string, err error,
+	ctx context.Context, pod *corev1.Pod, region string, baseTTL time.Duration, err error,
 ) {
 	if h.blocklist == nil {
 		return
@@ -1036,10 +1036,10 @@ func (h *Handler) recordBlock(
 		return
 	}
 
-	// TTL = base (pool policy or default) + jitter, so Pods that failed for the SAME scope
-	// do not all re-probe the just-freed candidate at once. Coalescing keeps the latest
-	// expiry, so jittered records spread the shared deadline instead of pinning it.
-	ttl := blocklistTTLOf(pool) + h.jitterFn()
+	// baseTTL + jitter, so Pods that failed for the SAME scope do not all re-probe the
+	// just-freed candidate at once. Coalescing keeps the latest expiry, so jittered records
+	// spread the shared deadline instead of pinning it.
+	ttl := baseTTL + h.jitterFn()
 	// The ctx logger, because it carries the virtualNode/provider values attached
 	// upstream; a fresh context.Background() would fall back to the global delegate and
 	// could be dropped before the real sink is installed.
