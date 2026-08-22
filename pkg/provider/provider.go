@@ -72,7 +72,9 @@ type Provider interface {
 	// Terminate destroys the instance by id. Must be idempotent — terminating an
 	// already-gone instance returns nil, so the finalizer that guarantees no paid instance
 	// leaks can retry safely.
-	Terminate(ctx context.Context, instanceID string) error
+	//
+	// region is needed for providers that cannot infer it from the instance id (AWS) only.
+	Terminate(ctx context.Context, instanceID, region string) error
 
 	// Get returns the current state of one instance, or (nil, nil) if it no
 	// longer exists (treat absence as terminated).
@@ -122,7 +124,7 @@ type Provider interface {
 	// the provider's own error. Better than refusing a region that shipped last week.
 	//
 	// Expanding HERE, at the pool boundary, keeps everything downstream single-valued —
-	// ProvisionRequest.Region, RegionAnnotation and the blocklist key — so a capacity
+	// NodeClaimSpec.Region, ProvisionRequest.Region and the blocklist key — so a capacity
 	// failure blocks the one candidate that failed, not the group it came from.
 	//
 	// How many candidates a declaration becomes depends on whether the provider can FAIL

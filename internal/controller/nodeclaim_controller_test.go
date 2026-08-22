@@ -45,6 +45,7 @@ type fakeProvider struct {
 	list         []provider.Instance // what List returns
 	listErr      error               // if set, List fails
 	terminated   []string            // instance ids passed to Terminate, in order
+	regions      []string            // regions passed to Terminate, positionally paired with terminated
 	terminateErr error               // if set, Terminate fails
 	gpus         []string            // accelerators MapAccelerator offers; nil = offer any
 	spot         bool                // Capabilities().SupportsSpot (placement skips Spot without it)
@@ -60,8 +61,9 @@ func (f *fakeProvider) Capabilities() provider.Capabilities {
 func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (provider.ProvisionResult, error) {
 	return provider.ProvisionResult{}, nil
 }
-func (f *fakeProvider) Terminate(_ context.Context, id string) error {
+func (f *fakeProvider) Terminate(_ context.Context, id, region string) error {
 	f.terminated = append(f.terminated, id)
+	f.regions = append(f.regions, region)
 	return f.terminateErr
 }
 func (f *fakeProvider) Get(context.Context, string) (*provider.Instance, error) { return nil, nil }
@@ -475,6 +477,25 @@ func TestReconcileDelete_UsesRecordedInstanceID(t *testing.T) {
 
 	if len(prov.terminated) != 1 || prov.terminated[0] != "inst-recorded" {
 		t.Fatalf("expected Terminate(inst-recorded) from recorded id, got %v", prov.terminated)
+	}
+}
+
+// The backstop runs when VK never did, so the region VK held in memory is gone too. It
+// must pass spec.Region, written before provisioning and never rewritten — otherwise a
+// region-partitioned provider has to search for the instance and can conclude "already
+// gone" about one it never looked for (see provider.Terminate).
+func TestReconcileDelete_PassesTheClaimRegion(t *testing.T) {
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Spec.Region = "eu-west-1"
+	claim.Status.InstanceID = "inst-1"
+	deleteClaim(t, claim)
+	prov := &fakeProvider{name: "fake"}
+	r, _ := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	if len(prov.regions) != 1 || prov.regions[0] != "eu-west-1" {
+		t.Fatalf("regions passed to Terminate = %v, want [eu-west-1]", prov.regions)
 	}
 }
 

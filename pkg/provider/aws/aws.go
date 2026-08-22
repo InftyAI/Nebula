@@ -359,18 +359,9 @@ func (p *Provider) sweepRegions() []string {
 	return out
 }
 
-// clientFor returns the Client for region (defaulting an empty region), building
-// and caching it on first use. Construction is serialized under mu: a region's
-// Client is built at most once, and a concurrent caller for the same or another
-// region waits — acceptable because a build is a rare one-time, per-region event
-// (an AMI + subnet resolution), not a hot path. A build failure is NOT cached, so
-// a transient resolution error (throttle, a not-yet-enabled region) is retried on
-// the next call rather than poisoning the region permanently.
+// clientFor returns the Client for region, building and caching it on first use.
 func (p *Provider) clientFor(ctx context.Context, region string) (Client, error) {
 	if region == "" {
-		// No region to build a client for. Unreachable on the normal path (every
-		// request carries a region), so this only guards a legacy unqualified instance
-		// id reaching Terminate/Get — surface it rather than silently guessing.
 		return nil, fmt.Errorf("aws: no region for client: %w", ErrConfig)
 	}
 	p.mu.Lock()
@@ -511,30 +502,24 @@ func (p *Provider) Provision(
 	return provider.ProvisionResult{InstanceID: id, Reserved: true}, nil
 }
 
-// Terminate implements provider.Provider. Idempotent by the Client contract. The
-// instanceID is a raw EC2 id, which does not carry its region, so teardown sweeps
-// the swept regions and terminates the instance wherever it lives. This is safe
-// and cheap: TerminateInstance is idempotent and a wrong-region lookup returns
-// InvalidInstanceID.NotFound, which the Client maps to nil — so terminating in a
-// region the instance is not in is a harmless no-op. It stops at the first region
-// that actually owns the instance.
+// Terminate implements provider.Provider. Idempotent by the Client contract.
 //
-// A legacy region-qualified id ("<region>/i-...") from before this change is still
-// honored: splitID peels the region off and it routes straight to that region.
-func (p *Provider) Terminate(ctx context.Context, instanceID string) error {
+// An EC2 id is only reachable through its own region's endpoint, so the region picks the
+// client — and terminating there needs no Describe first, since TerminateInstance is
+// idempotent and maps InvalidInstanceID.NotFound to nil.
+func (p *Provider) Terminate(ctx context.Context, instanceID, region string) error {
 	if instanceID == "" {
 		return nil // nothing provisioned yet; treat as already gone
 	}
-	// Back-compat: a legacy qualified id routes directly to its region.
-	if region, rawID := splitID(instanceID); region != "" {
+	if region != "" {
 		client, err := p.clientFor(ctx, region)
 		if err != nil {
 			return err
 		}
-		return client.TerminateInstance(ctx, rawID)
+		return client.TerminateInstance(ctx, instanceID)
 	}
 
-	// Raw id: sweep the regions and terminate wherever it lives. Confirm ownership
+	// Sweep the regions and terminate wherever it lives. Confirm ownership
 	// with a Describe first so we only issue TerminateInstance against the region
 	// that actually has it — and so a region whose client cannot be built does not
 	// mask a successful terminate elsewhere.
@@ -565,25 +550,7 @@ func (p *Provider) Terminate(ctx context.Context, instanceID string) error {
 // region's view of the instance. A per-region client-build/describe error is
 // tolerated and the sweep continues; only if every region errored (and none held
 // the instance) is that error surfaced.
-//
-// A legacy region-qualified id ("<region>/i-...") routes directly to its region.
 func (p *Provider) Get(ctx context.Context, instanceID string) (*provider.Instance, error) {
-	if region, rawID := splitID(instanceID); region != "" {
-		client, err := p.clientFor(ctx, region)
-		if err != nil {
-			return nil, err
-		}
-		ec2, err := client.DescribeInstance(ctx, rawID)
-		if err != nil {
-			return nil, err
-		}
-		if ec2 == nil {
-			return nil, nil // absent => terminated, per interface contract
-		}
-		inst := p.toInstance(*ec2)
-		return &inst, nil
-	}
-
 	var lastErr error
 	for _, region := range p.sweepRegions() {
 		client, err := p.clientFor(ctx, region)
@@ -724,24 +691,6 @@ func findByClaim(ctx context.Context, client Client, claimName string) (*EC2Inst
 		}
 	}
 	return nil, nil
-}
-
-// idSep separates the region prefix from the raw EC2 id in a legacy region-qualified
-// instance id ("<region>/<ec2-id>"). "/" cannot appear in either a region name or
-// an EC2 instance id, so it is an unambiguous delimiter. Current ids are raw EC2
-// ids; this exists only so splitID can still route ids recorded before that change.
-const idSep = "/"
-
-// splitID recognizes a LEGACY region-qualified id ("<region>/i-..."): it returns
-// the region and the raw EC2 id. A current, raw EC2 id (no separator) yields an
-// empty region, signaling the caller to locate the instance by sweeping regions
-// instead. It is the one remaining reader of the old format, kept so ids persisted
-// on a NodeClaim before the id stopped being qualified still terminate correctly.
-func splitID(instanceID string) (region, rawID string) {
-	if i := strings.Index(instanceID, idSep); i >= 0 {
-		return instanceID[:i], instanceID[i+len(idSep):]
-	}
-	return "", instanceID
 }
 
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the

@@ -52,17 +52,18 @@ type fakeProvider struct {
 	provisionReserved bool
 	// provisionURL/provisionToken are the connect credential Provision returns — the
 	// one-shot value the handler must persist, since it can never be re-read.
-	provisionURL   string
-	provisionToken string
-	provisionErr   error
-	provisionCnt   int
-	lastReq        provider.ProvisionRequest
-	terminateCnt   int
-	terminateID    string
-	terminateErr   error
-	list           []provider.Instance
-	listErr        error
-	capabilities   provider.Capabilities
+	provisionURL    string
+	provisionToken  string
+	provisionErr    error
+	provisionCnt    int
+	lastReq         provider.ProvisionRequest
+	terminateCnt    int
+	terminateID     string
+	terminateRegion string
+	terminateErr    error
+	list            []provider.Instance
+	listErr         error
+	capabilities    provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
 	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
 	// record what the handler passed in, so a test can assert it resolved them off the
@@ -109,11 +110,12 @@ func (f *fakeProvider) Provision(
 	}, nil
 }
 
-func (f *fakeProvider) Terminate(_ context.Context, id string) error {
+func (f *fakeProvider) Terminate(_ context.Context, id, region string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.terminateCnt++
 	f.terminateID = id
+	f.terminateRegion = region
 	return f.terminateErr
 }
 
@@ -147,28 +149,39 @@ func (b *recordingBlocklist) Record(prov string, scope provider.BlockScope, ttl 
 }
 
 // testPoolName is the pool every testPod is placed against. Provisioning resolves the
-// pool by this label, so a Pod without it cannot be provisioned at all (see egressFor).
+// pool by this label, so a Pod without it cannot be provisioned at all (see poolFor).
 const testPoolName = "pool-a"
+
+// testPodUID is the UID every testPod carries, and the one the NodeClaim openCluster serves
+// records. The two must agree: claimFor refuses a claim naming a different Pod incarnation,
+// so a fake that ignored the UID would pass what the real reader rejects.
+const testPodUID = "uid-1"
 
 func testPod(ns, name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: ns, Name: name,
+			Namespace: ns, Name: name, UID: testPodUID,
 			Labels: map[string]string{nebulav1alpha1.PoolLabel: testPoolName},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "img"}}},
 	}
 }
 
-// fakePools stands in for the manager's NodePool cache, serving pools from a map so a test
-// can pin the policy the handler is supposed to read (and count that it read it).
-type fakePools struct {
+// fakeCluster stands in for the manager's cache of the two objects CreatePod provisions
+// from, so a test can pin what the handler is supposed to find there — and count that it
+// looked, instead of reading a copy off the Pod.
+type fakeCluster struct {
 	pools map[string]*nebulav1alpha1.NodePool
-	err   error // when set, every Get fails with it
-	calls int
+	// claim is served under whatever name is asked for, since the name is derived from the
+	// Pod and every test Pod is placed the same way. Nil serves NotFound.
+	claim *nebulav1alpha1.NodeClaim
+
+	err        error // when set, every read fails with it
+	calls      int   // pool reads
+	claimCalls int
 }
 
-func (f *fakePools) Get(_ context.Context, name string) (*nebulav1alpha1.NodePool, error) {
+func (f *fakeCluster) Pool(_ context.Context, name string) (*nebulav1alpha1.NodePool, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
@@ -181,35 +194,66 @@ func (f *fakePools) Get(_ context.Context, name string) (*nebulav1alpha1.NodePoo
 	return pool, nil
 }
 
-// testPools serves testPoolName with the given policy; nil is an unrestricted pool, which
-// is what a pool that never set spec.egress means.
-func testPools(egress *nebulav1alpha1.EgressPolicy) *fakePools {
-	return &fakePools{pools: map[string]*nebulav1alpha1.NodePool{
-		testPoolName: {
-			ObjectMeta: metav1.ObjectMeta{Name: testPoolName},
-			Spec:       nebulav1alpha1.NodePoolSpec{Egress: egress},
-		},
-	}}
+func (f *fakeCluster) Claim(_ context.Context, name string) (*nebulav1alpha1.NodeClaim, error) {
+	f.claimCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.claim == nil {
+		return nil, apierrors.NewNotFound(
+			schema.GroupResource{Group: nebulav1alpha1.GroupVersion.Group, Resource: "nodeclaims"}, name)
+	}
+	claim := f.claim.DeepCopy()
+	claim.Name = name
+	return claim, nil
 }
 
-// openPools is the default for the many tests that provision without caring about egress.
-func openPools() *fakePools { return testPools(nil) }
+// clusterWithEgress serves testPoolName with the given policy; nil is an unrestricted pool,
+// which is what a pool that never set spec.egress means. The claim it serves records no
+// placement, the common case for a provider that has one tier and one region.
+func clusterWithEgress(egress *nebulav1alpha1.EgressPolicy) *fakeCluster {
+	return &fakeCluster{
+		pools: map[string]*nebulav1alpha1.NodePool{
+			testPoolName: {
+				ObjectMeta: metav1.ObjectMeta{Name: testPoolName},
+				Spec:       nebulav1alpha1.NodePoolSpec{Egress: egress},
+			},
+		},
+		claim: &nebulav1alpha1.NodeClaim{
+			Spec: nebulav1alpha1.NodeClaimSpec{
+				PodRef: nebulav1alpha1.PodReference{UID: testPodUID},
+			},
+		},
+	}
+}
 
-// poolsWithTTL serves testPoolName with an explicit failover TTL and no egress policy, for
-// the blocklist tests: the TTL is pool policy, read when a block is recorded.
-func poolsWithTTL(ttl time.Duration) *fakePools {
-	pools := openPools()
-	pools.pools[testPoolName].Spec.Failover = &nebulav1alpha1.FailoverPolicy{
+// openCluster is the default for the many tests that provision without caring about the
+// pool's policy or where placement landed.
+func openCluster() *fakeCluster { return clusterWithEgress(nil) }
+
+// clusterWithTTL serves testPoolName with an explicit failover TTL, for the blocklist tests:
+// the TTL is pool policy, read when a block is recorded.
+func clusterWithTTL(ttl time.Duration) *fakeCluster {
+	c := openCluster()
+	c.pools[testPoolName].Spec.Failover = &nebulav1alpha1.FailoverPolicy{
 		BlocklistTTL: metav1.Duration{Duration: ttl},
 	}
-	return pools
+	return c
+}
+
+// clusterWithPlacement serves a claim recording the decision placement made, which is where
+// the tier and region a provision runs under come from.
+func clusterWithPlacement(tier nebulav1alpha1.CapacityType, region string) *fakeCluster {
+	c := openCluster()
+	c.claim.Spec.CapacityType = tier
+	c.claim.Spec.Region = region
+	return c
 }
 
 func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, clusterWithPlacement(nebulav1alpha1.CapacitySpot, ""))
 	pod := testPod("default", "p1")
-	pod.Annotations = map[string]string{nebulav1alpha1.CapacityTypeAnnotation: string(nebulav1alpha1.CapacitySpot)}
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -221,7 +265,7 @@ func TestCreatePod_ProvisionsAndTracks(t *testing.T) {
 		t.Fatalf("expected claim name default-p1, got %q", fp.lastReq.ClaimName)
 	}
 	if fp.lastReq.CapacityType != nebulav1alpha1.CapacitySpot {
-		t.Fatalf("expected capacity type read from annotation, got %q", fp.lastReq.CapacityType)
+		t.Fatalf("expected capacity type read from the claim, got %q", fp.lastReq.CapacityType)
 	}
 
 	got, err := h.GetPod(context.Background(), "default", "p1")
@@ -238,7 +282,7 @@ func TestCreatePod_ReservedAdvancesToInitializing(t *testing.T) {
 	// allocated) means the instance is committed and booting, so the Pod may leave
 	// Provisioning immediately instead of waiting a whole poll tick for the same news.
 	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
@@ -267,7 +311,7 @@ func TestCreatePod_UnreservedStaysProvisioning(t *testing.T) {
 	// exactly true. Advancing to Initializing here would claim a commitment the
 	// provider has not made.
 	fp := &fakeProvider{provisionID: "sb-1", provisionReserved: false}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
@@ -296,7 +340,7 @@ func TestCreatePod_EmitsProvisioningWhileProvisionInFlight(t *testing.T) {
 	// Emitting an untracked Pod is what makes this safe: the tracked invariant forbids
 	// storing one mid-provision, not reporting one.
 	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 
 	var mu sync.Mutex
 	var reasons []string
@@ -337,7 +381,7 @@ func TestCreatePod_PollTickDuringProvisionEmitsNoTerminalStatus(t *testing.T) {
 	// correct either way. The damage is the emit — VK writes it to the API server, where
 	// Pod phases are terminal-sticky, and the NodeClaim then reclaims a live instance.
 	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 
 	var mu sync.Mutex
 	var emitted []string
@@ -374,7 +418,7 @@ func TestCreatePod_PollTickDuringProvisionEmitsNoTerminalStatus(t *testing.T) {
 
 func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity")}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
@@ -406,7 +450,7 @@ func TestCreatePod_UnattributableErrorLeavesPodProvisioning(t *testing.T) {
 		classifyScope: provider.BlockScope{Accelerator: &accel},
 	}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, openPools())
+	h := NewHandler(fp, nil, bl, openCluster())
 
 	var mu sync.Mutex
 	var emitted []string
@@ -456,7 +500,7 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	bl := &recordingBlocklist{}
 	// A non-default TTL on the POOL, so this asserts the pool's policy is honored rather
 	// than that it happens to equal defaultBlocklistTTL.
-	h := NewHandler(fp, nil, bl, poolsWithTTL(7*time.Minute))
+	h := NewHandler(fp, nil, bl, clusterWithTTL(7*time.Minute))
 	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base TTL is asserted exactly
 
 	pod := testPod("default", "p1")
@@ -491,7 +535,7 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 	// (which would exclude everything on the provider).
 	fp := &fakeProvider{provisionErr: errors.New("weird"), classifyScope: provider.BlockScope{}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, openPools())
+	h := NewHandler(fp, nil, bl, openCluster())
 
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 		t.Fatal("expected CreatePod to return the provision error")
@@ -507,20 +551,20 @@ func TestCreatePod_EmptyScopeDoesNotBlock(t *testing.T) {
 // is a pure function of the pool rather than a second read that would have to decide.
 func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		pools PoolReader
+		name    string
+		cluster ClusterReader
 	}{{
-		name:  "pool sets no failover policy",
-		pools: openPools(),
+		name:    "pool sets no failover policy",
+		cluster: openCluster(),
 	}, {
 		// Zero would install a PERMANENT block, so it has to read as "unset".
-		name:  "pool sets a zero TTL",
-		pools: poolsWithTTL(0),
+		name:    "pool sets a zero TTL",
+		cluster: clusterWithTTL(0),
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 			bl := &recordingBlocklist{}
-			h := NewHandler(fp, nil, bl, tc.pools)
+			h := NewHandler(fp, nil, bl, tc.cluster)
 			h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is exact
 
 			if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
@@ -543,7 +587,7 @@ func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
 func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, &fakePools{err: errors.New("cache not synced")})
+	h := NewHandler(fp, nil, bl, &fakeCluster{err: errors.New("cache not synced")})
 
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 		t.Fatal("expected CreatePod to fail closed on an unreadable pool")
@@ -561,7 +605,7 @@ func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
 func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, poolsWithTTL(30*time.Second))
+	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
 	h.jitterFn = func() time.Duration { return 20 * time.Second } // deterministic jitter
 
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
@@ -575,7 +619,7 @@ func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
 // The production jitter draw stays within [0, blocklistJitter) — never negative
 // (which would shorten the block below its base) and never at/over the bound.
 func TestProductionJitterInRange(t *testing.T) {
-	h := NewHandler(&fakeProvider{}, nil, nil, openPools())
+	h := NewHandler(&fakeProvider{}, nil, nil, openCluster())
 	for i := 0; i < 1000; i++ {
 		j := h.jitterFn()
 		if j < 0 || j >= blocklistJitter {
@@ -586,7 +630,7 @@ func TestProductionJitterInRange(t *testing.T) {
 
 func TestDeletePod_TerminatesAndUntracks(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
@@ -608,7 +652,7 @@ func TestDeletePod_TerminatesAndUntracks(t *testing.T) {
 
 func TestDeletePod_Idempotent(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -620,9 +664,59 @@ func TestDeletePod_Idempotent(t *testing.T) {
 	}
 }
 
+// Teardown must name the region the instance was provisioned in: on a region-partitioned
+// provider the id alone does not say which endpoint owns the instance. For a pod this
+// process provisioned, that comes from the tracked placement — no re-read of the claim,
+// which by then may already be deleted (the claim controller races the Pod's deletion).
+func TestDeletePod_TerminatesInTheProvisionedRegion(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	cluster := clusterWithPlacement(nebulav1alpha1.CapacitySpot, "eu-west-1")
+	h := NewHandler(fp, nil, nil, cluster)
+	pod := testPod("default", "p1")
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	reads := cluster.claimCalls
+	if err := h.DeletePod(context.Background(), pod); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	if fp.terminateRegion != "eu-west-1" {
+		t.Fatalf("terminate region = %q, want eu-west-1", fp.terminateRegion)
+	}
+	if cluster.claimCalls != reads {
+		t.Fatalf("claim reads = %d, want %d (the tracked region is enough)", cluster.claimCalls, reads)
+	}
+}
+
+// A pod re-adopted after a restart lost the tracked region with the process, so teardown
+// reads it back off the NodeClaim — the durable record. Without it the provider would have
+// to search for the instance, which can silently miss (see provider.Terminate).
+func TestDeletePod_ReAdoptedPodReadsRegionFromClaim(t *testing.T) {
+	fp := &fakeProvider{list: []provider.Instance{{
+		ID: "inst-9", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}}
+	h := NewHandler(fp, nil, nil, clusterWithPlacement(nebulav1alpha1.CapacitySpot, "ap-south-1"))
+	pod := testPod("default", "p1")
+
+	// Cold map: GetPod re-adopts the live instance, with no placement to inherit.
+	if _, err := h.GetPod(context.Background(), "default", "p1"); err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if err := h.DeletePod(context.Background(), pod); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	if fp.terminateID != "inst-9" {
+		t.Fatalf("terminate id = %q, want inst-9", fp.terminateID)
+	}
+	if fp.terminateRegion != "ap-south-1" {
+		t.Fatalf("terminate region = %q, want ap-south-1 (read from the claim)", fp.terminateRegion)
+	}
+}
+
 func TestReconcileOnce_ReportsRunning(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -669,7 +763,7 @@ func TestReconcileOnce_DNSEndpointNotWrittenToPodIP(t *testing.T) {
 	// must be left empty. The reachable address is surfaced on the annotation
 	// instead, which accepts any form.
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -710,7 +804,7 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 	})
 
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	_ = h.CreatePod(context.Background(), pod)
 	// Register the notify wrapper (this is where persistMetadata is injected).
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
@@ -760,7 +854,7 @@ func TestCreatePod_PersistsInstanceIDAlongsideEndpoint(t *testing.T) {
 	})
 
 	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: "tok-abc"}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	// Wrapper registered BEFORE the create, so the create-path emit is the write.
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
 
@@ -820,11 +914,10 @@ func secretValue(s *corev1.Secret, key string) string {
 func TestCreatePod_WritesConnectSecret(t *testing.T) {
 	const url, token = "https://sb-1.modal.host", "tok-abc"
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: token}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	// Register the notifier BEFORE CreatePod, as VK does (it wires NotifyPods before
 	// any pod work starts). The endpoint reaches the API server through it.
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
@@ -875,7 +968,6 @@ func TestCreatePod_WritesConnectSecret(t *testing.T) {
 // once and cannot be re-read, so no later tick has anything to write.
 func TestConnectSecret_WrittenOnceNotPerTick(t *testing.T) {
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	var creates int
@@ -889,7 +981,7 @@ func TestConnectSecret_WrittenOnceNotPerTick(t *testing.T) {
 		provisionURL:   "https://sb-1.modal.host",
 		provisionToken: "tok-abc",
 	}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -919,11 +1011,10 @@ func TestConnectSecret_WrittenOnceNotPerTick(t *testing.T) {
 // address is observed later rather than minted here.
 func TestCreatePod_NoSecretWithoutCredential(t *testing.T) {
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	fp := &fakeProvider{provisionID: "inst-1"} // no URL, no token
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -939,11 +1030,10 @@ func TestCreatePod_NoSecretWithoutCredential(t *testing.T) {
 func TestCreatePod_URLWithoutTokenPatchesEndpointOnly(t *testing.T) {
 	const url = "https://sb-1.modal.host"
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -965,10 +1055,11 @@ func TestCreatePod_URLWithoutTokenPatchesEndpointOnly(t *testing.T) {
 // would never be collected — leaking a live credential. Skip instead.
 func TestCreateConnectSecret_SkipsUIDLessPod(t *testing.T) {
 	client := fake.NewSimpleClientset()
-	h := NewHandler(&fakeProvider{}, client, nil, openPools())
+	h := NewHandler(&fakeProvider{}, client, nil, openCluster())
 
-	h.createConnectSecret(context.Background(), testPod("default", "p1"), // no UID
-		"https://sb-9.modal.host", "tok-abc")
+	pod := testPod("default", "p1")
+	pod.UID = "" // the one thing an ownerReference cannot be built without
+	h.createConnectSecret(context.Background(), pod, "https://sb-9.modal.host", "tok-abc")
 
 	if got := connectSecret(t, client, "default", "p1"); got != nil {
 		t.Fatalf("expected no Secret for a UID-less Pod (it would never be GC'd), got %+v", got)
@@ -979,11 +1070,10 @@ func TestCreateConnectSecret_SkipsUIDLessPod(t *testing.T) {
 // endpoint annotation would advertise an instance that does not exist.
 func TestCreatePod_NoCredentialPersistedOnProvisionFailure(t *testing.T) {
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	fp := &fakeProvider{provisionErr: errors.New("no capacity")}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	if err := h.CreatePod(context.Background(), pod); err == nil {
 		t.Fatal("expected CreatePod to fail")
 	}
@@ -1006,11 +1096,10 @@ func TestCreatePod_NoCredentialPersistedOnProvisionFailure(t *testing.T) {
 func TestReconcileOnce_EmptyObservedEndpointDoesNotClearAnnotation(t *testing.T) {
 	const url = "https://sb-1.modal.host"
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: "tok-abc"}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -1040,7 +1129,6 @@ func TestReconcileOnce_EmptyObservedEndpointDoesNotClearAnnotation(t *testing.T)
 func TestCreatePod_FailedEndpointPatchIsRetriedByPollLoop(t *testing.T) {
 	const url = "https://sb-1.modal.host"
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	var patches int
@@ -1054,7 +1142,7 @@ func TestCreatePod_FailedEndpointPatchIsRetriedByPollLoop(t *testing.T) {
 	})
 
 	fp := &fakeProvider{provisionID: "inst-1", provisionURL: url, provisionToken: "tok-abc"}
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod must not fail on a failed endpoint patch: %v", err)
@@ -1146,7 +1234,6 @@ func (s ctxRecordingSecrets) Create(
 func TestCreatePod_ProvisionDeadlineDoesNotLeakIntoCredentialWrite(t *testing.T) {
 	const url, token = "https://sb-1.modal.host", "tok-abc"
 	pod := testPod("default", "p1")
-	pod.UID = "uid-1"
 	client := fake.NewSimpleClientset(pod)
 
 	var secretCtx context.Context
@@ -1158,7 +1245,7 @@ func TestCreatePod_ProvisionDeadlineDoesNotLeakIntoCredentialWrite(t *testing.T)
 		// A tiny budget the call is guaranteed to exhaust.
 		capabilities: provider.Capabilities{ProvisionTimeout: time.Millisecond},
 	}
-	h := NewHandler(fp, ctxRecordingClient{client, &secretCtx}, nil, openPools())
+	h := NewHandler(fp, ctxRecordingClient{client, &secretCtx}, nil, openCluster())
 	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -1200,7 +1287,7 @@ func TestReconcileOnce_NotifiesOnProvisioningToInitializing(t *testing.T) {
 	// check would swallow this and strand the Pod on the stale "Provisioning"
 	// reason; the reason must move and a notification must fire.
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -1243,7 +1330,7 @@ func TestReconcileOnce_NotifiesOnProvisioningToInitializing(t *testing.T) {
 
 func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 	_ = h.CreatePod(context.Background(), pod)
 
@@ -1270,7 +1357,7 @@ func TestReconcileOnce_ListErrorLeavesStatusUntouched(t *testing.T) {
 	// recoverable ClaimName cannot be reported at all (an empty claim and an omitted
 	// sandbox both read as absent here). That choice is only safe because of this.
 	fp := &fakeProvider{provisionID: "inst-1", provisionReserved: true}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
 
 	var mu sync.Mutex
@@ -1302,11 +1389,11 @@ func TestReconcileOnce_ListErrorLeavesStatusUntouched(t *testing.T) {
 func TestNewHandler_PollIntervalFromCapabilities(t *testing.T) {
 	// A provider that declares a cadence overrides the default.
 	custom := &fakeProvider{capabilities: provider.Capabilities{PollInterval: 5 * time.Second}}
-	if got := NewHandler(custom, nil, nil, openPools()).pollEvery; got != 5*time.Second {
+	if got := NewHandler(custom, nil, nil, openCluster()).pollEvery; got != 5*time.Second {
 		t.Fatalf("expected the provider's PollInterval, got %v", got)
 	}
 	// A provider that leaves it zero falls back to the vnode default.
-	if got := NewHandler(&fakeProvider{}, nil, nil, openPools()).pollEvery; got != defaultPollInterval {
+	if got := NewHandler(&fakeProvider{}, nil, nil, openCluster()).pollEvery; got != defaultPollInterval {
 		t.Fatalf("expected the default cadence, got %v", got)
 	}
 }
@@ -1321,7 +1408,7 @@ func TestGetPod_ReAdoptsLiveInstanceAfterRestart(t *testing.T) {
 	fp := &fakeProvider{list: []provider.Instance{{
 		ID: "inst-9", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: "1.2.3.4",
 	}}}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 
 	got, err := h.GetPod(context.Background(), "default", "p1")
 	if err != nil {
@@ -1348,7 +1435,7 @@ func TestGetPod_ReAdoptsLiveInstanceAfterRestart(t *testing.T) {
 // the non-NotFound error makes VK's delete path requeue instead of terminating.
 func TestGetPod_ListErrorIsUnknownNotAbsent(t *testing.T) {
 	fp := &fakeProvider{listErr: errors.New("rpc error: code = Unavailable")}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 
 	got, err := h.GetPod(context.Background(), "default", "p1")
 	if err == nil {
@@ -1389,7 +1476,7 @@ func TestGetPod_UnknownClaimStaysNotFound(t *testing.T) {
 	fp := &fakeProvider{list: []provider.Instance{{
 		ID: "inst-1", ClaimName: "default-other", State: provider.InstanceRunning,
 	}}}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 
 	if _, err := h.GetPod(context.Background(), "default", "p1"); !errdefs.IsNotFound(err) {
 		t.Fatalf("expected NotFound for an unknown, unlisted claim, got %v", err)
@@ -1398,7 +1485,7 @@ func TestGetPod_UnknownClaimStaysNotFound(t *testing.T) {
 
 func TestGetPods_ReturnsTracked(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, openCluster())
 	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
 	_ = h.CreatePod(context.Background(), testPod("default", "p2"))
 
@@ -1440,7 +1527,7 @@ func TestCreatePod_ReadsEgressPolicyFromPool(t *testing.T) {
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			fp := &fakeProvider{provisionID: "inst-1"}
-			pools := testPools(tc.pool)
+			pools := clusterWithEgress(tc.pool)
 			h := NewHandler(fp, nil, nil, pools)
 
 			if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
@@ -1459,42 +1546,121 @@ func TestCreatePod_ReadsEgressPolicyFromPool(t *testing.T) {
 	}
 }
 
-// TestCreatePod_FailsClosedWithoutAPool covers the three ways the trusted state can be
-// missing. None may fall back to a default: the pool IS the policy, so an unreadable pool
-// means the policy is unknown, and provisioning under an unknown containment policy is the
-// failure this whole path exists to prevent. Nothing is provisioned, and the Pod carries the
-// reason rather than failing silently.
-func TestCreatePod_FailsClosedWithoutAPool(t *testing.T) {
+// TestCreatePod_ReadsPlacementFromClaim pins where the tier and region come FROM. Unlike the
+// egress policy they cannot be recomputed from the pool — the pool declares an ordered
+// fallback list, and which candidate won depends on the blocklist as it stood when placement
+// ran — so the decision has to be CARRIED. It rides the NodeClaim, not the Pod: the claim is
+// cluster-scoped and controller-written, while the Pod is patchable between ungate and here,
+// where a patched tier bills the cluster owner OnDemand rates for a pool pinned to Spot and a
+// patched region provisions outside a residency boundary.
+func TestCreatePod_ReadsPlacementFromClaim(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	cluster := clusterWithPlacement(nebulav1alpha1.CapacitySpot, "us-east-1")
+	h := NewHandler(fp, nil, nil, cluster)
+
+	pod := testPod("default", "p1")
+	// Exactly what such a patch would look like, in the keys this used to read. Spelled out
+	// rather than referenced: the constants are gone, and nothing may resurrect them.
+	pod.Annotations = map[string]string{
+		"nebula.inftyai.com/capacity-type": string(nebulav1alpha1.CapacityOnDemand),
+		"nebula.inftyai.com/region":        "eu-central-1",
+	}
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if cluster.claimCalls != 1 {
+		t.Errorf("claim reads = %d, want 1; the placement must be read from the claim", cluster.claimCalls)
+	}
+	if fp.lastReq.CapacityType != nebulav1alpha1.CapacitySpot {
+		t.Errorf("req.CapacityType = %q, want Spot from the claim", fp.lastReq.CapacityType)
+	}
+	if fp.lastReq.Region != "us-east-1" {
+		t.Errorf("req.Region = %q, want us-east-1 from the claim", fp.lastReq.Region)
+	}
+}
+
+// The region a failure is BLOCKLISTED under comes from the claim for a sharper reason: the
+// blocklist is one process-wide map shared by every tenant, so a Pod-borne region would let
+// whoever can patch a Pod fence a region off for everybody by failing a provision once.
+func TestCreatePod_BlocklistRegionComesFromTheClaim(t *testing.T) {
+	fp := &fakeProvider{
+		provisionErr:  errors.New("no capacity"),
+		classifyScope: provider.BlockScope{DenyAll: true},
+	}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl, clusterWithPlacement(nebulav1alpha1.CapacitySpot, "us-east-1"))
+
+	pod := testPod("default", "p1")
+	pod.Annotations = map[string]string{"nebula.inftyai.com/region": "eu-central-1"}
+
+	if err := h.CreatePod(context.Background(), pod); err == nil {
+		t.Fatal("expected CreatePod to return the provision error")
+	}
+	if bl.calls != 1 {
+		t.Fatalf("Record calls = %d, want 1", bl.calls)
+	}
+	if fp.classifyRegion != "us-east-1" {
+		t.Errorf("classified region = %q, want us-east-1 from the claim", fp.classifyRegion)
+	}
+}
+
+// TestCreatePod_FailsClosedWithoutClusterState covers every way the two objects a provision
+// is derived from can fail to resolve. None may fall back to a default: the pool IS the
+// policy and the claim IS the placement decision, so provisioning without either means
+// provisioning on terms nobody chose — the failure this whole path exists to prevent.
+// Nothing is provisioned, and the Pod carries the reason rather than failing silently.
+func TestCreatePod_FailsClosedWithoutClusterState(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		pools PoolReader
-		pod   func() *corev1.Pod
+		name    string
+		cluster func() ClusterReader
+		pod     func() *corev1.Pod
 	}{{
 		// A Pod that never went through placement: a scheduling gate can be removed by
 		// anyone who can patch the Pod, so reaching a virtual node proves nothing.
-		name:  "no pool label",
-		pools: openPools(),
+		name:    "no pool label",
+		cluster: func() ClusterReader { return openCluster() },
 		pod: func() *corev1.Pod {
 			pod := testPod("default", "p1")
 			delete(pod.Labels, nebulav1alpha1.PoolLabel)
 			return pod
 		},
 	}, {
-		name:  "pool does not exist",
-		pools: &fakePools{},
-		pod:   func() *corev1.Pod { return testPod("default", "p1") },
+		name:    "pool does not exist",
+		cluster: func() ClusterReader { return &fakeCluster{} },
+		pod:     func() *corev1.Pod { return testPod("default", "p1") },
 	}, {
-		name:  "no reader wired",
-		pools: nil,
-		pod:   func() *corev1.Pod { return testPod("default", "p1") },
+		name:    "no reader wired",
+		cluster: func() ClusterReader { return nil },
+		pod:     func() *corev1.Pod { return testPod("default", "p1") },
+	}, {
+		// The claim is the ledger placement writes BEFORE it ungates, so its absence means
+		// this Pod's provisioning terms were never recorded — or never decided.
+		name: "claim does not exist",
+		cluster: func() ClusterReader {
+			c := openCluster()
+			c.claim = nil
+			return c
+		},
+		pod: func() *corev1.Pod { return testPod("default", "p1") },
+	}, {
+		// A same-named claim from a PRIOR Pod incarnation. Its region and tier were chosen
+		// for a different workload, so honouring it would provision on someone else's terms.
+		name: "claim names a different Pod",
+		cluster: func() ClusterReader {
+			c := openCluster()
+			c.claim.Spec.PodRef.UID = "pod-uid-stale"
+			return c
+		},
+		pod: func() *corev1.Pod { return testPod("default", "p1") },
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			fp := &fakeProvider{provisionID: "inst-1"}
-			h := NewHandler(fp, nil, nil, tc.pools)
+			h := NewHandler(fp, nil, nil, tc.cluster())
 			pod := tc.pod()
 
 			if err := h.CreatePod(context.Background(), pod); err == nil {
-				t.Fatal("CreatePod succeeded; an unresolvable egress policy must refuse to provision")
+				t.Fatal("CreatePod succeeded; unresolvable cluster state must refuse to provision")
 			}
 			if fp.provisionCnt != 0 {
 				t.Errorf("provision calls = %d, want 0; nothing may be requested", fp.provisionCnt)

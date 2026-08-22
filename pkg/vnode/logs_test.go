@@ -343,7 +343,7 @@ func (p *loggingProvider) Logs(_ context.Context, instanceID string) (io.ReadClo
 func TestGetContainerLogs_StreamsTrackedPod(t *testing.T) {
 	fp := &fakeProvider{provisionID: "inst-1"}
 	lp := newLoggingProvider(fp, "hello from the sandbox\n")
-	h := NewHandler(lp, nil, nil, openPools())
+	h := NewHandler(lp, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestGetContainerLogs_StreamsTrackedPod(t *testing.T) {
 // stream behind it.
 func TestGetContainerLogs_IgnoresContainerName(t *testing.T) {
 	lp := newLoggingProvider(&fakeProvider{provisionID: "inst-1"}, "out\n")
-	h := NewHandler(lp, nil, nil, openPools())
+	h := NewHandler(lp, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestGetContainerLogs_IgnoresContainerName(t *testing.T) {
 func TestGetContainerLogs_NotFoundCases(t *testing.T) {
 	// No log support at all — a legitimate configuration, not an internal error.
 	t.Run("provider does not stream logs", func(t *testing.T) {
-		h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, openPools())
+		h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, openCluster())
 		if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}
@@ -406,7 +406,7 @@ func TestGetContainerLogs_NotFoundCases(t *testing.T) {
 
 	// Another node's pod, or one this process never adopted.
 	t.Run("pod not tracked", func(t *testing.T) {
-		h := NewHandler(newLoggingProvider(&fakeProvider{}, "x\n"), nil, nil, openPools())
+		h := NewHandler(newLoggingProvider(&fakeProvider{}, "x\n"), nil, nil, openCluster())
 		_, err := h.GetContainerLogs(context.Background(), "default", "ghost", "main", vkapi.ContainerLogOpts{})
 		assertNotFound(t, err)
 	})
@@ -416,7 +416,7 @@ func TestGetContainerLogs_NotFoundCases(t *testing.T) {
 	t.Run("tracked without an instance", func(t *testing.T) {
 		fp := &fakeProvider{provisionErr: errors.New("no capacity")}
 		lp := newLoggingProvider(fp, "x\n")
-		h := NewHandler(lp, nil, nil, openPools())
+		h := NewHandler(lp, nil, nil, openCluster())
 		if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 			t.Fatal("CreatePod: expected the provision rejection to surface")
 		}
@@ -433,7 +433,7 @@ func TestGetContainerLogs_NotFoundCases(t *testing.T) {
 func TestGetContainerLogs_ProviderErrorIsNotNotFound(t *testing.T) {
 	lp := newLoggingProvider(&fakeProvider{provisionID: "inst-1"}, "")
 	lp.logsErr = errors.New("provider API unreachable")
-	h := NewHandler(lp, nil, nil, openPools())
+	h := NewHandler(lp, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestGetContainerLogs_ProviderErrorIsNotNotFound(t *testing.T) {
 // otherwise --tail/--limit-bytes would silently do nothing.
 func TestGetContainerLogs_AppliesOpts(t *testing.T) {
 	lp := newLoggingProvider(&fakeProvider{provisionID: "inst-1"}, "a\nb\nc\n")
-	h := NewHandler(lp, nil, nil, openPools())
+	h := NewHandler(lp, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}

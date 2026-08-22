@@ -126,7 +126,7 @@ func (p *Provider) Provision(
 
 // Terminate forgets the instance. Idempotent: terminating an already-gone (or
 // never-created) instance returns nil.
-func (p *Provider) Terminate(_ context.Context, instanceID string) error {
+func (p *Provider) Terminate(_ context.Context, instanceID, _ string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.instances, instanceID)

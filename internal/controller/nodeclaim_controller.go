@@ -212,7 +212,9 @@ func (r *NodeClaimReconciler) reconcileDelete(ctx context.Context, nc *nebulav1a
 	// already terminated this instance, so this is a redundant no-op; the call is
 	// only load-bearing when DeletePod never ran. Idempotency also makes retries
 	// after a transient error safe.
-	if err := prov.Terminate(ctx, id); err != nil {
+	// spec.Region is written before provisioning and never rewritten, so unlike the region
+	// VK holds in memory it is still readable in the case this backstop exists for.
+	if err := prov.Terminate(ctx, id, nc.Spec.Region); err != nil {
 		log.Error(err, "terminate failed; will retry", "instanceID", id)
 		return ctrl.Result{}, err
 	}
