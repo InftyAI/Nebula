@@ -301,7 +301,7 @@ func TestKubeletServer_ClientCAErrorsAreFatal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewKubeletServer: %v", err)
 		}
-		if _, err := s.tlsConfig(); err == nil {
+		if _, err := s.tlsConfig(context.Background()); err == nil {
 			t.Fatal("expected an error for a client CA path that does not exist")
 		}
 	})
@@ -315,7 +315,7 @@ func TestKubeletServer_ClientCAErrorsAreFatal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewKubeletServer: %v", err)
 		}
-		if _, err := s.tlsConfig(); err == nil {
+		if _, err := s.tlsConfig(context.Background()); err == nil {
 			t.Fatal("expected an error for a client CA file containing no certificates")
 		}
 	})
@@ -327,7 +327,7 @@ func TestKubeletServer_ClientCAErrorsAreFatal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewKubeletServer: %v", err)
 		}
-		cfg, err := s.tlsConfig()
+		cfg, err := s.tlsConfig(context.Background())
 		if err != nil {
 			t.Fatalf("tlsConfig: %v", err)
 		}

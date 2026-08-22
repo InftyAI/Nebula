@@ -38,6 +38,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	vkapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
@@ -48,7 +49,9 @@ import (
 const DefaultKubeletAddr = ":10250"
 
 // certValidity is the lifetime of the self-signed serving cert. Rotation is a process
-// restart — the key never leaves memory, so there is no Secret to keep in step.
+// restart — the key never leaves memory, so there is no Secret to keep in step. A
+// signer-issued cert is different: the cluster picks its lifetime, so it is renewed in
+// place (see rotateServingCert).
 const certValidity = 365 * 24 * time.Hour
 
 // kubeletShutdownGrace is how long a `kubectl logs -f` stream may finish after shutdown
@@ -81,10 +84,10 @@ const (
 // is resolved by asking each registered Handler whether it tracks that Pod — at most one
 // can. Cheaper than a port per provider, and than reading the Pod to learn its node.
 //
-// TLS uses a self-signed in-memory cert, which is what the API server expects: it does
-// not verify a kubelet's serving cert unless --kubelet-certificate-authority is set. The
-// webhook cert rotator cannot help, since it mints for a Service DNS name and this
-// endpoint is dialed by Pod IP.
+// TLS defaults to a self-signed in-memory cert, which is enough for an API server that
+// does not set --kubelet-certificate-authority. Where it does, EnableServingCSR asks the
+// cluster's kubelet-serving signer instead. The webhook cert rotator cannot help either
+// way: it mints for a Service DNS name and this endpoint is dialed by Pod IP.
 //
 // Client certs are verified only when ClientCAPath is set. Off by default because which CA
 // signs the API server's kubelet client cert is not portable (kubeadm uses the cluster CA,
@@ -104,6 +107,18 @@ type KubeletServer struct {
 	// clientCAPath, when set, is a PEM bundle of CAs whose client certs are accepted;
 	// others are refused at the TLS layer. Empty disables verification — see above.
 	clientCAPath string
+
+	// csrClient, when set by EnableServingCSR, asks the cluster's kubelet-serving signer
+	// for the serving cert instead of self-signing it. nil keeps the self-signed default.
+	csrClient   kubernetes.Interface
+	csrNodeName string
+	// csrTimeout overrides csrIssueTimeout, so tests need not wait out the real one.
+	csrTimeout time.Duration
+
+	// certMu guards the served cert, which rotation swaps under live connections.
+	certMu     sync.RWMutex
+	cert       *tls.Certificate
+	certIssued bool
 
 	mu       sync.RWMutex
 	handlers map[string]*Handler
@@ -170,9 +185,12 @@ func (s *KubeletServer) daemonEndpoints() corev1.NodeDaemonEndpoints {
 func (s *KubeletServer) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithName("kubelet-api")
 
-	tlsCfg, err := s.tlsConfig()
+	tlsCfg, err := s.tlsConfig(ctx)
 	if err != nil {
 		return err
+	}
+	if s.csrClient != nil {
+		go s.rotateServingCert(ctx)
 	}
 
 	mux := http.NewServeMux()
@@ -211,8 +229,11 @@ func (s *KubeletServer) Start(ctx context.Context) error {
 		}
 	}()
 
+	// signerIssued is the field to read when logs fail with x509 errors: false means the
+	// fallback cert, which only a non-verifying API server accepts.
 	log.Info("serving kubelet api (container logs, exec)",
-		"addr", s.addr, "advertisedIP", s.nodeIP, "clientCertRequired", s.clientCAPath != "")
+		"addr", s.addr, "advertisedIP", s.nodeIP, "clientCertRequired", s.clientCAPath != "",
+		"signerIssued", s.signerIssued())
 	// The cert and key are already in TLSConfig, hence the empty paths.
 	if err := srv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("kubelet api: serve: %w", err)
@@ -260,15 +281,20 @@ func (s *KubeletServer) runInContainer(
 	return h.RunInContainer(ctx, namespace, podName, containerName, cmd, attach)
 }
 
-// tlsConfig: a fresh self-signed keypair, plus client verification if a CA is set.
-func (s *KubeletServer) tlsConfig() (*tls.Config, error) {
-	cert, err := selfSignedCert(s.nodeIP)
+// tlsConfig mints the first serving cert — signer-issued or self-signed, see servingCert —
+// and adds client verification if a CA is set.
+//
+// GetCertificate rather than Certificates, so rotation is a field swap that new handshakes
+// pick up without rebuilding the server.
+func (s *KubeletServer) tlsConfig(ctx context.Context) (*tls.Config, error) {
+	cert, issued, err := s.servingCert(ctx)
 	if err != nil {
 		return nil, err
 	}
+	s.setCert(cert, issued)
 	cfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return s.currentCert(), nil },
+		MinVersion:     tls.VersionTLS12,
 		// http/1.1 only, like a real kubelet: logs need nothing HTTP/2 offers, and this is
 		// the streaming path every kubelet client already exercises.
 		NextProtos: []string{"http/1.1"},

@@ -1,0 +1,17 @@
+# Binds the opt-in kubelet-serving permissions to the manager. Applied together with
+# kubelet_serving_role.yaml — see the rationale there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: nebula
+    app.kubernetes.io/managed-by: kustomize
+  name: kubelet-serving-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubelet-serving-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system
