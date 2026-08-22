@@ -354,14 +354,15 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 	return false, nil // stale claim for a prior Pod; wait for the backstop
 }
 
-// place stamps the routing decision onto the Pod and removes the gate, atomically
-// from the Pod's perspective (one Update). After this, the scheduler is free to
-// bind the Pod to the chosen provider's virtual node.
+// place writes the one thing the Pod itself needs — the nodeSelector that routes it to the
+// chosen provider's virtual node — and removes the gate, atomically from the Pod's
+// perspective (one Update). After this, the scheduler is free to bind it.
 //
-// It takes the DECISION, not the pool: nothing from the pool's own spec is copied onto the
-// Pod any more. The egress policy and the failover TTL both used to be stamped here for the
-// VK handler to read back, which made them patchable by whoever owns the Pod; the handler
-// reads both from the NodePool at provision time instead.
+// Nothing else about the decision goes on the Pod. The provisioning inputs (capacity tier,
+// region) are already on the NodeClaim ensureClaim wrote a moment ago, and the pool's policy
+// (egress, failover TTL) stays on the NodePool. All of it used to be stamped here for the VK
+// handler to read back, which made every one of them patchable between ungate and CreatePod
+// by whoever the policy constrains; the handler reads cluster state instead.
 func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, p placement) error {
 	// Route to the provider's virtual node.
 	if pod.Spec.NodeSelector == nil {
@@ -369,27 +370,11 @@ func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, p p
 	}
 	pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] = p.provider
 
-	// Carry the capacity tier and region the VK handler reads on CreatePod (inputs
-	// that are not otherwise on the Pod). Skip each when empty (provider default).
-	if p.capacityType != "" {
-		setAnnotation(pod, nebulav1alpha1.CapacityTypeAnnotation, string(p.capacityType))
-	}
-	if p.region != "" {
-		setAnnotation(pod, nebulav1alpha1.RegionAnnotation, p.region)
-	}
 	// Remove our gate, releasing the Pod to the scheduler. Preserve any other
 	// gates a different controller may hold.
 	pod.Spec.SchedulingGates = removeGate(pod.Spec.SchedulingGates, nebulav1alpha1.ProviderSelectionGate)
 
 	return r.Update(ctx, pod)
-}
-
-// setAnnotation sets one annotation on the Pod, allocating the map on first use.
-func setAnnotation(pod *corev1.Pod, key, value string) {
-	if pod.Annotations == nil {
-		pod.Annotations = map[string]string{}
-	}
-	pod.Annotations[key] = value
 }
 
 // removeGate returns gates with the named gate removed, preserving order.

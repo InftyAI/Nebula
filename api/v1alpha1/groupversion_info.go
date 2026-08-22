@@ -99,19 +99,6 @@ const (
 	// via util.AcceleratorRequest.
 	AcceleratorTypeLabel = "nebula.inftyai.com/accelerator-type"
 
-	// CapacityTypeAnnotation carries the chosen purchase tier (Spot/OnDemand). It is a
-	// provisioning input the Pod spec cannot express, so the placement controller
-	// writes it when it ungates the Pod and the virtual kubelet — which provisions
-	// solely from the Pod — reads it back on CreatePod. Empty means "use the provider's
-	// default" (Modal is OnDemand-only and ignores it).
-	CapacityTypeAnnotation = "nebula.inftyai.com/capacity-type"
-
-	// RegionAnnotation carries the chosen provider region. Same flow as
-	// CapacityTypeAnnotation: stamped at ungate, read on CreatePod into
-	// ProvisionRequest.Region. Absent means the provider's default region;
-	// region-simple providers (Modal, RunPod) ignore it.
-	RegionAnnotation = "nebula.inftyai.com/region"
-
 	// EndpointAnnotation carries the reachable address of the external instance (a DNS
 	// name, an IP, or a URL, in the provider's own form). It is the only way to reach
 	// the workload, and PodIP cannot hold it — the API server validates PodIP as a

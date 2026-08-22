@@ -281,7 +281,7 @@ func TestRunExec_CancelReleasesTheProcess(t *testing.T) {
 func TestRunInContainer_RunsInTrackedInstance(t *testing.T) {
 	proc := newExecProcess("root@sandbox:/#\n", "", 0)
 	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, proc)
-	h := NewHandler(ep, nil, nil, openPools())
+	h := NewHandler(ep, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestRunInContainer_RunsInTrackedInstance(t *testing.T) {
 func TestRunInContainer_IgnoresContainerName(t *testing.T) {
 	for _, container := range []string{"", "main", "not-a-container"} {
 		ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("ok\n", "", 0))
-		h := NewHandler(ep, nil, nil, openPools())
+		h := NewHandler(ep, nil, nil, openCluster())
 		if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}
@@ -328,7 +328,7 @@ func TestRunInContainer_IgnoresContainerName(t *testing.T) {
 func TestRunInContainer_NotFoundCases(t *testing.T) {
 	// No exec support at all — a legitimate configuration (no agent, no key), not a bug.
 	t.Run("provider does not support exec", func(t *testing.T) {
-		h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, openPools())
+		h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, openCluster())
 		if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}
@@ -340,7 +340,7 @@ func TestRunInContainer_NotFoundCases(t *testing.T) {
 	// Another node's pod, or one this process never adopted.
 	t.Run("pod not tracked", func(t *testing.T) {
 		ep := newExecProvider(&fakeProvider{}, newExecProcess("", "", 0))
-		h := NewHandler(ep, nil, nil, openPools())
+		h := NewHandler(ep, nil, nil, openCluster())
 		err := h.RunInContainer(context.Background(), "default", "ghost", "main",
 			[]string{"sh"}, &fakeAttach{stdout: newSyncBuffer()})
 		assertNotFound(t, err)
@@ -353,7 +353,7 @@ func TestRunInContainer_NotFoundCases(t *testing.T) {
 	// nothing to run in.
 	t.Run("tracked without an instance", func(t *testing.T) {
 		ep := newExecProvider(&fakeProvider{provisionErr: errors.New("no capacity")}, newExecProcess("", "", 0))
-		h := NewHandler(ep, nil, nil, openPools())
+		h := NewHandler(ep, nil, nil, openCluster())
 		if err := h.CreatePod(context.Background(), testPod("default", "p1")); err == nil {
 			t.Fatal("CreatePod: expected the provision rejection to surface")
 		}
@@ -369,7 +369,7 @@ func TestRunInContainer_NotFoundCases(t *testing.T) {
 func TestRunInContainer_OnlyTheStartIsBounded(t *testing.T) {
 	proc := newExecProcess("ok\n", "", 0)
 	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, proc)
-	h := NewHandler(ep, nil, nil, openPools())
+	h := NewHandler(ep, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestRunInContainer_OnlyTheStartIsBounded(t *testing.T) {
 func TestRunInContainer_StartErrorIsNotNotFound(t *testing.T) {
 	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("", "", 0))
 	ep.execErr = errors.New("timed out waiting for task id")
-	h := NewHandler(ep, nil, nil, openPools())
+	h := NewHandler(ep, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestRunInContainer_StartErrorIsNotNotFound(t *testing.T) {
 // provider — a provider that ran a default shell for it would be a surprise.
 func TestRunInContainer_EmptyCommandRejected(t *testing.T) {
 	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("", "", 0))
-	h := NewHandler(ep, nil, nil, openPools())
+	h := NewHandler(ep, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}

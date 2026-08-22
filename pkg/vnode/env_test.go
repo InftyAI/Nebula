@@ -368,7 +368,7 @@ func TestCreatePod_PassesResolvedEnvToProvider(t *testing.T) {
 			LocalObjectReference: corev1.LocalObjectReference{Name: "sec"}, Key: "K"}}},
 	})
 	client := fake.NewSimpleClientset(pod, secretObj("sec", map[string]string{"K": "t0ken"}))
-	h := NewHandler(fp, client, nil, openPools())
+	h := NewHandler(fp, client, nil, openCluster())
 
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -393,7 +393,7 @@ func TestCreatePod_UnresolvableEnvIsNonTerminal(t *testing.T) {
 			LocalObjectReference: corev1.LocalObjectReference{Name: "not-yet"}, Key: "K"},
 	}}})
 	client := fake.NewSimpleClientset(pod)
-	h := NewHandler(fp, client, bl, openPools())
+	h := NewHandler(fp, client, bl, openCluster())
 
 	err := h.CreatePod(context.Background(), pod)
 	if err == nil {

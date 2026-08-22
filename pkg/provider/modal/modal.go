@@ -261,8 +261,8 @@ func New(client Client, cat catalog.Lookup) *Provider {
 
 // regionSeparator joins several Modal regions into the ONE candidate placement
 // walks. It is deliberately a character no region name contains, so splitting is
-// unambiguous, and deliberately not a comma: the value lands in RegionAnnotation and
-// a comma reads like a list a consumer might re-split with different rules.
+// unambiguous, and deliberately not a comma: the value is recorded on the NodeClaim,
+// where a comma reads like a list a consumer might re-split with different rules.
 const regionSeparator = "|"
 
 // ExpandRegions implements provider.Provider, overriding catalog.Base's

@@ -100,7 +100,7 @@ func TestKubeletServer_AdvertisesInternalIPOnly(t *testing.T) {
 // the provider's bytes.
 func TestKubeletServer_ServesLogsOverTLS(t *testing.T) {
 	lp := newLoggingProvider(&fakeProvider{provisionID: "inst-1"}, "hello over tls\n")
-	h := NewHandler(lp, nil, nil, openPools())
+	h := NewHandler(lp, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestKubeletServer_ServesLogsOverTLS(t *testing.T) {
 // negotiated, and the command's output and exit code both survive the wire.
 func TestKubeletServer_ServesExecOverTLS(t *testing.T) {
 	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("hi from exec\n", "", 0))
-	h := NewHandler(ep, nil, nil, openPools())
+	h := NewHandler(ep, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestKubeletServer_ServesExecOverTLS(t *testing.T) {
 // failed to the client, with its own status, not like a broken kubelet.
 func TestKubeletServer_ExecReportsExitCode(t *testing.T) {
 	ep := newExecProvider(&fakeProvider{provisionID: "inst-1"}, newExecProcess("", "boom\n", 3))
-	h := NewHandler(ep, nil, nil, openPools())
+	h := NewHandler(ep, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -212,7 +212,7 @@ func execCommand(t *testing.T, base, namespace, pod string, cmd []string) (strin
 func TestKubeletServer_ResolvesAcrossProviders(t *testing.T) {
 	modalish := newLoggingProvider(&fakeProvider{provisionID: "sb-1"}, "from modal\n")
 	awsish := newLoggingProvider(&fakeProvider{provisionID: "i-1"}, "from aws\n")
-	hModal, hAWS := NewHandler(modalish, nil, nil, openPools()), NewHandler(awsish, nil, nil, openPools())
+	hModal, hAWS := NewHandler(modalish, nil, nil, openCluster()), NewHandler(awsish, nil, nil, openCluster())
 	if err := hModal.CreatePod(context.Background(), testPod("default", "on-modal")); err != nil {
 		t.Fatalf("CreatePod(modal): %v", err)
 	}
@@ -238,7 +238,7 @@ func TestKubeletServer_ResolvesAcrossProviders(t *testing.T) {
 func TestKubeletServer_ProviderErrorIsNotSwallowed(t *testing.T) {
 	broken := newLoggingProvider(&fakeProvider{provisionID: "inst-1"}, "")
 	broken.logsErr = fmt.Errorf("provider API unreachable")
-	h := NewHandler(broken, nil, nil, openPools())
+	h := NewHandler(broken, nil, nil, openCluster())
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}

@@ -91,11 +91,12 @@ type Handler struct {
 	// no-op.
 	blocklist Blocklister
 
-	// pools resolves the NodePool backing a Pod, which is where pool POLICY is read from
-	// rather than from the Pod carrying a copy of it. Unlike blocklist, nil is NOT a no-op:
-	// provisioning refuses without it, because the alternative is enforcing a containment
-	// policy nobody has read (see poolFor).
-	pools PoolReader
+	// cluster resolves the NodePool and NodeClaim behind a Pod: the pool's POLICY and
+	// placement's DECISION, both read from cluster state rather than from a copy carried on
+	// the Pod. Unlike blocklist, nil is NOT a no-op: provisioning refuses without it,
+	// because the alternative is enforcing a containment policy nobody has read (see
+	// poolFor and claimFor).
+	cluster ClusterReader
 
 	mu sync.Mutex
 
@@ -152,6 +153,24 @@ type trackedPod struct {
 	// histogram under-samples the slowest boots. Fixing it means persisting the start
 	// time, a write on the provisioning path we have not taken.
 	provisionStart time.Time
+
+	// placement is what this pod was provisioned against, so the poll loop can file its
+	// ready duration under the same dimensions as the provision counters. Set only where
+	// provisionStart is armed, which is the only path that observes.
+	placement
+}
+
+// placement is the decision one provision was issued against: the two metric dimensions
+// the Pod itself cannot supply, read from the NodeClaim at create (see claimFor). Carried
+// per attempt rather than re-read at observation, because placement may write a newer
+// decision onto the same claim on a re-provision, and because the poll loop holds h.mu
+// while it observes — the NodeClaim stays the durable record, this is the historical one.
+//
+// The zero value means "unknown" and is what every path that never provisioned stores.
+// Nothing is filed under it: those paths leave provisionStart zero, so they never observe.
+type placement struct {
+	region string
+	tier   nebulav1alpha1.CapacityType
 }
 
 // podMeta is the Pod metadata the virtual kubelet owns: the annotations it is the sole
@@ -197,10 +216,10 @@ func (m podMeta) minus(done podMeta) podMeta {
 
 // NewHandler builds a Handler for one provider backend. The poll cadence comes from
 // Capabilities.PollInterval, falling back to defaultPollInterval. blocklist (failover
-// recording) and client (the endpoint patch) may both be nil; pools may not, for anything
-// that provisions — see poolFor.
+// recording) and client (the endpoint patch) may both be nil; cluster may not, for anything
+// that provisions — see poolFor and claimFor.
 func NewHandler(
-	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister, pools PoolReader,
+	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister, cluster ClusterReader,
 ) *Handler {
 	poll := prov.Capabilities().PollInterval
 	if poll <= 0 {
@@ -210,7 +229,7 @@ func NewHandler(
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
-		pools:     pools,
+		cluster:   cluster,
 		tracked:   make(map[string]*trackedPod),
 		nowFn:     metav1.Now,
 		pollEvery: poll,
@@ -229,24 +248,22 @@ var (
 func key(namespace, name string) string { return namespace + "/" + name }
 
 // CreatePod provisions an external instance for the Pod through the provider.
-// The Pod carries the whole workload shape, and placement's choices (capacity tier, region)
-// ride on annotations. The egress policy is the exception: it is read from the NodePool,
-// because it constrains the Pod rather than describing it (see poolFor).
+//
+// The Pod carries the workload SHAPE (image, resources, env) and nothing else. Every
+// provisioning input that constrains rather than describes it — the egress policy, the
+// capacity tier, the region — comes from cluster state the workload's owner cannot write:
+// the NodePool for policy, the NodeClaim for placement's decision (see poolFor, claimFor).
 func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	claim := util.ClaimName(pod.Namespace, pod.Name)
-	req := provider.ProvisionRequest{
-		ClaimName:    claim,
-		CapacityType: nebulav1alpha1.CapacityType(pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation]),
-		Region:       pod.Annotations[nebulav1alpha1.RegionAnnotation],
-	}
+	req := provider.ProvisionRequest{ClaimName: claim}
 
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(pod.Namespace, pod.Name), "claim", claim)
 
-	// The pool, which is the trusted source for every policy below: the containment policy
-	// here, and the TTL of any block this provision's failure records. Resolved before
-	// anything is requested and with the same non-terminal treatment as the env below, so a
-	// pool we cannot read costs a retry rather than an unrestricted instance.
+	// The pool: the containment policy applied here, and the TTL of any block this
+	// provision's failure records. Resolved before anything is requested and with the same
+	// non-terminal treatment as the env below, so a pool we cannot read costs a retry rather
+	// than an unrestricted instance.
 	pool, err := h.poolFor(ctx, pod)
 	if err != nil {
 		log.Error(err, "cannot establish the pool's policy; nothing provisioned, retrying")
@@ -255,6 +272,19 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 	req.Egress = pool.Spec.Egress
+
+	// The claim: WHERE and on WHAT TERMS placement decided to provision. Empty values here
+	// are legitimate ("the provider's default"), but a missing claim is not — a Pod on a
+	// virtual node without one never went through placement.
+	nc, err := h.claimFor(ctx, pod, claim)
+	if err != nil {
+		log.Error(err, "cannot establish the placement decision; nothing provisioned, retrying")
+		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
+		h.emit(pod)
+		return err
+	}
+	req.CapacityType = nc.Spec.CapacityType
+	req.Region = nc.Spec.Region
 
 	// Resolve BEFORE anything is requested: the Pod's env may point at Secrets and ConfigMaps
 	// a provider cannot read (see resolveEnv), and nothing exists yet, so failing here is free.
@@ -302,7 +332,10 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// synchronous notify that can issue an API write, which would otherwise be charged
 	// to the provider's latency.
 	provisionStart := time.Now()
-	mlabels := h.metricLabels(pod)
+	// Carried into store so the poll loop's ready observation is filed under the same region
+	// and tier as the counters below, whatever the NodeClaim says by then.
+	place := placement{region: req.Region, tier: req.CapacityType}
+	labels := h.metricLabels(pod, place.region, place.tier)
 
 	// Report Provisioning BEFORE the call: it can run for minutes (AWS sweeps a region's
 	// zones on a capacity error), and until it returns this is the only explanation the
@@ -315,7 +348,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// One call site for both outcomes, so the attempt and failure counters cannot drift.
 	// An unreachable provider still counts as a failed attempt even though nothing gets
 	// blocklisted for it.
-	metrics.ObserveProvision(mlabels, time.Since(callStart), err)
+	metrics.ObserveProvision(labels, time.Since(callStart), err)
 	if err != nil {
 		// An error the provider never attributed to this request — a transport failure,
 		// our own timeout, a 503 — is not a rejection (see provider.IsRejection). The
@@ -342,12 +375,13 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		// → tier) instead of hot-looping here. The provider narrows its own error into a
 		// BlockScope (a Spot shortage in one region blocks only that; auth/quota blocks
 		// the whole provider); the TTL comes from the pool read at the top of this call.
-		h.recordBlock(ctx, pod, pool, err)
+		h.recordBlock(ctx, pod, pool, req.Region, err)
 		// Surface the failure so placement can fail over, and return the error so the pod
 		// controller retries with backoff.
 		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, err.Error())
-		// Zero start: terminal, so it never reaches Running and has no ready-duration.
-		h.store(pod, claim, "", time.Time{})
+		// Zero start: terminal, so it never reaches Running and has no ready-duration, which
+		// is also why the placement it would be filed under is not worth carrying.
+		h.store(pod, claim, "", time.Time{}, placement{})
 		h.emit(pod)
 		return err
 	}
@@ -371,7 +405,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// tracked copy carries it, published by the emit below, re-offered every tick until a
 	// write lands. Its reader is the NodeClaim controller (see InstanceIDAnnotation).
 	setInstanceID(pod, res.InstanceID)
-	h.store(pod, claim, res.InstanceID, provisionStart)
+	h.store(pod, claim, res.InstanceID, provisionStart, place)
 
 	// The TOKEN cannot ride the Pod (readable with `get pod`, unencrypted in etcd), so it
 	// gets its own write — the only place it exists, since the provider mints it once and
@@ -511,8 +545,9 @@ func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.P
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	applyState(pod, inst.State, inst.Endpoint, h.nowFn())
 	// Zero start: this process never provisioned it, so the real start time is gone and
-	// the ready-duration is not observable (see trackedPod.provisionStart).
-	h.store(pod, claim, inst.ID, time.Time{})
+	// the ready-duration is not observable (see trackedPod.provisionStart) — hence no
+	// placement either, since nothing here will be filed under it.
+	h.store(pod, claim, inst.ID, time.Time{}, placement{})
 	log.Info("re-adopted live instance after cold tracking map (VK restart)",
 		"claim", claim, "instanceID", inst.ID, "state", inst.State)
 	return pod.DeepCopy(), nil
@@ -677,12 +712,15 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 // a nonsense duration.
 //
 // ONE-SHOT — it consumes provisionStart, whose zero value covers both "never armed" and
-// "already recorded" (see trackedPod.provisionStart). Callers must hold h.mu.
+// "already recorded" (see trackedPod.provisionStart). That guard also keeps the poll loop
+// cheap: labels are rendered behind it, so at most once per pod, never per tick.
+//
+// Callers must hold h.mu.
 func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
 	if state != provider.InstanceRunning || tp.provisionStart.IsZero() {
 		return
 	}
-	metrics.ObserveReady(h.metricLabels(tp.pod), time.Since(tp.provisionStart))
+	metrics.ObserveReady(h.metricLabels(tp.pod, tp.region, tp.tier), time.Since(tp.provisionStart))
 	tp.provisionStart = time.Time{} // spent; never observe this pod again
 }
 
@@ -747,9 +785,12 @@ func statusSignature(pod *corev1.Pod) string {
 }
 
 // store records/updates the tracked pod under lock. provisionStart arms the
-// ready-duration observation (see trackedPod.provisionStart); pass the zero Time from
-// any path that cannot know it — a re-adoption, or an already-terminal pod.
-func (h *Handler) store(pod *corev1.Pod, claim, instance string, provisionStart time.Time) {
+// ready-duration observation (see trackedPod.provisionStart) and place is part of what that
+// observation is filed under; pass the zero values from any path that cannot know them —
+// a re-adoption, or an already-terminal pod.
+func (h *Handler) store(
+	pod *corev1.Pod, claim, instance string, provisionStart time.Time, place placement,
+) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.tracked[key(pod.Namespace, pod.Name)] = &trackedPod{
@@ -757,21 +798,25 @@ func (h *Handler) store(pod *corev1.Pod, claim, instance string, provisionStart 
 		claimName:      claim,
 		instance:       instance,
 		provisionStart: provisionStart,
+		placement:      place,
 	}
 }
 
-// metricLabels renders the provisioning metric labels for a Pod, read off what placement
-// stamped on it.
+// metricLabels renders the provisioning metric labels for one provision. The shape comes
+// off the Pod; where and on what terms it ran comes from the caller, which read it from the
+// NodeClaim (see claimFor).
 //
 // Type and count stay SEPARATE here, unlike recordBlock, which files the joined pool key:
 // a blocklist needs one opaque key so an H100:8 shortage never excludes H100:1, while a
 // metric needs two dimensions to be aggregated either way.
-func (h *Handler) metricLabels(pod *corev1.Pod) metrics.Labels {
+func (h *Handler) metricLabels(
+	pod *corev1.Pod, region string, tier nebulav1alpha1.CapacityType,
+) metrics.Labels {
 	accel, count, _ := util.AcceleratorRequest(pod)
 	return metrics.Labels{
 		Provider:         h.prov.Name(),
-		Region:           pod.Annotations[nebulav1alpha1.RegionAnnotation],
-		CapacityType:     pod.Annotations[nebulav1alpha1.CapacityTypeAnnotation],
+		Region:           region,
+		CapacityType:     string(tier),
 		Accelerator:      accel,
 		AcceleratorCount: count,
 	}
@@ -961,14 +1006,20 @@ func (h *Handler) markStatus(pod *corev1.Pod, phase corev1.PodPhase, reason, msg
 // from an instance-type shortage. The cost is one wasted re-probe by a sibling
 // accelerator, which is the right trade — over-broad would exclude serviceable
 // accelerators. DenyAll (auth/quota) ignores the accelerator: it fails for all.
-func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, err error) {
+func (h *Handler) recordBlock(
+	ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, region string, err error,
+) {
 	if h.blocklist == nil {
 		return
 	}
-	// Pool and region are properties of the REQUEST, not the error, so we resolve them off
-	// the Pod. The key is the POOL identity (type:count, e.g. "H100:8") — the same key
-	// placement queries a candidate by, since a block filed under any other key would
-	// never be read and failover would re-place onto the candidate that just failed.
+	// Accelerator and region are properties of the REQUEST, not the error: the accelerator
+	// is resolved off the Pod (it is the shape being asked for), the region comes in from the
+	// claim the request was built from — never from the Pod, since a block is process-wide
+	// and a patched region would let one tenant fence off a candidate for everyone.
+	//
+	// The key is the POOL identity (type:count, e.g. "H100:8") — the same key placement
+	// queries a candidate by, since a block filed under any other key would never be read
+	// and failover would re-place onto the candidate that just failed.
 	//
 	// The pool, NOT the provider's resolved SKU, because one launch may span several
 	// interchangeable instance types (AWS fleets) and only fails when every one is dry, so
@@ -977,7 +1028,6 @@ func (h *Handler) recordBlock(ctx context.Context, pod *corev1.Pod, pool *nebula
 	// H100:1. "" means "not applicable" — a CPU-only Pod, or a region-simple provider.
 	accel, count, _ := util.AcceleratorRequest(pod)
 	accelerator := util.AcceleratorPool(accel, count)
-	region := pod.Annotations[nebulav1alpha1.RegionAnnotation]
 	scope := h.prov.ClassifyProvisionError(err, accelerator, region)
 
 	if scope == (provider.BlockScope{}) {
