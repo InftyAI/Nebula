@@ -128,6 +128,9 @@ spec:
                     to permit nothing
                   rule: self.mode != 'Allowlist' || (has(self.targets) && self.targets.size()
                     > 0)
+                - message: a target must not contain a comma; list each target as
+                    its own entry
+                  rule: '!has(self.targets) || self.targets.all(t, !t.contains('',''))'
               failover:
                 description: |-
                   Failover controls how a provider that fails at provision time (e.g.

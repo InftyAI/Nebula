@@ -82,6 +82,7 @@ type NodePoolSpec struct {
 // Allowlist disjoint, so "no egress" has one spelling instead of three.
 // +kubebuilder:validation:XValidation:rule="self.mode == 'Allowlist' || !has(self.targets)",message="targets is only valid with mode Allowlist"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Allowlist' || (has(self.targets) && self.targets.size() > 0)",message="mode Allowlist requires at least one target; use mode Blocked to permit nothing"
+// +kubebuilder:validation:XValidation:rule="!has(self.targets) || self.targets.all(t, !t.contains(','))",message="a target must not contain a comma; list each target as its own entry"
 type EgressPolicy struct {
 	// Mode is required once spec.egress is set, so a half-written policy is rejected
 	// rather than defaulted into a weaker one.
@@ -89,6 +90,7 @@ type EgressPolicy struct {
 
 	// Targets is what mode Allowlist permits: CIDRs, bare IPs and domain names with an
 	// optional wildcard, mixed in one list, e.g. ["10.0.0.0/8", "*.huggingface.co"].
+	//
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=253
@@ -216,6 +218,7 @@ type FailoverPolicy struct {
 	// (up to 30s) on top so Pods that failed for the same reason do not all retry the
 	// just-freed candidate in lockstep, so the effective exclusion is this value plus
 	// that jitter.
+	//
 	// +kubebuilder:default="30s"
 	BlocklistTTL metav1.Duration `json:"blocklistTTL,omitempty"`
 }

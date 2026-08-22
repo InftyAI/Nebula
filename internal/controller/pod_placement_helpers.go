@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"hash/fnv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -358,7 +357,12 @@ func (r *PodPlacementReconciler) ensureClaim(ctx context.Context, pod *corev1.Po
 // place stamps the routing decision onto the Pod and removes the gate, atomically
 // from the Pod's perspective (one Update). After this, the scheduler is free to
 // bind the Pod to the chosen provider's virtual node.
-func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool, p placement) error {
+//
+// It takes the DECISION, not the pool: nothing from the pool's own spec is copied onto the
+// Pod any more. The egress policy and the failover TTL both used to be stamped here for the
+// VK handler to read back, which made them patchable by whoever owns the Pod; the handler
+// reads both from the NodePool at provision time instead.
+func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, p placement) error {
 	// Route to the provider's virtual node.
 	if pod.Spec.NodeSelector == nil {
 		pod.Spec.NodeSelector = map[string]string{}
@@ -373,22 +377,6 @@ func (r *PodPlacementReconciler) place(ctx context.Context, pod *corev1.Pod, poo
 	if p.region != "" {
 		setAnnotation(pod, nebulav1alpha1.RegionAnnotation, p.region)
 	}
-	// Carry the pool's blocklist TTL so the VK handler (which never sees the pool)
-	// knows how long to exclude a placement that fails. Only stamp an explicit
-	// policy value; an unset policy leaves the handler on its own default.
-	if pool.Spec.Failover != nil && pool.Spec.Failover.BlocklistTTL.Duration > 0 {
-		setAnnotation(pod, nebulav1alpha1.BlocklistTTLAnnotation, pool.Spec.Failover.BlocklistTTL.Duration.String())
-	}
-	// Same for the egress policy. Stamped only when it restricts something: the absence of
-	// the annotation IS Open, and selectPlacement has already ensured p.provider can enforce
-	// whatever is written here.
-	if pool.Spec.Egress.RestrictsEgress() {
-		setAnnotation(pod, nebulav1alpha1.EgressAnnotation, string(pool.Spec.Egress.ModeOrOpen()))
-		if len(pool.Spec.Egress.Targets) > 0 {
-			setAnnotation(pod, nebulav1alpha1.EgressTargetsAnnotation, strings.Join(pool.Spec.Egress.Targets, ","))
-		}
-	}
-
 	// Remove our gate, releasing the Pod to the scheduler. Preserve any other
 	// gates a different controller may hold.
 	pod.Spec.SchedulingGates = removeGate(pod.Spec.SchedulingGates, nebulav1alpha1.ProviderSelectionGate)

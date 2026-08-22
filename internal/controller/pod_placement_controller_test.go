@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -597,10 +598,7 @@ func TestPlacement_SpotOnlyPoolStaysGatedOnOnDemandOnlyProvider(t *testing.T) {
 	}
 }
 
-func TestPlacement_StampsEgressAnnotationsFromPool(t *testing.T) {
-	// The VK handler never sees the pool, so the policy has to ride the Pod. Both
-	// annotations must land: the mode alone is authoritative, and without the targets
-	// an Allowlist pool would reach the adapter as "permit nothing" — silently Blocked.
+func TestPlacement_CopiesNoEgressPolicyOntoThePod(t *testing.T) {
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
 	pool.Spec.Egress = &nebulav1alpha1.EgressPolicy{
@@ -616,33 +614,18 @@ func TestPlacement_StampsEgressAnnotationsFromPool(t *testing.T) {
 	if hasGateNamed(got) {
 		t.Fatal("expected the Pod placed on a provider that enforces egress")
 	}
-	if v := got.Annotations[nebulav1alpha1.EgressAnnotation]; v != string(nebulav1alpha1.EgressAllowlist) {
-		t.Errorf("egress annotation = %q, want %q", v, nebulav1alpha1.EgressAllowlist)
+	// Swept by substring rather than checked against the two retired keys, because the claim
+	// is that NO key carries the policy — a copy under a fresh spelling is the same bug and
+	// should fail here too.
+	for k, v := range got.Annotations {
+		if strings.Contains(k, "egress") {
+			t.Errorf("annotation %s=%q copies the pool's egress policy onto the Pod; the "+
+				"handler must read it from the pool", k, v)
+		}
 	}
-	if v := got.Annotations[nebulav1alpha1.EgressTargetsAnnotation]; v != "10.0.0.0/8,*.huggingface.co" {
-		t.Errorf("egress-targets annotation = %q, want the comma-joined list", v)
-	}
-}
-
-func TestPlacement_OpenPoolStampsNoEgressAnnotation(t *testing.T) {
-	// Absence IS Open (see EgressAnnotation), so an unrestricted pool must leave the Pod
-	// clean rather than stamping "Open" — otherwise every Pod in the cluster grows an
-	// annotation that means nothing.
-	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
-	// No egress on the pool at all, which is the common case.
-	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}} // egress: false
-	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
-
-	reconcilePod(t, r, "default", "p1")
-
-	got := getPod(t, c, "default", "p1")
-	if hasGateNamed(got) {
-		t.Fatal("expected an Open pool to place on a provider without egress support")
-	}
-	if _, ok := got.Annotations[nebulav1alpha1.EgressAnnotation]; ok {
-		t.Errorf("expected no egress annotation for an Open pool, got %q",
-			got.Annotations[nebulav1alpha1.EgressAnnotation])
+	// The pool label is what the handler resolves the policy through, so it must be set.
+	if got.Labels[nebulav1alpha1.PoolLabel] != "pool-a" {
+		t.Errorf("pool label = %q, want pool-a", got.Labels[nebulav1alpha1.PoolLabel])
 	}
 }
 
@@ -761,23 +744,6 @@ func TestPlacement_NoServableCandidateDoesNotRequeue(t *testing.T) {
 	}
 	if res.RequeueAfter != 0 {
 		t.Fatalf("expected no requeue when no candidate can ever be unblocked, got %v", res.RequeueAfter)
-	}
-}
-
-func TestPlacement_StampsBlocklistTTLAnnotation(t *testing.T) {
-	// The pool's FailoverPolicy.BlocklistTTL must reach the Pod so the VK handler
-	// knows how long to blocklist a placement that fails.
-	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
-	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
-	pool.Spec.Failover = &nebulav1alpha1.FailoverPolicy{BlocklistTTL: metav1.Duration{Duration: 7 * time.Minute}}
-	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
-	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
-
-	reconcilePod(t, r, "default", "p1")
-
-	got := getPod(t, c, "default", "p1")
-	if got.Annotations[nebulav1alpha1.BlocklistTTLAnnotation] != "7m0s" {
-		t.Fatalf("expected blocklist-ttl annotation 7m0s, got %q", got.Annotations[nebulav1alpha1.BlocklistTTLAnnotation])
 	}
 }
 

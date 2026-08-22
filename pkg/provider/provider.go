@@ -235,7 +235,8 @@ type ProvisionRequest struct {
 	// that this provider can enforce it (Capabilities.SupportsEgressPolicy), so an adapter
 	// receiving a restrictive policy must apply it or fail the Provision — never silently
 	// drop it, which would leave the workload on the open internet under a policy that says
-	// otherwise. Read off the Pod's annotations, not the pool; see EgressAnnotation.
+	// otherwise. Resolved from the NodePool at provision time, never from the Pod, which
+	// the workload's own owner can patch (see vnode.Handler.egressFor).
 	Egress *nebulav1alpha1.EgressPolicy
 	// Env is the container's environment, fully RESOLVED: literals plus everything
 	// envFrom/valueFrom referenced, merged in kubelet precedence (envFrom in listed order,

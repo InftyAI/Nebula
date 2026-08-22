@@ -176,7 +176,7 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Stamp the routing decision and release the Pod to the scheduler.
-	if err := r.place(ctx, &pod, pool, placement); err != nil {
+	if err := r.place(ctx, &pod, placement); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Counted only after the Update lands, which is also what keeps it from
