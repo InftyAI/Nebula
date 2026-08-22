@@ -458,10 +458,10 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 		if !ok {
 			continue
 		}
-		// The manager's client, so the pool read on the provisioning path hits the shared
-		// cache the controllers already keep warm.
-		pools := vnode.NewCachedPoolReader(mgr.GetClient())
-		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist, kubeletSrv, pools)); err != nil {
+		// The manager's client, so the pool and claim reads on the provisioning path hit the
+		// shared cache the controllers already keep warm.
+		cluster := vnode.NewCachedClusterReader(mgr.GetClient())
+		if err := mgr.Add(vnode.NewRunner(prov, clientset, blocklist, kubeletSrv, cluster)); err != nil {
 			return err
 		}
 		setupLog.Info("registered virtual node", "provider", name, "node", vnode.NodeName(name))

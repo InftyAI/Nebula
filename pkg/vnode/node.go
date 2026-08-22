@@ -108,9 +108,10 @@ func NodeName(providerName string) string {
 
 // RBAC for the virtual kubelet: the pod controller reports Pod status and reads the
 // config/secret/service objects a Pod references; the node controller maintains the
-// Node, its lease, and events. NodePools are read because pool policy is resolved from the
-// pool at provision time rather than from the Pod (see Handler.poolFor).
-// +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodepools,verbs=get;list;watch
+// Node, its lease, and events. NodePools and NodeClaims are read because every provisioning
+// input that is not the workload's own shape is resolved from cluster state at provision
+// time rather than from the Pod (see Handler.poolFor and Handler.claimFor).
+// +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodepools;nodeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;create;update;patch;delete
@@ -131,7 +132,7 @@ type Runner struct {
 	prov      provider.Provider
 	client    kubernetes.Interface
 	blocklist Blocklister
-	pools     PoolReader
+	cluster   ClusterReader
 	nodeName  string
 
 	// kubelet is the shared endpoint serving `kubectl logs` for every node. Nil is
@@ -141,18 +142,18 @@ type Runner struct {
 }
 
 // NewRunner builds the virtual-node runner for one provider. blocklist (Provision
-// failures) and kubelet (the log endpoint) are both shared, and both may be nil. pools is
-// how the handler reads pool policy from the pool instead of from the Pod, so a nil one
-// leaves this node unable to provision at all (see Handler.poolFor).
+// failures) and kubelet (the log endpoint) are both shared, and both may be nil. cluster is
+// how the handler reads policy and placement from the NodePool and NodeClaim instead of from
+// the Pod, so a nil one leaves this node unable to provision at all (see Handler.poolFor).
 func NewRunner(
 	prov provider.Provider, client kubernetes.Interface, blocklist Blocklister,
-	kubelet *KubeletServer, pools PoolReader,
+	kubelet *KubeletServer, cluster ClusterReader,
 ) *Runner {
 	return &Runner{
 		prov:      prov,
 		client:    client,
 		blocklist: blocklist,
-		pools:     pools,
+		cluster:   cluster,
 		nodeName:  NodeName(prov.Name()),
 		kubelet:   kubelet,
 	}
@@ -165,7 +166,7 @@ var _ manager.Runnable = (*Runner)(nil)
 func (r *Runner) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithValues("virtualNode", r.nodeName, "provider", r.prov.Name())
 
-	handler := NewHandler(r.prov, r.client, r.blocklist, r.pools)
+	handler := NewHandler(r.prov, r.client, r.blocklist, r.cluster)
 	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
 
 	// Register on the endpoint AND advertise it, so the API server can proxy `kubectl

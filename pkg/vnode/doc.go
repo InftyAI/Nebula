@@ -20,10 +20,11 @@ limitations under the License.
 //
 // Ownership model ("VK owns provisioning"): the pod controller's CreatePod calls
 // provider.Provision and DeletePod calls provider.Terminate directly. The Pod is
-// the single source of truth for the workload; the only provisioning input that
-// is not on the Pod — the optimizer's capacity tier — rides on the
-// CapacityTypeAnnotation, written by the placement controller when it ungates
-// the Pod. Instance identity is derived deterministically from the Pod
-// (ClaimName), so a provider whose List reports the claim tag can recover and
-// reclaim an instance across a controller restart without a durable ledger.
+// the single source of truth for the workload's SHAPE, and nothing more: every
+// provisioning input that constrains rather than describes it is read from
+// cluster state the workload's owner cannot patch — the NodePool for policy, the
+// NodeClaim for the capacity tier and region placement chose (see ClusterReader).
+// Instance identity is derived deterministically from the Pod (ClaimName), so a
+// provider whose List reports the claim tag can recover and reclaim an instance
+// across a controller restart without a durable ledger.
 package vnode

@@ -174,10 +174,6 @@ func TestPlacement_UngatesAndRoutesAndCreatesClaim(t *testing.T) {
 	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
 		t.Fatalf("expected nodeSelector provider=modal, got %v", got.Spec.NodeSelector)
 	}
-	// Capacity tier stamped for the VK handler.
-	if got.Annotations[nebulav1alpha1.CapacityTypeAnnotation] != "OnDemand" {
-		t.Fatalf("expected capacity-type OnDemand, got %q", got.Annotations[nebulav1alpha1.CapacityTypeAnnotation])
-	}
 	// NodeClaim created, pinned to the Pod, on the chosen provider.
 	var nc nebulav1alpha1.NodeClaim
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "default-p1"}, &nc); err != nil {
@@ -185,6 +181,11 @@ func TestPlacement_UngatesAndRoutesAndCreatesClaim(t *testing.T) {
 	}
 	if nc.Spec.Provider != provider.ProviderModal || nc.Spec.PodRef.UID != "uid-1" || nc.Spec.PoolRef != "pool-a" {
 		t.Fatalf("unexpected claim spec: %+v", nc.Spec)
+	}
+	// Capacity tier recorded on the CLAIM, which is what the VK handler reads on
+	// CreatePod. Never on the Pod, where it would be patchable after the gate is gone.
+	if nc.Spec.CapacityType != nebulav1alpha1.CapacityOnDemand {
+		t.Fatalf("expected claim capacityType OnDemand, got %q", nc.Spec.CapacityType)
 	}
 	// The request's POOL identity (type:count) is recorded for reporting: H100 with
 	// no explicit count defaults to 1, so the pool is "H100:1".
@@ -442,9 +443,8 @@ func TestPlacement_FailsOverToNextRegionWhenBlocked(t *testing.T) {
 
 	reconcilePod(t, r, "default", "p1")
 
-	got := getPod(t, c, "default", "p1")
-	if got.Annotations[nebulav1alpha1.RegionAnnotation] != "us-west-2" {
-		t.Fatalf("expected failover to us-west-2, got region %q", got.Annotations[nebulav1alpha1.RegionAnnotation])
+	if got := getClaim(t, c, "default-p1").Spec.Region; got != "us-west-2" {
+		t.Fatalf("expected failover to us-west-2, got region %q", got)
 	}
 }
 
@@ -469,11 +469,11 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 
 	reconcilePod(t, r, "default", "p1")
 
-	got := getPod(t, c, "default", "p1")
-	if got.Annotations[nebulav1alpha1.CapacityTypeAnnotation] != "OnDemand" {
-		t.Fatalf("expected the walk to drop to OnDemand, got %q", got.Annotations[nebulav1alpha1.CapacityTypeAnnotation])
+	if got := getClaim(t, c, "default-p1").Spec.CapacityType; got != nebulav1alpha1.CapacityOnDemand {
+		t.Fatalf("expected the walk to drop to OnDemand, got %q", got)
 	}
 	// ...and to the FIRST provider (runpod), since OnDemand is walked provider-first.
+	got := getPod(t, c, "default", "p1")
 	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "runpod" {
 		t.Fatalf("expected first provider runpod at the OnDemand tier, got %v", got.Spec.NodeSelector)
 	}
@@ -481,9 +481,9 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 
 func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
 	// The pool declares a GROUP token, not a region. Placement must walk the concrete
-	// regions the provider expands it into — and must stamp a CONCRETE one on the Pod,
-	// never the token: RegionAnnotation feeds ProvisionRequest.Region, which the
-	// adapter turns into a regional API endpoint, and "us" is not one.
+	// regions the provider expands it into — and must record a CONCRETE one on the claim,
+	// never the token: the claim's region feeds ProvisionRequest.Region, which the adapter
+	// turns into a regional API endpoint, and "us" is not one.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
 	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
 		provider.ProviderModal, "us")
@@ -506,8 +506,7 @@ func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
 
 	reconcilePod(t, r, "default", "p1")
 
-	got := getPod(t, c, "default", "p1")
-	if region := got.Annotations[nebulav1alpha1.RegionAnnotation]; region != "us-west-2" {
+	if region := getClaim(t, c, "default-p1").Spec.Region; region != "us-west-2" {
 		t.Fatalf("expected the group to expand and fail over to us-west-2, got %q", region)
 	}
 }
@@ -560,9 +559,8 @@ func TestPlacement_SkipsSpotWhenProviderHasNoSpotTier(t *testing.T) {
 	if hasGateNamed(got) {
 		t.Fatal("expected the Pod placed at the OnDemand tier")
 	}
-	if got.Annotations[nebulav1alpha1.CapacityTypeAnnotation] != string(nebulav1alpha1.CapacityOnDemand) {
-		t.Fatalf("expected the Spot candidate skipped for OnDemand, got %q",
-			got.Annotations[nebulav1alpha1.CapacityTypeAnnotation])
+	if tier := getClaim(t, c, "default-p1").Spec.CapacityType; tier != nebulav1alpha1.CapacityOnDemand {
+		t.Fatalf("expected the Spot candidate skipped for OnDemand, got %q", tier)
 	}
 }
 
@@ -626,6 +624,38 @@ func TestPlacement_CopiesNoEgressPolicyOntoThePod(t *testing.T) {
 	// The pool label is what the handler resolves the policy through, so it must be set.
 	if got.Labels[nebulav1alpha1.PoolLabel] != "pool-a" {
 		t.Errorf("pool label = %q, want pool-a", got.Labels[nebulav1alpha1.PoolLabel])
+	}
+}
+
+func TestPlacement_CopiesNothingNebulaOwnedOntoThePod(t *testing.T) {
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot},
+		provider.ProviderModal, "us-east-1")
+	// A pool with something to say on every axis that used to ride the Pod.
+	pool.Spec.Egress = &nebulav1alpha1.EgressPolicy{Mode: nebulav1alpha1.EgressBlocked}
+	pool.Spec.Failover = &nebulav1alpha1.FailoverPolicy{BlocklistTTL: metav1.Duration{Duration: time.Hour}}
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}, spot: true, egress: true}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if hasGateNamed(got) {
+		t.Fatal("expected the Pod placed")
+	}
+	// Swept by prefix rather than key by key: the claim is that NO Nebula-owned annotation is
+	// written, so a copy under a fresh spelling is the same bug and fails here too.
+	for k, v := range got.Annotations {
+		if strings.HasPrefix(k, nebulav1alpha1.GroupVersion.Group+"/") {
+			t.Errorf("annotation %s=%q was stamped on the Pod; a provisioning input on the Pod "+
+				"is patchable between ungate and CreatePod", k, v)
+		}
+	}
+	// ...and the decision really is recorded, on the claim the handler reads.
+	nc := getClaim(t, c, "default-p1")
+	if nc.Spec.CapacityType != nebulav1alpha1.CapacitySpot || nc.Spec.Region != "us-east-1" {
+		t.Errorf("claim records tier %q region %q, want Spot/us-east-1",
+			nc.Spec.CapacityType, nc.Spec.Region)
 	}
 }
 

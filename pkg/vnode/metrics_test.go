@@ -56,16 +56,18 @@ func histCount(t *testing.T, h *prometheus.HistogramVec, l prometheus.Labels) ui
 	return pb.GetHistogram().GetSampleCount()
 }
 
-// metricPod is a Pod carrying everything the label set is read off: the tier and region
-// placement stamped, plus the accelerator label the pool identity is derived from.
+// metricPod carries the half of the label set that comes off the Pod: the accelerator label
+// the pool identity is derived from. Pair it with metricCluster, which supplies the other
+// half — the tier and region, which are read from the NodeClaim, not the Pod.
 func metricPod(ns, name string) *corev1.Pod {
 	pod := testPod(ns, name)
-	pod.Annotations = map[string]string{
-		nebulav1alpha1.CapacityTypeAnnotation: string(nebulav1alpha1.CapacitySpot),
-		nebulav1alpha1.RegionAnnotation:       "us-east-1",
-	}
 	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = "H100"
 	return pod
+}
+
+// metricCluster records the placement the labels below expect.
+func metricCluster() *fakeCluster {
+	return clusterWithPlacement(nebulav1alpha1.CapacitySpot, "us-east-1")
 }
 
 // labelsFor is the label set metricPod produces. The accelerator TYPE and COUNT are
@@ -90,7 +92,7 @@ func TestCreatePod_RecordsSuccessfulProvisionAttempt(t *testing.T) {
 	beforeAttempts := testutil.ToFloat64(metrics.ProvisionAttempts.With(success))
 	beforeDuration := histCount(t, metrics.ProvisionDuration, success)
 
-	h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, openPools())
+	h := NewHandler(&fakeProvider{provisionID: "inst-1"}, nil, nil, metricCluster())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -112,7 +114,7 @@ func TestCreatePod_RecordsRejectionReason(t *testing.T) {
 	beforeFailures := testutil.ToFloat64(metrics.ProvisionFailures.With(capacity))
 
 	fp := &fakeProvider{provisionErr: provider.ErrNoCapacity}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, metricCluster())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m2")); err == nil {
 		t.Fatal("expected the provision error")
 	}
@@ -138,7 +140,7 @@ func TestCreatePod_UnreachableProviderCountedSeparately(t *testing.T) {
 	beforeCapacity := testutil.ToFloat64(metrics.ProvisionFailures.With(capacity))
 
 	fp := &fakeProvider{provisionErr: errors.New("rpc error: code = Unavailable desc = transport is closing")}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, metricCluster())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m3")); err == nil {
 		t.Fatal("expected the provision error")
 	}
@@ -163,7 +165,7 @@ func TestReconcileOnce_ObservesReadyDurationExactlyOnce(t *testing.T) {
 	before := histCount(t, metrics.InstanceReadyDuration, ready)
 
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, metricCluster())
 	if err := h.CreatePod(context.Background(), metricPod("default", "m4")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -195,10 +197,11 @@ func TestReconcileOnce_ObservesReadyDurationExactlyOnce(t *testing.T) {
 // minutes as microseconds and bias the histogram fast. A missing sample beats a wrong
 // one.
 func TestGetPod_ReAdoptedPodIsNotReadyObserved(t *testing.T) {
-	// A re-adopted pod is a synthesized stub with no annotations or labels, so it renders
-	// to the all-"none" series — that, not the fully-labelled one, is where a wrongly
-	// taken observation would land, and it is the assertion that carries this test. Both
-	// are deltas because other specs in this package write to both series.
+	// A re-adopted pod is tracked with no placement and a synthesized Pod carrying no
+	// accelerator request, so a wrongly taken observation would land on the series below:
+	// the provider is known, everything the lost provision knew reads "none". That, not the
+	// fully-labelled one, is the assertion carrying this test. Both are deltas because other
+	// specs in this package write to both series.
 	ready := labelsFor("", "")
 	none := prometheus.Labels{
 		"provider": "fake", "region": "none", "capacity_type": "none",
@@ -212,7 +215,7 @@ func TestGetPod_ReAdoptedPodIsNotReadyObserved(t *testing.T) {
 	fp := &fakeProvider{list: []provider.Instance{{
 		ID: "inst-9", ClaimName: "default-m5", State: provider.InstanceRunning,
 	}}}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, metricCluster())
 	if _, err := h.GetPod(context.Background(), "default", "m5"); err != nil {
 		t.Fatalf("GetPod: %v", err)
 	}
@@ -234,7 +237,7 @@ func TestObserveReady_IndependentOfPinnedStatusClock(t *testing.T) {
 	before := histCount(t, metrics.InstanceReadyDuration, ready)
 
 	fp := &fakeProvider{provisionID: "inst-1"}
-	h := NewHandler(fp, nil, nil, openPools())
+	h := NewHandler(fp, nil, nil, metricCluster())
 	// A status clock pinned far in the PAST: reusing it to measure would go negative.
 	pinned := metav1.NewTime(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
 	h.nowFn = func() metav1.Time { return pinned }

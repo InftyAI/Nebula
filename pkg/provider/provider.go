@@ -122,7 +122,7 @@ type Provider interface {
 	// the provider's own error. Better than refusing a region that shipped last week.
 	//
 	// Expanding HERE, at the pool boundary, keeps everything downstream single-valued —
-	// ProvisionRequest.Region, RegionAnnotation and the blocklist key — so a capacity
+	// NodeClaimSpec.Region, ProvisionRequest.Region and the blocklist key — so a capacity
 	// failure blocks the one candidate that failed, not the group it came from.
 	//
 	// How many candidates a declaration becomes depends on whether the provider can FAIL
