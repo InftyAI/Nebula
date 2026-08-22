@@ -545,12 +545,30 @@ func (p *Provider) Terminate(ctx context.Context, instanceID, region string) err
 	return lastErr
 }
 
-// Get implements provider.Provider. instanceID is a raw EC2 id, which does not
-// carry its region, so the lookup sweeps the swept regions and returns the first
-// region's view of the instance. A per-region client-build/describe error is
-// tolerated and the sweep continues; only if every region errored (and none held
-// the instance) is that error surfaced.
-func (p *Provider) Get(ctx context.Context, instanceID string) (*provider.Instance, error) {
+// Get implements provider.Provider. As in Terminate, the region names the endpoint that
+// can answer for the instance, and Describe there is the whole call.
+//
+// Without a region the lookup sweeps and returns the first region's view. A per-region
+// client-build/describe error is tolerated and the sweep continues; only if every region
+// errored (and none held the instance) is that error surfaced. An unswept region reads as
+// (nil, nil) — indistinguishable from terminated, which is why the region is worth passing.
+func (p *Provider) Get(ctx context.Context, instanceID, region string) (*provider.Instance, error) {
+	if region != "" {
+		client, err := p.clientFor(ctx, region)
+		if err != nil {
+			return nil, err
+		}
+		ec2, err := client.DescribeInstance(ctx, instanceID)
+		if err != nil {
+			return nil, err
+		}
+		if ec2 == nil {
+			return nil, nil // gone from the region that owns it: terminated
+		}
+		inst := p.toInstance(*ec2)
+		return &inst, nil
+	}
+
 	var lastErr error
 	for _, region := range p.sweepRegions() {
 		client, err := p.clientFor(ctx, region)

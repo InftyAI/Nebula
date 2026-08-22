@@ -63,7 +63,7 @@ func TestProvisionReportsRunningAndLists(t *testing.T) {
 	}
 
 	// Get reports it Running with the claim recovered.
-	inst, err := p.Get(ctx, id)
+	inst, err := p.Get(ctx, id, "")
 	if err != nil || inst == nil {
 		t.Fatalf("Get = (%v, %v), want a live instance", inst, err)
 	}
@@ -120,7 +120,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 		t.Fatalf("Terminate: %v", err)
 	}
 	// Gone from Get/List.
-	if inst, _ := p.Get(ctx, id); inst != nil {
+	if inst, _ := p.Get(ctx, id, ""); inst != nil {
 		t.Fatalf("Get after Terminate = %v, want nil (terminated)", inst)
 	}
 	// A repeat Terminate (and terminating an unknown id) is a no-op, not an error.

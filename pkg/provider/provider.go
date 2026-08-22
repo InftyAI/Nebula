@@ -78,7 +78,10 @@ type Provider interface {
 
 	// Get returns the current state of one instance, or (nil, nil) if it no
 	// longer exists (treat absence as terminated).
-	Get(ctx context.Context, instanceID string) (*Instance, error)
+	//
+	// region is as in Terminate, and matters more here: absence is read as terminated, so a
+	// provider that had to search and searched the wrong place reports a live instance dead.
+	Get(ctx context.Context, instanceID, region string) (*Instance, error)
 
 	// List returns every instance Nebula owns on this provider, in as few API calls as
 	// possible (ideally one). This is the engine of the poll loop: since no provider pushes

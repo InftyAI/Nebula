@@ -134,7 +134,7 @@ func (p *Provider) Terminate(_ context.Context, instanceID, _ string) error {
 }
 
 // Get returns one instance, or (nil, nil) if it no longer exists.
-func (p *Provider) Get(_ context.Context, instanceID string) (*provider.Instance, error) {
+func (p *Provider) Get(_ context.Context, instanceID, _ string) (*provider.Instance, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	inst, ok := p.instances[instanceID]
