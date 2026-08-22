@@ -119,7 +119,9 @@ func (f *fakeProvider) Terminate(_ context.Context, id, region string) error {
 	return f.terminateErr
 }
 
-func (f *fakeProvider) Get(context.Context, string) (*provider.Instance, error) { return nil, nil }
+func (f *fakeProvider) Get(context.Context, string, string) (*provider.Instance, error) {
+	return nil, nil
+}
 func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
 }

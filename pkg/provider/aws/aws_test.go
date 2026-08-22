@@ -415,8 +415,8 @@ func TestGetAndList_NormalizeInstance(t *testing.T) {
 	}
 	p := newTestProvider(f)
 
-	// Get takes the raw EC2 id Provision/List hand back; it sweeps regions to find it.
-	got, err := p.Get(context.Background(), "i-1")
+	// Get with no region falls back to sweeping for the instance.
+	got, err := p.Get(context.Background(), "i-1", "")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestGetAndList_NormalizeInstance(t *testing.T) {
 	}
 
 	// A missing instance is (nil, nil): absence == terminated per the contract.
-	missing, err := p.Get(context.Background(), "i-gone")
+	missing, err := p.Get(context.Background(), "i-gone", testRegion)
 	if err != nil {
 		t.Fatalf("Get(missing): %v", err)
 	}
@@ -449,8 +449,8 @@ func TestGetAndList_NormalizeInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	// List reports the raw EC2 id; a downstream Terminate re-locates it by sweeping
-	// regions.
+	// List reports the raw EC2 id, alongside the Region a downstream Get/Terminate should
+	// pass back so neither has to search for it.
 	if len(list) != 1 || list[0].ID != "i-1" {
 		t.Fatalf("List = %+v", list)
 	}

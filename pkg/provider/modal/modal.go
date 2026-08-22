@@ -406,8 +406,8 @@ func (p *Provider) Exec(
 	return p.client.SandboxExec(ctx, instanceID, cmd, opts)
 }
 
-// Get implements provider.Provider.
-func (p *Provider) Get(ctx context.Context, instanceID string) (*provider.Instance, error) {
+// Get implements provider.Provider. The region is ignored, as in Terminate.
+func (p *Provider) Get(ctx context.Context, instanceID, _ string) (*provider.Instance, error) {
 	sb, err := p.client.GetSandbox(ctx, instanceID)
 	if err != nil {
 		return nil, err
