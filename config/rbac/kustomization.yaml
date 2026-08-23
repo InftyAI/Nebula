@@ -9,8 +9,9 @@ resources:
 - role_binding.yaml
 - leader_election_role.yaml
 - leader_election_role_binding.yaml
-# Uncomment these two together with the manager's --kubelet-serving-csr flag, which is
-# needed when the API server runs with --kubelet-certificate-authority. Left out by
+# Uncomment these two together with the #- --kubelet-serving-csr line in
+# config/manager/manager.yaml — the flag asks and this permits, so neither half works
+# alone. Needed when the API server runs with --kubelet-certificate-authority. Left out by
 # default because approving on the kubelet-serving signer is a privileged grant — see
 # kubelet_serving_role.yaml.
 #- kubelet_serving_role.yaml

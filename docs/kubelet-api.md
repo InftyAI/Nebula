@@ -61,7 +61,8 @@ certificate that API server accepts is one from the cluster's own
 - kubelet_serving_role_binding.yaml
 ```
 
-**2. Pass the flag.** Add it to the manager's `args` in `config/manager/manager.yaml`:
+**2. Pass the flag.** Uncomment the last line of the manager's `args` in
+`config/manager/manager.yaml`:
 
 ```yaml
         args:
@@ -69,6 +70,8 @@ certificate that API server accepts is one from the cluster's own
           - --health-probe-bind-address=:8081
           - --kubelet-serving-csr
 ```
+
+Both halves are needed and neither is enough: the flag asks, the RBAC permits.
 
 **3. Apply**, with `make deploy IMG=<your image>`, then confirm the request was issued and
 that both commands work:
@@ -118,14 +121,40 @@ condition, which name the cause between them:
 |---|---|
 | no CSR at all, `signerIssued=false` | the flag is not set |
 | `create`/`approve ... is forbidden` in the log | the RBAC is not applied |
-| CSR stays `Approved` and never reaches `Issued` | the cluster's kubelet-serving signer is disabled — common on managed control planes, and not fixable from here |
+| CSR stays `Approved` and never reaches `Issued` | the cluster's signer will not sign it — either disabled, or (EKS) restricted to node identities; not fixable from here |
 | `signerIssued=true` but still `x509` | the API server's `--kubelet-certificate-authority` is a different CA than the signer's |
+
+### Which clusters need it, and where it works
+
+kind and EKS both set `--kubelet-certificate-authority`, so on either one the self-signed
+certificate is rejected and `kubectl logs` / `kubectl exec` fail on Nebula pods with the
+x509 error above — on a connection the control plane otherwise reached fine.
+
+Needing it and being able to use it are different things, though:
+
+| cluster | outcome |
+|---|---|
+| kind | works — CSR reaches `Approved,Issued` and both commands then succeed |
+| EKS | **does not work**: the CSR stays `Approved` and is never signed |
+
+EKS's signer only signs requests whose *requester* is a node identity. Ours is the
+manager's ServiceAccount, so the request is ignored — no certificate, and no `Failed`
+condition to say why. Measured on EKS 1.35 by submitting the identical CSR bytes with the
+identical approval under two identities: signed as `system:node:<name>` (group
+`system:nodes`), unsigned as
+`system:serviceaccount:nebula-system:nebula-controller-manager`. Self-approval is not the
+obstacle — an admin-approved CSR from the ServiceAccount is ignored just the same.
+
+So do not infer that the signer will sign for us from the fact that it signs for real
+kubelets: `kubectl logs` on a pod on a real node succeeds on EKS (its nodes run
+`serverTLSBootstrap: true`) while our request goes unsigned. The only proof is our own CSR
+reaching `Issued`. An empty `kubectl get csr` proves nothing either way — issued CSRs are
+garbage-collected about an hour later.
 
 ### On kind
 
-kind always sets `--kubelet-certificate-authority`, so both switches above are needed for
-`kubectl logs` and `kubectl exec` to work on Nebula pods at all. It also has a second,
-unrelated fault worth recognising: it sets the kubelet's `serverTLSBootstrap: true` but
+kind has a second, unrelated fault worth recognising: it sets the kubelet's
+`serverTLSBootstrap: true` but
 ships nothing that approves the resulting CSRs. So the *real* kubelet never gets a serving
 certificate either, and `kubectl logs` fails for every pod in the cluster — with `remote
 error: tls: internal error` rather than the x509 error above, since a kubelet with no
