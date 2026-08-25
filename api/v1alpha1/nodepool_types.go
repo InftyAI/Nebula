@@ -252,6 +252,12 @@ type NodePoolStatus struct {
 	// +optional
 	Placed map[string]int32 `json:"placed,omitempty"`
 
+	// Providers is a comma-separated list of provider names from the pool
+	// spec. kubectl printcolumns cannot join array fields via JSONPath, so
+	// the controller materializes this summary for `kubectl get nodepool`.
+	// +optional
+	Providers string `json:"providers,omitempty"`
+
 	// Conditions follows the standard Kubernetes condition convention.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
@@ -261,7 +267,7 @@ type NodePoolStatus struct {
 // +kubebuilder:resource:scope=Cluster,shortName=np
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Strategy",type=string,JSONPath=`.spec.strategy`
-// +kubebuilder:printcolumn:name="Providers",type=string,JSONPath=`.spec.providers[*].name`
+// +kubebuilder:printcolumn:name="Providers",type=string,JSONPath=`.status.providers`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // NodePool is the placement policy for GPU workloads across NeoClouds.
