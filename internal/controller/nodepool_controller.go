@@ -148,6 +148,12 @@ func (r *NodePoolReconciler) refreshPlaced(ctx context.Context, pool *nebulav1al
 	if len(placed) == 0 {
 		placed = nil // keep status clean when nothing is placed
 	}
+	// Materialize provider names for the kubectl column (JSONPath cannot join arrays).
+	names := make([]string, 0, len(pool.Spec.Providers))
+	for _, p := range pool.Spec.Providers {
+		names = append(names, p.Name)
+	}
+	pool.Status.Providers = strings.Join(names, ",")
 	pool.Status.Placed = placed
 	return nil
 }
