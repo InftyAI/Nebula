@@ -266,6 +266,7 @@ type NodePoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=np
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Strategy",type=string,JSONPath=`.spec.strategy`
 // +kubebuilder:printcolumn:name="Providers",type=string,JSONPath=`.status.providers`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

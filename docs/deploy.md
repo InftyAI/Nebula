@@ -197,7 +197,12 @@ diff <(kubectl get secret nebula-webhook-server-cert -n nebula-system -o jsonpat
 A pool referencing an unregistered provider shows it plainly:
 
 ```bash
-kubectl get nodepool <name> -o jsonpath='{.status.conditions}'
+kubectl get nodepools
+# NAME       STATUS   STRATEGY   PROVIDERS   AGE
+# gpu-pool   False    Ordered    modal,aws   2m
+
+# Inspect the condition reason and message when STATUS is False.
+kubectl get nodepool <name> -o jsonpath='{.status.conditions[?(@.type=="Ready")]}'
 # Ready=False / UnknownProvider means that provider's creds are missing or wrong.
 ```
 
