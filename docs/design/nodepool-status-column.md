@@ -42,6 +42,5 @@ for existing pools, and the next `kubectl get` uses their existing conditions.
 
 ## Verification
 
-Generation is checked into `config/crd/bases`. A unit test parses that manifest
-and requires exactly one `Status` string column with the `Ready`-condition
-JSONPath, preventing source markers and generated API artifacts from drifting.
+Generation is checked into `config/crd/bases`. Regenerating the manifests keeps
+the CRD printer column aligned with the marker in `nodepool_types.go`.
