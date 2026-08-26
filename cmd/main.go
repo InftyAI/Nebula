@@ -84,6 +84,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var kubeletAddr, kubeletClientCA string
+	var kubeletServingCSR bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -110,6 +111,13 @@ func main() {
 			"serves TLS without client verification, because which CA signs the API server's kubelet "+
 			"client certificate is not portable across distributions; restrict the port with a "+
 			"NetworkPolicy, or set this to your API server's kubelet client CA.")
+	flag.BoolVar(&kubeletServingCSR, "kubelet-serving-csr", false,
+		"Request the kubelet API's serving certificate from the cluster's kubernetes.io/kubelet-serving "+
+			"signer instead of self-signing it. Set this if `kubectl logs` fails with "+
+			"\"certificate signed by unknown authority\", which means the API server runs with "+
+			"--kubelet-certificate-authority. Needs the RBAC in config/rbac/kubelet_serving_role.yaml "+
+			"(it self-approves its own CSR); without it, and on a control plane whose signer is "+
+			"disabled, it logs and falls back to self-signed.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -270,7 +278,7 @@ func main() {
 	// The kubelet endpoint for `kubectl logs` — one listener shared by every provider's
 	// node, hence built here rather than in setupVirtualNodes. Nil is supported: the
 	// nodes then advertise no address, and logs report NotFound.
-	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA)
+	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA, kubeletServingCSR)
 
 	// Controller and webhook registration is deferred until the cert exists, so it
 	// runs in a goroutine: the cert cannot be minted until the manager is STARTED
@@ -417,7 +425,7 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 // what the API server dials and nothing substitutes for it: a Service would balance to
 // a non-leader replica, which holds no tracked Pods. Either way only logs degrade, so
 // it is logged loudly and the manager carries on.
-func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletServer {
+func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingCSR bool) *vnode.KubeletServer {
 	if addr == "" {
 		setupLog.Info("kubelet API disabled by configuration; `kubectl logs` will not work for Nebula pods")
 		return nil
@@ -435,11 +443,27 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletS
 		setupLog.Error(err, "unable to set up the kubelet API; `kubectl logs` will not work for Nebula pods")
 		return nil
 	}
+	if servingCSR {
+		// Only reachable because registerProviders ran first; without a provider there is no
+		// virtual node, and nothing to serve logs for. The name is only the CSR's subject —
+		// one issued cert covers every node here, since it is the IP SAN that matters.
+		names := provider.Names()
+		clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+		switch {
+		case err != nil:
+			setupLog.Error(err, "unable to build a clientset for the kubelet serving CSR; self-signing instead")
+		case len(names) == 0:
+			setupLog.Info("no provider registered; skipping the kubelet serving CSR")
+		default:
+			srv.EnableServingCSR(clientset, vnode.NodeName(names[0]))
+		}
+	}
 	if err := mgr.Add(srv); err != nil {
 		setupLog.Error(err, "unable to add the kubelet API to the manager")
 		return nil
 	}
-	setupLog.Info("kubelet API enabled", "addr", addr, "advertisedIP", podIP, "clientCertRequired", clientCA != "")
+	setupLog.Info("kubelet API enabled", "addr", addr, "advertisedIP", podIP,
+		"clientCertRequired", clientCA != "", "servingCSR", servingCSR)
 	return srv
 }
 

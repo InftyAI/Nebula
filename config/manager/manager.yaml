@@ -63,6 +63,15 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          # Uncomment together with kubelet_serving_role{,_binding}.yaml in
+          # config/rbac/kustomization.yaml — the flag asks, the RBAC permits, and both are
+          # needed. Required wherever the API server runs with
+          # --kubelet-certificate-authority, which rejects this endpoint's self-signed cert
+          # and so breaks `kubectl logs` and `kubectl exec` (kind and EKS both set it).
+          # Harmless but pointless elsewhere — and it does NOT fix EKS, whose signer ignores
+          # a CSR from a ServiceAccount and leaves it approved but unsigned. Verified on
+          # kind. See docs/kubelet-api.md.
+          #- --kubelet-serving-csr
         image: controller:latest
         name: manager
         imagePullPolicy: IfNotPresent
@@ -128,6 +137,11 @@ spec:
         # portable — requiring it would break logs on managed control planes. So
         # anything able to reach this port can read any Nebula pod's logs: restrict it
         # with a NetworkPolicy, or set --kubelet-client-ca to require mTLS.
+        #
+        # The self-signed cert is only accepted by an API server that does not verify it.
+        # If logs fail with "certificate signed by unknown authority", the control plane
+        # sets --kubelet-certificate-authority: uncomment --kubelet-serving-csr in the args
+        # above, and the two kubelet_serving_role files in config/rbac/kustomization.yaml.
         - name: kubelet-api
           containerPort: 10250
           protocol: TCP
