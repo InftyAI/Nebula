@@ -82,7 +82,15 @@ fi
 # loader above). To add a provider, append a row — nothing else needs to change.
 PROVIDER_SECRETS=(
   # Only secrets belong here.
-  "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|"
+  #
+  # MODAL_ENVIRONMENT is OPTIONAL (third field): a Modal Environment is a named
+  # partition of app/secret/volume names within one workspace, so setting it keeps an
+  # experiment's app from colliding with another cluster's. Blank omits the key
+  # entirely, and the SDK then falls back to the token profile's default — today's
+  # behaviour. It must name an environment that already EXISTS — `modal environment
+  # create <name>` — since the Go SDK exposes no environment service to create one,
+  # and doing so is a workspace-admin act, not a provisioning-time one.
+  "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|MODAL_ENVIRONMENT"
   # AWS: creds are the only secret. CRITICAL — these are the PROVISIONING identity
   # (the account that launches GPU instances), which is DISTINCT from the identity
   # that talks to the EKS control plane this deploy runs against. They use the

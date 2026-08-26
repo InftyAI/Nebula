@@ -131,7 +131,7 @@ Credentials live in **one Kubernetes Secret per provider**, mounted via an optio
 
    ```bash
    PROVIDER_SECRETS=(
-     "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|"
+     "nebula-modal-credentials|MODAL_TOKEN_ID MODAL_TOKEN_SECRET|MODAL_ENVIRONMENT"
      "nebula-runpod-credentials|RUNPOD_API_KEY|"
    )
    ```
