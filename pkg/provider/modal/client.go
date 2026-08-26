@@ -47,6 +47,17 @@ type sdkClient struct {
 	mc      *modal.Client
 	appName string
 
+	// environment is the Modal Environment (a named partition of app/secret/volume
+	// names inside one workspace) all Nebula objects live in. Empty means "whatever
+	// the token profile defaults to", which is the unset case.
+	//
+	// It is ALSO set on the SDK client's profile (see NewSDKClient), and that is what
+	// makes it complete: only the App call accepts an environment argument, while the
+	// image and the ephemeral env Secret resolve from the profile, and the sandbox
+	// inherits from the App it is created under. Passing it here alone would put the
+	// App in one environment and those objects in another.
+	environment string
+
 	// readyTimeout is how long one background readiness waiter gets. WaitUntilReady
 	// returns early only to say "ready", never "not ready", so a budget under the call's
 	// own setup cost yields a deadline rather than an answer. Setup dominates (~16s cold:
@@ -78,13 +89,16 @@ var _ Client = (*sdkClient)(nil)
 // Modal App all Nebula sandboxes are created under (created if missing at first
 // use). The returned *Provider is ready to register.
 //
+// environment is the optional Modal Environment; empty keeps the profile's own value
+// (MODAL_ENVIRONMENT, else ~/.modal.toml), so unset changes nothing.
+//
 // Example wiring:
 //
-//	c, err := modal.NewSDKClient(ctx, "nebula")
+//	c, err := modal.NewSDKClient(ctx, "nebula", "dev")
 //	if err != nil { return err }
 //	provider.Register(modal.New(c))
-func NewSDKClient(ctx context.Context, appName string) (*Provider, error) {
-	mc, err := modal.NewClient()
+func NewSDKClient(ctx context.Context, appName, environment string) (*Provider, error) {
+	mc, err := modal.NewClientWithOptions(&modal.ClientParams{Environment: environment})
 	if err != nil {
 		return nil, fmt.Errorf("modal: init SDK client: %w", err)
 	}
@@ -98,15 +112,25 @@ func NewSDKClient(ctx context.Context, appName string) (*Provider, error) {
 	return New(&sdkClient{
 		mc:           mc,
 		appName:      appName,
+		environment:  environment,
 		readyTimeout: 30 * time.Second,
 		ready:        make(map[string]bool),
 		waiting:      make(map[string]struct{}),
 	}, cat), nil
 }
 
-// app resolves (creating if missing) the Modal App all sandboxes live under.
+// app resolves (creating if missing) the Modal App all sandboxes live under, in
+// c.environment when one is set — empty falls back to the profile, which carries the
+// same value, so both routes agree.
+//
+// CreateIfMissing creates the APP, never the environment: a name that does not exist
+// fails here, and the SDK reports any not-found on this call as "App not found" even
+// when the environment is the missing part.
 func (c *sdkClient) app(ctx context.Context) (*modal.App, error) {
-	return c.mc.Apps.FromName(ctx, c.appName, &modal.AppFromNameParams{CreateIfMissing: true})
+	return c.mc.Apps.FromName(ctx, c.appName, &modal.AppFromNameParams{
+		Environment:     c.environment,
+		CreateIfMissing: true,
+	})
 }
 
 // CreateSandbox implements Client.

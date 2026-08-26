@@ -476,7 +476,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 // unregistered provider surfaces as a clear NodePool condition rather than a
 // crash loop.
 func registerProviders(ctx context.Context, c client.Client) {
-	if p, err := modal.NewSDKClient(ctx, os.Getenv("MODAL_APP_NAME")); err != nil {
+	if p, err := modal.NewSDKClient(ctx, os.Getenv("MODAL_APP_NAME"), os.Getenv("MODAL_ENVIRONMENT")); err != nil {
 		setupLog.Info("skipping Modal provider registration", "reason", err.Error())
 	} else {
 		provider.Register(p)

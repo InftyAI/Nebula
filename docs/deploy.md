@@ -8,6 +8,7 @@ cluster, including wiring provider credentials.
 - [Webhook TLS (no cert-manager)](#webhook-tls-no-cert-manager)
 - [What `deploy-all` does](#what-deploy-all-does)
 - [Configuration](#configuration)
+- [Modal Environments](#modal-environments)
 - [Manual deployment](#manual-deployment)
 - [Verifying the deployment](#verifying-the-deployment)
 - [Smoke test](#smoke-test)
@@ -111,6 +112,7 @@ itself at startup (see [Webhook TLS](#webhook-tls-no-cert-manager)).
 |---|---|---|---|
 | `MODAL_TOKEN_ID` | Modal | yes | From `modal token new` |
 | `MODAL_TOKEN_SECRET` | Modal | yes | From `modal token new` |
+| `MODAL_ENVIRONMENT` | Modal | no | Modal Environment to create sandboxes in. Blank omits the key and the SDK uses the token profile's default. See [Modal Environments](#modal-environments). |
 | `AWS_ACCESS_KEY_ID` | AWS | dev only | Prefer IRSA / instance role in production and leave blank — the SDK's default credential chain finds the role. Set only for local/dev. |
 | `AWS_SECRET_ACCESS_KEY` | AWS | dev only | Pairs with `AWS_ACCESS_KEY_ID`; both required together or both blank. |
 
@@ -137,6 +139,20 @@ off-cluster leaves it unset, and logs degrade to unsupported. See
 
 ---
 
+## Modal Environments
+
+Optional, and off unless you set it. A Modal **Environment** is a named partition of
+object *names* — apps, secrets, volumes — inside one workspace.
+
+```bash
+# once, on the Modal side — Nebula never creates an environment
+modal environment create dev
+
+# then, in .env
+MODAL_ENVIRONMENT=dev
+```
+---
+
 ## Manual deployment
 
 If you don't want the script (e.g. you manage Secrets via sealed-secrets or a
@@ -148,9 +164,12 @@ before deploying so the manager boots configured:
 kubectl create namespace nebula-system --dry-run=client -o yaml | kubectl apply -f -
 
 # 2. Modal credential Secret (before deploy — read as env at pod startup).
+# The MODAL_ENVIRONMENT literal is optional — drop that line for the token
+# profile's default environment (see Modal Environments above).
 kubectl create secret generic nebula-modal-credentials -n nebula-system \
   --from-literal=MODAL_TOKEN_ID=ak-... \
-  --from-literal=MODAL_TOKEN_SECRET=as-...
+  --from-literal=MODAL_TOKEN_SECRET=as-... \
+  --from-literal=MODAL_ENVIRONMENT=dev
 
 # 3. Deploy CRDs + manager. The pod reads creds on first boot, and provisions its
 #    own webhook cert + caBundle at startup — no cert step of your own.
