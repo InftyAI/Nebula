@@ -102,9 +102,6 @@ func NewSDKClient(ctx context.Context, appName, environment string) (*Provider, 
 	if err != nil {
 		return nil, fmt.Errorf("modal: init SDK client: %w", err)
 	}
-	if appName == "" {
-		appName = "nebula"
-	}
 	cat, err := catalog.Load()
 	if err != nil {
 		return nil, fmt.Errorf("modal: load price catalog: %w", err)
