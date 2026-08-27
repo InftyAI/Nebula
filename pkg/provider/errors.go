@@ -48,6 +48,13 @@ var (
 	// nothing about the same request in another. The adapter confines it to the
 	// failing region (see aws.ClassifyProvisionError). Transient until quota frees up.
 	ErrQuota = errors.New("provider: quota exceeded")
+	// ErrImagePull: the image could not be pulled — a credential the provider cannot honour,
+	// one it was not given, or a registry that refused it.
+	//
+	// Deliberately NOT ErrAuth, though both are authentication: ErrAuth widens to DenyAll,
+	// which would fence off the whole provider because ONE Pod named a role it cannot
+	// assume. This is a property of the Pod, so it is scoped like capacity.
+	ErrImagePull = errors.New("provider: cannot pull image")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be blocklisted at,
@@ -114,7 +121,7 @@ const (
 	// catAuth: credentials or authorization failed, so nothing on the provider works.
 	catAuth
 	// catCapacity: the provider refused THIS request — no capacity, quota exhausted,
-	// or an accelerator it does not offer.
+	// an accelerator it does not offer, or an image it cannot pull.
 	catCapacity
 )
 
@@ -125,7 +132,8 @@ func categorize(err error) failureCategory {
 	switch {
 	case errors.Is(err, ErrAuth):
 		return catAuth
-	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator), errors.Is(err, ErrQuota):
+	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator),
+		errors.Is(err, ErrQuota), errors.Is(err, ErrImagePull):
 		return catCapacity
 	}
 

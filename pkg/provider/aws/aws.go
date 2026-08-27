@@ -722,6 +722,18 @@ func (p *Provider) instanceSpecFromPod(
 	}
 	c := pod.Spec.Containers[0]
 
+	// Refused, not ignored: buildUserData's `docker pull` is anonymous, so honouring this
+	// needs a bootstrap that logs in first (`aws ecr get-login-password` for a role — the
+	// instance profile is already there). Until then, silently pulling without the credential
+	// would either 401 or fetch a PUBLIC image of the same name.
+	//
+	// TODO: implement the role path in buildUserData. A basic credential needs more care —
+	// user-data is readable via DescribeInstanceAttribute (see buildSpec's env caveat).
+	if req.RegistryAuth != nil {
+		// No kind is wired here yet, so the shared refusal covers every one of them.
+		return InstanceSpec{}, req.RegistryAuth.Unsupported("aws")
+	}
+
 	// Accelerator type comes from the AcceleratorTypeLabel; the count rides on the
 	// nvidia.com/gpu resource. On EC2 both are lookup keys: the instance type is the
 	// one whose (accelerator_type, gpu_count) pair matches, since the GPU count is

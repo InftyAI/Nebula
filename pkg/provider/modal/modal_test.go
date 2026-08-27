@@ -18,6 +18,7 @@ package modal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -243,6 +244,66 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 	}
 	if f.lastSpec.Timeout != time.Hour {
 		t.Fatalf("Timeout = %v, want 1h (from activeDeadlineSeconds)", f.lastSpec.Timeout)
+	}
+}
+
+func TestProvision_MapsResourceLimits(t *testing.T) {
+	cases := []struct {
+		name                      string
+		requests, limits          corev1.ResourceList
+		wantCPU, wantCPULimit     float64
+		wantMemMiB, wantMemLimMiB int
+	}{
+		{
+			name:    "limits only: limit is the ceiling AND the request falls back to it",
+			limits:  corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("8Gi")},
+			wantCPU: 2, wantCPULimit: 2,
+			wantMemMiB: 8192, wantMemLimMiB: 8192,
+		},
+		{
+			name:     "both: burstable, request below the ceiling",
+			requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+			limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("16Gi")},
+			wantCPU:  0.5, wantCPULimit: 4,
+			wantMemMiB: 1024, wantMemLimMiB: 16384,
+		},
+		{
+			name:    "neither: Modal applies its own defaults, uncapped",
+			wantCPU: 0, wantCPULimit: 0,
+			wantMemMiB: 0, wantMemLimMiB: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeClient{createID: "sb-lim"}
+			p := newTestProvider(f)
+
+			pod := gpuPod("claim-lim", "H100", 1)
+			c := &pod.Spec.Containers[0]
+			// MERGE into the limits gpuPod already set: nvidia.com/gpu lives there, and
+			// replacing the map would drop it, silently making these CPU-only Pods and
+			// leaving the GPU-plus-limits combination untested.
+			c.Resources.Requests = tc.requests
+			for name, q := range tc.limits {
+				if c.Resources.Limits == nil {
+					c.Resources.Limits = corev1.ResourceList{}
+				}
+				c.Resources.Limits[name] = q
+			}
+
+			if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-lim"}); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if f.lastSpec.CPU != tc.wantCPU || f.lastSpec.CPULimit != tc.wantCPULimit {
+				t.Fatalf("CPU/CPULimit = (%v, %v), want (%v, %v)",
+					f.lastSpec.CPU, f.lastSpec.CPULimit, tc.wantCPU, tc.wantCPULimit)
+			}
+			if f.lastSpec.MemoryMiB != tc.wantMemMiB || f.lastSpec.MemoryLimitMiB != tc.wantMemLimMiB {
+				t.Fatalf("MemoryMiB/MemoryLimitMiB = (%d, %d), want (%d, %d)",
+					f.lastSpec.MemoryMiB, f.lastSpec.MemoryLimitMiB, tc.wantMemMiB, tc.wantMemLimMiB)
+			}
+		})
 	}
 }
 
@@ -1440,5 +1501,99 @@ func TestProvision_CarriesEgressPolicy(t *testing.T) {
 	}
 	if got := f.lastSpec.EgressMode; got != nebulav1alpha1.EgressOpen {
 		t.Errorf("spec.EgressMode = %q, want %q for a nil policy", got, nebulav1alpha1.EgressOpen)
+	}
+}
+
+func TestCheckRegistryAuth(t *testing.T) {
+	const arn = "arn:aws:iam::123456789012:role/pull"
+
+	// Both kinds are wired here, so a well-formed one of either passes.
+	if err := checkRegistryAuth(&provider.RegistryAuth{
+		AWSRole: &provider.AWSRoleAuth{RoleARN: arn, Region: "eu-central-1"},
+	}); err != nil {
+		t.Fatalf("AWS role: %v", err)
+	}
+	if err := checkRegistryAuth(&provider.RegistryAuth{
+		Basic: &provider.BasicAuth{Username: "bot", Password: "hunter2"},
+	}); err != nil {
+		t.Fatalf("basic: %v", err)
+	}
+
+	// Well-formedness is the shared check's, but it must reach the caller through here —
+	// and as ErrImagePull, so it fails this Pod rather than blocklisting the whole provider
+	// the way ErrAuth would.
+	err := checkRegistryAuth(&provider.RegistryAuth{
+		AWSRole: &provider.AWSRoleAuth{RoleARN: arn}, // no region
+	})
+	if !errors.Is(err, provider.ErrImagePull) {
+		t.Fatalf("err = %v, want ErrImagePull", err)
+	}
+	if !strings.HasPrefix(err.Error(), "modal: ") {
+		t.Errorf("err = %q, want the adapter's prefix", err)
+	}
+
+	// A kind Modal is not wired for must not silently become an anonymous pull.
+	err = checkRegistryAuth(&provider.RegistryAuth{Registry: "gcr.io"})
+	if !errors.Is(err, provider.ErrImagePull) {
+		t.Fatalf("err = %v, want ErrImagePull for an unwired kind", err)
+	}
+}
+
+// TestProvision_CarriesRegistryAuth pins the whole seam: what the resolver put on the
+// request reaches the SandboxSpec, and the spec never prints the password.
+func TestProvision_CarriesRegistryAuth(t *testing.T) {
+	f := &fakeClient{createID: "sb-auth"}
+	p := newTestProvider(f)
+
+	pod := gpuPod("claim-auth", "H100", 1)
+	pod.Spec.Containers[0].Image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/team/trainer:v3"
+	_, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-auth",
+		RegistryAuth: &provider.RegistryAuth{
+			Registry: "123456789012.dkr.ecr.us-west-2.amazonaws.com",
+			AWSRole: &provider.AWSRoleAuth{
+				RoleARN: "arn:aws:iam::123456789012:role/pull",
+				Region:  "us-west-2",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	// The canonical credential reaches the spec verbatim — no per-adapter copy to drift.
+	a := f.lastSpec.RegistryAuth
+	if a == nil || a.AWSRole == nil {
+		t.Fatalf("spec.RegistryAuth = %v, want an AWSRole credential", a)
+	}
+	if a.AWSRole.Region != "us-west-2" {
+		t.Errorf("region = %q, want us-west-2", a.AWSRole.Region)
+	}
+
+	// A Pod naming a role Modal cannot use fails the Pod, and does so before any API call:
+	// a rejected credential must not leave a sandbox running.
+	f2 := &fakeClient{createID: "sb-none"}
+	pod2 := gpuPod("claim-bad", "H100", 1)
+	pod2.Spec.Containers[0].Image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/a"
+	_, err = newTestProvider(f2).Provision(context.Background(), pod2, provider.ProvisionRequest{
+		ClaimName:    "claim-bad",
+		RegistryAuth: &provider.RegistryAuth{AWSRole: &provider.AWSRoleAuth{RoleARN: "arn:x"}},
+	})
+	if !errors.Is(err, provider.ErrImagePull) {
+		t.Fatalf("err = %v, want ErrImagePull", err)
+	}
+	if f2.createCnt != 0 {
+		t.Errorf("CreateSandbox called %d times, want 0", f2.createCnt)
+	}
+}
+
+func TestSandboxSpecStringRedactsRegistryAuth(t *testing.T) {
+	s := SandboxSpec{
+		Image: "ghcr.io/org/app:v1",
+		RegistryAuth: &provider.RegistryAuth{
+			Basic: &provider.BasicAuth{Username: "bot", Password: "hunter2"},
+		},
+	}
+	if got := s.String(); strings.Contains(got, "hunter2") {
+		t.Errorf("String() = %q, must not contain the password", got)
 	}
 }

@@ -307,6 +307,18 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	req.Env = env
 
+	// Same resolve-before-requesting rule, and the same non-terminal treatment, for the
+	// image pull credential: an imagePullSecret names a Secret in the Pod's namespace that
+	// an adapter cannot read either (see resolveRegistryAuth).
+	auth, err := resolveRegistryAuth(ctx, h.client, pod)
+	if err != nil {
+		log.Error(err, "cannot resolve the Pod's image pull credential; nothing provisioned, retrying")
+		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
+		h.emit(pod)
+		return err
+	}
+	req.RegistryAuth = auth
+
 	// Bound the provision call so a wedged backend cannot pin this worker forever. A
 	// provider may raise the deadline via Capabilities.ProvisionTimeout (AWS does, for
 	// cross-zone failover).
