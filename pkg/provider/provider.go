@@ -256,14 +256,20 @@ type ProvisionRequest struct {
 	// the same rule as ProvisionResult.ConnectToken. Nil is normal: no env, or an
 	// unresolving caller.
 	Env map[string]string
+	// RegistryAuth authenticates the pull of the container image, from the Pod's
+	// imagePullSecrets; nil is an anonymous pull. Resolved by the caller (pkg/vnode) for the
+	// same reason as Env — it names a Secret an adapter cannot read.
+	RegistryAuth *RegistryAuth
 }
 
 // String redacts Env so a ProvisionRequest can be logged safely — nothing stops a future
 // log.Info("...", "req", req). Key names print, since they are in the Pod spec already and
 // are what makes a "wrong env" report actionable; only values are withheld.
 func (r ProvisionRequest) String() string {
-	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Egress:%s Env:%s}",
-		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), RedactedEnv(r.Env))
+	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Egress:%s Env:%s "+
+		"RegistryAuth:%s}",
+		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), RedactedEnv(r.Env),
+		r.RegistryAuth)
 }
 
 // GoString implements fmt.GoStringer so %#v is redacted too.

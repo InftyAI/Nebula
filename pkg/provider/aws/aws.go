@@ -682,6 +682,13 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 		tier = nebulav1alpha1.CapacitySpot
 	}
 	scope := provider.ClassifyError(err, tier, accelerator)
+	// The zero scope means BLOCK NOTHING — a rejection of this request that says nothing
+	// about the candidate, such as an image pull credential this adapter cannot honour.
+	// Stamping a region onto it would make it non-empty, and recordBlock would then install a
+	// block covering every accelerator and tier in that region.
+	if scope == (provider.BlockScope{}) {
+		return scope
+	}
 	// Confine an accelerator/capacity/quota block to the region that failed. A
 	// DenyAll (auth) fails in every region, so it stays region-wide (Region left nil).
 	// An empty region (should not happen — every request carries one) maps to &"" =
@@ -721,6 +728,18 @@ func (p *Provider) instanceSpecFromPod(
 		return InstanceSpec{}, errors.New("aws: pod has no containers")
 	}
 	c := pod.Spec.Containers[0]
+
+	// Refused, not ignored: buildUserData's `docker pull` is anonymous, so honouring this
+	// needs a bootstrap that logs in first (`aws ecr get-login-password` for a role — the
+	// instance profile is already there). Until then, silently pulling without the credential
+	// would either 401 or fetch a PUBLIC image of the same name.
+	//
+	// TODO: implement the role path in buildUserData. A basic credential needs more care —
+	// user-data is readable via DescribeInstanceAttribute (see buildSpec's env caveat).
+	if req.RegistryAuth != nil {
+		// No kind is wired here yet, so the shared refusal covers every one of them.
+		return InstanceSpec{}, req.RegistryAuth.Unsupported("aws")
+	}
 
 	// Accelerator type comes from the AcceleratorTypeLabel; the count rides on the
 	// nvidia.com/gpu resource. On EC2 both are lookup keys: the instance type is the

@@ -139,7 +139,10 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if spec.Image == "" {
 		return "", Credential{}, fmt.Errorf("modal: empty image in sandbox spec")
 	}
-	image := c.mc.Images.FromRegistry(spec.Image, nil)
+	image, err := c.imageFor(ctx, spec)
+	if err != nil {
+		return "", Credential{}, err
+	}
 
 	probe, err := modalProbe(spec.ReadinessProbe)
 	if err != nil {
@@ -161,6 +164,8 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		GPU:            gpuReservation(spec.GPU, spec.GPUCount),
 		CPU:            spec.CPU,
 		MemoryMiB:      spec.MemoryMiB,
+		CPULimit:       spec.CPULimit,
+		MemoryLimitMiB: spec.MemoryLimitMiB,
 		EncryptedPorts: spec.Ports,
 		// Nil leaves Modal's SchedulerPlacement unset entirely (the SDK only builds one
 		// when Regions is non-empty), which is the unconstrained, un-multiplied case.
@@ -180,6 +185,57 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		return "", Credential{}, err
 	}
 	return sb.SandboxID, c.mintCredential(ctx, sb, spec), nil
+}
+
+// imageFor resolves the sandbox's image, attaching pull credentials when the spec carries
+// them. Modal takes them as a Secret, so this is where the spec's data becomes an SDK object.
+func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Image, error) {
+	a := spec.RegistryAuth
+	switch {
+	case a == nil:
+		return c.mc.Images.FromRegistry(spec.Image, nil), nil
+
+	case a.AWSRole != nil:
+		// REGISTRY_AUTH_TYPE_AWS: Modal assumes the role via its own OIDC identity, so the
+		// role's trust policy must trust this workspace — workspace-admin setup that a
+		// provision cannot arrange, hence a failure here is terminal for the Pod.
+		//
+		// Region is guaranteed non-empty by checkRegistryAuth; Modal always sends it.
+		secret, err := c.registrySecret(ctx, map[string]string{
+			"AWS_ROLE_ARN": a.AWSRole.RoleARN,
+			"AWS_REGION":   a.AWSRole.Region,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("modal: ECR pull secret: %w", err)
+		}
+		return c.mc.Images.FromAwsEcr(spec.Image, secret, nil), nil
+
+	case a.Basic != nil:
+		secret, err := c.registrySecret(ctx, map[string]string{
+			"REGISTRY_USERNAME": a.Basic.Username,
+			"REGISTRY_PASSWORD": a.Basic.Password,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("modal: registry pull secret: %w", err)
+		}
+		return c.mc.Images.FromRegistry(spec.Image, &modal.ImageFromRegistryParams{Secret: secret}), nil
+
+	default:
+		// Refuse rather than pull anonymously; see provider.RegistryAuth.
+		return nil, fmt.Errorf("modal: unsupported image pull credential: %w", provider.ErrImagePull)
+	}
+}
+
+// registrySecret builds a lazily-hydrated ephemeral Modal Secret for these values.
+//
+// Per sandbox, and cached nowhere: the credential belongs to the Pod, is re-read from the
+// Pod's Kubernetes Secret on every provision, and must not outlive the call. The cost is that
+// a distinct SecretID gives the image a distinct hash, so Modal may re-pull an image it has
+// already built — layer caching still applies, and a credential kept in process memory for
+// the manager's lifetime is the worse trade.
+func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*modal.Secret, error) {
+	// The server-side create happens later, when the image build hydrates this.
+	return c.mc.Secrets.FromMap(ctx, kv, nil)
 }
 
 // mintCredential issues the sandbox's connect credential and RETURNS it, storing nothing.

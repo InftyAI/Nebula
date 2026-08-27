@@ -127,6 +127,17 @@ type SandboxSpec struct {
 	// MemoryMiB is the requested memory in MiB, from the Pod's request. Zero lets
 	// Modal apply its own default.
 	MemoryMiB int
+	// CPULimit and MemoryLimitMiB are the HARD caps, from the Pod's limits only —
+	// never from its requests, unlike CPU/MemoryMiB above, which fall back to limits
+	// when no request is given.
+	//
+	// Zero means no cap, which is also what a Pod that declares no limit means, so the
+	// two vocabularies line up on everything but one case: a positive limit smaller than
+	// Modal's unit must not truncate into that sentinel (see limitMiB). Without these a Pod's limits
+	// reached Modal as nothing at all: a limits-only Pod became a RESERVATION of that
+	// size with an unbounded ceiling — the inverse of what it asked for, and billable.
+	CPULimit       float64
+	MemoryLimitMiB int
 	// Ports are the container ports to expose, from the Pod's containerPorts. They
 	// declare to Modal which ports may receive traffic at all, and the connect URL
 	// routes to the first of them (see firstPort) — one token routes to one port.
@@ -170,6 +181,14 @@ type SandboxSpec struct {
 	// sandbox is reported statusInitializing rather than statusRunning.
 	// We only ever pass a user-supplied probe; the adapter never fabricates one.
 	ReadinessProbe *corev1.Probe
+	// RegistryAuth is the pull credential, or nil for an anonymous pull — the canonical form
+	// verbatim, since its two kinds already map 1:1 onto the SDK entry points (AWSRole →
+	// Images.FromAwsEcr, Basic → Images.FromRegistry). Data, not a *modal.Secret: minting one
+	// is an SDK call, and this spec stays SDK-free.
+	//
+	// Whether Modal can express it at all is settled before this is set; see
+	// checkRegistryAuth. Its own String redacts the password.
+	RegistryAuth *provider.RegistryAuth
 }
 
 // String redacts Env so a spec can be logged or wrapped in an error safely: key names print
@@ -177,10 +196,11 @@ type SandboxSpec struct {
 // a pointer, so %v would print an address, and only its presence matters.
 func (s SandboxSpec) String() string {
 	return fmt.Sprintf("SandboxSpec{Image:%s Command:%v Env:%s GPU:%s GPUCount:%d CPU:%g "+
-		"MemoryMiB:%d Ports:%v Regions:%v Egress:%s EgressTargets:%v Timeout:%s Tags:%v ReadinessProbe:%t}",
+		"CPULimit:%g MemoryMiB:%d MemoryLimitMiB:%d Ports:%v Regions:%v Egress:%s "+
+		"EgressTargets:%v Timeout:%s Tags:%v ReadinessProbe:%t RegistryAuth:%s}",
 		s.Image, s.Command, provider.RedactedEnv(s.Env), s.GPU, s.GPUCount, s.CPU,
-		s.MemoryMiB, s.Ports, s.Regions, s.EgressMode, s.EgressTargets,
-		s.Timeout, s.Tags, s.ReadinessProbe != nil)
+		s.CPULimit, s.MemoryMiB, s.MemoryLimitMiB, s.Ports, s.Regions, s.EgressMode,
+		s.EgressTargets, s.Timeout, s.Tags, s.ReadinessProbe != nil, s.RegistryAuth)
 }
 
 // GoString implements fmt.GoStringer so %#v is redacted too.
@@ -452,6 +472,13 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 		return provider.BlockScope{}
 	}
 	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
+	// The zero scope means BLOCK NOTHING — a rejection of this request that says nothing
+	// about the candidate, such as an image credential Modal cannot use. Stamping a region
+	// onto it would make it non-empty, and recordBlock would install a region-wide block
+	// across every accelerator: the same trap as the err == nil guard above.
+	if scope == (provider.BlockScope{}) {
+		return scope
+	}
 	// DenyAll already covers every region (auth fails everywhere), so narrowing it
 	// would contradict the category.
 	if region != "" && !scope.DenyAll {
@@ -503,10 +530,12 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
 		// here: it holds references this adapter has no cluster access to follow. See
 		// provider.ProvisionRequest.Env.
-		Env:       req.Env,
-		CPU:       cpuCores(&c),
-		MemoryMiB: memoryMiB(&c),
-		Ports:     containerPorts(&c),
+		Env:            req.Env,
+		CPU:            cpuCores(&c),
+		MemoryMiB:      memoryMiB(&c),
+		CPULimit:       cpuLimitCores(&c),
+		MemoryLimitMiB: memoryLimitMiB(&c),
+		Ports:          containerPorts(&c),
 		// An empty request region stays an empty slice, not a one-element [""]: that
 		// is the unconstrained case (no region declared on the pool), and it must
 		// reach Modal as "no placement constraint" — its widest pool and its
@@ -517,6 +546,16 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		Timeout:        sandboxTimeout(pod),
 		Tags:           tags,
 		ReadinessProbe: c.ReadinessProbe,
+	}
+
+	// Vet the resolved pull credential HERE, with the Pod in hand and before any API call, so
+	// one Modal cannot express costs nothing — the same place and for the same reason as the
+	// MapAccelerator check below.
+	if req.RegistryAuth != nil {
+		if err := checkRegistryAuth(req.RegistryAuth); err != nil {
+			return SandboxSpec{}, err
+		}
+		spec.RegistryAuth = req.RegistryAuth
 	}
 
 	// Accelerator type comes from the AcceleratorTypeLabel; count from the
@@ -561,27 +600,72 @@ func regionsOf(region string) []string {
 	return out
 }
 
+// checkRegistryAuth reports whether Modal can honour a pull credential, so the spec carries
+// only ones the Client is able to attach. Nothing to translate — the kinds map 1:1 onto the
+// SDK entry points — so this is only the supported-kinds decision plus the shared
+// well-formedness check.
+//
+// A refusal, never a fallback: an anonymous pull of a private image either 401s opaquely or
+// succeeds against a PUBLIC image of the same name.
+func checkRegistryAuth(a *provider.RegistryAuth) error {
+	switch {
+	case a.AWSRole != nil, a.Basic != nil:
+		if err := a.Validate(); err != nil {
+			return fmt.Errorf("modal: %w", err) // every error out of this adapter is prefixed
+		}
+		return nil
+	default:
+		// A kind the canonical form carries but this adapter has not wired — GCP, which
+		// Modal reaches via Images.FromGcpArtifactRegistry.
+		return a.Unsupported("modal")
+	}
+}
+
 // cpuCores reads the container's CPU request as fractional physical cores (Modal's
 // unit). It prefers requests, falling back to limits, and returns 0 (→ Modal
 // default) when neither is set.
-func cpuCores(c *corev1.Container) float64 {
-	q := resourceQty(c, corev1.ResourceCPU)
-	if q == nil {
-		return 0
-	}
-	// MilliValue is cores*1000; convert to fractional cores.
-	return float64(q.MilliValue()) / 1000.0
-}
+func cpuCores(c *corev1.Container) float64 { return cores(resourceQty(c, corev1.ResourceCPU)) }
 
 // memoryMiB reads the container's memory request in MiB (Modal's unit), preferring
 // requests over limits. Returns 0 (→ Modal default) when neither is set.
-func memoryMiB(c *corev1.Container) int {
-	q := resourceQty(c, corev1.ResourceMemory)
+func memoryMiB(c *corev1.Container) int { return mib(resourceQty(c, corev1.ResourceMemory)) }
+
+// cpuLimitCores and memoryLimitMiB read the LIMITS, with no fallback to the request: a
+// request is a floor, and reusing it as a ceiling would cap a burstable Pod that never
+// asked to be capped. Zero (no limit declared) reaches Modal as "no limit", matching
+// Kubernetes. The request/limit asymmetry is entirely in which lookup they use.
+func cpuLimitCores(c *corev1.Container) float64 { return cores(limitQty(c, corev1.ResourceCPU)) }
+func memoryLimitMiB(c *corev1.Container) int    { return limitMiB(limitQty(c, corev1.ResourceMemory)) }
+
+// cores converts a CPU quantity to Modal's unit, fractional physical cores. MilliValue
+// is cores*1000. A nil quantity (unset) is 0, which lets Modal apply its own default.
+func cores(q *resource.Quantity) float64 {
+	if q == nil {
+		return 0
+	}
+	return float64(q.MilliValue()) / 1000.0
+}
+
+// mib converts a memory quantity to Modal's unit, MiB. Nil is 0, as in cores.
+func mib(q *resource.Quantity) int {
 	if q == nil {
 		return 0
 	}
 	const miB = 1024 * 1024
 	return int(q.Value() / miB)
+}
+
+// limitMiB is mib for a LIMIT, where 0 does not mean "unset" but "no cap". A positive
+// quantity below 1 MiB truncates to 0 there, so the plain conversion would hand an
+// UNBOUNDED sandbox to the one Pod that asked for the tightest ceiling — the inverse
+// of its declaration. Any positive limit therefore floors at 1 MiB, the smallest cap
+// Modal's unit can express. Modal may then refuse it as below its own minimum, which is
+// the honest answer for a limit it cannot honour, and is not silently unlimited.
+func limitMiB(q *resource.Quantity) int {
+	if m := mib(q); m != 0 || q == nil || q.Sign() <= 0 {
+		return m
+	}
+	return 1
 }
 
 // resourceQty returns the container's request for name, falling back to its limit,
@@ -590,6 +674,14 @@ func resourceQty(c *corev1.Container, name corev1.ResourceName) *resource.Quanti
 	if q, ok := c.Resources.Requests[name]; ok {
 		return &q
 	}
+	if q, ok := c.Resources.Limits[name]; ok {
+		return &q
+	}
+	return nil
+}
+
+// limitQty returns the container's limit for name, or nil when it has none.
+func limitQty(c *corev1.Container, name corev1.ResourceName) *resource.Quantity {
 	if q, ok := c.Resources.Limits[name]; ok {
 		return &q
 	}
