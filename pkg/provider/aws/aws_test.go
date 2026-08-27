@@ -572,6 +572,13 @@ func TestClassifyProvisionError(t *testing.T) {
 			&smithy.GenericAPIError{Code: "InvalidFleetConfiguration", Message: "not supported in AZ"},
 			onDemandRegional},
 		{"nil", nil, provider.BlockScope{}},
+		// An image pull credential this adapter cannot honour is a fact about the POD, so it
+		// blocks nothing. Region must NOT be stamped on: a scope carrying only a region
+		// fences off every accelerator and tier there, on behalf of one Pod.
+		{"image pull blocks nothing", provider.ErrImagePull, provider.BlockScope{}},
+		{"wrapped image pull blocks nothing",
+			fmt.Errorf("aws: unsupported image pull credential: %w", provider.ErrImagePull),
+			provider.BlockScope{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

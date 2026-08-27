@@ -62,11 +62,14 @@ const ecrImage = "123456789012.dkr.ecr.us-west-2.amazonaws.com/team/trainer:v3"
 
 func TestResolveRegistryAuth(t *testing.T) {
 	cases := []struct {
-		name    string
-		pod     *corev1.Pod
-		objs    []runtime.Object
-		want    *provider.RegistryAuth
-		wantErr string
+		name string
+		pod  *corev1.Pod
+		objs []runtime.Object
+		want *provider.RegistryAuth
+		// wantErr is one substring the error must contain; wantErrAll is several, for the
+		// aggregate error that reports every entry it tried.
+		wantErr    string
+		wantErrAll []string
 	}{
 		{
 			// The overwhelmingly common case: a public image and no credential at all.
@@ -141,6 +144,50 @@ func TestResolveRegistryAuth(t *testing.T) {
 			wantErr: `no auths entry for registry "ghcr.io"`,
 		},
 		{
+			// The reported bug: Kubernetes allows one imagePullSecret per registry, so a
+			// Docker Hub entry listed first must not decide a GHCR pull.
+			name: "a Secret for another registry falls through to the next one",
+			pod:  pullPod("ghcr.io/org/app:v1", "hub", "ghcr"),
+			objs: []runtime.Object{
+				dockerConfigSecret("hub", "docker.io", "u", "p"),
+				dockerConfigSecret("ghcr", "ghcr.io", "bot", "hunter2"),
+			},
+			want: &provider.RegistryAuth{
+				Registry: "ghcr.io",
+				Basic:    &provider.BasicAuth{Username: "bot", Password: "hunter2"},
+			},
+		},
+		{
+			// Order must not matter for a BROKEN entry either: if a later Secret works, the
+			// earlier failures were noise.
+			name: "a malformed Secret does not stop a later working one",
+			pod:  pullPod("ghcr.io/org/app:v1", "corrupt", "missing", "ghcr"),
+			objs: []runtime.Object{
+				typedSecret("corrupt", corev1.SecretTypeDockerConfigJson, map[string]string{
+					corev1.DockerConfigJsonKey: "{not json",
+				}),
+				dockerConfigSecret("ghcr", "ghcr.io", "bot", "hunter2"),
+			},
+			want: &provider.RegistryAuth{
+				Registry: "ghcr.io",
+				Basic:    &provider.BasicAuth{Username: "bot", Password: "hunter2"},
+			},
+		},
+		{
+			// Nothing worked, so every reason is reported — which one was meant to be the
+			// working entry cannot be known from here.
+			name: "when nothing works, every reason is reported",
+			pod:  pullPod("ghcr.io/org/app:v1", "hub", "opaque"),
+			objs: []runtime.Object{
+				dockerConfigSecret("hub", "docker.io", "u", "p"),
+				secretObj("opaque", map[string]string{"roleARN": "arn:x"}),
+			},
+			wantErrAll: []string{
+				`no auths entry for registry "ghcr.io"`,
+				`"opaque" has unsupported type`,
+			},
+		},
+		{
 			// The first RECOGNIZED type wins, so an unknown type earlier is skipped over.
 			name: "the first recognized type wins",
 			pod:  pullPod(ecrImage, "opaque", "ecr-pull"),
@@ -177,19 +224,25 @@ func TestResolveRegistryAuth(t *testing.T) {
 			name:    "no Secret of a supported type is an error",
 			pod:     pullPod(ecrImage, "opaque"),
 			objs:    []runtime.Object{secretObj("opaque", map[string]string{"roleARN": "arn:x"})},
-			wantErr: "no imagePullSecret of a supported type",
+			wantErr: `"opaque" has unsupported type`,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := resolveRegistryAuth(context.Background(), fake.NewSimpleClientset(tc.objs...), tc.pod)
+			wantErrs := tc.wantErrAll
 			if tc.wantErr != "" {
+				wantErrs = append(wantErrs, tc.wantErr)
+			}
+			if len(wantErrs) > 0 {
 				if err == nil {
-					t.Fatalf("got nil error, want one containing %q", tc.wantErr)
+					t.Fatalf("got nil error, want one containing %q", wantErrs)
 				}
-				if !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+				for _, want := range wantErrs {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %v, want it to contain %q", err, want)
+					}
 				}
 				if got != nil {
 					t.Errorf("auth = %v on error, want nil — a partial credential must not reach a provider", got)
@@ -215,6 +268,110 @@ func TestResolveRegistryAuthNoClient(t *testing.T) {
 	_, err := resolveRegistryAuth(context.Background(), nil, pullPod(ecrImage, "ecr-pull"))
 	if err == nil {
 		t.Fatal("imagePullSecrets with a nil client: got nil error, want one")
+	}
+}
+
+// TestCreatePod_PassesResolvedRegistryAuthToProvider is the handler seam, the mirror of
+// TestCreatePod_PassesResolvedEnvToProvider: the virtual node reads the imagePullSecret, the
+// provider receives a credential. Without it the resolver could be perfect while CreatePod
+// handed every adapter a nil, turning every private pull anonymous — which fails opaquely, or
+// worse, succeeds against a PUBLIC image of the same name.
+func TestCreatePod_PassesResolvedRegistryAuthToProvider(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	pod := pullPod("ghcr.io/org/app:v1", "ghcr")
+	client := fake.NewSimpleClientset(pod, dockerConfigSecret("ghcr", "ghcr.io", "bot", "hunter2"))
+	h := NewHandler(fp, client, nil, openCluster())
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	want := &provider.RegistryAuth{
+		Registry: "ghcr.io",
+		Basic:    &provider.BasicAuth{Username: "bot", Password: "hunter2"},
+	}
+	if diff := authDiff(fp.lastReq.RegistryAuth, want); diff != "" {
+		t.Fatalf("provider got the wrong credential: %s", diff)
+	}
+	// The Pod keeps its REFERENCE, as with env: VK compares specs on every sync, and the
+	// resolved credential has no business in an object this package copies, emits and patches.
+	if len(pod.Spec.ImagePullSecrets) != 1 || pod.Spec.ImagePullSecrets[0].Name != "ghcr" {
+		t.Fatalf("the Pod's imagePullSecrets must be left alone, got %v", pod.Spec.ImagePullSecrets)
+	}
+}
+
+// TestCreatePod_AnonymousPullPassesNoCredential is the same seam for the common case: the
+// handler must forward what the resolver decided, including "nothing", rather than fabricate a
+// credential for a public image.
+func TestCreatePod_AnonymousPullPassesNoCredential(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	pod := pullPod("nginx:1.27")
+	h := NewHandler(fp, fake.NewSimpleClientset(pod), nil, openCluster())
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if fp.lastReq.RegistryAuth != nil {
+		t.Fatalf("RegistryAuth = %v, want nil for a Pod with no imagePullSecrets", fp.lastReq.RegistryAuth)
+	}
+}
+
+// TestCreatePod_UnresolvableRegistryAuthIsNonTerminal mirrors
+// TestCreatePod_UnresolvableEnvIsNonTerminal for the pull credential, and is why resolution
+// runs before the provider call. A credential problem belongs to the Pod, so no other provider
+// or region can fix it: nothing is provisioned, nothing is blocklisted, the Pod waits at
+// ConfigError, and the error goes back for VK to retry.
+func TestCreatePod_UnresolvableRegistryAuthIsNonTerminal(t *testing.T) {
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		objs []runtime.Object
+	}{
+		{
+			// The read failure: the Secret has not landed yet (a bootstrap job, an
+			// external-secrets sync). Failing the Pod would reap a workload over a race.
+			name: "the Secret does not exist yet",
+			pod:  pullPod(ecrImage, "ecr-pull"),
+		},
+		{
+			// Readable, but not a credential for THIS registry — equally not grounds to go
+			// provision an anonymous pull.
+			name: "the Secret holds a credential for another registry",
+			pod:  pullPod("ghcr.io/org/app:v1", "hub"),
+			objs: []runtime.Object{dockerConfigSecret("hub", "docker.io", "u", "hunter2")},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeProvider{provisionID: "inst-1"}
+			bl := &recordingBlocklist{}
+			h := NewHandler(fp, fake.NewSimpleClientset(append(tc.objs, tc.pod)...), bl, openCluster())
+
+			if err := h.CreatePod(context.Background(), tc.pod); err == nil {
+				t.Fatal("expected CreatePod to fail so VK retries the sync")
+			}
+			if fp.provisionCnt != 0 {
+				t.Errorf("provision calls = %d, want 0; an unusable credential must not reach the provider",
+					fp.provisionCnt)
+			}
+			if bl.calls != 0 {
+				t.Errorf("Record calls = %d, want 0; a Pod-spec problem must not blocklist a candidate", bl.calls)
+			}
+			if tc.pod.Status.Phase != corev1.PodPending || tc.pod.Status.Reason != reasonConfigError {
+				t.Errorf("expected Pending/%s, got %s/%s",
+					reasonConfigError, tc.pod.Status.Phase, tc.pod.Status.Reason)
+			}
+			// Untracked, like every other pre-instance failure: a tracked pod with no instance
+			// id reads as absent from List and gets written Terminated.
+			if h.Tracks(tc.pod.Namespace, tc.pod.Name) {
+				t.Error("a pod that never reached the provider must not be tracked")
+			}
+			// The reason lands in a status the API server stores and every pod reader can see,
+			// so it must name the problem without quoting the credential it read.
+			if strings.Contains(tc.pod.Status.Message, "hunter2") {
+				t.Errorf("status message leaks a password: %q", tc.pod.Status.Message)
+			}
+		})
 	}
 }
 

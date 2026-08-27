@@ -46,13 +46,17 @@ const SecretTypeAWSRole corev1.SecretType = "nebula.inftyai.com/aws-role"
 // which name Secrets in the Pod's namespace that an adapter cannot read — the same reason
 // resolveEnv lives here. (nil, nil) is an anonymous pull.
 //
-// The FIRST entry of a recognized type wins, never a merge: a provider attaches ONE
-// credential to one image, and the kubelet's own rule (try each until a pull succeeds) is
-// unavailable, since the pull happens inside the provider after this returns.
+// The first USABLE entry wins, never a merge: a provider attaches ONE credential to one image.
+// Every earlier entry that did not work out — unreadable, mistyped, malformed, or holding
+// credentials for a different registry — is recorded and skipped, not raised. Kubernetes lets
+// a Pod list one imagePullSecret per registry precisely so they can be tried in turn, so
+// [docker-hub, ghcr] has to pull from GHCR; failing at the first entry made the ORDER decide
+// whether a pull worked.
 //
-// Every other outcome is an error. imagePullSecrets states that this image needs a
-// credential, and pulling without one either 401s opaquely or succeeds against a PUBLIC image
-// of the same name.
+// An error only when NOTHING works, and it then carries every reason collected, since which
+// one the user meant to be the working entry is unknowable from here. It cannot degrade to an
+// anonymous pull: imagePullSecrets states that this image needs a credential, and pulling
+// without one either 401s opaquely or succeeds against a PUBLIC image of the same name.
 func resolveRegistryAuth(
 	ctx context.Context, client kubernetes.Interface, pod *corev1.Pod,
 ) (*provider.RegistryAuth, error) {
@@ -66,39 +70,68 @@ func resolveRegistryAuth(
 	// One container per Nebula Pod, as everywhere else that reads the workload.
 	registry := registryHost(pod.Spec.Containers[0].Image)
 
-	for _, ref := range pod.Spec.ImagePullSecrets {
-		s, err := client.CoreV1().Secrets(pod.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
-		if err != nil {
-			// Includes NotFound, and non-terminally so: the caller stamps ConfigError and
-			// retries, which is right for a Secret written moments after the Pod.
-			return nil, fmt.Errorf("read imagePullSecret %q: %w", ref.Name, err)
-		}
-		switch s.Type {
-		case SecretTypeAWSRole:
-			arn := strings.TrimSpace(string(s.Data[secretKeyRoleARN]))
-			region := strings.TrimSpace(string(s.Data[secretKeyRegion]))
-			// Both required. The region is the REGISTRY's, which the ECR host does encode,
-			// but a pull-through or replicated reference makes reading it off the image a
-			// guess — and a wrong one only ever surfaces as an opaque auth failure.
-			if arn == "" || region == "" {
-				return nil, fmt.Errorf("imagePullSecret %q of type %s needs a non-empty %q and %q",
-					ref.Name, s.Type, secretKeyRoleARN, secretKeyRegion)
-			}
-			return &provider.RegistryAuth{
-				Registry: registry,
-				AWSRole:  &provider.AWSRoleAuth{RoleARN: arn, Region: region},
-			}, nil
+	// Why each entry so far was unusable, in the order tried. Collected rather than returned
+	// because a later imagePullSecret may still be the right one, and then none of this
+	// mattered.
+	var problems []string
 
-		case corev1.SecretTypeDockerConfigJson:
-			auth, err := dockerConfigAuth(s, registry)
-			if err != nil {
-				return nil, fmt.Errorf("imagePullSecret %q: %w", ref.Name, err)
-			}
-			return auth, nil
+	for _, ref := range pod.Spec.ImagePullSecrets {
+		auth, err := registryAuthFromSecret(ctx, client, pod.Namespace, ref.Name, registry)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
 		}
+		return auth, nil
 	}
-	return nil, fmt.Errorf("no imagePullSecret of a supported type (%s, %s) among %v",
-		SecretTypeAWSRole, corev1.SecretTypeDockerConfigJson, pullSecretNames(pod))
+	// Non-empty by construction: the loop either returned or appended on every entry, and
+	// there is at least one.
+	return nil, fmt.Errorf("no imagePullSecret yielded a credential for registry %q: %s",
+		registry, strings.Join(problems, "; "))
+}
+
+// registryAuthFromSecret resolves ONE imagePullSecret, or says why it cannot be used.
+//
+// It never returns (nil, nil): "this Secret is not the one" is an error here so the caller can
+// report it, and the caller decides whether it matters — none of these failures is fatal while
+// another imagePullSecret is left to try.
+func registryAuthFromSecret(
+	ctx context.Context, client kubernetes.Interface, namespace, name, registry string,
+) (*provider.RegistryAuth, error) {
+	s, err := client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		// Includes NotFound. Still worth retrying when it is the only entry, which the
+		// caller's aggregate error gets for free: it stamps ConfigError and comes back, and a
+		// Secret written moments after the Pod then resolves.
+		return nil, fmt.Errorf("read imagePullSecret %q: %w", name, err)
+	}
+
+	switch s.Type {
+	case SecretTypeAWSRole:
+		arn := strings.TrimSpace(string(s.Data[secretKeyRoleARN]))
+		region := strings.TrimSpace(string(s.Data[secretKeyRegion]))
+		// Both required. The region is the REGISTRY's, which the ECR host does encode, but a
+		// pull-through or replicated reference makes reading it off the image a guess — and a
+		// wrong one only ever surfaces as an opaque auth failure.
+		if arn == "" || region == "" {
+			return nil, fmt.Errorf("imagePullSecret %q of type %s needs a non-empty %q and %q",
+				name, s.Type, secretKeyRoleARN, secretKeyRegion)
+		}
+		return &provider.RegistryAuth{
+			Registry: registry,
+			AWSRole:  &provider.AWSRoleAuth{RoleARN: arn, Region: region},
+		}, nil
+
+	case corev1.SecretTypeDockerConfigJson:
+		auth, err := dockerConfigAuth(s, registry)
+		if err != nil {
+			return nil, fmt.Errorf("imagePullSecret %q: %w", name, err)
+		}
+		return auth, nil
+
+	default:
+		return nil, fmt.Errorf("imagePullSecret %q has unsupported type %s, want %s or %s",
+			name, s.Type, SecretTypeAWSRole, corev1.SecretTypeDockerConfigJson)
+	}
 }
 
 // The keys SecretTypeAWSRole carries, both required.
@@ -138,6 +171,8 @@ func dockerConfigAuth(s *corev1.Secret, registry string) (*provider.RegistryAuth
 		}
 	}
 	if !ok {
+		// A miss, not a fault — the commonest reason a Pod lists more than one
+		// imagePullSecret. The caller simply moves on to the next.
 		return nil, fmt.Errorf("no auths entry for registry %q", registry)
 	}
 
@@ -184,14 +219,4 @@ func dockerHubAliases(registry string) []string {
 		return nil
 	}
 	return []string{"https://index.docker.io/v1/", "index.docker.io", "registry-1.docker.io"}
-}
-
-// pullSecretNames lists the Pod's imagePullSecret names, so the "no supported type" error
-// names what was found and not only what was wanted.
-func pullSecretNames(pod *corev1.Pod) []string {
-	out := make([]string, 0, len(pod.Spec.ImagePullSecrets))
-	for _, ref := range pod.Spec.ImagePullSecrets {
-		out = append(out, ref.Name)
-	}
-	return out
 }

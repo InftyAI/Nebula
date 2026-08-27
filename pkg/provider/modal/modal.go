@@ -132,7 +132,8 @@ type SandboxSpec struct {
 	// when no request is given.
 	//
 	// Zero means no cap, which is also what a Pod that declares no limit means, so the
-	// two vocabularies line up without a special case. Without these a Pod's limits
+	// two vocabularies line up on everything but one case: a positive limit smaller than
+	// Modal's unit must not truncate into that sentinel (see limitMiB). Without these a Pod's limits
 	// reached Modal as nothing at all: a limits-only Pod became a RESERVATION of that
 	// size with an unbounded ceiling — the inverse of what it asked for, and billable.
 	CPULimit       float64
@@ -471,6 +472,13 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 		return provider.BlockScope{}
 	}
 	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
+	// The zero scope means BLOCK NOTHING — a rejection of this request that says nothing
+	// about the candidate, such as an image credential Modal cannot use. Stamping a region
+	// onto it would make it non-empty, and recordBlock would install a region-wide block
+	// across every accelerator: the same trap as the err == nil guard above.
+	if scope == (provider.BlockScope{}) {
+		return scope
+	}
 	// DenyAll already covers every region (auth fails everywhere), so narrowing it
 	// would contradict the category.
 	if region != "" && !scope.DenyAll {
@@ -627,7 +635,7 @@ func memoryMiB(c *corev1.Container) int { return mib(resourceQty(c, corev1.Resou
 // asked to be capped. Zero (no limit declared) reaches Modal as "no limit", matching
 // Kubernetes. The request/limit asymmetry is entirely in which lookup they use.
 func cpuLimitCores(c *corev1.Container) float64 { return cores(limitQty(c, corev1.ResourceCPU)) }
-func memoryLimitMiB(c *corev1.Container) int    { return mib(limitQty(c, corev1.ResourceMemory)) }
+func memoryLimitMiB(c *corev1.Container) int    { return limitMiB(limitQty(c, corev1.ResourceMemory)) }
 
 // cores converts a CPU quantity to Modal's unit, fractional physical cores. MilliValue
 // is cores*1000. A nil quantity (unset) is 0, which lets Modal apply its own default.
@@ -645,6 +653,19 @@ func mib(q *resource.Quantity) int {
 	}
 	const miB = 1024 * 1024
 	return int(q.Value() / miB)
+}
+
+// limitMiB is mib for a LIMIT, where 0 does not mean "unset" but "no cap". A positive
+// quantity below 1 MiB truncates to 0 there, so the plain conversion would hand an
+// UNBOUNDED sandbox to the one Pod that asked for the tightest ceiling — the inverse
+// of its declaration. Any positive limit therefore floors at 1 MiB, the smallest cap
+// Modal's unit can express. Modal may then refuse it as below its own minimum, which is
+// the honest answer for a limit it cannot honour, and is not silently unlimited.
+func limitMiB(q *resource.Quantity) int {
+	if m := mib(q); m != 0 || q == nil || q.Sign() <= 0 {
+		return m
+	}
+	return 1
 }
 
 // resourceQty returns the container's request for name, falling back to its limit,

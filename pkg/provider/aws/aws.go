@@ -682,6 +682,13 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 		tier = nebulav1alpha1.CapacitySpot
 	}
 	scope := provider.ClassifyError(err, tier, accelerator)
+	// The zero scope means BLOCK NOTHING — a rejection of this request that says nothing
+	// about the candidate, such as an image pull credential this adapter cannot honour.
+	// Stamping a region onto it would make it non-empty, and recordBlock would then install a
+	// block covering every accelerator and tier in that region.
+	if scope == (provider.BlockScope{}) {
+		return scope
+	}
 	// Confine an accelerator/capacity/quota block to the region that failed. A
 	// DenyAll (auth) fails in every region, so it stays region-wide (Region left nil).
 	// An empty region (should not happen — every request carries one) maps to &"" =

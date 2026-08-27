@@ -255,22 +255,45 @@ func TestProvision_MapsResourceLimits(t *testing.T) {
 		wantMemMiB, wantMemLimMiB int
 	}{
 		{
-			name:    "limits only: limit is the ceiling AND the request falls back to it",
-			limits:  corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("8Gi")},
+			name: "limits only: limit is the ceiling AND the request falls back to it",
+			limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
 			wantCPU: 2, wantCPULimit: 2,
 			wantMemMiB: 8192, wantMemLimMiB: 8192,
 		},
 		{
-			name:     "both: burstable, request below the ceiling",
-			requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")},
-			limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("16Gi")},
-			wantCPU:  0.5, wantCPULimit: 4,
+			name: "both: burstable, request below the ceiling",
+			requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("16Gi"),
+			},
+			wantCPU: 0.5, wantCPULimit: 4,
 			wantMemMiB: 1024, wantMemLimMiB: 16384,
 		},
 		{
 			name:    "neither: Modal applies its own defaults, uncapped",
 			wantCPU: 0, wantCPULimit: 0,
 			wantMemMiB: 0, wantMemLimMiB: 0,
+		},
+		{
+			// A ceiling below Modal's unit must not truncate into the zero that means
+			// "no cap" on the limit fields: it would leave the Pod asking for the
+			// TIGHTEST ceiling running unbounded. The matching request is a different
+			// question — zero there means "Modal's default", so falling back to 0 is
+			// correct and the asymmetry is deliberate.
+			name: "sub-MiB ceiling floors at 1 MiB instead of becoming uncapped",
+			limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("1m"),
+				corev1.ResourceMemory: resource.MustParse("500Ki"),
+			},
+			wantCPU: 0.001, wantCPULimit: 0.001,
+			wantMemMiB: 0, wantMemLimMiB: 1,
 		},
 	}
 
@@ -912,6 +935,15 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	// block on that region.
 	if got := p.ClassifyProvisionError(nil, "H100:1", "us-east"); got != (provider.BlockScope{}) {
 		t.Fatalf("a nil error must classify to the zero scope, got %+v", got)
+	}
+
+	// Same trap, and the reason the guard is not just the nil check above: an unusable image
+	// credential belongs to one POD, so it blocks nothing. Stamping the region here would
+	// make the scope non-empty and fence off every accelerator in us-east because one Pod
+	// named a role Modal cannot assume.
+	if got := p.ClassifyProvisionError(provider.ErrImagePull, "H100:1", "us-east"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("an image-pull rejection must block nothing, got %+v", got)
 	}
 }
 

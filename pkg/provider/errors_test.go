@@ -45,6 +45,16 @@ func TestClassifyError(t *testing.T) {
 		{"quota sentinel", ErrQuota, capacityScope},
 		{"no-capacity sentinel", ErrNoCapacity, capacityScope},
 		{"unsupported sentinel", ErrUnsupportedAccelerator, capacityScope},
+		// An unusable image credential belongs to the POD. The blocklist key carries no Pod,
+		// image or credential identity, so ANY scope here would exclude the candidate for
+		// unrelated Pods that pull perfectly well — hence the zero scope, which blocks
+		// nothing. Still a rejection: see TestIsRejection.
+		{"image-pull sentinel blocks nothing", ErrImagePull, BlockScope{}},
+		{
+			"wrapped image-pull sentinel blocks nothing",
+			fmt.Errorf("modal: unsupported image pull credential: %w", ErrImagePull),
+			BlockScope{},
+		},
 		{"wrapped sentinel", fmt.Errorf("provision failed: %w", ErrNoCapacity), capacityScope},
 		{"string unauthorized", fmt.Errorf("HTTP 401 unauthorized"), BlockScope{DenyAll: true}},
 		{"string quota", fmt.Errorf("account limit exceeded"), capacityScope},
@@ -102,6 +112,10 @@ func TestIsRejection(t *testing.T) {
 		{"wrapped sentinel", fmt.Errorf("create sandbox: %w", ErrNoCapacity), true},
 		{"string capacity", errors.New("InsufficientInstanceCapacity"), true},
 		{"string auth", errors.New("HTTP 401 unauthorized"), true},
+		// Blocks nothing (see TestClassifyError), yet still a rejection: the provider DID
+		// decide, and a Pod whose credential it cannot use must fail with that reason rather
+		// than retry it forever. Blocking and rejecting are separate questions.
+		{"image-pull sentinel", ErrImagePull, true},
 
 		// The failures this predicate exists for.
 		{"deadline exceeded", context.DeadlineExceeded, false},
