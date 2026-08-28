@@ -55,6 +55,17 @@ func TestClassifyError(t *testing.T) {
 			fmt.Errorf("modal: unsupported image pull credential: %w", ErrImagePull),
 			BlockScope{},
 		},
+		// Same scope as a pull failure, and it must stay that way: the image is the Pod's,
+		// and a builder that refused this one has nothing to say about the candidate. The
+		// wrapped case is the shape Modal produces — the SDK's own verdict, then the label
+		// (see modal.sdkClient.buildImage) — and it is the one that regressed to DenyAll when the
+		// registry's "unauthorized" text was left to the heuristics.
+		{"image-build sentinel blocks nothing", ErrImageBuild, BlockScope{}},
+		{
+			"wrapped image-build sentinel blocks nothing",
+			fmt.Errorf("modal: RemoteError: unauthorized: authentication required: %w", ErrImageBuild),
+			BlockScope{},
+		},
 		{"wrapped sentinel", fmt.Errorf("provision failed: %w", ErrNoCapacity), capacityScope},
 		{"string unauthorized", fmt.Errorf("HTTP 401 unauthorized"), BlockScope{DenyAll: true}},
 		{"string quota", fmt.Errorf("account limit exceeded"), capacityScope},
@@ -116,6 +127,7 @@ func TestIsRejection(t *testing.T) {
 		// decide, and a Pod whose credential it cannot use must fail with that reason rather
 		// than retry it forever. Blocking and rejecting are separate questions.
 		{"image-pull sentinel", ErrImagePull, true},
+		{"image-build sentinel", ErrImageBuild, true},
 
 		// The failures this predicate exists for.
 		{"deadline exceeded", context.DeadlineExceeded, false},

@@ -66,6 +66,11 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
+// provisionTimeout overrides the vnode handler's generic 90s Provision deadline, because
+// Provision here BLOCKS on the image build (see sdkClient.buildImage): a cold multi-GB
+// image can take minutes to pull into Modal's cache.
+const provisionTimeout = 5 * time.Minute
+
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
 // work here, and asserting them separately is the point — a provider is free to serve
@@ -323,12 +328,13 @@ func (p *Provider) ExpandRegions(declared []string) []string {
 // trait is set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:         false, // create/terminate only
-		SupportsSpot:         false, // no user-facing preemptible tier
-		SupportsEgressPolicy: true,  // outbound allowlists on the sandbox itself
-		NativeTags:           true,  // sandbox tags carry identity
-		PreemptionNotice:     0,     // no push; poll-based detection
-		PollInterval:         0,     // OnDemand-only (never preempts) → the default cadence is fine
+		SupportsStop:         false,            // create/terminate only
+		SupportsSpot:         false,            // no user-facing preemptible tier
+		SupportsEgressPolicy: true,             // outbound allowlists on the sandbox itself
+		NativeTags:           true,             // sandbox tags carry identity
+		PreemptionNotice:     0,                // no push; poll-based detection
+		PollInterval:         0,                // OnDemand-only (never preempts) → the default cadence is fine
+		ProvisionTimeout:     provisionTimeout, // Provision blocks on the image build
 	}
 }
 

@@ -58,6 +58,13 @@ var (
 	// other Pods perfectly well, since the blocklist key carries no Pod, image or credential
 	// identity. A failure that belongs to one request cannot be recorded against a candidate.
 	ErrImagePull = errors.New("provider: cannot pull image")
+	// ErrImageBuild: the provider could not PRODUCE the image it was asked to run —
+	// distinct from ErrImagePull because pulling is only one of the ways it fails.
+	//
+	// REQUEST-scoped like ErrImagePull, and for the same reason: WHICH image to run belongs
+	// to the Pod, so it blocklists NOTHING — no other region, tier or provider produces an
+	// image this one just refused to produce.
+	ErrImageBuild = errors.New("provider: cannot build image")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be blocklisted at,
@@ -143,8 +150,8 @@ const (
 	// it is meaningful, because the next Pod asking for the same candidate would fail too.
 	catCapacity
 	// catRequest: the provider refused this request because of something about the REQUEST
-	// itself — today only an image it cannot pull. A decision, so a rejection, but it says
-	// nothing about the candidate and must not blocklist one.
+	// itself — today an image it cannot pull or cannot build. A decision, so a rejection, but
+	// it says nothing about the candidate and must not blocklist one.
 	catRequest
 )
 
@@ -155,7 +162,7 @@ func categorize(err error) failureCategory {
 	switch {
 	case errors.Is(err, ErrAuth):
 		return catAuth
-	case errors.Is(err, ErrImagePull):
+	case errors.Is(err, ErrImagePull), errors.Is(err, ErrImageBuild):
 		return catRequest
 	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator),
 		errors.Is(err, ErrQuota):

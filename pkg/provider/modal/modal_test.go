@@ -465,6 +465,13 @@ func TestCapabilities(t *testing.T) {
 	if caps.SupportsStop || caps.SupportsSpot || caps.PreemptionNotice != 0 || !caps.NativeTags {
 		t.Fatalf("unexpected caps: %+v", caps)
 	}
+	// Must be stated, and must be well above the handler's generic 90s: Provision blocks on
+	// the image build here, so at the default a cold multi-GB image never finishes pulling
+	// and the Pod dies on a deadline instead of a verdict. Zero would silently restore that.
+	if caps.ProvisionTimeout < 5*time.Minute {
+		t.Fatalf("ProvisionTimeout = %v, want at least 5m to cover a cold image build",
+			caps.ProvisionTimeout)
+	}
 	if p.Name() != provider.ProviderModal {
 		t.Fatalf("name = %q", p.Name())
 	}
@@ -944,6 +951,47 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	if got := p.ClassifyProvisionError(provider.ErrImagePull, "H100:1", "us-east"); got !=
 		(provider.BlockScope{}) {
 		t.Fatalf("an image-pull rejection must block nothing, got %+v", got)
+	}
+}
+
+// TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider is the regression test for the
+// worst blast radius this adapter can produce. Modal relays the REGISTRY's words in a build
+// failure, and a private registry's 401 says "unauthorized" — the same word the shared auth
+// heuristic promotes to DenyAll, which is meant for OUR workspace credentials being wrong.
+// Unlabelled, one Pod naming an image it cannot pull would fence off the entire provider for
+// the blocklist TTL, failing over every other workload for something none of them did.
+func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	// The shape buildImage produces: Modal's verdict, carrying the registry's text, wrapped
+	// with the sentinel. Spelled as the verdict's rendered text rather than the SDK type, to
+	// keep this file SDK-free — under test is the label, not how buildImage obtained one.
+	verdict := errors.New("RemoteError: Image build for im-1 failed with the exception:\n" +
+		"unauthorized: authentication required")
+	err := fmt.Errorf("modal: image build: %w: %w", verdict, provider.ErrImageBuild)
+
+	// Blocks nothing at all: the image is a property of the request, and no region or tier
+	// builds an image Modal refused to build.
+	if got := p.ClassifyProvisionError(err, "H100:1", "us-east"); got != (provider.BlockScope{}) {
+		t.Fatalf("an image build failure must block nothing, got %+v", got)
+	}
+	// Still a rejection, so the Pod fails with the reason instead of retrying an image that
+	// will never build. Blocking and rejecting are separate questions.
+	if !provider.IsRejection(err) {
+		t.Error("an image build failure must be a rejection")
+	}
+	// The registry's text survives for whoever has to fix the Secret.
+	if !strings.Contains(err.Error(), "authentication required") {
+		t.Errorf("err = %q, want the registry's reason preserved", err)
+	}
+	// Named for what actually failed. A build fails on more than pulls — a layer it cannot
+	// unpack, a manifest it rejects — so ErrImagePull would assert a pull problem the
+	// adapter has not established, and send whoever reads it to check a credential.
+	if !errors.Is(err, provider.ErrImageBuild) {
+		t.Errorf("err must identify as ErrImageBuild, got %v", err)
+	}
+	if errors.Is(err, provider.ErrImagePull) {
+		t.Error("a build failure must not claim to be a pull failure")
 	}
 }
 

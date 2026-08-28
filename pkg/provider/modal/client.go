@@ -143,6 +143,12 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
+	// Built HERE rather than implicitly inside Sandboxes.Create, so a build failure can be
+	// told apart from a create failure and labelled; see buildImage.
+	image, err = c.buildImage(ctx, app, image)
+	if err != nil {
+		return "", Credential{}, err
+	}
 
 	probe, err := modalProbe(spec.ReadinessProbe)
 	if err != nil {
@@ -224,6 +230,16 @@ func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Imag
 		// Refuse rather than pull anonymously; see provider.RegistryAuth.
 		return nil, fmt.Errorf("modal: unsupported image pull credential: %w", provider.ErrImagePull)
 	}
+}
+
+// buildImage hydrates the image, which is where Modal pulls it into its own cache.
+// EVERY failure is labelled ErrImageBuild.
+func (c *sdkClient) buildImage(ctx context.Context, app *modal.App, image *modal.Image) (*modal.Image, error) {
+	built, err := image.Build(ctx, app, nil)
+	if err != nil {
+		return nil, fmt.Errorf("modal: image build: %w: %w", err, provider.ErrImageBuild)
+	}
+	return built, nil
 }
 
 // registrySecret builds a lazily-hydrated ephemeral Modal Secret for these values.
