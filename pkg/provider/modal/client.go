@@ -190,7 +190,7 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
-	return sb.SandboxID, c.mintCredential(ctx, sb, spec), nil
+	return sb.SandboxID, c.mintCredential(ctx, sb, firstPort(spec.Ports)), nil
 }
 
 // imageFor resolves the sandbox's image, attaching pull credentials when the spec carries
@@ -233,7 +233,6 @@ func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Imag
 }
 
 // buildImage hydrates the image, which is where Modal pulls it into its own cache.
-// EVERY failure is labelled ErrImageBuild.
 func (c *sdkClient) buildImage(ctx context.Context, app *modal.App, image *modal.Image) (*modal.Image, error) {
 	built, err := image.Build(ctx, app, nil)
 	if err != nil {
@@ -259,34 +258,11 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 // would hand over every workload's token. Not in memory, which is not durable. A
 // credential belongs in an access-controlled Secret, and this layer has no cluster
 // access, so it hands the pair up to the virtual kubelet, which writes it.
-//
-// Minting is one-shot: every CreateConnectToken call mints a FRESH token, with no
-// read-back. A caller that drops the return value has lost it for the sandbox's life.
-// That is also why this cannot move to the read path — observe would hand out a token
-// that changed every tick. (The endpoint lives on the Pod annotation instead, so Modal
-// reports no observed endpoint at all; see observe.)
-//
-// It can run this early because the RPC needs only the sandbox id and port — no task id,
-// no running container, no booted GPU (contrast Tunnels, which needs the container up).
-// So the credential is in hand while the sandbox is still queued.
-//
-// Every workload gets one: an authenticated URL is the only general way to reach a
-// NeoCloud instance, and a workload with nothing to serve just leaves it unused. The URL
-// routes to the first of spec.Ports, or Modal's default 8080 if none are declared.
-//
-// TODO: a Sandbox is reached by identity (`kubectl exec sbx-alice`), not by address, so it
-// should not get a credential — it does today because it arrives here as an ordinary Pod.
-//
-// Best-effort: a sandbox that exists must be reported and reclaimed whether or not it got
-// a credential, so a failure returns the zero Credential and the instance is simply
-// unreachable. Returning the error would fail a Provision whose sandbox is already
-// running, leaking a paid instance to save an address. The text is dropped rather than
-// logged because it can echo the request.
-func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, spec SandboxSpec) Credential {
+func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) Credential {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 		// Derived from the exposed set rather than carried separately, so the routed
 		// port cannot name one the sandbox was never told to accept traffic on.
-		Port: firstPort(spec.Ports),
+		Port: port,
 	})
 	if err != nil || creds == nil || creds.Token == "" {
 		return Credential{}

@@ -155,10 +155,16 @@ const (
 	catRequest
 )
 
-// categorize buckets a provision error, sentinels first and string heuristics after.
+// categorize buckets a provision error: cancellation first, then sentinels, then string
+// heuristics.
 func categorize(err error) failureCategory {
-	// Sentinels first. An adapter that wrapped one has made an explicit decision, and
-	// it outranks anything the raw message text happens to contain.
+	msg := strings.ToLower(err.Error())
+
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		containsAny(msg, "context deadline exceeded", "context canceled") {
+		return catUnattributable
+	}
+
 	switch {
 	case errors.Is(err, ErrAuth):
 		return catAuth
@@ -169,23 +175,10 @@ func categorize(err error) failureCategory {
 		return catCapacity
 	}
 
-	msg := strings.ToLower(err.Error())
-
-	// Transport and timeout markers are checked BEFORE the category heuristics,
-	// because they are the failures those heuristics most reliably MISREAD: a gRPC
-	// status renders as "rpc error: code = Unavailable desc = ...", whose
-	// "unavailable" would otherwise match the capacity bucket below and turn "we could
-	// not reach the provider" into "the provider has no capacity" — the exact
-	// misattribution IsRejection exists to prevent. A deadline is unattributable for a
-	// second reason too: our own ProvisionTimeout can fire on a call the provider went
-	// on to honour, so the instance may well exist.
-	switch {
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		return catUnattributable
-	case containsAny(msg,
+	if containsAny(msg,
 		"rpc error", "connection refused", "connection reset", "broken pipe",
 		"no such host", "i/o timeout", "eof", "tls handshake",
-		"service unavailable", "bad gateway", "gateway timeout", "internal server error"):
+		"service unavailable", "bad gateway", "gateway timeout", "internal server error") {
 		return catUnattributable
 	}
 

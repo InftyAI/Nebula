@@ -145,6 +145,28 @@ func TestIsRejection(t *testing.T) {
 		// adapter that classified a gRPC error itself is not second-guessed.
 		{"grpc unavailable wrapping a sentinel",
 			fmt.Errorf("rpc error: code = Unavailable desc = no gpu: %w", ErrNoCapacity), true},
+
+		// OUR clock is the one thing a sentinel does NOT win over. An adapter labels the
+		// failure it saw and cannot see whose deadline fired, so a ProvisionTimeout mid-call
+		// must stay retryable — failing the Pod here would reap the attempt that was warming
+		// the provider's cache for the retry (see modal.sdkClient.buildImage).
+		{"deadline wrapped in an image-build label",
+			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImageBuild), false},
+		{"cancellation wrapped in a capacity label",
+			fmt.Errorf("sweep: %w: %w", context.Canceled, ErrNoCapacity), false},
+		// The form errors.Is CANNOT see: grpc-go turns a dead context into a status error
+		// that wraps nothing, and it is the likelier arrival — an SDK blocked in Recv finds
+		// out from gRPC, not from its own ctx.Err() poll.
+		{"grpc deadline wrapping an image-build label",
+			fmt.Errorf("modal: image build: %w: %w",
+				errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
+				ErrImageBuild), false},
+		// A verdict Modal actually reached still rejects: the label is only overridden when
+		// the context is what died.
+		{"image-build label on a remote verdict",
+			fmt.Errorf("modal: image build: %w: %w",
+				errors.New("Image build for im-1 failed with the exception:\nunauthorized"),
+				ErrImageBuild), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
