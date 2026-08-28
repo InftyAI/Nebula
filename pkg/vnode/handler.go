@@ -65,10 +65,14 @@ type Blocklister interface {
 }
 
 // defaultProvisionTimeout bounds one Provision call, so a hung backend cannot pin a
-// pod-controller worker forever. Deliberately generous — a backstop, not a tuning
-// knob. A provider that needs longer (AWS sweeping zones) raises it via
-// Capabilities.ProvisionTimeout.
-const defaultProvisionTimeout = 90 * time.Second
+// pod-controller worker forever. A backstop, not a tuning knob: it is what a provider gets
+// when it declares nothing, and an API that accepts a create takes seconds, not minutes.
+// Short on purpose — the cost of waiting is a pinned worker and a Pod learning nothing,
+// while the cost of giving up early is one retry of an idempotent call.
+//
+// A provider that genuinely needs longer raises it via Capabilities.ProvisionTimeout: AWS
+// sweeps a region's zones, Modal blocks on an image build.
+const defaultProvisionTimeout = 30 * time.Second
 
 // Handler bridges one provider into the virtual kubelet: CreatePod provisions an
 // external instance, DeletePod terminates it. This is the "VK owns provisioning"

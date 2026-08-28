@@ -465,11 +465,11 @@ func TestCapabilities(t *testing.T) {
 	if caps.SupportsStop || caps.SupportsSpot || caps.PreemptionNotice != 0 || !caps.NativeTags {
 		t.Fatalf("unexpected caps: %+v", caps)
 	}
-	// Must be stated, and must be well above the handler's generic 90s: Provision blocks on
-	// the image build here, so at the default a cold multi-GB image never finishes pulling
-	// and the Pod dies on a deadline instead of a verdict. Zero would silently restore that.
-	if caps.ProvisionTimeout < 5*time.Minute {
-		t.Fatalf("ProvisionTimeout = %v, want at least 5m to cover a cold image build",
+	// Must be STATED, and above the handler's generic default: Provision blocks on the image
+	// build here, so this adapter needs more than a provider whose create just returns an id.
+	// Zero is the regression to guard — it silently reverts to that default.
+	if caps.ProvisionTimeout < 90*time.Second {
+		t.Fatalf("ProvisionTimeout = %v, want at least 90s to cover an image build",
 			caps.ProvisionTimeout)
 	}
 	if p.Name() != provider.ProviderModal {

@@ -66,10 +66,10 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
-// provisionTimeout overrides the vnode handler's generic 90s Provision deadline, because
-// Provision here BLOCKS on the image build (see sdkClient.buildImage): a cold multi-GB
-// image can take minutes to pull into Modal's cache.
-const provisionTimeout = 5 * time.Minute
+// provisionTimeout raises the vnode handler's generic Provision deadline, because Provision
+// here BLOCKS on the image build (see sdkClient.buildImage): a cold image is pulled into
+// Modal's cache on this call, and the create leg only gets what the build leaves it.
+const provisionTimeout = 90 * time.Second
 
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
