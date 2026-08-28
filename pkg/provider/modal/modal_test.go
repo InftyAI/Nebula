@@ -49,6 +49,15 @@ type fakeClient struct {
 	cred       Credential // credential CreateSandbox returns; zero = none minted
 	terminated []string
 
+	// The mint path: what MintConnectCredential returns, and what it was asked for.
+	// mintCnt is the assertion that matters most — minting when a token is already held
+	// is the one mistake nothing can undo.
+	mintCred Credential
+	mintErr  error
+	mintCnt  int
+	mintID   string
+	mintPort int
+
 	// logs is the stream SandboxLogs hands back, and logsFor records the id it was
 	// asked for — the one thing the adapter decides on that path.
 	logs    string
@@ -74,6 +83,15 @@ func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string,
 	}
 	f.sandboxes = append(f.sandboxes, Sandbox{ID: id, Tags: spec.Tags, Status: "pending"})
 	return id, f.cred, nil
+}
+
+func (f *fakeClient) MintConnectCredential(_ context.Context, id string, port int) (Credential, error) {
+	f.mintCnt++
+	f.mintID, f.mintPort = id, port
+	if f.mintErr != nil {
+		return Credential{}, f.mintErr
+	}
+	return f.mintCred, nil
 }
 
 func (f *fakeClient) TerminateSandbox(_ context.Context, id string) error {
@@ -1092,31 +1110,94 @@ func TestProvision_NoCredentialWhenNoneMinted(t *testing.T) {
 	}
 }
 
-// An idempotent re-Provision carries NO credential. The original was minted once and
-// cannot be re-read, and minting a second one here would hand the consumer a token
-// that changes on every retry.
-func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
-	f := &fakeClient{
+// adoptable returns a client holding one Running sandbox tagged for claim-a, so a
+// Provision for that claim takes the idempotent branch instead of creating.
+func adoptable() *fakeClient {
+	return &fakeClient{
 		sandboxes: []Sandbox{{
 			ID:     "sb-existing",
 			Tags:   map[string]string{ClaimTagKey: "claim-a"},
 			Status: statusRunning,
 		}},
-		cred: Credential{URL: "https://x.modal.host", Token: "tok-abc"},
+		cred:     Credential{URL: "https://created.modal.host", Token: "tok-created"},
+		mintCred: Credential{URL: "https://minted.modal.host", Token: "tok-minted"},
 	}
+}
+
+// An adopted sandbox whose Pod ALREADY carries an endpoint carries no credential: a token
+// was published for it, and minting a second would leave the consumer holding one the
+// Secret no longer matches, with the original still valid and unrevokable.
+func TestProvision_IdempotentKeepsPublishedCredential(t *testing.T) {
+	f := adoptable()
 	p := newTestProvider(f)
 
-	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
-		provider.ProvisionRequest{ClaimName: "claim-a"})
+	pod := gpuPod("claim-a", "H100", 1)
+	pod.Annotations = map[string]string{
+		nebulav1alpha1.EndpointAnnotation: "https://published.modal.host",
+	}
+
+	res, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if res.InstanceID != "sb-existing" {
 		t.Fatalf("InstanceID = %q, want sb-existing", res.InstanceID)
 	}
+	if f.mintCnt != 0 {
+		t.Fatalf("minted %d credentials for a Pod that already has an endpoint; want 0", f.mintCnt)
+	}
 	if res.ConnectURL != "" || res.ConnectToken != "" {
-		t.Fatalf("an adopted sandbox must carry no credential, got url=%q token set=%t",
+		t.Fatalf("an adopted sandbox with a published endpoint must carry no credential, got url=%q token set=%t",
 			res.ConnectURL, res.ConnectToken != "")
+	}
+}
+
+// The recovery case: the first attempt created the sandbox but never published its
+// address, so nothing holds the original token and the adopted sandbox is unreachable.
+// It gets a fresh credential, routed to the port the POD declares.
+func TestProvision_IdempotentMintsWhenNoEndpointPublished(t *testing.T) {
+	f := adoptable()
+	p := newTestProvider(f)
+
+	pod := gpuPod("claim-a", "H100", 1) // no endpoint annotation
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 9000}}
+
+	res, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if f.createCnt != 0 {
+		t.Fatalf("created %d sandboxes; recovery must adopt, not create", f.createCnt)
+	}
+	if f.mintCnt != 1 || f.mintID != "sb-existing" {
+		t.Fatalf("mint calls = %d for id %q, want 1 for sb-existing", f.mintCnt, f.mintID)
+	}
+	if f.mintPort != 9000 {
+		t.Fatalf("minted for port %d, want the Pod's declared 9000", f.mintPort)
+	}
+	if res.ConnectURL != "https://minted.modal.host" || res.ConnectToken != "tok-minted" {
+		t.Fatalf("credential = %q/%q, want the freshly minted pair", res.ConnectURL, res.ConnectToken)
+	}
+}
+
+// A failed mint FAILS the Provision, rather than reporting an unreachable sandbox as
+// provisioned. It is not a rejection, so the handler leaves the Pod provisioning and VK
+// retries — and the retry adopts this same sandbox and mints again.
+func TestProvision_IdempotentFailsWhenMintFails(t *testing.T) {
+	f := adoptable()
+	f.mintErr = errors.New("boom")
+	p := newTestProvider(f)
+
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err == nil {
+		t.Fatal("Provision succeeded; a sandbox that could not be given a credential is unreachable")
+	}
+	if res.InstanceID != "" {
+		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
+	}
+	if provider.IsRejection(err) {
+		t.Fatal("a mint failure must not be a rejection; it would fail the Pod and blocklist the provider")
 	}
 }
 

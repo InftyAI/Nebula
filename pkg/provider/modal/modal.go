@@ -86,11 +86,14 @@ var (
 // real implementation (Modal SDK/HTTP) and a fake (tests) are interchangeable.
 type Client interface {
 	// CreateSandbox launches one sandbox from spec and returns its Modal id plus the
-	// connect credential minted for it. The credential is returned HERE and nowhere
-	// else — minting is one-shot and there is no read-back, so a caller that drops it
-	// has lost it for the sandbox's life. Zero when none could be minted; see
-	// sdkClient.mintCredential.
+	// connect credential minted for it. Minting is one-shot and there is no read-back, so
+	// a caller that drops the credential can only get another from MintConnectCredential.
+	// Zero when none could be minted; see sdkClient.mintCredential.
 	CreateSandbox(ctx context.Context, spec SandboxSpec) (id string, cred Credential, err error)
+	// MintConnectCredential mints a NEW credential for a sandbox that already exists,
+	// which Modal allows from the id alone. Every call returns a different token and none
+	// can be revoked, so it is only safe where nothing holds the previous one.
+	MintConnectCredential(ctx context.Context, id string, port int) (Credential, error)
 	// TerminateSandbox terminates a sandbox by id. Must be idempotent:
 	// terminating an already-gone sandbox returns nil.
 	TerminateSandbox(ctx context.Context, id string) error
@@ -366,18 +369,34 @@ func (p *Provider) Provision(
 	// the poll loop reports Running has capacity, one still queued does not. That is more
 	// information than a create can return, so report it rather than a flat false.
 	//
-	// It carries NO credential, per the interface contract: the original cannot be
-	// re-read, and minting a second would hand the consumer a token that changed on every
-	// retry. That leaves a real gap — if the first create succeeded but its credential
-	// never reached a Secret, nothing recovers it. Closing it needs cluster access this
-	// layer does not have.
+	// Its credential is minted anew, but ONLY when the Pod carries no endpoint: that
+	// annotation and the credential Secret are written in the same pass (see
+	// vnode.Handler.CreatePod), so no endpoint means the first token reached nobody and the
+	// sandbox is unreachable. Where one exists, minting would strand the consumer holding
+	// it — a new token revokes nothing and the old one keeps working.
 	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {
-		return provider.ProvisionResult{
+		res := provider.ProvisionResult{
 			InstanceID: existing.ID,
 			Reserved:   existing.State == provider.InstanceRunning,
-		}, nil
+		}
+		if pod.Annotations[nebulav1alpha1.EndpointAnnotation] == "" {
+			port := 0
+			if len(pod.Spec.Containers) > 0 {
+				port = firstPort(containerPorts(&pod.Spec.Containers[0]))
+			}
+			cred, err := p.client.MintConnectCredential(ctx, existing.ID, port)
+			if err != nil {
+				// Fail the whole provision rather than report an unreachable sandbox as
+				// provisioned. The error is not a rejection, so the Pod stays Provisioning
+				// and VK retries; the retry adopts this same sandbox by its claim tag and
+				// mints again, which is safe precisely because no endpoint was published.
+				return provider.ProvisionResult{}, err
+			}
+			res.ConnectURL, res.ConnectToken = cred.URL, cred.Token
+		}
+		return res, nil
 	}
 
 	spec, err := p.sandboxSpecFromPod(pod, req)

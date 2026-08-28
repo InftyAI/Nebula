@@ -270,6 +270,23 @@ func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port 
 	return Credential{URL: creds.URL, Token: creds.Token}
 }
 
+// MintConnectCredential implements Client. FromID attaches to a live sandbox and creates
+// nothing, which is what lets a credential be minted for one this process never created.
+//
+// Unlike the create path it ERRORS on an empty credential: this call exists only to produce
+// one, so nothing downstream can do anything useful with a zero value.
+func (c *sdkClient) MintConnectCredential(ctx context.Context, id string, port int) (Credential, error) {
+	sb, err := c.mc.Sandboxes.FromID(ctx, id, nil)
+	if err != nil {
+		return Credential{}, fmt.Errorf("modal: attach sandbox %s: %w", id, err)
+	}
+	cred := c.mintCredential(ctx, sb, port)
+	if cred.Token == "" {
+		return Credential{}, fmt.Errorf("modal: sandbox %s: no connect credential minted", id)
+	}
+	return cred, nil
+}
+
 // modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only
 // TCP and Exec probes, so an HTTPGet probe degrades to a TCP probe on its port
 // (readiness ≈ the port accepting connections). Returns (nil, nil) when p is nil
