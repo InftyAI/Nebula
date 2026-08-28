@@ -95,6 +95,7 @@ func main() {
 	var enableHTTP2 bool
 	var kubeletAddr, kubeletClientCA string
 	var costLabels string
+	var kubeletServingTLSBootstrap bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -129,6 +130,10 @@ func main() {
 			"by candidate shape only. Changing this changes the identity of every cost series. Values "+
 			"come from Pod labels and are NOT capped: the manager warns once if they push the cost "+
 			"metric past 5000 series, but pick keys an admission policy constrains.")
+	flag.BoolVar(&kubeletServingTLSBootstrap, "kubelet-serving-tls-bootstrap", true,
+		"Request a serving certificate for the manager Pod IP through the "+
+			"kubernetes.io/kubelet-serving CSR signer. The self-signed certificate remains active "+
+			"until an external approver approves the CSR.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -308,7 +313,7 @@ func main() {
 	// The kubelet endpoint for `kubectl logs` — one listener shared by every provider's
 	// node, hence built here rather than in setupVirtualNodes. Nil is supported: the
 	// nodes then advertise no address, and logs report NotFound.
-	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA)
+	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA, kubeletServingTLSBootstrap)
 
 	// Controller and webhook registration is deferred until the cert exists, so it
 	// runs in a goroutine: the cert cannot be minted until the manager is STARTED
@@ -465,7 +470,9 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 // what the API server dials and nothing substitutes for it: a Service would balance to
 // a non-leader replica, which holds no tracked Pods. Either way only logs degrade, so
 // it is logged loudly and the manager carries on.
-func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletServer {
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,verbs=create;delete;get
+
+func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBootstrap bool) *vnode.KubeletServer {
 	if addr == "" {
 		setupLog.Info("kubelet API disabled by configuration; `kubectl logs` will not work for Nebula pods")
 		return nil
@@ -487,7 +494,31 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletS
 		setupLog.Error(err, "unable to add the kubelet API to the manager")
 		return nil
 	}
-	setupLog.Info("kubelet API enabled", "addr", addr, "advertisedIP", podIP, "clientCertRequired", clientCA != "")
+	if servingTLSBootstrap {
+		clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+		if err != nil {
+			setupLog.Error(err, "failed to create Kubernetes client for kubelet serving certificate bootstrap")
+		} else {
+			bootstrapper, err := vnode.NewKubeletServingCertificateBootstrapper(
+				clientset,
+				srv,
+				podIP,
+				managerNamespace(),
+				os.Getenv("POD_NAME"),
+				os.Getenv("POD_UID"),
+			)
+			if err != nil {
+				setupLog.Error(err, "failed to configure kubelet serving certificate bootstrap")
+			} else if err := mgr.Add(bootstrapper); err != nil {
+				setupLog.Error(err, "failed to add kubelet serving certificate bootstrap to the manager")
+			}
+		}
+	}
+	setupLog.Info("kubelet API enabled",
+		"addr", addr,
+		"advertisedIP", podIP,
+		"clientCertRequired", clientCA != "",
+		"servingTLSBootstrap", servingTLSBootstrap)
 	return srv
 }
 

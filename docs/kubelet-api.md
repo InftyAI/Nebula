@@ -23,13 +23,18 @@ Pod IP and that port. Consequences worth knowing:
 - The endpoint is **leader-scoped and dialed by Pod IP**, not through a Service. The
   tracked Pods live in one process's memory, so a Service balancing across replicas
   would send requests to a replica that answers `NotFound`.
-- It serves TLS with a self-signed, in-memory certificate — what the API server
-  expects of a kubelet, which does not verify it unless
-  `--kubelet-certificate-authority` is set. Client certificates are **not** verified
-  by default, because which CA signs the API server's kubelet client cert is not
-  portable across distributions. Anything that can reach the port can therefore read the
-  logs of, and **run commands in**, any Pod on these virtual nodes, with no RBAC check:
-  keep it closed with a NetworkPolicy, or pass `--kubelet-client-ca` to require mTLS.
+- It starts with a self-signed, in-memory certificate and, by default, creates a
+  `kubernetes.io/kubelet-serving` CSR whose IP SAN is the advertised Pod IP. This is
+  required by control planes such as EKS that verify kubelet serving certificates.
+  The built-in signer requires an external approval decision; once the certificate is
+  issued, new TLS handshakes use it immediately without restarting the manager. See
+  [deploy.md](deploy.md#configuration) for approval and inspection commands.
+- Client certificates are **not** verified by default, because which CA signs the API
+  server's kubelet client cert is not portable across distributions. Serving-certificate
+  bootstrap secures the opposite direction and does not change that. Anything that can
+  reach the port can therefore read logs and **run commands in** any Pod on these virtual
+  nodes with no RBAC check: keep it closed with a NetworkPolicy, or pass
+  `--kubelet-client-ca` to require mTLS.
 - No POD_IP (running the manager off-cluster) means no endpoint. Logs and exec degrade
   to unsupported; nothing else is affected.
 
