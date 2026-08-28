@@ -93,6 +93,17 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.podIP
+          # Identity used to give the kubelet-serving CSR a stable name for this
+          # exact Pod. The private key remains in memory; a recreated Pod gets a
+          # new UID and a separate request.
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_UID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
         envFrom:
           # Provider credentials live in a per-provider Secret, one secretRef per
           # provider — NOT a single shared secret. This matches the "creds-absent →
@@ -123,11 +134,11 @@ spec:
         # kubelet). Declaring it is documentation and NetworkPolicy surface; the
         # listener binds either way.
         #
-        # It serves TLS with a self-signed cert but does NOT verify client certs by
-        # default, because which CA signs the API server's kubelet client cert is not
-        # portable — requiring it would break logs on managed control planes. So
-        # anything able to reach this port can read any Nebula pod's logs: restrict it
-        # with a NetworkPolicy, or set --kubelet-client-ca to require mTLS.
+        # It starts with a self-signed cert, then requests a kubelet-serving cert for
+        # POD_IP. Managed control planes that verify kubelet certificates use the
+        # signed cert after an external approver approves its CSR. Client certs are
+        # still not verified by default: restrict this port with a NetworkPolicy, or
+        # set --kubelet-client-ca to require mTLS.
         - name: kubelet-api
           containerPort: 10250
           protocol: TCP

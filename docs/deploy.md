@@ -128,12 +128,36 @@ Manager flags worth knowing (edit `config/manager/manager.yaml` `args`):
 | Flag | Default | Meaning |
 |---|---|---|
 | `--kubelet-bind-address` | `:10250` | Where the kubelet log endpoint listens — the address the API server proxies `kubectl logs` to. Set it empty to disable the endpoint, which disables logs and nothing else. |
+| `--kubelet-serving-tls-bootstrap` | `true` | Request a certificate for the advertised Pod IP from the `kubernetes.io/kubelet-serving` signer. Until it is approved and issued, the endpoint retains its self-signed fallback. Disable this only when the API server does not verify kubelet serving certificates. |
 | `--kubelet-client-ca` | *(empty)* | PEM bundle of CAs whose client certificates are accepted on that port. **Empty means client certificates are not verified**, so anything able to reach port 10250 can read the logs of any Pod on Nebula's virtual nodes. Set it to your API server's kubelet client CA to require mTLS, or keep the port closed with a NetworkPolicy. The default is open because which CA signs that client cert is not portable — kubeadm uses the cluster CA, EKS/GKE their own — so requiring it by default would break logs on managed control planes. |
 
 The endpoint needs `POD_IP` (projected via `fieldRef` in `config/manager/manager.yaml`)
 because virtual nodes advertise the leader's Pod IP, not a Service. Running the manager
 off-cluster leaves it unset, and logs degrade to unsupported. See
 [kubelet-api.md](kubelet-api.md).
+
+The Kubernetes signer does not approve kubelet-serving requests itself. On a cluster
+without a dedicated approver, inspect and approve Nebula's request after each manager
+Pod recreation and certificate renewal:
+
+```bash
+CSR=$(kubectl get csr \
+  -l app.kubernetes.io/name=nebula,app.kubernetes.io/component=kubelet-serving-certificate \
+  --sort-by=.metadata.creationTimestamp -o name | tail -n1)
+
+# Confirm the requested IP SAN matches the manager Pod IP before approving it.
+kubectl get csr "$CSR" -o jsonpath='{.spec.request}' \
+  | openssl base64 -d -A | openssl req -text -noout
+kubectl -n nebula-system get pod -l control-plane=controller-manager -o wide
+
+kubectl certificate approve "$CSR"
+kubectl -n nebula-system logs deploy/nebula-controller-manager \
+  | grep 'installed trusted kubelet serving certificate'
+```
+
+An installation with an external CSR approver should restrict it to requests that
+match Nebula's ServiceAccount, `system:nodes` organization, manager Pod identity, and
+current Pod IP. Nebula intentionally receives no permission to approve certificates.
 
 ---
 
@@ -186,6 +210,10 @@ kubectl -n nebula-system logs deploy/nebula-controller-manager | grep -i provide
 
 # Virtual nodes exist, one per registered provider.
 kubectl get nodes -l nebula.inftyai.com/provider
+
+# Kubelet serving CSR is signed (required by control planes that verify kubelet TLS).
+kubectl get csr \
+  -l app.kubernetes.io/name=nebula,app.kubernetes.io/component=kubelet-serving-certificate
 
 # Webhook TLS is wired: the caBundle matches the serving cert Secret.
 diff <(kubectl get secret nebula-webhook-server-cert -n nebula-system -o jsonpath='{.data.tls\.crt}') \
