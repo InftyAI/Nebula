@@ -46,11 +46,8 @@ const informerResync = time.Minute
 // podSyncWorkers is how many workers the pod controller runs per queue. VK serializes
 // work per pod key, so distinct pods provision in parallel while one key never runs
 // twice — without this, a single slow provision blocks pods that would succeed
-// instantly. Modest, to bound concurrent bursts against a provider's rate limits.
-//
-// Worthless on its own: the workers pull from queues whose ADMISSION is rate limited, so
-// the ceiling is podQueueRate below, not this. See podQueueRateLimiter.
-const podSyncWorkers = 8
+// instantly.
+const podSyncWorkers = 32
 
 // podQueueRate and podQueueBurst size the token bucket that admits work into each of the
 // pod controller's queues.

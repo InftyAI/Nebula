@@ -61,6 +61,15 @@ import (
 // a fallback for managerNamespace when POD_NAMESPACE is unset.
 const defaultNamespace = "nebula-system"
 
+// restConfigQPS and restConfigBurst size the client-go bucket shared by every API call in the
+// process — each controller's, and the virtual kubelet's status pushes. controller-runtime's
+// default 20/30 is what binds first at fleet scale, and it binds invisibly: throttled calls
+// wait in our own process, so it reads as API-server or provider slowness.
+const (
+	restConfigQPS   = 50
+	restConfigBurst = 100
+)
+
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
@@ -207,7 +216,11 @@ func main() {
 		})
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+	restConfig.QPS = restConfigQPS
+	restConfig.Burst = restConfigBurst
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
