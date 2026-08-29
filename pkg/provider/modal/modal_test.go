@@ -46,7 +46,7 @@ type fakeClient struct {
 	createCnt  int
 	createErr  error
 	createID   string
-	cred       Credential // credential CreateSandbox returns; zero = none minted
+	cred       Credential // credential CreateSandbox returns alongside its id
 	terminated []string
 
 	// The mint path: what MintConnectCredential returns, and what it was asked for.
@@ -1091,22 +1091,25 @@ func TestProvision_ReturnsMintedCredential(t *testing.T) {
 	}
 }
 
-// A sandbox that minted nothing yields no credential rather than an error: it still
-// exists, still costs money, and must still be reported and reclaimed.
-func TestProvision_NoCredentialWhenNoneMinted(t *testing.T) {
-	f := &fakeClient{createID: "sb-1"} // zero cred
+// The create leg's half of TestProvision_IdempotentFailsWhenMintFails: a sandbox that came
+// up but could not be given a credential is unreachable, so the create reports a failure
+// and no id rather than a provisioned sandbox with an empty credential — which nothing
+// downstream would revisit, since the Pod succeeded. Not a rejection, so the Pod stays
+// provisioning and the retry adopts the sandbox by its claim tag.
+func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
+	f := &fakeClient{createID: "sb-1", createErr: errors.New("mint connect credential: boom")}
 	p := newTestProvider(f)
 
 	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
 		provider.ProvisionRequest{ClaimName: "claim-a"})
-	if err != nil {
-		t.Fatalf("Provision: %v", err)
+	if err == nil {
+		t.Fatal("Provision succeeded; a sandbox that could not be given a credential is unreachable")
 	}
-	if res.InstanceID != "sb-1" {
-		t.Fatalf("InstanceID = %q, want sb-1 even with no credential", res.InstanceID)
+	if res.InstanceID != "" {
+		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
 	}
-	if res.ConnectURL != "" || res.ConnectToken != "" {
-		t.Fatalf("expected no credential, got url=%q token set=%t", res.ConnectURL, res.ConnectToken != "")
+	if provider.IsRejection(err) {
+		t.Fatal("a mint failure must not be a rejection; it would fail the Pod and blocklist the provider")
 	}
 }
 

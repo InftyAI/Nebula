@@ -190,7 +190,11 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
-	return sb.SandboxID, c.mintCredential(ctx, sb, firstPort(spec.Ports)), nil
+	cred, err := c.mintCredential(ctx, sb, firstPort(spec.Ports))
+	if err != nil {
+		return "", Credential{}, err
+	}
+	return sb.SandboxID, cred, nil
 }
 
 // imageFor resolves the sandbox's image, attaching pull credentials when the spec carries
@@ -258,33 +262,36 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 // would hand over every workload's token. Not in memory, which is not durable. A
 // credential belongs in an access-controlled Secret, and this layer has no cluster
 // access, so it hands the pair up to the virtual kubelet, which writes it.
-func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) Credential {
+//
+// A failure is REPORTED, never swallowed into a zero credential. Minting is one-shot with
+// no read-back, so a dropped error loses the credential of a sandbox that exists and is
+// billing — silently, since a caller handed an empty pair has nothing to log.
+func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) (Credential, error) {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 		// Derived from the exposed set rather than carried separately, so the routed
 		// port cannot name one the sandbox was never told to accept traffic on.
 		Port: port,
 	})
-	if err != nil || creds == nil || creds.Token == "" {
-		return Credential{}
+	if err != nil {
+		return Credential{}, fmt.Errorf("modal: mint connect credential for sandbox %s on port %d: %w",
+			sb.SandboxID, port, err)
 	}
-	return Credential{URL: creds.URL, Token: creds.Token}
+	// A token-less success is the same outcome as an error — an address with nothing to
+	// authenticate against it — so it is reported as one.
+	if creds == nil || creds.Token == "" {
+		return Credential{}, fmt.Errorf("modal: sandbox %s: connect credential minted without a token", sb.SandboxID)
+	}
+	return Credential{URL: creds.URL, Token: creds.Token}, nil
 }
 
 // MintConnectCredential implements Client. FromID attaches to a live sandbox and creates
 // nothing, which is what lets a credential be minted for one this process never created.
-//
-// Unlike the create path it ERRORS on an empty credential: this call exists only to produce
-// one, so nothing downstream can do anything useful with a zero value.
 func (c *sdkClient) MintConnectCredential(ctx context.Context, id string, port int) (Credential, error) {
 	sb, err := c.mc.Sandboxes.FromID(ctx, id, nil)
 	if err != nil {
 		return Credential{}, fmt.Errorf("modal: attach sandbox %s: %w", id, err)
 	}
-	cred := c.mintCredential(ctx, sb, port)
-	if cred.Token == "" {
-		return Credential{}, fmt.Errorf("modal: sandbox %s: no connect credential minted", id)
-	}
-	return cred, nil
+	return c.mintCredential(ctx, sb, port)
 }
 
 // modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only

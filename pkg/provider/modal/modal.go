@@ -88,7 +88,9 @@ type Client interface {
 	// CreateSandbox launches one sandbox from spec and returns its Modal id plus the
 	// connect credential minted for it. Minting is one-shot and there is no read-back, so
 	// a caller that drops the credential can only get another from MintConnectCredential.
-	// Zero when none could be minted; see sdkClient.mintCredential.
+	// A sandbox that could not be given one is unreachable, so a failed mint is an ERROR
+	// with no id, not a zero credential — the sandbox may exist, and the claim tag is what
+	// reclaims it (see sdkClient.CreateSandbox).
 	CreateSandbox(ctx context.Context, spec SandboxSpec) (id string, cred Credential, err error)
 	// MintConnectCredential mints a NEW credential for a sandbox that already exists,
 	// which Modal allows from the id alone. Every call returns a different token and none
