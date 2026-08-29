@@ -367,37 +367,15 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// blocklisted for it.
 	metrics.ObserveProvision(labels, time.Since(callStart), err)
 	if err != nil {
-		// An error the provider never attributed to this request — a transport failure,
-		// our own timeout, a 503 — is not a rejection (see provider.IsRejection). The
-		// request may even have been accepted, so failing the Pod would reap it out from
-		// under a paid instance whose id we never learned, and blocklisting would fence
-		// off a candidate that never misbehaved.
-		//
-		// So leave it NON-terminal at the Provisioning already stamped, with the error as
-		// its message, and return the error for VK to retry with backoff. Provision is
-		// idempotent on ClaimName, so the retry adopts whatever the failed attempt created.
-		//
-		// Deliberately NOT stored: a tracked pod with no instance id would be read as
-		// absent from List and written the very Terminated this branch avoids.
-		if !provider.IsRejection(err) {
-			log.Error(err, "provision failed with an error the provider did not attribute "+
-				"to this request; Pod left provisioning for retry, nothing blocklisted")
-			h.markStatus(pod, corev1.PodPending, reasonProvisioning, "retrying: "+err.Error())
-			h.emit(pod)
-			return err
-		}
-
-		log.Error(err, "provision rejected by the provider; Pod marked Failed for failover")
-		// Record the failure so placement fails over to the next candidate (zone → region
-		// → tier) instead of hot-looping here. The provider narrows its own error into a
-		// BlockScope (a Spot shortage in one region blocks only that; auth/quota blocks
-		// the whole provider).
+		log.Error(err, "provision failed; Pod marked Failed")
 		h.recordBlock(ctx, pod, req.Region, blocklistTTLOf(pool), err)
-		// Surface the failure so placement can fail over, and return the error so the pod
-		// controller retries with backoff.
+		// Surface the failure on the Pod so placement can fail over, and return the error for
+		// VK's own accounting — not for a retry, which the store below suppresses.
 		h.markStatus(pod, corev1.PodFailed, reasonProvisionFailed, err.Error())
-		// Zero start: terminal, so it never reaches Running and has no ready-duration, which
-		// is also why the placement it would be filed under is not worth carrying.
+		// Stored to SUPPRESS the create: tracked means GetPod returns non-nil, so VK takes the
+		// update branch instead of provisioning again.
+		//
+		// Safe only because Pod with empty instanceID will be terminated on the next poll tick.
 		h.store(pod, claim, "", time.Time{}, placement{})
 		h.emit(pod)
 		return err
@@ -459,17 +437,15 @@ func (h *Handler) persistCredential(ctx context.Context, pod *corev1.Pod, url, t
 	h.createConnectSecret(ctx, pod, url, token)
 }
 
-// UpdatePod is a no-op: an instance's shape is immutable once provisioned (recovery
-// from any change is delete-and-recreate). We still refresh the tracked copy so GetPod
-// reflects the latest metadata.
+// UpdatePod is a no-op on the instance: its shape is immutable once provisioned (recovery
+// from any change is delete-and-recreate). It only refreshes the tracked copy, which is
+// what GetPod serves and the poll loop re-emits.
 func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		// Keep what WE own and the API server does not know yet: the status we compute,
-		// and the endpoint — possibly an address minted at create whose patch has not
-		// landed, so the incoming Pod lacks it. Dropping it would discard the only copy,
-		// since a minted URL is never re-observed. Everything else is adopted.
+		// Copy the status and endpoint just in case the update failed,
+		// so we do not lose them in the tracked copy.
 		status := tp.pod.Status
 		endpoint := tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation]
 		tp.pod = pod.DeepCopy()

@@ -464,7 +464,7 @@ func TestClassifyProvisionError(t *testing.T) {
 		{"string no capacity", fmt.Errorf("no capacity available in region"), onDemand},
 		// An unrecognized error is scoped like capacity, not DenyAll: a whole-provider
 		// block on an unidentifiable failure is too broad; failover routes around it.
-		{"unknown capacity-scoped", fmt.Errorf("weird transient blip"), onDemand},
+		{"unknown blocks nothing", fmt.Errorf("weird transient blip"), provider.BlockScope{}},
 		{"nil", nil, provider.BlockScope{}},
 	}
 	for _, tt := range tests {
@@ -1091,13 +1091,16 @@ func TestProvision_ReturnsMintedCredential(t *testing.T) {
 	}
 }
 
-// The create leg's half of TestProvision_IdempotentFailsWhenMintFails: a sandbox that came
-// up but could not be given a credential is unreachable, so the create reports a failure
-// and no id rather than a provisioned sandbox with an empty credential — which nothing
-// downstream would revisit, since the Pod succeeded. Not a rejection, so the Pod stays
-// provisioning and the retry adopts the sandbox by its claim tag.
+// A sandbox that came up but could not be given a credential is unreachable, and nothing
+// revisits it: minting is one-shot with no read-back, and the idempotent branch below hands
+// back no credential. So the create reports a failure and no id, and reports it as a
+// REJECTION — the Pod fails terminally and its owner recreates it, which is the only recovery
+// left. The scope stays zero, because the candidate served the request correctly.
 func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
-	f := &fakeClient{createID: "sb-1", createErr: errors.New("mint connect credential: boom")}
+	f := &fakeClient{
+		createID:  "sb-1",
+		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w", provider.ErrCredential),
+	}
 	p := newTestProvider(f)
 
 	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
@@ -1108,8 +1111,35 @@ func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
 	if res.InstanceID != "" {
 		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
 	}
-	if provider.IsRejection(err) {
-		t.Fatal("a mint failure must not be a rejection; it would fail the Pod and blocklist the provider")
+	if !provider.IsRejection(err) {
+		t.Fatal("a mint failure must be a rejection; otherwise the Pod sits provisioning and is never re-provisioned")
+	}
+	if scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope !=
+		(provider.BlockScope{}) {
+		t.Fatalf("BlockScope = %+v, want zero; the request failed, not the candidate", scope)
+	}
+}
+
+// The production shape of the same failure: the image build eats the provision budget and the
+// mint — last of the three legs — dies on the deadline, so the error carries BOTH the sentinel
+// and a deadline. It must still classify as a rejection: the sentinel says the outcome is
+// known, while a bare deadline would mean "we cannot say", leaving the Pod provisioning
+// forever behind a sandbox that can never be given a credential.
+func TestProvision_MintDeadlineIsStillARejection(t *testing.T) {
+	f := &fakeClient{
+		createID: "sb-1",
+		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w: %w",
+			fmt.Errorf("rpc error: code = DeadlineExceeded: %w", context.DeadlineExceeded), provider.ErrCredential),
+	}
+	p := newTestProvider(f)
+
+	_, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err == nil {
+		t.Fatal("Provision succeeded; the sandbox has no credential")
+	}
+	if !provider.IsRejection(err) {
+		t.Fatal("a timed-out mint must be a rejection; the deadline is how it failed, not whether we know it did")
 	}
 }
 
@@ -1127,80 +1157,34 @@ func adoptable() *fakeClient {
 	}
 }
 
-// An adopted sandbox whose Pod ALREADY carries an endpoint carries no credential: a token
-// was published for it, and minting a second would leave the consumer holding one the
-// Secret no longer matches, with the original still valid and unrevokable.
-func TestProvision_IdempotentKeepsPublishedCredential(t *testing.T) {
+// An adopted sandbox NEVER carries a credential, whatever the Pod looks like. Its token was
+// minted once, at create, and cannot be read back; a second one would leave the consumer
+// holding a token the Secret no longer matches, with the original still valid and unrevokable.
+// The instance id and its state are all the branch reports.
+func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
 	f := adoptable()
 	p := newTestProvider(f)
 
-	pod := gpuPod("claim-a", "H100", 1)
-	pod.Annotations = map[string]string{
-		nebulav1alpha1.EndpointAnnotation: "https://published.modal.host",
-	}
-
-	res, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"})
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if res.InstanceID != "sb-existing" {
 		t.Fatalf("InstanceID = %q, want sb-existing", res.InstanceID)
 	}
-	if f.mintCnt != 0 {
-		t.Fatalf("minted %d credentials for a Pod that already has an endpoint; want 0", f.mintCnt)
-	}
-	if res.ConnectURL != "" || res.ConnectToken != "" {
-		t.Fatalf("an adopted sandbox with a published endpoint must carry no credential, got url=%q token set=%t",
-			res.ConnectURL, res.ConnectToken != "")
-	}
-}
-
-// The recovery case: the first attempt created the sandbox but never published its
-// address, so nothing holds the original token and the adopted sandbox is unreachable.
-// It gets a fresh credential, routed to the port the POD declares.
-func TestProvision_IdempotentMintsWhenNoEndpointPublished(t *testing.T) {
-	f := adoptable()
-	p := newTestProvider(f)
-
-	pod := gpuPod("claim-a", "H100", 1) // no endpoint annotation
-	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 9000}}
-
-	res, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"})
-	if err != nil {
-		t.Fatalf("Provision: %v", err)
+	if !res.Reserved {
+		t.Fatal("Reserved = false for an adopted Running sandbox, which has its capacity")
 	}
 	if f.createCnt != 0 {
-		t.Fatalf("created %d sandboxes; recovery must adopt, not create", f.createCnt)
+		t.Fatalf("created %d sandboxes; the claim tag must be adopted, not duplicated", f.createCnt)
 	}
-	if f.mintCnt != 1 || f.mintID != "sb-existing" {
-		t.Fatalf("mint calls = %d for id %q, want 1 for sb-existing", f.mintCnt, f.mintID)
+	if f.mintCnt != 0 {
+		t.Fatalf("minted %d credentials for an adopted sandbox; want 0", f.mintCnt)
 	}
-	if f.mintPort != 9000 {
-		t.Fatalf("minted for port %d, want the Pod's declared 9000", f.mintPort)
-	}
-	if res.ConnectURL != "https://minted.modal.host" || res.ConnectToken != "tok-minted" {
-		t.Fatalf("credential = %q/%q, want the freshly minted pair", res.ConnectURL, res.ConnectToken)
-	}
-}
-
-// A failed mint FAILS the Provision, rather than reporting an unreachable sandbox as
-// provisioned. It is not a rejection, so the handler leaves the Pod provisioning and VK
-// retries — and the retry adopts this same sandbox and mints again.
-func TestProvision_IdempotentFailsWhenMintFails(t *testing.T) {
-	f := adoptable()
-	f.mintErr = errors.New("boom")
-	p := newTestProvider(f)
-
-	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
-		provider.ProvisionRequest{ClaimName: "claim-a"})
-	if err == nil {
-		t.Fatal("Provision succeeded; a sandbox that could not be given a credential is unreachable")
-	}
-	if res.InstanceID != "" {
-		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
-	}
-	if provider.IsRejection(err) {
-		t.Fatal("a mint failure must not be a rejection; it would fail the Pod and blocklist the provider")
+	if res.ConnectURL != "" || res.ConnectToken != "" {
+		t.Fatalf("an adopted sandbox must carry no credential, got url=%q token set=%t",
+			res.ConnectURL, res.ConnectToken != "")
 	}
 }
 

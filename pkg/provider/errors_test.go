@@ -70,10 +70,9 @@ func TestClassifyError(t *testing.T) {
 		{"string unauthorized", fmt.Errorf("HTTP 401 unauthorized"), BlockScope{DenyAll: true}},
 		{"string quota", fmt.Errorf("account limit exceeded"), capacityScope},
 		{"string capacity", fmt.Errorf("no capacity available"), capacityScope},
-		// An unrecognized error is scoped like capacity (this accelerator + tier), NOT
-		// DenyAll: a DenyAll would fence off the whole provider on a failure we can't
-		// even identify, so failover past the one failing candidate is the safer default.
-		{"unknown capacity-scoped", fmt.Errorf("weird transient blip"), capacityScope},
+		// An error we cannot attribute blocks NOTHING: it is no evidence against the
+		// candidate, and the zero scope is what keeps recordBlock from acting on it.
+		{"unknown blocks nothing", fmt.Errorf("weird transient blip"), BlockScope{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -129,9 +128,14 @@ func TestIsRejection(t *testing.T) {
 		{"image-pull sentinel", ErrImagePull, true},
 		{"image-build sentinel", ErrImageBuild, true},
 
-		// The failures this predicate exists for.
-		{"deadline exceeded", context.DeadlineExceeded, false},
-		{"wrapped deadline", fmt.Errorf("provision: %w", context.DeadlineExceeded), false},
+		// A deadline REJECTS: the candidate had the whole provision budget and produced no
+		// usable instance, so the Pod fails and the candidate is blocked for the TTL, sending
+		// the next attempt somewhere else instead of spending another full budget here.
+		{"deadline exceeded", context.DeadlineExceeded, true},
+		{"wrapped deadline", fmt.Errorf("provision: %w", context.DeadlineExceeded), true},
+
+		// The failures this predicate exists for. Cancellation is OUR exit, not the
+		// candidate's failure, so it stays retryable however the deadline is treated.
 		{"canceled", context.Canceled, false},
 		{"connection refused", errors.New("dial tcp 10.0.0.1:443: connect: connection refused"), false},
 		{"eof", errors.New("unexpected EOF"), false},
@@ -146,12 +150,12 @@ func TestIsRejection(t *testing.T) {
 		{"grpc unavailable wrapping a sentinel",
 			fmt.Errorf("rpc error: code = Unavailable desc = no gpu: %w", ErrNoCapacity), true},
 
-		// OUR clock is the one thing a sentinel does NOT win over. An adapter labels the
-		// failure it saw and cannot see whose deadline fired, so a ProvisionTimeout mid-call
-		// must stay retryable — failing the Pod here would reap the attempt that was warming
-		// the provider's cache for the retry (see modal.sdkClient.buildImage).
+		// OUR clock outranks any label a sentinel carries: an adapter reports the failure it
+		// saw and cannot see whose deadline fired. So a build that ran out of budget is a
+		// capacity rejection, not the zero-scope image failure its label suggests — the
+		// candidate spent the whole budget and delivered nothing.
 		{"deadline wrapped in an image-build label",
-			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImageBuild), false},
+			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImageBuild), true},
 		{"cancellation wrapped in a capacity label",
 			fmt.Errorf("sweep: %w: %w", context.Canceled, ErrNoCapacity), false},
 		// The form errors.Is CANNOT see: grpc-go turns a dead context into a status error
@@ -160,7 +164,7 @@ func TestIsRejection(t *testing.T) {
 		{"grpc deadline wrapping an image-build label",
 			fmt.Errorf("modal: image build: %w: %w",
 				errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
-				ErrImageBuild), false},
+				ErrImageBuild), true},
 		// A verdict Modal actually reached still rejects: the label is only overridden when
 		// the context is what died.
 		{"image-build label on a remote verdict",
@@ -177,20 +181,16 @@ func TestIsRejection(t *testing.T) {
 	}
 }
 
-// ClassifyError answers "how widely, IF we block" and keeps its capacity-shaped
-// default for an unattributable error: a caller that has decided to block something
-// still wants the narrow blast radius. IsRejection is the separate question of
-// whether to block at all, so the two must not be collapsed.
-func TestClassifyError_UnattributableStillScopesNarrow(t *testing.T) {
+// The scope is the single answer to "should anything be blocked", so an unattributable
+// error must classify to ZERO — callers hand every failure to recordBlock and rely on this
+// to record nothing. A narrow-but-non-empty scope here would fence off a candidate for a
+// transport failure that was never its doing.
+func TestClassifyError_UnattributableBlocksNothing(t *testing.T) {
 	got := ClassifyError(
 		errors.New("rpc error: code = Unavailable desc = transport is closing"),
 		nebulav1alpha1.CapacitySpot, "H100:8")
-	if got.DenyAll {
-		t.Fatalf("an unattributable error must never widen to DenyAll, got %+v", got)
-	}
-	if got.Accelerator == nil || *got.Accelerator != "H100:8" ||
-		got.CapacityType != nebulav1alpha1.CapacitySpot {
-		t.Fatalf("expected a Spot/H100:8-scoped block, got %+v", got)
+	if got != (BlockScope{}) {
+		t.Fatalf("an unattributable error must block nothing, got %+v", got)
 	}
 }
 

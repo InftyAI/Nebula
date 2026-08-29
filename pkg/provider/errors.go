@@ -65,15 +65,23 @@ var (
 	// to the Pod, so it blocklists NOTHING — no other region, tier or provider produces an
 	// image this one just refused to produce.
 	ErrImageBuild = errors.New("provider: cannot build image")
+	// ErrCredential: the instance came up but could not be given the credential that makes it
+	// reachable. Minting is create-only with no read-back, so it cannot be repeated for that
+	// instance — the adapter destroys it and reports this.
+	ErrCredential = errors.New("provider: cannot mint connect credential")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be blocklisted at,
 // checking the shared sentinels first and falling back to string heuristics for raw API
 // messages. The rule it encodes: a narrow failure must not disqualify other accelerators, or
-// other regions. Only auth widens to the whole provider via DenyAll; a failure that belongs to
-// the REQUEST rather than the candidate blocks nothing at all; everything else — including an
-// unrecognized error — is scoped to the failing accelerator/tier/region so failover can route
-// around it.
+// other regions. Only auth widens to the whole provider via DenyAll; a capacity refusal is
+// scoped to the failing accelerator/tier/region so failover can route around it; and two cases
+// block nothing at all — a failure that belongs to the REQUEST rather than the candidate, and
+// one that could not be attributed to either.
+//
+// The zero scope is the ONLY signal for "block nothing": recordBlock no-ops on it, so callers
+// classify every failure and act on the result instead of pre-filtering with a second
+// predicate. IsRejection answers a different question and does not gate this one.
 //
 // This is the single place the SHARED part of a scope is derived, so every adapter delegates
 // here and then only adds what is provider-specific (AWS adds its region). Nothing assembles
@@ -118,17 +126,22 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 		// Still a rejection, so the Pod fails with the reason rather than retrying forever —
 		// the two questions are separate. See IsRejection.
 		return BlockScope{}
-	default:
-		// An unrecognized error is scoped like capacity (this accelerator + tier, and
-		// per region once the adapter confines it), NOT DenyAll. A DenyAll on an
-		// unknown error fences off the WHOLE provider — every region and accelerator —
-		// which is far too broad a blast radius for a failure we can't even identify
-		// (e.g. a transient malformed-request blip in one region). Failover past the
-		// one failing candidate is the safer default; the TTL still bounds it.
+	case catUnattributable:
+		// Nothing is blocklisted, and for a different reason than catRequest above: there the
+		// candidate is known to be innocent, here nothing at all was learned about it. A
+		// cancelled context or a dropped connection is no evidence against a candidate, so
+		// recording one would exclude a provider for a failure that was never its doing.
 		//
-		// This answers "how widely, IF we block", not "should we block": a caller that
-		// cannot attribute the failure to the request at all should not be filing a block
-		// in the first place — see IsRejection.
+		// This zero is what makes the scope the SINGLE answer to "should anything be blocked":
+		// callers hand every failure to recordBlock and let the scope decide, rather than
+		// gating on a second predicate that could disagree with it.
+		return BlockScope{}
+	default:
+		// A category added to the enum but not handled above. Scoped like capacity (this
+		// accelerator + tier, and per region once the adapter confines it) rather than zero,
+		// because zero is a CLAIM — that the candidate is fine — which an unreasoned-about
+		// category has not earned. NOT DenyAll either: that fences off every region and
+		// accelerator on the provider, far too wide a blast radius to reach by omission.
 		return capacityScope()
 	}
 }
@@ -139,15 +152,17 @@ type failureCategory int
 
 const (
 	// catUnattributable: nothing in the error says what the provider decided, because
-	// it may not have decided anything — a transport failure, a timeout, an
-	// unparseable API blip. Kept distinct from the scope ClassifyError ultimately
-	// returns for it.
+	// it may not have decided anything — a transport failure, a cancellation, an
+	// unparseable API blip. The only category IsRejection answers false for, and it
+	// blocklists nothing: no candidate can be held responsible for a failure nobody
+	// could attribute to it.
 	catUnattributable failureCategory = iota
 	// catAuth: credentials or authorization failed, so nothing on the provider works.
 	catAuth
 	// catCapacity: the provider refused this request because of something about the
-	// CANDIDATE — no capacity, quota exhausted, an accelerator it does not offer. Blocking
-	// it is meaningful, because the next Pod asking for the same candidate would fail too.
+	// CANDIDATE — no capacity, quota exhausted, an accelerator it does not offer, or the whole
+	// provision budget spent without a usable instance. Blocking it is meaningful, because the
+	// next Pod asking for the same candidate would fail the same way.
 	catCapacity
 	// catRequest: the provider refused this request because of something about the REQUEST
 	// itself — today an image it cannot pull or cannot build. A decision, so a rejection, but
@@ -155,20 +170,30 @@ const (
 	catRequest
 )
 
-// categorize buckets a provision error: cancellation first, then sentinels, then string
-// heuristics.
+// categorize buckets a provision error: the deadline and cancellation checks first — they
+// outrank any label an adapter attached, since an adapter cannot see whose clock fired — then
+// the sentinels, then string heuristics.
 func categorize(err error) failureCategory {
 	msg := strings.ToLower(err.Error())
 
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
-		containsAny(msg, "context deadline exceeded", "context canceled") {
+	// A deadline is a capacity failure, not an unknown: the candidate was given the whole
+	// provision budget and did not produce a usable instance.
+	if errors.Is(err, context.DeadlineExceeded) || containsAny(msg, "context deadline exceeded") {
+		return catCapacity
+	}
+
+	// Cancellation stays unattributable, unlike the deadline above: it means WE stopped asking
+	// — a manager shutdown, a leader handoff — and the provider may well have accepted the
+	// request. Nothing about the candidate was learned, so failing the Pod or blocklisting
+	// would punish it for our own exit.
+	if errors.Is(err, context.Canceled) || containsAny(msg, "context canceled") {
 		return catUnattributable
 	}
 
 	switch {
 	case errors.Is(err, ErrAuth):
 		return catAuth
-	case errors.Is(err, ErrImagePull), errors.Is(err, ErrImageBuild):
+	case errors.Is(err, ErrImagePull), errors.Is(err, ErrImageBuild), errors.Is(err, ErrCredential):
 		return catRequest
 	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator),
 		errors.Is(err, ErrQuota):
@@ -197,19 +222,22 @@ func categorize(err error) failureCategory {
 // IsRejection reports whether err is a provider DECISION about this request — "no
 // capacity", "over quota", "bad credentials", "I do not offer that accelerator" — as
 // opposed to a failure to find out what the provider would have decided: a transport
-// error, a timeout, a 503, an unparseable response.
+// error, a cancellation, a 503, an unparseable response.
 //
-// The distinction exists because the two call for opposite handling and the costs are
-// asymmetric. A rejection is authoritative, so the Pod is failed with the reason — correct,
-// because the provider said no. Whether a CANDIDATE is also blocklisted is a separate
-// question, answered by ClassifyError: a capacity rejection blocks one and failover routes
-// around it, while a request-scoped one (an unusable image credential) blocks nothing, because
-// the candidate did nothing wrong. An unattributable failure is authoritative about nothing,
-// so the same writes
-// stamp a terminal status onto a request the provider may have accepted (leaving a
-// paid instance running behind a Pod that is about to be reaped) and fence off a
-// candidate that never misbehaved. Retrying costs a request and Provision is
-// idempotent on ClaimName; acting on a guess costs an instance.
+// A provision DEADLINE counts as a decision, though nobody spoke it: the candidate was given
+// the entire provision budget and produced no usable instance, which is as good a refusal as
+// one it words. Treating it as unknown left the Pod provisioning behind an attempt nothing
+// re-enters. A cancellation is the opposite — that is us stopping, not the candidate failing.
+//
+// It does NOT decide what happens to the Pod, and no longer gates the blocklist. A provision
+// failure is terminal either way (see vnode.Handler.CreatePod), and what may be blocklisted is
+// answered by ClassifyError alone, whose zero scope means "nothing". Two mechanisms for one
+// question could disagree; one cannot.
+//
+// What it still separates is DIAGNOSIS: a rejection is a placement problem — the provider was
+// reached and said no — while an unattributable failure is an integration problem, and the two
+// are fixed by different people. That is the split metrics reports on (see
+// metrics.provisionReason).
 //
 // A nil error is not a rejection.
 func IsRejection(err error) bool {

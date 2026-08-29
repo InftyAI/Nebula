@@ -68,8 +68,11 @@ const defaultSandboxTimeout = 24 * time.Hour
 
 // provisionTimeout raises the vnode handler's generic Provision deadline, because Provision
 // here BLOCKS on the image build (see sdkClient.buildImage): a cold image is pulled into
-// Modal's cache on this call, and the create leg only gets what the build leaves it.
-const provisionTimeout = 90 * time.Second
+// Modal's cache on this call, and the create and credential legs only get what the build
+// leaves them. Generous on purpose — at 90s a slow build starved the mint, which is the last
+// call of the three and the one with no second chance: it is one-shot with no read-back, so a
+// sandbox that misses it is unreachable for good and the Pod fails.
+const provisionTimeout = 15 * time.Minute
 
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
@@ -371,34 +374,16 @@ func (p *Provider) Provision(
 	// the poll loop reports Running has capacity, one still queued does not. That is more
 	// information than a create can return, so report it rather than a flat false.
 	//
-	// Its credential is minted anew, but ONLY when the Pod carries no endpoint: that
-	// annotation and the credential Secret are written in the same pass (see
-	// vnode.Handler.CreatePod), so no endpoint means the first token reached nobody and the
-	// sandbox is unreachable. Where one exists, minting would strand the consumer holding
-	// it — a new token revokes nothing and the old one keeps working.
+	// No credential comes back, per the Provider contract: minting is one-shot with no
+	// read-back, and a fresh token revokes nothing, so re-minting for a sandbox whose token is
+	// already published strands the consumer holding it.
 	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {
-		res := provider.ProvisionResult{
+		return provider.ProvisionResult{
 			InstanceID: existing.ID,
 			Reserved:   existing.State == provider.InstanceRunning,
-		}
-		if pod.Annotations[nebulav1alpha1.EndpointAnnotation] == "" {
-			port := 0
-			if len(pod.Spec.Containers) > 0 {
-				port = firstPort(containerPorts(&pod.Spec.Containers[0]))
-			}
-			cred, err := p.client.MintConnectCredential(ctx, existing.ID, port)
-			if err != nil {
-				// Fail the whole provision rather than report an unreachable sandbox as
-				// provisioned. The error is not a rejection, so the Pod stays Provisioning
-				// and VK retries; the retry adopts this same sandbox by its claim tag and
-				// mints again, which is safe precisely because no endpoint was published.
-				return provider.ProvisionResult{}, err
-			}
-			res.ConnectURL, res.ConnectToken = cred.URL, cred.Token
-		}
-		return res, nil
+		}, nil
 	}
 
 	spec, err := p.sandboxSpecFromPod(pod, req)

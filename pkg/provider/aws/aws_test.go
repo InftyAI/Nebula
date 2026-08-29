@@ -559,18 +559,17 @@ func TestClassifyProvisionError(t *testing.T) {
 		{"wrapped capacity is regional", fmt.Errorf("run: %w", provider.ErrNoCapacity), onDemandRegional},
 		{"spot capacity blocks only Spot in region", spotNoCapacity, spotRegional},
 		{"string no-capacity is regional OnDemand", stringNoCapacity, onDemandRegional},
-		// An unrecognized error is confined to this accelerator + tier + region, NOT
-		// DenyAll: a whole-provider block on an unidentifiable failure is too broad, so
-		// failover routes around the one failing candidate instead.
-		{"unknown is regional OnDemand", fmt.Errorf("weird transient blip"), onDemandRegional},
-		// InvalidFleetConfiguration, in a CreateFleet per-override error, means the
-		// instance type is not offered in that subnet's AZ — a zone-local availability
-		// gap classifyEC2Error maps to no-capacity, so it blocks only this
-		// accelerator/tier/region (a sibling AZ or region may still serve it), never
-		// DenyAll.
-		{"invalid fleet config is regional OnDemand",
+		// An error we cannot attribute blocks NOTHING, so no region is stamped either: a
+		// transport failure or an unknown code is no evidence against this candidate.
+		{"unknown blocks nothing", fmt.Errorf("weird transient blip"), provider.BlockScope{}},
+		// The RAW code reaches here only if it escaped translation, and unrecognized means
+		// unattributable, so it blocks nothing. The real path never presents it this way:
+		// classifyEC2Error wraps InvalidFleetConfiguration as no-capacity first (it means
+		// "not offered in this subnet's AZ" — see translate.go), which lands on the
+		// ErrNoCapacity rows above and blocks this accelerator/tier/region.
+		{"raw invalid fleet config blocks nothing",
 			&smithy.GenericAPIError{Code: "InvalidFleetConfiguration", Message: "not supported in AZ"},
-			onDemandRegional},
+			provider.BlockScope{}},
 		{"nil", nil, provider.BlockScope{}},
 		// An image pull credential this adapter cannot honour is a fact about the POD, so it
 		// blocks nothing. Region must NOT be stamped on: a scope carrying only a region

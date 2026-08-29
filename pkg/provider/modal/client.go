@@ -265,7 +265,9 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 //
 // A failure is REPORTED, never swallowed into a zero credential. Minting is one-shot with
 // no read-back, so a dropped error loses the credential of a sandbox that exists and is
-// billing — silently, since a caller handed an empty pair has nothing to log.
+// billing — silently, since a caller handed an empty pair has nothing to log. It is tagged
+// provider.ErrCredential, which fails the Pod terminally (blocklisting nothing) so its owner
+// recreates it — the only recovery, since this sandbox can never be given a credential.
 func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) (Credential, error) {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 		// Derived from the exposed set rather than carried separately, so the routed
@@ -273,13 +275,14 @@ func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port 
 		Port: port,
 	})
 	if err != nil {
-		return Credential{}, fmt.Errorf("modal: mint connect credential for sandbox %s on port %d: %w",
-			sb.SandboxID, port, err)
+		return Credential{}, fmt.Errorf("modal: mint connect credential for sandbox %s on port %d: %w: %w",
+			sb.SandboxID, port, err, provider.ErrCredential)
 	}
 	// A token-less success is the same outcome as an error — an address with nothing to
 	// authenticate against it — so it is reported as one.
 	if creds == nil || creds.Token == "" {
-		return Credential{}, fmt.Errorf("modal: sandbox %s: connect credential minted without a token", sb.SandboxID)
+		return Credential{}, fmt.Errorf("modal: sandbox %s: connect credential minted without a token: %w",
+			sb.SandboxID, provider.ErrCredential)
 	}
 	return Credential{URL: creds.URL, Token: creds.Token}, nil
 }

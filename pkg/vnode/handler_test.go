@@ -436,21 +436,20 @@ func TestCreatePod_ProvisionErrorSurfaces(t *testing.T) {
 	}
 }
 
-// An error the provider never attributed to the request is not a rejection, so it
-// must not be acted on like one: no terminal status (the request may have been
-// accepted, and a Failed Pod is reaped out from under a paid instance), no blocklist
-// entry against a candidate that never misbehaved, and no tracking (a tracked pod with
-// no instance id is written Terminated by the very next poll tick). The Pod stays
-// Provisioning with the error as its message and VK retries with backoff.
-func TestCreatePod_UnattributableErrorLeavesPodProvisioning(t *testing.T) {
+// An error the provider never attributed to the request still FAILS the Pod: leaving it
+// provisioning promised a retry that does not exist (VK re-enters CreatePod only while
+// GetPod reports nothing, so an attempt that created an instance was never re-driven), and
+// a Pod hung there forever is worse than one whose owner can replace it.
+//
+// What the attribution still decides is the BLOCKLIST: nothing may be recorded against a
+// candidate that never misbehaved.
+func TestCreatePod_UnattributableErrorFailsPodWithoutBlocklisting(t *testing.T) {
 	provErr := errors.New("rpc error: code = Unavailable desc = transport is closing")
-	// A non-empty classifyScope proves the guard runs BEFORE classification: a provider
-	// willing to hand back a blockable scope still must not have one recorded.
-	accel := "H100:1"
-	fp := &fakeProvider{
-		provisionErr:  provErr,
-		classifyScope: provider.BlockScope{Accelerator: &accel},
-	}
+	// The zero classifyScope is what a real adapter returns for this error (see
+	// provider.ClassifyError), and asserting on it end-to-end is the point: nothing here
+	// pre-filters which errors may be blocked, so the scope is the only thing standing
+	// between a transport failure and a block against an innocent candidate.
+	fp := &fakeProvider{provisionErr: provErr, classifyScope: provider.BlockScope{}}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, openCluster())
 
@@ -467,9 +466,9 @@ func TestCreatePod_UnattributableErrorLeavesPodProvisioning(t *testing.T) {
 	if !errors.Is(err, provErr) {
 		t.Fatalf("CreatePod must return the provision error for VK to back off, got %v", err)
 	}
-	if pod.Status.Phase != corev1.PodPending || pod.Status.Reason != reasonProvisioning {
-		t.Fatalf("status = %s/%s, want the non-terminal %s/%s",
-			pod.Status.Phase, pod.Status.Reason, corev1.PodPending, reasonProvisioning)
+	if pod.Status.Phase != corev1.PodFailed || pod.Status.Reason != reasonProvisionFailed {
+		t.Fatalf("status = %s/%s, want %s/%s",
+			pod.Status.Phase, pod.Status.Reason, corev1.PodFailed, reasonProvisionFailed)
 	}
 	if !strings.Contains(pod.Status.Message, provErr.Error()) {
 		t.Fatalf("expected the error surfaced as the Pod message, got %q", pod.Status.Message)
@@ -477,17 +476,18 @@ func TestCreatePod_UnattributableErrorLeavesPodProvisioning(t *testing.T) {
 	if bl.calls != 0 {
 		t.Fatalf("expected no blocklist entry for an unattributable error, got %d", bl.calls)
 	}
-	if len(h.tracked) != 0 {
-		t.Fatalf("expected the Pod left untracked, got %d tracked", len(h.tracked))
+
+	// Tracked, so GetPod returns non-nil and VK stops trying to create: the Pod is terminal
+	// and nothing here should provision again for it.
+	if len(h.tracked) != 1 {
+		t.Fatalf("expected the failed Pod tracked to suppress a re-create, got %d tracked", len(h.tracked))
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	// Both emits are the same non-terminal status: the pre-call stamp and the retry
-	// message. Neither may be Failed.
-	for _, e := range emitted {
-		if strings.HasPrefix(e, string(corev1.PodFailed)) {
-			t.Fatalf("emitted a terminal status %q for an unattributable error: %v", e, emitted)
-		}
+	// The terminal status must actually reach VK, not just the local copy — a SandboxSet
+	// replaces the box off the back of this emit.
+	if len(emitted) == 0 || !strings.HasPrefix(emitted[len(emitted)-1], string(corev1.PodFailed)) {
+		t.Fatalf("expected the last emit to carry the terminal status, got %v", emitted)
 	}
 }
 
