@@ -19,7 +19,14 @@ spec:
     - us
     - eu
     - ap-melbourne
-  # - name: runpod
+  - name: runpod
+    # RunPod takes a region as either an ISO country code (US, SE) or one exact data
+    # center (US-KS-2, EU-RO-1) — no group tokens: "eu" is not a country code, so it
+    # would be forwarded and rejected at provision time. Each entry is one failover
+    # candidate, so a shortage in one blocklists only that one.
+    regions:
+    - US
+    - EU-RO-1
   # Outer axis: try OnDemand on every provider first, fall back to Spot.
   capacityTypes:
   - OnDemand
@@ -31,6 +38,11 @@ spec:
   # Outbound network policy. Omitted (as here) means Open. Inbound is never restricted, so a
   # sandbox stays reachable through its connect URL and token under every mode — it just
   # cannot call out.
+  #
+  # Setting ANY mode other than Open narrows this pool to the providers that can enforce
+  # it: placement skips a provider whose Capabilities report SupportsEgressPolicy=false
+  # (RunPod, which exposes no outbound knob at all), rather than provisioning something
+  # with open internet access under a policy that says otherwise.
   #
   # Blocked permits nothing:
   # egress:
