@@ -115,6 +115,7 @@ itself at startup (see [Webhook TLS](#webhook-tls-no-cert-manager)).
 | `MODAL_ENVIRONMENT` | Modal | no | Modal Environment to create sandboxes in. Blank omits the key and the SDK uses the token profile's default. See [Modal Environments](#modal-environments). |
 | `AWS_ACCESS_KEY_ID` | AWS | dev only | Prefer IRSA / instance role in production and leave blank — the SDK's default credential chain finds the role. Set only for local/dev. |
 | `AWS_SECRET_ACCESS_KEY` | AWS | dev only | Pairs with `AWS_ACCESS_KEY_ID`; both required together or both blank. |
+| `RUNPOD_API_KEY` | RunPod | yes | From [console.runpod.io/user/settings](https://console.runpod.io/user/settings). Needs **read+write on Pods**: a read-only key registers fine and then fails every provision with an auth error, which blocklists the whole provider. Unlike AWS there is no ambient identity, so blank skips RunPod entirely. |
 
 Non-secret config, passed as `make` variables:
 

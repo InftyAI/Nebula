@@ -54,6 +54,9 @@ metadata:
 spec:
   providers:
   - name: modal            # NeoCloud; regions omitted = place anywhere (cheapest)
+  - name: runpod           # NeoCloud with real Spot; a region is a country code
+    regions:               # ("us") or one data center ("us-ks-2")
+    - us
   - name: aws              # hyperscaler; "us" expands to every US region
     regions:
     - us
@@ -95,7 +98,8 @@ placement controller owns those.
 > `kubectl logs` and `kubectl exec` both work on Modal, `-f`/`--tail` and `-it`
 > included: the manager serves the two kubelet routes the API server proxies.
 > `--timestamps`/`--previous`/`--since` and `-c` are ignored, and a terminal resize is
-> not forwarded. On providers that do not support them yet, both answer NotFound.
+> not forwarded. On providers that do not support them yet — AWS and RunPod — both
+> answer NotFound.
 
 ## Getting started
 
