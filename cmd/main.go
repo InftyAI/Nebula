@@ -58,6 +58,7 @@ import (
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
+	"github.com/InftyAI/Nebula/pkg/provider/runpod"
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
 )
@@ -661,6 +662,19 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 	register(provider.ProviderAWS, func() (provider.Provider, error) {
 		return awsprovider.NewSDKClient(ctx, awsRegionSource(c))
 	})
+
+	// RunPod. Like Modal and unlike AWS, its credential is a single API key read from the
+	// environment (RUNPOD_API_KEY, delivered by the per-provider Secret) — there is no
+	// role/instance-identity path to fall back on, so an absent key is exactly the
+	// logged-and-skipped case. Also like Modal, there is no region config here: a pool's
+	// regions become RunPod data centers or country codes at provision time, so editing a
+	// NodePool changes placement without a restart.
+	if p, err := runpod.NewSDKClient(ctx); err != nil {
+		setupLog.Info("skipping RunPod provider registration", "reason", err.Error())
+	} else {
+		provider.Register(p)
+		setupLog.Info("registered provider", "provider", p.Name())
+	}
 
 	// The fake provider is an in-memory backend used only by the e2e suite to
 	// exercise the full control-plane loop without cloud credentials. It ships in
