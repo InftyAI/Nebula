@@ -62,6 +62,9 @@ metadata:
 spec:
   providers:
   - name: modal            # NeoCloud; regions omitted = place anywhere (cheapest)
+  - name: runpod           # NeoCloud with real Spot; a region is a country code
+    regions:               # ("us") or one data center ("us-ks-2")
+    - us
   - name: aws              # hyperscaler; "us" expands to every US region
     regions:
     - us
