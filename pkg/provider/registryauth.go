@@ -95,8 +95,8 @@ func (a *RegistryAuth) Validate() error {
 
 // Unsupported is the error an adapter returns for a credential kind it cannot honour, named
 // so the message says which provider refused. Shared so the ErrImagePull wrap cannot be
-// forgotten: unwrapped, the same refusal reads as unattributable and the Pod retries against
-// a provider that will never accept it (see ErrImagePull, IsRejection).
+// forgotten: unwrapped, the same refusal reads as unattributable and the failure is reported
+// as an integration problem rather than the request's own (see ErrImagePull).
 func (a *RegistryAuth) Unsupported(providerName string) error {
 	return fmt.Errorf("%s: unsupported image pull credential %s: %w", providerName, a, ErrImagePull)
 }

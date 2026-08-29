@@ -27,7 +27,7 @@ import (
 
 // The reason label is a CLOSED set, so this pins every mapping into it. The label is
 // what an operator reads to decide whether a provisioning problem is theirs (quota,
-// credentials), the provider's (capacity, unreachable) or neither.
+// credentials), the provider's (capacity) or neither.
 func TestFailureReason(t *testing.T) {
 	tests := []struct {
 		name string
@@ -46,17 +46,17 @@ func TestFailureReason(t *testing.T) {
 		{"capacity beats timeout", fmt.Errorf("%w: %w", provider.ErrNoCapacity, context.DeadlineExceeded), ReasonCapacity},
 		{"bare timeout", context.DeadlineExceeded, ReasonTimeout},
 
-		// The split that matters operationally: an integration outage must not read as a
-		// capacity shortfall, or the failure series points at the wrong problem entirely.
-		{"grpc transport", errors.New("rpc error: code = Unavailable desc = transport is closing"), ReasonUnreachable},
-		{"connection refused", errors.New("dial tcp: connect: connection refused"), ReasonUnreachable},
-		{"unrecognized", errors.New("weird transient blip"), ReasonUnreachable},
+		// What matters here is that a transport failure does NOT read as a capacity
+		// shortfall, which would point the failure series at the wrong problem entirely.
+		// "Unavailable" in a gRPC status text is the misread this guards.
+		{"grpc transport", errors.New("rpc error: code = Unavailable desc = transport is closing"), ReasonOther},
+		{"connection refused", errors.New("dial tcp: connect: connection refused"), ReasonOther},
+		{"unrecognized", errors.New("weird transient blip"), ReasonOther},
 
-		// An unwrapped provider message is recognized as a REJECTION (so not
-		// "unreachable"), but its category is unavailable here: FailureReason matches
-		// sentinels only, on purpose, rather than re-running the string heuristics. So it
-		// lands on "other", which is precisely the signal that an adapter is not wrapping
-		// its errors — actionable, unlike a guess at the category.
+		// An unwrapped provider message lands on "other" too: FailureReason matches
+		// sentinels only, on purpose, rather than re-running the string heuristics. That is
+		// precisely the signal that an adapter is not wrapping its errors — actionable,
+		// unlike a guess at the category.
 		{"unwrapped rejection", errors.New("InsufficientInstanceCapacity"), ReasonOther},
 	}
 	for _, tt := range tests {
@@ -93,7 +93,7 @@ func TestObserveProvision_CountersStayInStep(t *testing.T) {
 	// A success must never touch the failure-reason counter, whatever the reason.
 	allReasons := []string{
 		ReasonCapacity, ReasonAuth, ReasonQuota,
-		ReasonUnsupported, ReasonTimeout, ReasonUnreachable, ReasonOther,
+		ReasonUnsupported, ReasonTimeout, ReasonOther,
 	}
 	for _, reason := range allReasons {
 		if reason == ReasonCapacity {

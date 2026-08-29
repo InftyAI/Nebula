@@ -45,19 +45,12 @@ const (
 	ReasonAuth        = "auth"
 	ReasonUnsupported = "unsupported_accelerator"
 	ReasonTimeout     = "timeout"
-	// ReasonUnreachable: the provider never told us what it decided — a transport
-	// failure, a 503, an unparseable response. Kept separate from every other reason
-	// because it is the one that is NOT about capacity, credentials or the request: it
-	// says the integration itself is unhealthy, and it is the only reason for which
-	// Nebula deliberately does not fail the Pod or blocklist the candidate (see
-	// provider.IsRejection). A spike here alongside flat capacity/auth series is a
-	// network or provider-outage signal, not a placement one.
-	ReasonUnreachable = "unreachable"
-	// ReasonOther: the provider DID reject the request, but not through a sentinel, so
-	// the category is unavailable. In practice that means the adapter returned a raw API
-	// error without wrapping it, which makes a sustained rate on this series a to-do
-	// rather than an incident: wrap the condition in the adapter (see
-	// docs/add-a-provider.md) and the failure moves onto its real category.
+	// ReasonOther: the failure carried no sentinel, so its category is unavailable — either
+	// the adapter returned a raw API error without wrapping it, or the provider never told
+	// us what it decided at all (a transport failure, a 503, an unparseable response). A
+	// sustained rate here is a to-do rather than an incident: wrap the condition in the
+	// adapter (see docs/add-a-provider.md) and the failure moves onto its real category.
+	// Which of the two it was is in the vnode-handler error log.
 	ReasonOther = "other"
 )
 
@@ -175,12 +168,6 @@ func FailureReason(err error) string {
 	// of the two.
 	case errors.Is(err, context.DeadlineExceeded):
 		return ReasonTimeout
-	// Everything left is either a rejection whose category we could not name, or a
-	// failure to reach the provider at all. Splitting them is the whole point of having
-	// this label: the first is a placement problem, the second an integration one, and
-	// they are fixed by completely different people.
-	case !provider.IsRejection(err):
-		return ReasonUnreachable
 	default:
 		return ReasonOther
 	}

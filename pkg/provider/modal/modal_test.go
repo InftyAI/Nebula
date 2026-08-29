@@ -993,10 +993,10 @@ func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	if got := p.ClassifyProvisionError(err, "H100:1", "us-east"); got != (provider.BlockScope{}) {
 		t.Fatalf("an image build failure must block nothing, got %+v", got)
 	}
-	// Still a rejection, so the Pod fails with the reason instead of retrying an image that
-	// will never build. Blocking and rejecting are separate questions.
-	if !provider.IsRejection(err) {
-		t.Error("an image build failure must be a rejection")
+	// The label is what keeps it at zero: the registry's "unauthorized" text left to the
+	// heuristics reads as auth and fences off the whole provider.
+	if !errors.Is(err, provider.ErrImageBuild) {
+		t.Error("an image build failure must carry the ErrImageBuild label")
 	}
 	// The registry's text survives for whoever has to fix the Secret.
 	if !strings.Contains(err.Error(), "authentication required") {
@@ -1111,8 +1111,8 @@ func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
 	if res.InstanceID != "" {
 		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
 	}
-	if !provider.IsRejection(err) {
-		t.Fatal("a mint failure must be a rejection; otherwise the Pod sits provisioning and is never re-provisioned")
+	if !errors.Is(err, provider.ErrCredential) {
+		t.Fatal("a mint failure must carry the ErrCredential label, or its text is left to the heuristics")
 	}
 	if scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope !=
 		(provider.BlockScope{}) {
@@ -1122,10 +1122,10 @@ func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
 
 // The production shape of the same failure: the image build eats the provision budget and the
 // mint — last of the three legs — dies on the deadline, so the error carries BOTH the sentinel
-// and a deadline. It must still classify as a rejection: the sentinel says the outcome is
-// known, while a bare deadline would mean "we cannot say", leaving the Pod provisioning
-// forever behind a sandbox that can never be given a credential.
-func TestProvision_MintDeadlineIsStillARejection(t *testing.T) {
+// and a deadline. OUR clock outranks the label: the candidate spent the whole budget and
+// delivered nothing, so it is blocked for the TTL and the next attempt goes elsewhere instead
+// of spending another full budget here.
+func TestProvision_MintDeadlineBlocksTheCandidate(t *testing.T) {
 	f := &fakeClient{
 		createID: "sb-1",
 		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w: %w",
@@ -1138,8 +1138,9 @@ func TestProvision_MintDeadlineIsStillARejection(t *testing.T) {
 	if err == nil {
 		t.Fatal("Provision succeeded; the sandbox has no credential")
 	}
-	if !provider.IsRejection(err) {
-		t.Fatal("a timed-out mint must be a rejection; the deadline is how it failed, not whether we know it did")
+	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1")
+	if scope == (provider.BlockScope{}) || scope.DenyAll {
+		t.Fatalf("BlockScope = %+v, want an accelerator-scoped block for a spent budget", scope)
 	}
 }
 

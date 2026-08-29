@@ -20,6 +20,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
 
 func TestRegistryAuthValidate(t *testing.T) {
@@ -94,10 +96,11 @@ func TestRegistryAuthUnsupported(t *testing.T) {
 	if !errors.Is(err, ErrImagePull) {
 		t.Errorf("err = %v, want it to wrap ErrImagePull", err)
 	}
-	// A refusal must be a rejection, not an unattributable failure: the latter leaves the
-	// Pod retrying against a provider that will never accept the credential.
-	if !IsRejection(err) {
-		t.Errorf("IsRejection(%v) = false, want true", err)
+	// The refusal is the POD's, so it must blocklist nothing: the candidate accepts other
+	// Pods' credentials perfectly well, and "unsupported credential" text left to the
+	// heuristics would read as auth and fence off the whole provider.
+	if scope := ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope != (BlockScope{}) {
+		t.Errorf("BlockScope = %+v, want zero", scope)
 	}
 	if !strings.Contains(err.Error(), "aws") {
 		t.Errorf("err = %q, want the refusing provider named", err)

@@ -81,7 +81,7 @@ var (
 //
 // The zero scope is the ONLY signal for "block nothing": recordBlock no-ops on it, so callers
 // classify every failure and act on the result instead of pre-filtering with a second
-// predicate. IsRejection answers a different question and does not gate this one.
+// predicate.
 //
 // This is the single place the SHARED part of a scope is derived, so every adapter delegates
 // here and then only adds what is provider-specific (AWS adds its region). Nothing assembles
@@ -123,8 +123,8 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 		// must therefore not decorate this scope (see ClassifyProvisionError in each
 		// adapter): adding a region would make it non-empty and install a region-wide block.
 		//
-		// Still a rejection, so the Pod fails with the reason rather than retrying forever —
-		// the two questions are separate. See IsRejection.
+		// The Pod still fails with the reason rather than retrying forever; that is the
+		// caller's doing (see vnode.Handler.CreatePod), not this scope's.
 		return BlockScope{}
 	case catUnattributable:
 		// Nothing is blocklisted, and for a different reason than catRequest above: there the
@@ -146,16 +146,14 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 	}
 }
 
-// failureCategory is the internal classification ClassifyError and IsRejection both
-// drive off, so the two can never disagree about whether an error was recognized.
+// failureCategory is the internal classification ClassifyError drives off.
 type failureCategory int
 
 const (
 	// catUnattributable: nothing in the error says what the provider decided, because
 	// it may not have decided anything — a transport failure, a cancellation, an
-	// unparseable API blip. The only category IsRejection answers false for, and it
-	// blocklists nothing: no candidate can be held responsible for a failure nobody
-	// could attribute to it.
+	// unparseable API blip. It blocklists nothing: no candidate can be held responsible
+	// for a failure nobody could attribute to it.
 	catUnattributable failureCategory = iota
 	// catAuth: credentials or authorization failed, so nothing on the provider works.
 	catAuth
@@ -217,31 +215,6 @@ func categorize(err error) failureCategory {
 	default:
 		return catUnattributable
 	}
-}
-
-// IsRejection reports whether err is a provider DECISION about this request — "no
-// capacity", "over quota", "bad credentials", "I do not offer that accelerator" — as
-// opposed to a failure to find out what the provider would have decided: a transport
-// error, a cancellation, a 503, an unparseable response.
-//
-// A provision DEADLINE counts as a decision, though nobody spoke it: the candidate was given
-// the entire provision budget and produced no usable instance, which is as good a refusal as
-// one it words. Treating it as unknown left the Pod provisioning behind an attempt nothing
-// re-enters. A cancellation is the opposite — that is us stopping, not the candidate failing.
-//
-// It does NOT decide what happens to the Pod, and no longer gates the blocklist. A provision
-// failure is terminal either way (see vnode.Handler.CreatePod), and what may be blocklisted is
-// answered by ClassifyError alone, whose zero scope means "nothing". Two mechanisms for one
-// question could disagree; one cannot.
-//
-// What it still separates is DIAGNOSIS: a rejection is a placement problem — the provider was
-// reached and said no — while an unattributable failure is an integration problem, and the two
-// are fixed by different people. That is the split metrics reports on (see
-// metrics.provisionReason).
-//
-// A nil error is not a rejection.
-func IsRejection(err error) bool {
-	return err != nil && categorize(err) != catUnattributable
 }
 
 // containsAny reports whether s contains any of subs.

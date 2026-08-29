@@ -69,9 +69,7 @@ const defaultSandboxTimeout = 24 * time.Hour
 // provisionTimeout raises the vnode handler's generic Provision deadline, because Provision
 // here BLOCKS on the image build (see sdkClient.buildImage): a cold image is pulled into
 // Modal's cache on this call, and the create and credential legs only get what the build
-// leaves them. Generous on purpose — at 90s a slow build starved the mint, which is the last
-// call of the three and the one with no second chance: it is one-shot with no read-back, so a
-// sandbox that misses it is unreachable for good and the Pod fails.
+// leaves them.
 const provisionTimeout = 15 * time.Minute
 
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and

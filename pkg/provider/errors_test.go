@@ -48,7 +48,7 @@ func TestClassifyError(t *testing.T) {
 		// An unusable image credential belongs to the POD. The blocklist key carries no Pod,
 		// image or credential identity, so ANY scope here would exclude the candidate for
 		// unrelated Pods that pull perfectly well — hence the zero scope, which blocks
-		// nothing. Still a rejection: see TestIsRejection.
+		// nothing.
 		{"image-pull sentinel blocks nothing", ErrImagePull, BlockScope{}},
 		{
 			"wrapped image-pull sentinel blocks nothing",
@@ -73,6 +73,42 @@ func TestClassifyError(t *testing.T) {
 		// An error we cannot attribute blocks NOTHING: it is no evidence against the
 		// candidate, and the zero scope is what keeps recordBlock from acting on it.
 		{"unknown blocks nothing", fmt.Errorf("weird transient blip"), BlockScope{}},
+
+		// A DEADLINE is scoped like capacity: the candidate had the whole provision budget
+		// and produced no usable instance, so the next attempt should go elsewhere instead
+		// of spending another full budget here. Cancellation is the opposite — that is US
+		// stopping, no evidence against the candidate — so it blocks nothing.
+		{"deadline exceeded", context.DeadlineExceeded, capacityScope},
+		{"wrapped deadline", fmt.Errorf("provision: %w", context.DeadlineExceeded), capacityScope},
+		{"canceled blocks nothing", context.Canceled, BlockScope{}},
+
+		// OUR clock outranks any label a sentinel carries: an adapter reports the failure it
+		// saw and cannot see whose deadline fired. So a build that ran out of budget is a
+		// capacity failure, not the zero-scope image failure its label suggests.
+		{"deadline wrapped in an image-build label",
+			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImageBuild), capacityScope},
+		{"cancellation wrapped in a capacity label",
+			fmt.Errorf("sweep: %w: %w", context.Canceled, ErrNoCapacity), BlockScope{}},
+		// The form errors.Is CANNOT see: grpc-go turns a dead context into a status error
+		// that wraps nothing, and it is the likelier arrival — an SDK blocked in Recv finds
+		// out from gRPC, not from its own ctx.Err() poll.
+		{"grpc deadline wrapping an image-build label",
+			fmt.Errorf("modal: image build: %w: %w",
+				errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
+				ErrImageBuild), capacityScope},
+		// ...but a verdict Modal actually reached keeps the label's zero scope: the override
+		// fires only when the context is what died, so a registry refusal must not fence off
+		// the accelerator.
+		{"image-build label on a remote verdict",
+			fmt.Errorf("modal: image build: %w: %w",
+				errors.New("Image build for im-1 failed with the exception:\nunauthorized"),
+				ErrImageBuild), BlockScope{}},
+		// A gRPC status renders "Unavailable" in its text, which the capacity heuristic
+		// would otherwise match — the misread the transport check precedes it for. A sentinel
+		// the adapter wrapped still wins over the raw text, so an adapter that classified a
+		// gRPC error itself is not second-guessed.
+		{"grpc unavailable wrapping a sentinel",
+			fmt.Errorf("rpc error: code = Unavailable desc = no gpu: %w", ErrNoCapacity), capacityScope},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -101,83 +137,6 @@ func TestClassifyError_EmptyAcceleratorStaysNil(t *testing.T) {
 	}
 	if got.DenyAll || got.CapacityType != nebulav1alpha1.CapacityOnDemand {
 		t.Fatalf("expected an OnDemand capacity scope, got %+v", got)
-	}
-}
-
-// IsRejection separates a provider DECISION about the request from a failure to
-// learn what it would have decided. The vnode handler fails the Pod and blocklists
-// the candidate only for the former, so a transport error misclassified as a
-// rejection stamps a terminal status on a request that may have been accepted.
-func TestIsRejection(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil is not a rejection", nil, false},
-		{"auth sentinel", ErrAuth, true},
-		{"no-capacity sentinel", ErrNoCapacity, true},
-		{"quota sentinel", ErrQuota, true},
-		{"unsupported sentinel", ErrUnsupportedAccelerator, true},
-		{"wrapped sentinel", fmt.Errorf("create sandbox: %w", ErrNoCapacity), true},
-		{"string capacity", errors.New("InsufficientInstanceCapacity"), true},
-		{"string auth", errors.New("HTTP 401 unauthorized"), true},
-		// Blocks nothing (see TestClassifyError), yet still a rejection: the provider DID
-		// decide, and a Pod whose credential it cannot use must fail with that reason rather
-		// than retry it forever. Blocking and rejecting are separate questions.
-		{"image-pull sentinel", ErrImagePull, true},
-		{"image-build sentinel", ErrImageBuild, true},
-
-		// A deadline REJECTS: the candidate had the whole provision budget and produced no
-		// usable instance, so the Pod fails and the candidate is blocked for the TTL, sending
-		// the next attempt somewhere else instead of spending another full budget here.
-		{"deadline exceeded", context.DeadlineExceeded, true},
-		{"wrapped deadline", fmt.Errorf("provision: %w", context.DeadlineExceeded), true},
-
-		// The failures this predicate exists for. Cancellation is OUR exit, not the
-		// candidate's failure, so it stays retryable however the deadline is treated.
-		{"canceled", context.Canceled, false},
-		{"connection refused", errors.New("dial tcp 10.0.0.1:443: connect: connection refused"), false},
-		{"eof", errors.New("unexpected EOF"), false},
-		{"http 503", errors.New("503 Service Unavailable"), false},
-		{"unrecognized", errors.New("weird transient blip"), false},
-
-		// A gRPC status renders "Unavailable" in its text, which the capacity heuristic
-		// would otherwise match — this is the misread the transport check precedes it for.
-		{"grpc unavailable", errors.New("rpc error: code = Unavailable desc = transport is closing"), false},
-		// ...but a sentinel the adapter wrapped still wins over the raw text, so an
-		// adapter that classified a gRPC error itself is not second-guessed.
-		{"grpc unavailable wrapping a sentinel",
-			fmt.Errorf("rpc error: code = Unavailable desc = no gpu: %w", ErrNoCapacity), true},
-
-		// OUR clock outranks any label a sentinel carries: an adapter reports the failure it
-		// saw and cannot see whose deadline fired. So a build that ran out of budget is a
-		// capacity rejection, not the zero-scope image failure its label suggests — the
-		// candidate spent the whole budget and delivered nothing.
-		{"deadline wrapped in an image-build label",
-			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImageBuild), true},
-		{"cancellation wrapped in a capacity label",
-			fmt.Errorf("sweep: %w: %w", context.Canceled, ErrNoCapacity), false},
-		// The form errors.Is CANNOT see: grpc-go turns a dead context into a status error
-		// that wraps nothing, and it is the likelier arrival — an SDK blocked in Recv finds
-		// out from gRPC, not from its own ctx.Err() poll.
-		{"grpc deadline wrapping an image-build label",
-			fmt.Errorf("modal: image build: %w: %w",
-				errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
-				ErrImageBuild), true},
-		// A verdict Modal actually reached still rejects: the label is only overridden when
-		// the context is what died.
-		{"image-build label on a remote verdict",
-			fmt.Errorf("modal: image build: %w: %w",
-				errors.New("Image build for im-1 failed with the exception:\nunauthorized"),
-				ErrImageBuild), true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsRejection(tt.err); got != tt.want {
-				t.Fatalf("IsRejection(%v) = %v, want %v", tt.err, got, tt.want)
-			}
-		})
 	}
 }
 
