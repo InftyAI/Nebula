@@ -70,7 +70,7 @@ const defaultSandboxTimeout = 24 * time.Hour
 // here BLOCKS on the image build (see sdkClient.buildImage): a cold image is pulled into
 // Modal's cache on this call, and the create and credential legs only get what the build
 // leaves them.
-const provisionTimeout = 15 * time.Minute
+const provisionTimeout = 10 * time.Minute
 
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
