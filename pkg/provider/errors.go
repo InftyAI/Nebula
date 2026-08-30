@@ -48,27 +48,11 @@ var (
 	// nothing about the same request in another. The adapter confines it to the
 	// failing region (see aws.ClassifyProvisionError). Transient until quota frees up.
 	ErrQuota = errors.New("provider: quota exceeded")
-	// ErrImagePull: the image could not be pulled — a credential the provider cannot honour,
-	// one it was not given, or a registry that refused it.
-	//
-	// REQUEST-scoped, and the only sentinel that is: it describes the Pod, not the candidate.
-	// So it blocklists NOTHING (see ClassifyError). Both alternatives are wrong — ErrAuth
-	// widens to DenyAll, fencing off the whole provider because one Pod named a role it
-	// cannot assume, and a capacity scope evicts an accelerator/tier/region that is serving
-	// other Pods perfectly well, since the blocklist key carries no Pod, image or credential
-	// identity. A failure that belongs to one request cannot be recorded against a candidate.
-	ErrImagePull = errors.New("provider: cannot pull image")
-	// ErrImageBuild: the provider could not PRODUCE the image it was asked to run —
-	// distinct from ErrImagePull because pulling is only one of the ways it fails.
-	//
-	// REQUEST-scoped like ErrImagePull, and for the same reason: WHICH image to run belongs
-	// to the Pod, so it blocklists NOTHING — no other region, tier or provider produces an
-	// image this one just refused to produce.
-	ErrImageBuild = errors.New("provider: cannot build image")
-	// ErrCredential: the instance came up but could not be given the credential that makes it
-	// reachable. Minting is create-only with no read-back, so it cannot be repeated for that
-	// instance — the adapter destroys it and reports this.
-	ErrCredential = errors.New("provider: cannot mint connect credential")
+	// ErrImage: the provider could not obtain the image it was asked to run — a credential it
+	// cannot honour, one it was not given, a registry that refused it, or a build that failed.
+	// ONE sentinel for all of those because pulling and building are not separable outcomes:
+	// the provider pulls the image as part of building it (see modal.sdkClient.buildImage).
+	ErrImage = errors.New("provider: cannot obtain image")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be blocklisted at,
@@ -146,6 +130,12 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 	}
 }
 
+// IsDeadline reports whether err is a provision deadline that fired.
+func IsDeadline(err error) bool {
+	return err != nil && (errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded"))
+}
+
 // failureCategory is the internal classification ClassifyError drives off.
 type failureCategory int
 
@@ -176,14 +166,14 @@ func categorize(err error) failureCategory {
 
 	// A deadline is a capacity failure, not an unknown: the candidate was given the whole
 	// provision budget and did not produce a usable instance.
-	if errors.Is(err, context.DeadlineExceeded) || containsAny(msg, "context deadline exceeded") {
+	if IsDeadline(err) {
 		return catCapacity
 	}
 
 	// Cancellation stays unattributable, unlike the deadline above: it means WE stopped asking
 	// — a manager shutdown, a leader handoff — and the provider may well have accepted the
-	// request. Nothing about the candidate was learned, so failing the Pod or blocklisting
-	// would punish it for our own exit.
+	// request. Nothing about the candidate was learned, so blocklisting would punish it for
+	// our own exit. Only the block scope; the caller still fails the Pod.
 	if errors.Is(err, context.Canceled) || containsAny(msg, "context canceled") {
 		return catUnattributable
 	}
@@ -191,7 +181,7 @@ func categorize(err error) failureCategory {
 	switch {
 	case errors.Is(err, ErrAuth):
 		return catAuth
-	case errors.Is(err, ErrImagePull), errors.Is(err, ErrImageBuild), errors.Is(err, ErrCredential):
+	case errors.Is(err, ErrImage):
 		return catRequest
 	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator),
 		errors.Is(err, ErrQuota):

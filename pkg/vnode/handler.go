@@ -300,8 +300,9 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// would reap a workload over a race, and would run recordBlock's failover machinery over
 	// a Pod-spec problem no other provider or region can fix.
 	//
-	// Deliberately NOT stored, as in the transport-failure branch below: a tracked pod with
-	// no instance id reads as absent from List and gets written Terminated.
+	// Deliberately NOT stored: tracking a pod makes GetPod return non-nil, which suppresses
+	// the retry this branch wants. (The provision-failure branch below stores for exactly
+	// that reason — it does not want one.)
 	env, err := resolveEnv(ctx, h.client, pod)
 	if err != nil {
 		log.Error(err, "cannot resolve the Pod's environment; nothing provisioned, retrying")

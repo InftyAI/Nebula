@@ -87,7 +87,7 @@ What the external call cost, and how it failed.
 | --- | --- | --- |
 | `nebula_provision_attempts_total{result}` | counter | Provisioning volume and error rate, per candidate. |
 | `nebula_provision_failures_total{reason}` | counter | *Why* provisioning fails. |
-| `nebula_provision_duration_seconds{result}` | histogram | Latency of the `Provision` call alone. AWS sweeps a region's availability zones inside it, so a capacity shortage shows up as latency *here*; Modal returns as soon as the sandbox is accepted and the wait moves to the next metric. |
+| `nebula_provision_duration_seconds{result}` | histogram | Latency of the `Provision` call alone. What lands here is provider-specific: AWS sweeps a region's availability zones inside the call, so a capacity shortage shows up as latency *here*; Modal builds the image inside it, so a build-cache miss does. Bucketed to 600s, the largest `ProvisionTimeout` — so `+Inf` means a call outran its own deadline. |
 | `nebula_instance_ready_duration_seconds` | histogram | The whole user-visible wait, from `CreatePod` to the first poll tick reporting `Running` — including provider-side queueing, image pull, GPU attach and up to one poll interval of detection lag. |
 
 `nebula_provision_failures_total` deliberately overlaps

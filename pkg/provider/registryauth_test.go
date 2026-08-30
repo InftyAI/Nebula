@@ -72,10 +72,10 @@ func TestRegistryAuthValidate(t *testing.T) {
 			if err == nil {
 				t.Fatal("Validate() = nil, want an error")
 			}
-			// The sentinel is the contract: ErrImagePull scopes the block to this Pod's
+			// The sentinel is the contract: ErrImage scopes the block to this Pod's
 			// request, where ErrAuth would fence off the entire provider.
-			if !errors.Is(err, ErrImagePull) {
-				t.Errorf("Validate() = %v, want it to wrap ErrImagePull", err)
+			if !errors.Is(err, ErrImage) {
+				t.Errorf("Validate() = %v, want it to wrap ErrImage", err)
 			}
 			if errors.Is(err, ErrAuth) {
 				t.Errorf("Validate() = %v, must NOT wrap ErrAuth (it widens to DenyAll)", err)
@@ -93,8 +93,8 @@ func TestRegistryAuthUnsupported(t *testing.T) {
 		Basic:    &BasicAuth{Username: "bot", Password: "hunter2"},
 	}).Unsupported("aws")
 
-	if !errors.Is(err, ErrImagePull) {
-		t.Errorf("err = %v, want it to wrap ErrImagePull", err)
+	if !errors.Is(err, ErrImage) {
+		t.Errorf("err = %v, want it to wrap ErrImage", err)
 	}
 	// The refusal is the POD's, so it must blocklist nothing: the candidate accepts other
 	// Pods' credentials perfectly well, and "unsupported credential" text left to the

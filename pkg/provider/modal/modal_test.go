@@ -486,9 +486,9 @@ func TestCapabilities(t *testing.T) {
 	// Must be STATED, and above the handler's generic default: Provision blocks on the image
 	// build here, so this adapter needs more than a provider whose create just returns an id.
 	// Zero is the regression to guard — it silently reverts to that default.
-	if caps.ProvisionTimeout < 90*time.Second {
-		t.Fatalf("ProvisionTimeout = %v, want at least 90s to cover an image build",
-			caps.ProvisionTimeout)
+	if caps.ProvisionTimeout != provisionTimeout {
+		t.Fatalf("ProvisionTimeout = %v, want %v to cover a cold image build",
+			caps.ProvisionTimeout, provisionTimeout)
 	}
 	if p.Name() != provider.ProviderModal {
 		t.Fatalf("name = %q", p.Name())
@@ -966,9 +966,9 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	// credential belongs to one POD, so it blocks nothing. Stamping the region here would
 	// make the scope non-empty and fence off every accelerator in us-east because one Pod
 	// named a role Modal cannot assume.
-	if got := p.ClassifyProvisionError(provider.ErrImagePull, "H100:1", "us-east"); got !=
+	if got := p.ClassifyProvisionError(provider.ErrImage, "H100:1", "us-east"); got !=
 		(provider.BlockScope{}) {
-		t.Fatalf("an image-pull rejection must block nothing, got %+v", got)
+		t.Fatalf("an image failure must block nothing, got %+v", got)
 	}
 }
 
@@ -986,7 +986,7 @@ func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	// keep this file SDK-free — under test is the label, not how buildImage obtained one.
 	verdict := errors.New("RemoteError: Image build for im-1 failed with the exception:\n" +
 		"unauthorized: authentication required")
-	err := fmt.Errorf("modal: image build: %w: %w", verdict, provider.ErrImageBuild)
+	err := fmt.Errorf("modal: image build: %w: %w", verdict, provider.ErrImage)
 
 	// Blocks nothing at all: the image is a property of the request, and no region or tier
 	// builds an image Modal refused to build.
@@ -995,21 +995,13 @@ func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	}
 	// The label is what keeps it at zero: the registry's "unauthorized" text left to the
 	// heuristics reads as auth and fences off the whole provider.
-	if !errors.Is(err, provider.ErrImageBuild) {
-		t.Error("an image build failure must carry the ErrImageBuild label")
+	if !errors.Is(err, provider.ErrImage) {
+		t.Error("an image build failure must carry the ErrImage label")
 	}
-	// The registry's text survives for whoever has to fix the Secret.
+	// The registry's text survives for whoever has to fix the Secret. It is the only thing
+	// that says WHICH of the image failures this was, now that one sentinel covers them all.
 	if !strings.Contains(err.Error(), "authentication required") {
 		t.Errorf("err = %q, want the registry's reason preserved", err)
-	}
-	// Named for what actually failed. A build fails on more than pulls — a layer it cannot
-	// unpack, a manifest it rejects — so ErrImagePull would assert a pull problem the
-	// adapter has not established, and send whoever reads it to check a credential.
-	if !errors.Is(err, provider.ErrImageBuild) {
-		t.Errorf("err must identify as ErrImageBuild, got %v", err)
-	}
-	if errors.Is(err, provider.ErrImagePull) {
-		t.Error("a build failure must not claim to be a pull failure")
 	}
 }
 
@@ -1093,13 +1085,14 @@ func TestProvision_ReturnsMintedCredential(t *testing.T) {
 
 // A sandbox that came up but could not be given a credential is unreachable, and nothing
 // revisits it: minting is one-shot with no read-back, and the idempotent branch below hands
-// back no credential. So the create reports a failure and no id, and reports it as a
-// REJECTION — the Pod fails terminally and its owner recreates it, which is the only recovery
-// left. The scope stays zero, because the candidate served the request correctly.
+// back no credential. So the create reports a failure and no id, and the Pod fails terminally
+// for its owner to recreate — the only recovery left. This mint named no cause, so it blocks
+// nothing; one that names an auth or rate-limit refusal does fence the provider (see
+// provider.ClassifyError).
 func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
 	f := &fakeClient{
 		createID:  "sb-1",
-		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w", provider.ErrCredential),
+		createErr: errors.New("modal: sandbox sb-1: connect credential minted without a token"),
 	}
 	p := newTestProvider(f)
 
@@ -1111,9 +1104,6 @@ func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
 	if res.InstanceID != "" {
 		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
 	}
-	if !errors.Is(err, provider.ErrCredential) {
-		t.Fatal("a mint failure must carry the ErrCredential label, or its text is left to the heuristics")
-	}
 	if scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope !=
 		(provider.BlockScope{}) {
 		t.Fatalf("BlockScope = %+v, want zero; the request failed, not the candidate", scope)
@@ -1121,15 +1111,14 @@ func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
 }
 
 // The production shape of the same failure: the image build eats the provision budget and the
-// mint — last of the three legs — dies on the deadline, so the error carries BOTH the sentinel
-// and a deadline. OUR clock outranks the label: the candidate spent the whole budget and
-// delivered nothing, so it is blocked for the TTL and the next attempt goes elsewhere instead
-// of spending another full budget here.
+// mint — last of the three legs — dies on the deadline. The candidate spent the whole budget
+// and delivered nothing, so it is blocked for the TTL and the next attempt goes elsewhere
+// instead of spending another full budget here.
 func TestProvision_MintDeadlineBlocksTheCandidate(t *testing.T) {
 	f := &fakeClient{
 		createID: "sb-1",
-		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w: %w",
-			fmt.Errorf("rpc error: code = DeadlineExceeded: %w", context.DeadlineExceeded), provider.ErrCredential),
+		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
+			fmt.Errorf("rpc error: code = DeadlineExceeded: %w", context.DeadlineExceeded)),
 	}
 	p := newTestProvider(f)
 
@@ -1669,13 +1658,13 @@ func TestCheckRegistryAuth(t *testing.T) {
 	}
 
 	// Well-formedness is the shared check's, but it must reach the caller through here —
-	// and as ErrImagePull, so it fails this Pod rather than blocklisting the whole provider
+	// and as ErrImage, so it fails this Pod rather than blocklisting the whole provider
 	// the way ErrAuth would.
 	err := checkRegistryAuth(&provider.RegistryAuth{
 		AWSRole: &provider.AWSRoleAuth{RoleARN: arn}, // no region
 	})
-	if !errors.Is(err, provider.ErrImagePull) {
-		t.Fatalf("err = %v, want ErrImagePull", err)
+	if !errors.Is(err, provider.ErrImage) {
+		t.Fatalf("err = %v, want ErrImage", err)
 	}
 	if !strings.HasPrefix(err.Error(), "modal: ") {
 		t.Errorf("err = %q, want the adapter's prefix", err)
@@ -1683,8 +1672,8 @@ func TestCheckRegistryAuth(t *testing.T) {
 
 	// A kind Modal is not wired for must not silently become an anonymous pull.
 	err = checkRegistryAuth(&provider.RegistryAuth{Registry: "gcr.io"})
-	if !errors.Is(err, provider.ErrImagePull) {
-		t.Fatalf("err = %v, want ErrImagePull for an unwired kind", err)
+	if !errors.Is(err, provider.ErrImage) {
+		t.Fatalf("err = %v, want ErrImage for an unwired kind", err)
 	}
 }
 
@@ -1727,8 +1716,8 @@ func TestProvision_CarriesRegistryAuth(t *testing.T) {
 		ClaimName:    "claim-bad",
 		RegistryAuth: &provider.RegistryAuth{AWSRole: &provider.AWSRoleAuth{RoleARN: "arn:x"}},
 	})
-	if !errors.Is(err, provider.ErrImagePull) {
-		t.Fatalf("err = %v, want ErrImagePull", err)
+	if !errors.Is(err, provider.ErrImage) {
+		t.Fatalf("err = %v, want ErrImage", err)
 	}
 	if f2.createCnt != 0 {
 		t.Errorf("CreateSandbox called %d times, want 0", f2.createCnt)

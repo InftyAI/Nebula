@@ -17,7 +17,6 @@ limitations under the License.
 package metrics
 
 import (
-	"context"
 	"errors"
 	"time"
 
@@ -76,17 +75,19 @@ var (
 	}, withExtra("reason"))
 
 	// ProvisionDuration measures the provider's Provision call alone — not the
-	// wait for the instance to become usable. The two differ enormously and for
-	// different reasons: AWS sweeps a region's availability zones inside this call
-	// (so a capacity shortage shows up as latency HERE), while Modal returns as soon
-	// as the sandbox is accepted and the wait moves to InstanceReadyDuration.
-	// Bucketed out to 300s because the call is bounded by
-	// Capabilities.ProvisionTimeout, which AWS raises above the 90s default.
+	// wait for the instance to become usable. What lands here is provider-specific
+	// and worth knowing per provider: AWS sweeps a region's availability zones
+	// inside the call (so a capacity shortage shows up as latency HERE), Modal
+	// builds the image inside it (so a cache miss does).
+	//
+	// The top bucket tracks the largest Capabilities.ProvisionTimeout — Modal's 10
+	// minutes. A lower ceiling would bury every slow build in +Inf; at 600s, +Inf
+	// means one thing only: a call outran its own deadline.
 	ProvisionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "nebula_provision_duration_seconds",
 		Help: "Latency of the provider's Provision call, by provider, region, capacity type, " +
 			"accelerator type, accelerator count and outcome.",
-		Buckets: []float64{0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300},
+		Buckets: []float64{0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300, 420, 600},
 	}, withExtra("result"))
 
 	// InstanceReadyDuration measures the whole user-visible wait: from the moment
@@ -163,10 +164,7 @@ func FailureReason(err error) string {
 		return ReasonUnsupported
 	case errors.Is(err, provider.ErrNoCapacity):
 		return ReasonCapacity
-	// Checked after the sentinels: a provider that hits its own deadline while
-	// sweeping for capacity may wrap both, and the capacity cause is the more useful
-	// of the two.
-	case errors.Is(err, context.DeadlineExceeded):
+	case provider.IsDeadline(err):
 		return ReasonTimeout
 	default:
 		return ReasonOther

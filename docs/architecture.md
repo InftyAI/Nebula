@@ -604,10 +604,10 @@ Components designed to degrade without leaks:
 - **Provider unreachable during `Provision`.** Every provision failure fails the Pod, so
   placement can fail over rather than sit behind an attempt nothing re-enters. What the
   failure's *kind* still decides is the blocklist, and `provider.ClassifyError` is the
-  single answer: a transport error, timeout or 503 files nothing, because it is not
-  evidence about the candidate — the provider may well have accepted the request. Only a
-  decision about the candidate (no capacity, quota, unsupported accelerator) files an
-  entry, and only auth widens it to the whole provider. `Provision` is idempotent on
+  single answer: a transport error or 503 files nothing, because it is not evidence about
+  the candidate — the provider may well have accepted the request. An exhausted provision
+  timeout is candidate-scoped; other candidate decisions (no capacity, quota, unsupported
+  accelerator) also file an entry, and only auth widens it to the whole provider.
   `ClaimName`, so a re-provision adopts whatever the failed attempt created rather than
   doubling it.
 

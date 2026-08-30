@@ -76,29 +76,29 @@ func (a *RegistryAuth) Validate() error {
 		return nil // no credential is not a malformed one; an anonymous pull is legal
 	case a.AWSRole != nil && a.Basic != nil:
 		return fmt.Errorf("registry auth for %q sets two kinds at once: %w",
-			a.Registry, ErrImagePull)
+			a.Registry, ErrImage)
 	case a.AWSRole != nil:
 		if a.AWSRole.RoleARN == "" || a.AWSRole.Region == "" {
 			return fmt.Errorf("AWS role auth for %q needs both a role ARN and a region: %w",
-				a.Registry, ErrImagePull)
+				a.Registry, ErrImage)
 		}
 	case a.Basic != nil:
 		if a.Basic.Username == "" || a.Basic.Password == "" {
 			return fmt.Errorf("basic auth for %q needs both a username and a password: %w",
-				a.Registry, ErrImagePull)
+				a.Registry, ErrImage)
 		}
 	default:
-		return fmt.Errorf("registry auth for %q sets no credential: %w", a.Registry, ErrImagePull)
+		return fmt.Errorf("registry auth for %q sets no credential: %w", a.Registry, ErrImage)
 	}
 	return nil
 }
 
 // Unsupported is the error an adapter returns for a credential kind it cannot honour, named
-// so the message says which provider refused. Shared so the ErrImagePull wrap cannot be
+// so the message says which provider refused. Shared so the ErrImage wrap cannot be
 // forgotten: unwrapped, the same refusal reads as unattributable and the failure is reported
-// as an integration problem rather than the request's own (see ErrImagePull).
+// as an integration problem rather than the request's own (see ErrImage).
 func (a *RegistryAuth) Unsupported(providerName string) error {
-	return fmt.Errorf("%s: unsupported image pull credential %s: %w", providerName, a, ErrImagePull)
+	return fmt.Errorf("%s: unsupported image pull credential %s: %w", providerName, a, ErrImage)
 }
 
 // String names the role ARN — an identifier, and what makes "cannot assume this role"

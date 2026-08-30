@@ -45,25 +45,22 @@ func TestClassifyError(t *testing.T) {
 		{"quota sentinel", ErrQuota, capacityScope},
 		{"no-capacity sentinel", ErrNoCapacity, capacityScope},
 		{"unsupported sentinel", ErrUnsupportedAccelerator, capacityScope},
-		// An unusable image credential belongs to the POD. The blocklist key carries no Pod,
-		// image or credential identity, so ANY scope here would exclude the candidate for
-		// unrelated Pods that pull perfectly well — hence the zero scope, which blocks
-		// nothing.
-		{"image-pull sentinel blocks nothing", ErrImagePull, BlockScope{}},
+		// An image the provider cannot obtain belongs to the POD. The blocklist key carries no
+		// Pod, image or credential identity, so ANY scope here would exclude the candidate for
+		// unrelated Pods that pull perfectly well — hence the zero scope, which blocks nothing.
+		{"image sentinel blocks nothing", ErrImage, BlockScope{}},
 		{
-			"wrapped image-pull sentinel blocks nothing",
-			fmt.Errorf("modal: unsupported image pull credential: %w", ErrImagePull),
+			"unsupported pull credential blocks nothing",
+			fmt.Errorf("modal: unsupported image pull credential: %w", ErrImage),
 			BlockScope{},
 		},
-		// Same scope as a pull failure, and it must stay that way: the image is the Pod's,
-		// and a builder that refused this one has nothing to say about the candidate. The
-		// wrapped case is the shape Modal produces — the SDK's own verdict, then the label
-		// (see modal.sdkClient.buildImage) — and it is the one that regressed to DenyAll when the
-		// registry's "unauthorized" text was left to the heuristics.
-		{"image-build sentinel blocks nothing", ErrImageBuild, BlockScope{}},
+		// The one that matters: a build refused by the REGISTRY, which is the shape Modal
+		// produces — the SDK's own verdict, then the label (see modal.sdkClient.buildImage).
+		// This regressed to DenyAll once, when the registry's "unauthorized" text was left to
+		// the heuristics and one Pod's bad Secret fenced off the whole provider.
 		{
-			"wrapped image-build sentinel blocks nothing",
-			fmt.Errorf("modal: RemoteError: unauthorized: authentication required: %w", ErrImageBuild),
+			"registry refusal during a build blocks nothing",
+			fmt.Errorf("modal: RemoteError: unauthorized: authentication required: %w", ErrImage),
 			BlockScope{},
 		},
 		{"wrapped sentinel", fmt.Errorf("provision failed: %w", ErrNoCapacity), capacityScope},
@@ -85,24 +82,41 @@ func TestClassifyError(t *testing.T) {
 		// OUR clock outranks any label a sentinel carries: an adapter reports the failure it
 		// saw and cannot see whose deadline fired. So a build that ran out of budget is a
 		// capacity failure, not the zero-scope image failure its label suggests.
-		{"deadline wrapped in an image-build label",
-			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImageBuild), capacityScope},
+		{"deadline wrapped in an image label",
+			fmt.Errorf("modal: image build: %w: %w", context.DeadlineExceeded, ErrImage), capacityScope},
 		{"cancellation wrapped in a capacity label",
 			fmt.Errorf("sweep: %w: %w", context.Canceled, ErrNoCapacity), BlockScope{}},
 		// The form errors.Is CANNOT see: grpc-go turns a dead context into a status error
 		// that wraps nothing, and it is the likelier arrival — an SDK blocked in Recv finds
 		// out from gRPC, not from its own ctx.Err() poll.
-		{"grpc deadline wrapping an image-build label",
+		{"grpc deadline wrapping an image label",
 			fmt.Errorf("modal: image build: %w: %w",
 				errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
-				ErrImageBuild), capacityScope},
+				ErrImage), capacityScope},
 		// ...but a verdict Modal actually reached keeps the label's zero scope: the override
 		// fires only when the context is what died, so a registry refusal must not fence off
 		// the accelerator.
-		{"image-build label on a remote verdict",
+		{"image label on a remote verdict",
 			fmt.Errorf("modal: image build: %w: %w",
 				errors.New("Image build for im-1 failed with the exception:\nunauthorized"),
-				ErrImageBuild), BlockScope{}},
+				ErrImage), BlockScope{}},
+		// A mint failure carries no label, so it is scoped by its cause. That is the point: the
+		// mint uses OUR provider credentials, so an auth or rate-limit refusal there is
+		// provider-wide, and a request scope would fence off nothing while every replacement
+		// Pod picked the same broken provider.
+		{"mint failure on an auth refusal",
+			fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
+				errors.New("unauthorized")), BlockScope{DenyAll: true}},
+		{"mint failure on a rate limit",
+			fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
+				errors.New("429 rate limit exceeded")), capacityScope},
+		// Only a mint failure that names nothing recognizable stays at zero.
+		{"mint failure on a transport error",
+			fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
+				errors.New("rpc error: code = Unavailable")), BlockScope{}},
+		{"mint failure with no cause", errors.New("modal: connect credential minted without a token"),
+			BlockScope{}},
+
 		// A gRPC status renders "Unavailable" in its text, which the capacity heuristic
 		// would otherwise match — the misread the transport check precedes it for. A sentinel
 		// the adapter wrapped still wins over the raw text, so an adapter that classified a

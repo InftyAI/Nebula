@@ -574,9 +574,9 @@ func TestClassifyProvisionError(t *testing.T) {
 		// An image pull credential this adapter cannot honour is a fact about the POD, so it
 		// blocks nothing. Region must NOT be stamped on: a scope carrying only a region
 		// fences off every accelerator and tier there, on behalf of one Pod.
-		{"image pull blocks nothing", provider.ErrImagePull, provider.BlockScope{}},
+		{"image pull blocks nothing", provider.ErrImage, provider.BlockScope{}},
 		{"wrapped image pull blocks nothing",
-			fmt.Errorf("aws: unsupported image pull credential: %w", provider.ErrImagePull),
+			fmt.Errorf("aws: unsupported image pull credential: %w", provider.ErrImage),
 			provider.BlockScope{}},
 	}
 	for _, tt := range tests {

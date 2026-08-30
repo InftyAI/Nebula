@@ -45,6 +45,15 @@ func TestFailureReason(t *testing.T) {
 		// the capacity cause is the more useful of the two, so the sentinels come first.
 		{"capacity beats timeout", fmt.Errorf("%w: %w", provider.ErrNoCapacity, context.DeadlineExceeded), ReasonCapacity},
 		{"bare timeout", context.DeadlineExceeded, ReasonTimeout},
+		// The form errors.Is CANNOT see, and the one a timed-out Modal build actually arrives
+		// in: grpc-go renders an expired context as a status error wrapping nothing, under the
+		// adapter's image label. This read as "other" until FailureReason moved onto
+		// provider.IsDeadline — a real timeout reported as an unwrapped-adapter to-do, which is
+		// the one thing "other" must not mean.
+		{"grpc deadline under an image label",
+			fmt.Errorf("modal: image build: %w: %w",
+				errors.New("rpc error: code = DeadlineExceeded desc = context deadline exceeded"),
+				provider.ErrImage), ReasonTimeout},
 
 		// What matters here is that a transport failure does NOT read as a capacity
 		// shortfall, which would point the failure series at the wrong problem entirely.
