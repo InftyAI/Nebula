@@ -232,7 +232,7 @@ func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Imag
 
 	default:
 		// Refuse rather than pull anonymously; see provider.RegistryAuth.
-		return nil, fmt.Errorf("modal: unsupported image pull credential: %w", provider.ErrImage)
+		return nil, a.Unsupported("modal")
 	}
 }
 
@@ -240,7 +240,7 @@ func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Imag
 func (c *sdkClient) buildImage(ctx context.Context, app *modal.App, image *modal.Image) (*modal.Image, error) {
 	built, err := image.Build(ctx, app, nil)
 	if err != nil {
-		return nil, fmt.Errorf("modal: image build: %w: %w", err, provider.ErrImage)
+		return nil, fmt.Errorf("modal: image build: %w", err)
 	}
 	return built, nil
 }

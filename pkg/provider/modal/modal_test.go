@@ -966,7 +966,8 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	// credential belongs to one POD, so it blocks nothing. Stamping the region here would
 	// make the scope non-empty and fence off every accelerator in us-east because one Pod
 	// named a role Modal cannot assume.
-	if got := p.ClassifyProvisionError(provider.ErrImage, "H100:1", "us-east"); got !=
+	unusable := (&provider.RegistryAuth{Registry: "ghcr.io"}).Unsupported("modal")
+	if got := p.ClassifyProvisionError(unusable, "H100:1", "us-east"); got !=
 		(provider.BlockScope{}) {
 		t.Fatalf("an image failure must block nothing, got %+v", got)
 	}
@@ -981,27 +982,36 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 
-	// The shape buildImage produces: Modal's verdict, carrying the registry's text, wrapped
-	// with the sentinel. Spelled as the verdict's rendered text rather than the SDK type, to
-	// keep this file SDK-free — under test is the label, not how buildImage obtained one.
+	// The shape buildImage produces: Modal's own verdict, carrying the registry's text.
+	// Spelled as the verdict's rendered text rather than the SDK type, to keep this file
+	// SDK-free — under test is the classification, not how buildImage obtained the error.
 	verdict := errors.New("RemoteError: Image build for im-1 failed with the exception:\n" +
 		"unauthorized: authentication required")
-	err := fmt.Errorf("modal: image build: %w: %w", verdict, provider.ErrImage)
+	err := fmt.Errorf("modal: image build: %w", verdict)
 
 	// Blocks nothing at all: the image is a property of the request, and no region or tier
 	// builds an image Modal refused to build.
 	if got := p.ClassifyProvisionError(err, "H100:1", "us-east"); got != (provider.BlockScope{}) {
 		t.Fatalf("an image build failure must block nothing, got %+v", got)
 	}
-	// The label is what keeps it at zero: the registry's "unauthorized" text left to the
-	// heuristics reads as auth and fences off the whole provider.
-	if !errors.Is(err, provider.ErrImage) {
-		t.Error("an image build failure must carry the ErrImage label")
+	// The verdict's own phrasing is what keeps it at zero, now that no sentinel does. If the
+	// SDK ever rewords this line, the registry's "unauthorized" falls through to the auth
+	// heuristic and fences the provider — so pin the phrase the classifier depends on.
+	if !strings.Contains(err.Error(), "Image build for") {
+		t.Errorf("err = %q, want the SDK's build-verdict phrasing preserved", err)
 	}
-	// The registry's text survives for whoever has to fix the Secret. It is the only thing
-	// that says WHICH of the image failures this was, now that one sentinel covers them all.
+	// The registry's text survives for whoever has to fix the Secret.
 	if !strings.Contains(err.Error(), "authentication required") {
 		t.Errorf("err = %q, want the registry's reason preserved", err)
+	}
+
+	// The counterpart, and why the phrase must be specific: the SAME call fails this way when
+	// MODAL refuses US. No build verdict, so it must NOT be excused as the request's problem —
+	// an expired workspace token has to fence the provider, or every replacement Pod retries it.
+	refused := fmt.Errorf("modal: image build: %w",
+		errors.New("rpc error: code = Unauthenticated desc = invalid token"))
+	if got := p.ClassifyProvisionError(refused, "H100:1", "us-east"); !got.DenyAll {
+		t.Fatalf("Modal refusing our credentials must fence the provider, got %+v", got)
 	}
 }
 
@@ -1657,14 +1667,15 @@ func TestCheckRegistryAuth(t *testing.T) {
 		t.Fatalf("basic: %v", err)
 	}
 
-	// Well-formedness is the shared check's, but it must reach the caller through here —
-	// and as ErrImage, so it fails this Pod rather than blocklisting the whole provider
-	// the way ErrAuth would.
+	// Well-formedness is the shared check's, but it must reach the caller through here — and
+	// scope the block to this Pod rather than fencing the whole provider the way an auth
+	// reading would.
 	err := checkRegistryAuth(&provider.RegistryAuth{
 		AWSRole: &provider.AWSRoleAuth{RoleARN: arn}, // no region
 	})
-	if !errors.Is(err, provider.ErrImage) {
-		t.Fatalf("err = %v, want ErrImage", err)
+	if got := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("err = %v, BlockScope = %+v, want zero", err, got)
 	}
 	if !strings.HasPrefix(err.Error(), "modal: ") {
 		t.Errorf("err = %q, want the adapter's prefix", err)
@@ -1672,8 +1683,12 @@ func TestCheckRegistryAuth(t *testing.T) {
 
 	// A kind Modal is not wired for must not silently become an anonymous pull.
 	err = checkRegistryAuth(&provider.RegistryAuth{Registry: "gcr.io"})
-	if !errors.Is(err, provider.ErrImage) {
-		t.Fatalf("err = %v, want ErrImage for an unwired kind", err)
+	if err == nil {
+		t.Fatal("checkRegistryAuth() = nil for an unwired kind, want an error")
+	}
+	if got := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("err = %v, BlockScope = %+v, want zero for an unwired kind", err, got)
 	}
 }
 
@@ -1716,8 +1731,9 @@ func TestProvision_CarriesRegistryAuth(t *testing.T) {
 		ClaimName:    "claim-bad",
 		RegistryAuth: &provider.RegistryAuth{AWSRole: &provider.AWSRoleAuth{RoleARN: "arn:x"}},
 	})
-	if !errors.Is(err, provider.ErrImage) {
-		t.Fatalf("err = %v, want ErrImage", err)
+	if got := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("err = %v, BlockScope = %+v, want zero", err, got)
 	}
 	if f2.createCnt != 0 {
 		t.Errorf("CreateSandbox called %d times, want 0", f2.createCnt)

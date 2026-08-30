@@ -48,9 +48,6 @@ var (
 	// nothing about the same request in another. The adapter confines it to the
 	// failing region (see aws.ClassifyProvisionError). Transient until quota frees up.
 	ErrQuota = errors.New("provider: quota exceeded")
-	// ErrImage: the provider could not obtain the image it was asked to run — a credential it
-	// cannot honour, one it was not given, a registry that refused it, or a build that failed.
-	ErrImage = errors.New("provider: cannot obtain image")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be blocklisted at,
@@ -179,11 +176,33 @@ func categorize(err error) failureCategory {
 	switch {
 	case errors.Is(err, ErrAuth):
 		return catAuth
-	case errors.Is(err, ErrImage):
-		return catRequest
 	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator),
 		errors.Is(err, ErrQuota):
 		return catCapacity
+	}
+
+	// An image the provider cannot obtain belongs to the REQUEST. This MUST precede the auth
+	// checks below, because both failures render the same word: a registry's "unauthorized" is
+	// the Pod's own pull credential, and reading it as ours would fence the whole provider for
+	// one bad Secret. Two phrase families, no sentinel:
+	//   - "image pull credential": ours (see RegistryAuth.Validate and Unsupported).
+	//   - "image build for": the Modal SDK's remote build verdict, the only thing it says when
+	//     the build itself reached a decision. An API error from the same call does NOT carry
+	//     it, which is what keeps an expired workspace token classifiable as auth below.
+	if containsAny(msg, "image pull credential", "image build for") {
+		return catRequest
+	}
+
+	// A gRPC status code is a VERDICT, so it outranks the transport catch-all below — "rpc
+	// error" alone would file an expired provider credential as unattributable, fencing nothing
+	// while every replacement Pod retried the same broken provider.
+	if strings.Contains(msg, "rpc error") {
+		switch {
+		case containsAny(msg, "code = unauthenticated", "code = permissiondenied"):
+			return catAuth
+		case strings.Contains(msg, "code = resourceexhausted"):
+			return catCapacity
+		}
 	}
 
 	if containsAny(msg,
@@ -194,7 +213,8 @@ func categorize(err error) failureCategory {
 	}
 
 	switch {
-	case containsAny(msg, "unauthorized", "forbidden", "authentication", "invalid token", "api key"):
+	case containsAny(msg, "unauthorized", "forbidden", "authentication",
+		"unauthenticated", "invalid token", "api key"):
 		return catAuth
 	case containsAny(msg, "quota", "limit exceeded", "rate limit"):
 		return catCapacity
