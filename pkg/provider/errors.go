@@ -50,8 +50,6 @@ var (
 	ErrQuota = errors.New("provider: quota exceeded")
 	// ErrImage: the provider could not obtain the image it was asked to run — a credential it
 	// cannot honour, one it was not given, a registry that refused it, or a build that failed.
-	// ONE sentinel for all of those because pulling and building are not separable outcomes:
-	// the provider pulls the image as part of building it (see modal.sdkClient.buildImage).
 	ErrImage = errors.New("provider: cannot obtain image")
 )
 
