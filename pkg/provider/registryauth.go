@@ -74,31 +74,32 @@ func (a *RegistryAuth) Validate() error {
 	switch {
 	case a == nil:
 		return nil // no credential is not a malformed one; an anonymous pull is legal
+	// Every message says "image pull credential" on purpose: that phrase is what
+	// ClassifyError matches to scope the failure to this Pod instead of the candidate.
 	case a.AWSRole != nil && a.Basic != nil:
-		return fmt.Errorf("registry auth for %q sets two kinds at once: %w",
-			a.Registry, ErrImagePull)
+		return fmt.Errorf("image pull credential for %q sets two kinds at once", a.Registry)
 	case a.AWSRole != nil:
 		if a.AWSRole.RoleARN == "" || a.AWSRole.Region == "" {
-			return fmt.Errorf("AWS role auth for %q needs both a role ARN and a region: %w",
-				a.Registry, ErrImagePull)
+			return fmt.Errorf("image pull credential for %q (AWS role) needs both a role ARN and a region",
+				a.Registry)
 		}
 	case a.Basic != nil:
 		if a.Basic.Username == "" || a.Basic.Password == "" {
-			return fmt.Errorf("basic auth for %q needs both a username and a password: %w",
-				a.Registry, ErrImagePull)
+			return fmt.Errorf("image pull credential for %q (basic auth) needs both a username and a password",
+				a.Registry)
 		}
 	default:
-		return fmt.Errorf("registry auth for %q sets no credential: %w", a.Registry, ErrImagePull)
+		return fmt.Errorf("image pull credential for %q sets no credential", a.Registry)
 	}
 	return nil
 }
 
 // Unsupported is the error an adapter returns for a credential kind it cannot honour, named
-// so the message says which provider refused. Shared so the ErrImagePull wrap cannot be
-// forgotten: unwrapped, the same refusal reads as unattributable and the Pod retries against
-// a provider that will never accept it (see ErrImagePull, IsRejection).
+// so the message says which provider refused. Shared so the phrase ClassifyError keys on
+// ("image pull credential") cannot be reworded away in one adapter: without it the same
+// refusal reads as OUR auth failing and fences the whole provider.
 func (a *RegistryAuth) Unsupported(providerName string) error {
-	return fmt.Errorf("%s: unsupported image pull credential %s: %w", providerName, a, ErrImagePull)
+	return fmt.Errorf("%s: unsupported image pull credential %s", providerName, a)
 }
 
 // String names the role ARN — an identifier, and what makes "cannot assume this role"

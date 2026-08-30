@@ -34,17 +34,21 @@ claim identity). Do not duplicate Pod fields onto the request.
 
 ### Wrap the errors your `Provision` returns
 
-`ClassifyProvisionError` decides *how widely* to blocklist, but a separate predicate —
-`provider.IsRejection` — decides *whether to blocklist at all*, and whether the Pod is
-failed. It answers: did the provider make a decision about this request ("no capacity",
-"over quota", "bad credentials"), or did we merely fail to find out what it would have
-decided (a transport error, a timeout, a 503)?
+`provider.ClassifyError` — which `ClassifyProvisionError` delegates to before adding
+anything provider-specific — is the *single* answer to what a failure blocklists, and its
+**zero scope means "block nothing"**. Three outcomes are possible: a decision about the
+candidate ("no capacity", "over quota", "I do not offer that accelerator") is scoped to
+that accelerator and tier so failover routes around it; bad credentials widen to the whole
+provider; and two cases block nothing at all — a failure that belongs to the *request*
+rather than the candidate (an image it cannot pull or build), and one that could not be
+attributed to either (a transport error, a 503, an unparseable response).
 
-Only a **decision** is acted on. An unattributable failure leaves the Pod
-non-terminal at `Provisioning` for the pod controller to retry, and records nothing —
-because failing a Pod there would stamp a terminal verdict on a request the provider may
-well have accepted, reaping the Pod out from under a paid instance whose id was never
-returned.
+The Pod fails either way, so failover can pick a different candidate rather than sit behind
+an attempt nothing re-enters. What your wrapping decides is whether a candidate is fenced
+off for the blocklist TTL — and getting it wrong is expensive in both directions: an
+unwrapped image failure whose text says `unauthorized` reads as auth and fences off your
+entire provider, while an unwrapped capacity refusal lets the next Pod fail exactly the
+same way.
 
 What this asks of an adapter: **wrap every error your `Provision` path returns with the
 matching sentinel** (`fmt.Errorf("...: %w", provider.ErrNoCapacity)`). A wrapped sentinel

@@ -46,8 +46,17 @@ type fakeClient struct {
 	createCnt  int
 	createErr  error
 	createID   string
-	cred       Credential // credential CreateSandbox returns; zero = none minted
+	cred       Credential // credential CreateSandbox returns alongside its id
 	terminated []string
+
+	// The mint path: what MintConnectCredential returns, and what it was asked for.
+	// mintCnt is the assertion that matters most — minting when a token is already held
+	// is the one mistake nothing can undo.
+	mintCred Credential
+	mintErr  error
+	mintCnt  int
+	mintID   string
+	mintPort int
 
 	// logs is the stream SandboxLogs hands back, and logsFor records the id it was
 	// asked for — the one thing the adapter decides on that path.
@@ -74,6 +83,15 @@ func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string,
 	}
 	f.sandboxes = append(f.sandboxes, Sandbox{ID: id, Tags: spec.Tags, Status: "pending"})
 	return id, f.cred, nil
+}
+
+func (f *fakeClient) MintConnectCredential(_ context.Context, id string, port int) (Credential, error) {
+	f.mintCnt++
+	f.mintID, f.mintPort = id, port
+	if f.mintErr != nil {
+		return Credential{}, f.mintErr
+	}
+	return f.mintCred, nil
 }
 
 func (f *fakeClient) TerminateSandbox(_ context.Context, id string) error {
@@ -446,7 +464,7 @@ func TestClassifyProvisionError(t *testing.T) {
 		{"string no capacity", fmt.Errorf("no capacity available in region"), onDemand},
 		// An unrecognized error is scoped like capacity, not DenyAll: a whole-provider
 		// block on an unidentifiable failure is too broad; failover routes around it.
-		{"unknown capacity-scoped", fmt.Errorf("weird transient blip"), onDemand},
+		{"unknown blocks nothing", fmt.Errorf("weird transient blip"), provider.BlockScope{}},
 		{"nil", nil, provider.BlockScope{}},
 	}
 	for _, tt := range tests {
@@ -464,6 +482,13 @@ func TestCapabilities(t *testing.T) {
 	caps := p.Capabilities()
 	if caps.SupportsStop || caps.SupportsSpot || caps.PreemptionNotice != 0 || !caps.NativeTags {
 		t.Fatalf("unexpected caps: %+v", caps)
+	}
+	// Must be STATED, and above the handler's generic default: Provision blocks on the image
+	// build here, so this adapter needs more than a provider whose create just returns an id.
+	// Zero is the regression to guard — it silently reverts to that default.
+	if caps.ProvisionTimeout != provisionTimeout {
+		t.Fatalf("ProvisionTimeout = %v, want %v to cover a cold image build",
+			caps.ProvisionTimeout, provisionTimeout)
 	}
 	if p.Name() != provider.ProviderModal {
 		t.Fatalf("name = %q", p.Name())
@@ -941,9 +966,52 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	// credential belongs to one POD, so it blocks nothing. Stamping the region here would
 	// make the scope non-empty and fence off every accelerator in us-east because one Pod
 	// named a role Modal cannot assume.
-	if got := p.ClassifyProvisionError(provider.ErrImagePull, "H100:1", "us-east"); got !=
+	unusable := (&provider.RegistryAuth{Registry: "ghcr.io"}).Unsupported("modal")
+	if got := p.ClassifyProvisionError(unusable, "H100:1", "us-east"); got !=
 		(provider.BlockScope{}) {
-		t.Fatalf("an image-pull rejection must block nothing, got %+v", got)
+		t.Fatalf("an image failure must block nothing, got %+v", got)
+	}
+}
+
+// TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider is the regression test for the
+// worst blast radius this adapter can produce. Modal relays the REGISTRY's words in a build
+// failure, and a private registry's 401 says "unauthorized" — the same word the shared auth
+// heuristic promotes to DenyAll, which is meant for OUR workspace credentials being wrong.
+// Unlabelled, one Pod naming an image it cannot pull would fence off the entire provider for
+// the blocklist TTL, failing over every other workload for something none of them did.
+func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	// The shape buildImage produces: Modal's own verdict, carrying the registry's text.
+	// Spelled as the verdict's rendered text rather than the SDK type, to keep this file
+	// SDK-free — under test is the classification, not how buildImage obtained the error.
+	verdict := errors.New("RemoteError: Image build for im-1 failed with the exception:\n" +
+		"unauthorized: authentication required")
+	err := fmt.Errorf("modal: image build: %w", verdict)
+
+	// Blocks nothing at all: the image is a property of the request, and no region or tier
+	// builds an image Modal refused to build.
+	if got := p.ClassifyProvisionError(err, "H100:1", "us-east"); got != (provider.BlockScope{}) {
+		t.Fatalf("an image build failure must block nothing, got %+v", got)
+	}
+	// The verdict's own phrasing is what keeps it at zero, now that no sentinel does. If the
+	// SDK ever rewords this line, the registry's "unauthorized" falls through to the auth
+	// heuristic and fences the provider — so pin the phrase the classifier depends on.
+	if !strings.Contains(err.Error(), "Image build for") {
+		t.Errorf("err = %q, want the SDK's build-verdict phrasing preserved", err)
+	}
+	// The registry's text survives for whoever has to fix the Secret.
+	if !strings.Contains(err.Error(), "authentication required") {
+		t.Errorf("err = %q, want the registry's reason preserved", err)
+	}
+
+	// The counterpart, and why the phrase must be specific: the SAME call fails this way when
+	// MODAL refuses US. No build verdict, so it must NOT be excused as the request's problem —
+	// an expired workspace token has to fence the provider, or every replacement Pod retries it.
+	refused := fmt.Errorf("modal: image build: %w",
+		errors.New("rpc error: code = Unauthenticated desc = invalid token"))
+	if got := p.ClassifyProvisionError(refused, "H100:1", "us-east"); !got.DenyAll {
+		t.Fatalf("Modal refusing our credentials must fence the provider, got %+v", got)
 	}
 }
 
@@ -1025,37 +1093,76 @@ func TestProvision_ReturnsMintedCredential(t *testing.T) {
 	}
 }
 
-// A sandbox that minted nothing yields no credential rather than an error: it still
-// exists, still costs money, and must still be reported and reclaimed.
-func TestProvision_NoCredentialWhenNoneMinted(t *testing.T) {
-	f := &fakeClient{createID: "sb-1"} // zero cred
+// A sandbox that came up but could not be given a credential is unreachable, and nothing
+// revisits it: minting is one-shot with no read-back, and the idempotent branch below hands
+// back no credential. So the create reports a failure and no id, and the Pod fails terminally
+// for its owner to recreate — the only recovery left. This mint named no cause, so it blocks
+// nothing; one that names an auth or rate-limit refusal does fence the provider (see
+// provider.ClassifyError).
+func TestProvision_FailsWhenCreateCannotMint(t *testing.T) {
+	f := &fakeClient{
+		createID:  "sb-1",
+		createErr: errors.New("modal: sandbox sb-1: connect credential minted without a token"),
+	}
 	p := newTestProvider(f)
 
 	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
 		provider.ProvisionRequest{ClaimName: "claim-a"})
-	if err != nil {
-		t.Fatalf("Provision: %v", err)
+	if err == nil {
+		t.Fatal("Provision succeeded; a sandbox that could not be given a credential is unreachable")
 	}
-	if res.InstanceID != "sb-1" {
-		t.Fatalf("InstanceID = %q, want sb-1 even with no credential", res.InstanceID)
+	if res.InstanceID != "" {
+		t.Fatalf("InstanceID = %q, want empty so nothing reads a half-provisioned result", res.InstanceID)
 	}
-	if res.ConnectURL != "" || res.ConnectToken != "" {
-		t.Fatalf("expected no credential, got url=%q token set=%t", res.ConnectURL, res.ConnectToken != "")
+	if scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope !=
+		(provider.BlockScope{}) {
+		t.Fatalf("BlockScope = %+v, want zero; the request failed, not the candidate", scope)
 	}
 }
 
-// An idempotent re-Provision carries NO credential. The original was minted once and
-// cannot be re-read, and minting a second one here would hand the consumer a token
-// that changes on every retry.
-func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
+// The production shape of the same failure: the image build eats the provision budget and the
+// mint — last of the three legs — dies on the deadline. The candidate spent the whole budget
+// and delivered nothing, so it is blocked for the TTL and the next attempt goes elsewhere
+// instead of spending another full budget here.
+func TestProvision_MintDeadlineBlocksTheCandidate(t *testing.T) {
 	f := &fakeClient{
+		createID: "sb-1",
+		createErr: fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
+			fmt.Errorf("rpc error: code = DeadlineExceeded: %w", context.DeadlineExceeded)),
+	}
+	p := newTestProvider(f)
+
+	_, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err == nil {
+		t.Fatal("Provision succeeded; the sandbox has no credential")
+	}
+	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1")
+	if scope == (provider.BlockScope{}) || scope.DenyAll {
+		t.Fatalf("BlockScope = %+v, want an accelerator-scoped block for a spent budget", scope)
+	}
+}
+
+// adoptable returns a client holding one Running sandbox tagged for claim-a, so a
+// Provision for that claim takes the idempotent branch instead of creating.
+func adoptable() *fakeClient {
+	return &fakeClient{
 		sandboxes: []Sandbox{{
 			ID:     "sb-existing",
 			Tags:   map[string]string{ClaimTagKey: "claim-a"},
 			Status: statusRunning,
 		}},
-		cred: Credential{URL: "https://x.modal.host", Token: "tok-abc"},
+		cred:     Credential{URL: "https://created.modal.host", Token: "tok-created"},
+		mintCred: Credential{URL: "https://minted.modal.host", Token: "tok-minted"},
 	}
+}
+
+// An adopted sandbox NEVER carries a credential, whatever the Pod looks like. Its token was
+// minted once, at create, and cannot be read back; a second one would leave the consumer
+// holding a token the Secret no longer matches, with the original still valid and unrevokable.
+// The instance id and its state are all the branch reports.
+func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
+	f := adoptable()
 	p := newTestProvider(f)
 
 	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
@@ -1065,6 +1172,15 @@ func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
 	}
 	if res.InstanceID != "sb-existing" {
 		t.Fatalf("InstanceID = %q, want sb-existing", res.InstanceID)
+	}
+	if !res.Reserved {
+		t.Fatal("Reserved = false for an adopted Running sandbox, which has its capacity")
+	}
+	if f.createCnt != 0 {
+		t.Fatalf("created %d sandboxes; the claim tag must be adopted, not duplicated", f.createCnt)
+	}
+	if f.mintCnt != 0 {
+		t.Fatalf("minted %d credentials for an adopted sandbox; want 0", f.mintCnt)
 	}
 	if res.ConnectURL != "" || res.ConnectToken != "" {
 		t.Fatalf("an adopted sandbox must carry no credential, got url=%q token set=%t",
@@ -1551,14 +1667,15 @@ func TestCheckRegistryAuth(t *testing.T) {
 		t.Fatalf("basic: %v", err)
 	}
 
-	// Well-formedness is the shared check's, but it must reach the caller through here —
-	// and as ErrImagePull, so it fails this Pod rather than blocklisting the whole provider
-	// the way ErrAuth would.
+	// Well-formedness is the shared check's, but it must reach the caller through here — and
+	// scope the block to this Pod rather than fencing the whole provider the way an auth
+	// reading would.
 	err := checkRegistryAuth(&provider.RegistryAuth{
 		AWSRole: &provider.AWSRoleAuth{RoleARN: arn}, // no region
 	})
-	if !errors.Is(err, provider.ErrImagePull) {
-		t.Fatalf("err = %v, want ErrImagePull", err)
+	if got := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("err = %v, BlockScope = %+v, want zero", err, got)
 	}
 	if !strings.HasPrefix(err.Error(), "modal: ") {
 		t.Errorf("err = %q, want the adapter's prefix", err)
@@ -1566,8 +1683,12 @@ func TestCheckRegistryAuth(t *testing.T) {
 
 	// A kind Modal is not wired for must not silently become an anonymous pull.
 	err = checkRegistryAuth(&provider.RegistryAuth{Registry: "gcr.io"})
-	if !errors.Is(err, provider.ErrImagePull) {
-		t.Fatalf("err = %v, want ErrImagePull for an unwired kind", err)
+	if err == nil {
+		t.Fatal("checkRegistryAuth() = nil for an unwired kind, want an error")
+	}
+	if got := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("err = %v, BlockScope = %+v, want zero for an unwired kind", err, got)
 	}
 }
 
@@ -1610,8 +1731,9 @@ func TestProvision_CarriesRegistryAuth(t *testing.T) {
 		ClaimName:    "claim-bad",
 		RegistryAuth: &provider.RegistryAuth{AWSRole: &provider.AWSRoleAuth{RoleARN: "arn:x"}},
 	})
-	if !errors.Is(err, provider.ErrImagePull) {
-		t.Fatalf("err = %v, want ErrImagePull", err)
+	if got := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); got !=
+		(provider.BlockScope{}) {
+		t.Fatalf("err = %v, BlockScope = %+v, want zero", err, got)
 	}
 	if f2.createCnt != 0 {
 		t.Errorf("CreateSandbox called %d times, want 0", f2.createCnt)

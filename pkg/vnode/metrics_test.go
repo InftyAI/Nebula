@@ -128,15 +128,15 @@ func TestCreatePod_RecordsRejectionReason(t *testing.T) {
 }
 
 // An unreachable provider is still a counted ATTEMPT — the call happened and failed —
-// even though the handler deliberately does not fail the Pod or blocklist anything for
-// it. reason="unreachable" is what distinguishes an integration outage from a capacity
-// shortfall, which is the whole reason the two are not both "other".
-func TestCreatePod_UnreachableProviderCountedSeparately(t *testing.T) {
+// even though the handler blocklists nothing for it. It counts as reason="other", and what
+// this pins is that it does NOT count as capacity: "Unavailable" in a gRPC status text must
+// not read as a shortfall, or the failure series points at the wrong problem.
+func TestCreatePod_UnreachableProviderNotCountedAsCapacity(t *testing.T) {
 	failure := labelsFor("result", metrics.ResultFailure)
-	unreachable := labelsFor("reason", metrics.ReasonUnreachable)
+	other := labelsFor("reason", metrics.ReasonOther)
 	capacity := labelsFor("reason", metrics.ReasonCapacity)
 	beforeAttempts := testutil.ToFloat64(metrics.ProvisionAttempts.With(failure))
-	beforeUnreachable := testutil.ToFloat64(metrics.ProvisionFailures.With(unreachable))
+	beforeOther := testutil.ToFloat64(metrics.ProvisionFailures.With(other))
 	beforeCapacity := testutil.ToFloat64(metrics.ProvisionFailures.With(capacity))
 
 	fp := &fakeProvider{provisionErr: errors.New("rpc error: code = Unavailable desc = transport is closing")}
@@ -148,10 +148,9 @@ func TestCreatePod_UnreachableProviderCountedSeparately(t *testing.T) {
 	if got := testutil.ToFloat64(metrics.ProvisionAttempts.With(failure)) - beforeAttempts; got != 1 {
 		t.Fatalf("failure attempts delta = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(metrics.ProvisionFailures.With(unreachable)) - beforeUnreachable; got != 1 {
-		t.Fatalf("unreachable failures delta = %v, want 1", got)
+	if got := testutil.ToFloat64(metrics.ProvisionFailures.With(other)) - beforeOther; got != 1 {
+		t.Fatalf("other failures delta = %v, want 1", got)
 	}
-	// "Unavailable" in the gRPC status text must not be read as a capacity shortfall.
 	if got := testutil.ToFloat64(metrics.ProvisionFailures.With(capacity)) - beforeCapacity; got != 0 {
 		t.Fatalf("capacity failures delta = %v, want 0 for a transport error", got)
 	}

@@ -601,13 +601,15 @@ Components designed to degrade without leaks:
   suppresses both a duplicate `CreatePod` and a premature `DeletePod` until the
   provider answers. Conflating the two would let one failed list mark a healthy Pod
   `Failed` for reaping while the paid instance kept running behind a zero instance id.
-- **Provider unreachable during `Provision`.** Distinguished from a *rejection*
-  (`provider.IsRejection`). Only a rejection — no capacity, quota, auth, unsupported
-  accelerator — fails the Pod and files a blocklist entry. A transport error, timeout
-  or 503 leaves the Pod non-terminal at `Provisioning` with the error as its message
-  and records nothing, because it is not evidence about the request: the provider may
-  have accepted it. `Provision` is idempotent on `ClaimName`, so the retry adopts
-  whatever the failed attempt created rather than doubling it.
+- **Provider unreachable during `Provision`.** Every provision failure fails the Pod, so
+  placement can fail over rather than sit behind an attempt nothing re-enters. What the
+  failure's *kind* still decides is the blocklist, and `provider.ClassifyError` is the
+  single answer: a transport error or 503 files nothing, because it is not evidence about
+  the candidate — the provider may well have accepted the request. An exhausted provision
+  timeout is candidate-scoped; other candidate decisions (no capacity, quota, unsupported
+  accelerator) also file an entry, and only auth widens it to the whole provider.
+  `ClaimName`, so a re-provision adopts whatever the failed attempt created rather than
+  doubling it.
 
 Leader election (`LeaderElectionID: nebula.inftyai.com`) keeps a single active
 manager reconciling controllers and owning virtual-node leases.

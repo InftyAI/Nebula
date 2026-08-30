@@ -87,7 +87,7 @@ What the external call cost, and how it failed.
 | --- | --- | --- |
 | `nebula_provision_attempts_total{result}` | counter | Provisioning volume and error rate, per candidate. |
 | `nebula_provision_failures_total{reason}` | counter | *Why* provisioning fails. |
-| `nebula_provision_duration_seconds{result}` | histogram | Latency of the `Provision` call alone. AWS sweeps a region's availability zones inside it, so a capacity shortage shows up as latency *here*; Modal returns as soon as the sandbox is accepted and the wait moves to the next metric. |
+| `nebula_provision_duration_seconds{result}` | histogram | Latency of the `Provision` call alone. What lands here is provider-specific: AWS sweeps a region's availability zones inside the call, so a capacity shortage shows up as latency *here*; Modal builds the image inside it, so a build-cache miss does. Bucketed to 600s, the largest `ProvisionTimeout` — so `+Inf` means a call outran its own deadline. |
 | `nebula_instance_ready_duration_seconds` | histogram | The whole user-visible wait, from `CreatePod` to the first poll tick reporting `Running` — including provider-side queueing, image pull, GPU attach and up to one poll interval of detection lag. |
 
 `nebula_provision_failures_total` deliberately overlaps
@@ -105,8 +105,7 @@ The failure `reason` is a coarse, closed set, mapped from the shared sentinels i
 | `auth` | `ErrAuth` — credentials or permissions. |
 | `unsupported_accelerator` | `ErrUnsupportedAccelerator` — the request cannot be honoured here at all. |
 | `timeout` | The `Provision` call hit its own deadline without a capacity cause. |
-| `unreachable` | The provider never told us what it decided. |
-| `other` | The provider *did* reject the request, but the adapter returned a raw API error without wrapping a sentinel, so the category was unavailable. |
+| `other` | No sentinel, so the category was unavailable — either the adapter returned a raw API error without wrapping one, or the provider never told us what it decided at all. |
 
 Fine-grained detail is deliberately *not* here: it stays where it is already available
 (the Pod's `Failed` status message and the `vnode-handler` error log). These labels exist
@@ -149,11 +148,11 @@ Five label values are load-bearing:
 - **`region`** is the provider's own token, not necessarily one region. For a provider that
   collapses every declared region into a single candidate (Modal) it is the joined form —
   the same value `NodeClaimSpec.Region` carries.
-- **`reason="unreachable"`** means the provider never told us what it decided: a transport
-  failure, a 503, an unparseable response. It is the one failure reason for which Nebula
-  deliberately does *not* fail the Pod or blocklist the candidate (see
-  `provider.IsRejection`), so a spike here alongside flat `capacity`/`auth` series is a
-  network or provider-outage problem, not a placement one.
+- **`reason="other"`** covers both an adapter that did not wrap its errors and a provider
+  that never told us what it decided (a transport failure, a 503). Neither blocklists the
+  candidate on its own, and the two are separated in the `vnode-handler` error log rather
+  than in the label. A spike here alongside flat `capacity`/`auth` series is the shape of a
+  network or provider outage.
 
 Cardinality is bounded by *configuration*, not by workload: providers x regions x tiers x
 accelerator pools, all of which come from NodePools and provider catalogs. Nothing

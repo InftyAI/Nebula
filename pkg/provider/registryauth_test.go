@@ -17,9 +17,10 @@ limitations under the License.
 package provider
 
 import (
-	"errors"
 	"strings"
 	"testing"
+
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
 
 func TestRegistryAuthValidate(t *testing.T) {
@@ -70,13 +71,13 @@ func TestRegistryAuthValidate(t *testing.T) {
 			if err == nil {
 				t.Fatal("Validate() = nil, want an error")
 			}
-			// The sentinel is the contract: ErrImagePull scopes the block to this Pod's
-			// request, where ErrAuth would fence off the entire provider.
-			if !errors.Is(err, ErrImagePull) {
-				t.Errorf("Validate() = %v, want it to wrap ErrImagePull", err)
-			}
-			if errors.Is(err, ErrAuth) {
-				t.Errorf("Validate() = %v, must NOT wrap ErrAuth (it widens to DenyAll)", err)
+			// The resulting SCOPE is the contract, and the message text is how it is
+			// reached: a malformed credential is this Pod's problem, so it must blocklist
+			// nothing. Reword these messages without "image pull credential" and the same
+			// refusal reads as auth and fences the entire provider — which is what this
+			// asserts, since there is no sentinel left to carry the intent.
+			if scope := ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope != (BlockScope{}) {
+				t.Errorf("Validate() = %v, BlockScope = %+v, want zero", err, scope)
 			}
 			if strings.Contains(err.Error(), "hunter2") {
 				t.Errorf("Validate() = %q, must not leak the password", err)
@@ -91,13 +92,11 @@ func TestRegistryAuthUnsupported(t *testing.T) {
 		Basic:    &BasicAuth{Username: "bot", Password: "hunter2"},
 	}).Unsupported("aws")
 
-	if !errors.Is(err, ErrImagePull) {
-		t.Errorf("err = %v, want it to wrap ErrImagePull", err)
-	}
-	// A refusal must be a rejection, not an unattributable failure: the latter leaves the
-	// Pod retrying against a provider that will never accept the credential.
-	if !IsRejection(err) {
-		t.Errorf("IsRejection(%v) = false, want true", err)
+	// The refusal is the POD's, so it must blocklist nothing: the candidate accepts other
+	// Pods' credentials perfectly well, and "unsupported credential" text left to the
+	// heuristics would read as auth and fence off the whole provider.
+	if scope := ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1"); scope != (BlockScope{}) {
+		t.Errorf("BlockScope = %+v, want zero", scope)
 	}
 	if !strings.Contains(err.Error(), "aws") {
 		t.Errorf("err = %q, want the refusing provider named", err)

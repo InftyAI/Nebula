@@ -66,6 +66,12 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
+// provisionTimeout raises the vnode handler's generic Provision deadline, because Provision
+// here BLOCKS on the image build (see sdkClient.buildImage): a cold image is pulled into
+// Modal's cache on this call, and the create and credential legs only get what the build
+// leaves them.
+const provisionTimeout = 10 * time.Minute
+
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
 // work here, and asserting them separately is the point — a provider is free to serve
@@ -81,11 +87,16 @@ var (
 // real implementation (Modal SDK/HTTP) and a fake (tests) are interchangeable.
 type Client interface {
 	// CreateSandbox launches one sandbox from spec and returns its Modal id plus the
-	// connect credential minted for it. The credential is returned HERE and nowhere
-	// else — minting is one-shot and there is no read-back, so a caller that drops it
-	// has lost it for the sandbox's life. Zero when none could be minted; see
-	// sdkClient.mintCredential.
+	// connect credential minted for it. Minting is one-shot and there is no read-back, so
+	// a caller that drops the credential can only get another from MintConnectCredential.
+	// A sandbox that could not be given one is unreachable, so a failed mint is an ERROR
+	// with no id, not a zero credential — the sandbox may exist, and the claim tag is what
+	// reclaims it (see sdkClient.CreateSandbox).
 	CreateSandbox(ctx context.Context, spec SandboxSpec) (id string, cred Credential, err error)
+	// MintConnectCredential mints a NEW credential for a sandbox that already exists,
+	// which Modal allows from the id alone. Every call returns a different token and none
+	// can be revoked, so it is only safe where nothing holds the previous one.
+	MintConnectCredential(ctx context.Context, id string, port int) (Credential, error)
 	// TerminateSandbox terminates a sandbox by id. Must be idempotent:
 	// terminating an already-gone sandbox returns nil.
 	TerminateSandbox(ctx context.Context, id string) error
@@ -323,12 +334,13 @@ func (p *Provider) ExpandRegions(declared []string) []string {
 // trait is set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:         false, // create/terminate only
-		SupportsSpot:         false, // no user-facing preemptible tier
-		SupportsEgressPolicy: true,  // outbound allowlists on the sandbox itself
-		NativeTags:           true,  // sandbox tags carry identity
-		PreemptionNotice:     0,     // no push; poll-based detection
-		PollInterval:         0,     // OnDemand-only (never preempts) → the default cadence is fine
+		SupportsStop:         false,            // create/terminate only
+		SupportsSpot:         false,            // no user-facing preemptible tier
+		SupportsEgressPolicy: true,             // outbound allowlists on the sandbox itself
+		NativeTags:           true,             // sandbox tags carry identity
+		PreemptionNotice:     0,                // no push; poll-based detection
+		PollInterval:         0,                // OnDemand-only (never preempts) → the default cadence is fine
+		ProvisionTimeout:     provisionTimeout, // Provision blocks on the image build
 	}
 }
 
@@ -360,11 +372,9 @@ func (p *Provider) Provision(
 	// the poll loop reports Running has capacity, one still queued does not. That is more
 	// information than a create can return, so report it rather than a flat false.
 	//
-	// It carries NO credential, per the interface contract: the original cannot be
-	// re-read, and minting a second would hand the consumer a token that changed on every
-	// retry. That leaves a real gap — if the first create succeeded but its credential
-	// never reached a Secret, nothing recovers it. Closing it needs cluster access this
-	// layer does not have.
+	// No credential comes back, per the Provider contract: minting is one-shot with no
+	// read-back, and a fresh token revokes nothing, so re-minting for a sandbox whose token is
+	// already published strands the consumer holding it.
 	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {

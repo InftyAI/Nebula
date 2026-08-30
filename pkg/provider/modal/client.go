@@ -143,6 +143,12 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
+	// Built HERE rather than implicitly inside Sandboxes.Create, so a build failure can be
+	// told apart from a create failure and labelled; see buildImage.
+	image, err = c.buildImage(ctx, app, image)
+	if err != nil {
+		return "", Credential{}, err
+	}
 
 	probe, err := modalProbe(spec.ReadinessProbe)
 	if err != nil {
@@ -184,7 +190,11 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
-	return sb.SandboxID, c.mintCredential(ctx, sb, spec), nil
+	cred, err := c.mintCredential(ctx, sb, firstPort(spec.Ports))
+	if err != nil {
+		return "", Credential{}, err
+	}
+	return sb.SandboxID, cred, nil
 }
 
 // imageFor resolves the sandbox's image, attaching pull credentials when the spec carries
@@ -222,8 +232,17 @@ func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Imag
 
 	default:
 		// Refuse rather than pull anonymously; see provider.RegistryAuth.
-		return nil, fmt.Errorf("modal: unsupported image pull credential: %w", provider.ErrImagePull)
+		return nil, a.Unsupported("modal")
 	}
+}
+
+// buildImage hydrates the image, which is where Modal pulls it into its own cache.
+func (c *sdkClient) buildImage(ctx context.Context, app *modal.App, image *modal.Image) (*modal.Image, error) {
+	built, err := image.Build(ctx, app, nil)
+	if err != nil {
+		return nil, fmt.Errorf("modal: image build: %w", err)
+	}
+	return built, nil
 }
 
 // registrySecret builds a lazily-hydrated ephemeral Modal Secret for these values.
@@ -244,38 +263,41 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 // credential belongs in an access-controlled Secret, and this layer has no cluster
 // access, so it hands the pair up to the virtual kubelet, which writes it.
 //
-// Minting is one-shot: every CreateConnectToken call mints a FRESH token, with no
-// read-back. A caller that drops the return value has lost it for the sandbox's life.
-// That is also why this cannot move to the read path — observe would hand out a token
-// that changed every tick. (The endpoint lives on the Pod annotation instead, so Modal
-// reports no observed endpoint at all; see observe.)
-//
-// It can run this early because the RPC needs only the sandbox id and port — no task id,
-// no running container, no booted GPU (contrast Tunnels, which needs the container up).
-// So the credential is in hand while the sandbox is still queued.
-//
-// Every workload gets one: an authenticated URL is the only general way to reach a
-// NeoCloud instance, and a workload with nothing to serve just leaves it unused. The URL
-// routes to the first of spec.Ports, or Modal's default 8080 if none are declared.
-//
-// TODO: a Sandbox is reached by identity (`kubectl exec sbx-alice`), not by address, so it
-// should not get a credential — it does today because it arrives here as an ordinary Pod.
-//
-// Best-effort: a sandbox that exists must be reported and reclaimed whether or not it got
-// a credential, so a failure returns the zero Credential and the instance is simply
-// unreachable. Returning the error would fail a Provision whose sandbox is already
-// running, leaking a paid instance to save an address. The text is dropped rather than
-// logged because it can echo the request.
-func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, spec SandboxSpec) Credential {
+// A failure is REPORTED, never swallowed into a zero credential. Minting is one-shot with
+// no read-back, so a dropped error loses the credential of a sandbox that exists and is
+// billing — silently, since a caller handed an empty pair has nothing to log. The Pod fails
+// terminally and its owner recreates it — the only recovery, since this sandbox can never be
+// given a credential. The API error is passed through unlabelled, because it is what decides
+// the blocklist scope: an "unauthorized" here is OUR Modal credential, so it must fence the
+// provider off rather than be scoped to one request.
+func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) (Credential, error) {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 		// Derived from the exposed set rather than carried separately, so the routed
 		// port cannot name one the sandbox was never told to accept traffic on.
-		Port: firstPort(spec.Ports),
+		Port: port,
 	})
-	if err != nil || creds == nil || creds.Token == "" {
-		return Credential{}
+	if err != nil {
+		return Credential{}, fmt.Errorf("modal: mint connect credential for sandbox %s on port %d: %w",
+			sb.SandboxID, port, err)
 	}
-	return Credential{URL: creds.URL, Token: creds.Token}
+	// A token-less success is the same outcome as an error — an address with nothing to
+	// authenticate against it — so it is reported as one. Nothing to wrap: Modal reported
+	// no failure, so there is no cause to attribute and the candidate is not blocklisted.
+	if creds == nil || creds.Token == "" {
+		return Credential{}, fmt.Errorf("modal: sandbox %s: connect credential minted without a token",
+			sb.SandboxID)
+	}
+	return Credential{URL: creds.URL, Token: creds.Token}, nil
+}
+
+// MintConnectCredential implements Client. FromID attaches to a live sandbox and creates
+// nothing, which is what lets a credential be minted for one this process never created.
+func (c *sdkClient) MintConnectCredential(ctx context.Context, id string, port int) (Credential, error) {
+	sb, err := c.mc.Sandboxes.FromID(ctx, id, nil)
+	if err != nil {
+		return Credential{}, fmt.Errorf("modal: attach sandbox %s: %w", id, err)
+	}
+	return c.mintCredential(ctx, sb, port)
 }
 
 // modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only
