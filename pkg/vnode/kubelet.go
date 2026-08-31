@@ -33,6 +33,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -81,10 +82,9 @@ const (
 // is resolved by asking each registered Handler whether it tracks that Pod — at most one
 // can. Cheaper than a port per provider, and than reading the Pod to learn its node.
 //
-// TLS uses a self-signed in-memory cert, which is what the API server expects: it does
-// not verify a kubelet's serving cert unless --kubelet-certificate-authority is set. The
-// webhook cert rotator cannot help, since it mints for a Service DNS name and this
-// endpoint is dialed by Pod IP.
+// TLS starts with a self-signed in-memory cert. Clusters that verify kubelet serving
+// certificates can replace it at runtime with a certificate issued through the
+// kubernetes.io/kubelet-serving signer; see KubeletServingCertificateBootstrapper.
 //
 // Client certs are verified only when ClientCAPath is set. Off by default because which CA
 // signs the API server's kubelet client cert is not portable (kubeadm uses the cluster CA,
@@ -104,6 +104,10 @@ type KubeletServer struct {
 	// clientCAPath, when set, is a PEM bundle of CAs whose client certs are accepted;
 	// others are refused at the TLS layer. Empty disables verification — see above.
 	clientCAPath string
+
+	// servingCert is read on every TLS handshake, so an approved kubelet-serving
+	// certificate takes effect without restarting this listener or dropping streams.
+	servingCert atomic.Pointer[tls.Certificate]
 
 	mu       sync.RWMutex
 	handlers map[string]*Handler
@@ -148,6 +152,12 @@ func (s *KubeletServer) Register(nodeName string, h *Handler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[nodeName] = h
+}
+
+// SetServingCertificate atomically replaces the certificate used for new TLS
+// handshakes. Existing log and exec streams keep their current connections.
+func (s *KubeletServer) SetServingCertificate(cert tls.Certificate) {
+	s.servingCert.Store(&cert)
 }
 
 // nodeAddress is what a node advertises so the API server can find this endpoint.
@@ -260,15 +270,26 @@ func (s *KubeletServer) runInContainer(
 	return h.RunInContainer(ctx, namespace, podName, containerName, cmd, attach)
 }
 
-// tlsConfig: a fresh self-signed keypair, plus client verification if a CA is set.
+// tlsConfig installs a self-signed fallback and reads servingCert on every handshake,
+// allowing TLS bootstrap to replace it without restarting the server. Client
+// verification is added independently when a CA is configured.
 func (s *KubeletServer) tlsConfig() (*tls.Config, error) {
 	cert, err := selfSignedCert(s.nodeIP)
 	if err != nil {
 		return nil, err
 	}
+	if s.servingCert.Load() == nil {
+		s.SetServingCertificate(cert)
+	}
 	cfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert := s.servingCert.Load()
+			if cert == nil {
+				return nil, errors.New("kubelet api: no serving certificate")
+			}
+			return cert, nil
+		},
+		MinVersion: tls.VersionTLS12,
 		// http/1.1 only, like a real kubelet: logs need nothing HTTP/2 offers, and this is
 		// the streaming path every kubelet client already exercises.
 		NextProtos: []string{"http/1.1"},

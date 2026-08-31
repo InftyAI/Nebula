@@ -406,6 +406,12 @@ Responsibilities:
 - compute `status.placed` from Bound NodeClaims per provider;
 - watch NodeClaims so placement counts update as instances come and go.
 
+The default `kubectl get nodepools` table exposes the `Ready` condition's value
+as `STATUS`, followed by strategy, providers, and age. The CRD printer column
+reads the condition directly, so `status.conditions` remains the source of truth.
+See the [printer-column design](design/nodepool-status-column.md) for the empty
+condition and compatibility behavior.
+
 Static spec rules are admission-time CEL validations. Examples: `Weighted`
 requires a weight on every provider entry, and AWS provider entries require at
 least one region.
