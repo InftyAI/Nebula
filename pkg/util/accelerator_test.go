@@ -99,3 +99,47 @@ func TestAcceleratorRequest_CountFromRequestsWhenNoLimit(t *testing.T) {
 		t.Fatalf("AcceleratorRequest = (%q, %d), want (h100, 3)", accel, count)
 	}
 }
+
+// SplitAcceleratorPool must round-trip AcceleratorPool for every real request, and
+// degrade to "no accelerator" for anything outside the grammar rather than minting a
+// garbage metrics label.
+func TestSplitAcceleratorPool(t *testing.T) {
+	for _, tc := range []struct {
+		pool      string
+		wantType  string
+		wantCount int32
+	}{
+		{"H100:8", "H100", 8},
+		{"A100-80GB:1", "A100-80GB", 1},
+		{"", "", 0},        // CPU-only claim
+		{"H100", "", 0},    // no separator
+		{":8", "", 0},      // no type
+		{"H100:", "", 0},   // no count
+		{"H100:x", "", 0},  // unparseable count
+		{"H100:0", "", 0},  // a count of zero is not a request
+		{"H100:-2", "", 0}, // negative
+	} {
+		t.Run(tc.pool, func(t *testing.T) {
+			typ, count := SplitAcceleratorPool(tc.pool)
+			if typ != tc.wantType || count != tc.wantCount {
+				t.Fatalf("SplitAcceleratorPool(%q) = (%q, %d), want (%q, %d)",
+					tc.pool, typ, count, tc.wantType, tc.wantCount)
+			}
+		})
+	}
+}
+
+// The two are inverses: whatever AcceleratorPool joins, SplitAcceleratorPool recovers.
+func TestAcceleratorPool_RoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		typ   string
+		count int32
+	}{{"H100", 1}, {"H100", 8}, {"A100-80GB", 4}, {"T4", 16}} {
+		pool := AcceleratorPool(tc.typ, tc.count)
+		gotType, gotCount := SplitAcceleratorPool(pool)
+		if gotType != tc.typ || gotCount != tc.count {
+			t.Fatalf("round trip of (%q, %d) through %q = (%q, %d)",
+				tc.typ, tc.count, pool, gotType, gotCount)
+		}
+	}
+}

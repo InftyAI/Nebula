@@ -49,6 +49,7 @@ import (
 	webhookv1 "github.com/InftyAI/Nebula/internal/webhook/v1"
 	nebulacert "github.com/InftyAI/Nebula/pkg/cert"
 	"github.com/InftyAI/Nebula/pkg/failover"
+	nebulametrics "github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
@@ -93,6 +94,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var kubeletAddr, kubeletClientCA string
+	var costLabels string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -119,6 +121,13 @@ func main() {
 			"serves TLS without client verification, because which CA signs the API server's kubelet "+
 			"client certificate is not portable across distributions; restrict the port with a "+
 			"NetworkPolicy, or set this to your API server's kubelet client CA.")
+	flag.StringVar(&costLabels, "cost-labels", "",
+		"Comma-separated Pod label names whose values attribute cost, e.g. \"org_id,team_id\". Each name "+
+			"is used verbatim as both the Pod label key and the metric label, so it must be legal as "+
+			"both: letters, digits and underscores, starting with a letter. Empty (the default) reports "+
+			"cost by candidate shape only. Changing this changes the identity of every cost series. "+
+			"Values come from Pod labels and are NOT capped: the manager warns once if they push the "+
+			"cost metric past 5000 series, but pick names an admission policy constrains.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -126,6 +135,21 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Before anything can record: the counter's label names are fixed when it is constructed, and
+	// a bad --cost-labels must stop the process rather than silently report every tenant as "none".
+	attribution, err := nebulametrics.ParseCostLabels(costLabels)
+	if err != nil {
+		setupLog.Error(err, "invalid --cost-labels")
+		os.Exit(1)
+	}
+	if err := nebulametrics.InitCost(attribution); err != nil {
+		setupLog.Error(err, "configuring the cost metric")
+		os.Exit(1)
+	}
+	if len(attribution) > 0 {
+		setupLog.Info("cost attribution enabled", "labels", attribution)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -418,6 +442,16 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 			return fmt.Errorf("unable to create Pod webhook: %w", err)
 		}
 	}
+
+	// Cost accrual is a clock-driven loop, not a reconciler, so it is added directly. It opts into
+	// leader election by NOT implementing LeaderElectionRunnable, which buys two things: N replicas
+	// would mean N times the writes, and each would book windows into its OWN cost counter, leaving
+	// increase() to read a series that holds only the races that replica won. The ledger itself is
+	// safe either way (see CostAccrual.accrue).
+	if err := mgr.Add(controller.NewCostAccrual(mgr.GetClient())); err != nil {
+		return fmt.Errorf("unable to add the cost accrual loop: %w", err)
+	}
+
 	// +kubebuilder:scaffold:builder
 	return nil
 }

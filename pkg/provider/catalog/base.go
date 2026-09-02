@@ -18,8 +18,10 @@ package catalog
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
@@ -36,9 +38,9 @@ type Lookup interface {
 }
 
 // Base supplies the parts of provider.Provider that are identical for every
-// adapter whose price/availability comes from a catalog: Name, Offerings, and a
-// default identity MapAccelerator. Adapters embed it so those three methods are
-// not re-implemented per provider:
+// adapter whose price/availability comes from a catalog: Name, Offerings, a
+// default identity MapAccelerator, and the optional provider.Pricer. Adapters
+// embed it so none of those are re-implemented per provider:
 //
 //	type Provider struct {
 //	    catalog.Base
@@ -47,7 +49,9 @@ type Lookup interface {
 //
 // Name and Offerings are fully generic. MapAccelerator is generic only while a provider
 // names its accelerators like Nebula's canonical names (Modal does); one whose identifiers
-// diverge overrides just that method and still reuses the rest.
+// diverge overrides just that method and still reuses the rest. PricePerHour is generic
+// only while a provider's catalog price is all-in; one that meters CPU/memory separately
+// overrides it and adds those components.
 //
 // Lifecycle, Capabilities and ClassifyProvisionError are genuinely provider-specific and
 // are not provided here.
@@ -132,4 +136,60 @@ func (b Base) MapAccelerator(canonical string, count int32) (providerAccelerator
 		ids = append(ids, id)
 	}
 	return ids, len(ids) > 0
+}
+
+// PricePerHour implements the optional provider.Pricer from the matched catalog row. That
+// row is the WHOLE rate only where a provider's price is all-in (AWS sells an instance); one
+// metering CPU and memory apart (Modal, whose rows quote a GPU alone) overrides this and
+// adds them.
+//
+// Rows match as MapAccelerator matches them, plus capacity type: the one dimension
+// MapAccelerator can ignore and pricing cannot (AWS p5.48xlarge is $34.412 Spot against
+// $98.320 OnDemand). Among interchangeable alternates the FIRST row wins, so the price
+// describes the id a launch actually tries first.
+func (b Base) PricePerHour(req provider.PriceRequest) (float64, error) {
+	// A CPU-only request. No row can match an empty type, so this is the same ErrNoPrice the
+	// loop below would reach; it is stated here for a clearer message, and because it MUST
+	// land before the Count check, which would otherwise flag count 0 as malformed. A
+	// provider that really can run CPU-only work (Modal) overrides this and prices it.
+	if req.AcceleratorType == "" {
+		return 0, fmt.Errorf("catalog: %s prices accelerators only: %w", b.ProviderName, provider.ErrNoPrice)
+	}
+	// Contradictory input, not a missing price — hence a plain error, which callers do not
+	// swallow the way they swallow ErrNoPrice.
+	if req.Count <= 0 {
+		return 0, fmt.Errorf("catalog: %s: accelerator %q with count %d", b.ProviderName, req.AcceleratorType, req.Count)
+	}
+	// An empty tier is the candidate a pool declaring no capacityTypes emits.
+	// servesCapacityTier already reads that as non-Spot, so resolve it here rather than let
+	// row order decide — on AWS that is a threefold difference.
+	tier := req.CapacityType
+	if tier == "" {
+		tier = nebulav1alpha1.CapacityOnDemand
+	}
+
+	for _, o := range b.Catalog.Offerings(b.ProviderName) {
+		if !strings.EqualFold(o.AcceleratorType, req.AcceleratorType) || !o.Available {
+			continue
+		}
+		if o.CapacityType != tier {
+			continue
+		}
+		if o.GPUCount != 0 && o.GPUCount != req.Count {
+			continue
+		}
+		// An unpriced placeholder row (a hand-edited ConfigMap), not a free accelerator.
+		if o.PricePerHour <= 0 {
+			continue
+		}
+		rate := o.PricePerHour
+		// GPUCount 0 => the row prices ONE accelerator and the count is a runtime knob, so
+		// the rate scales with it. A row carrying a count prices the whole offering already.
+		if o.GPUCount == 0 {
+			rate *= float64(req.Count)
+		}
+		return rate, nil
+	}
+	return 0, fmt.Errorf("catalog: %s has no available %s x%d row on %s: %w",
+		b.ProviderName, req.AcceleratorType, req.Count, tier, provider.ErrNoPrice)
 }

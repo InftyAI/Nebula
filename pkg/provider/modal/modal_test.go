@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -1749,5 +1750,69 @@ func TestSandboxSpecStringRedactsRegistryAuth(t *testing.T) {
 	}
 	if got := s.String(); strings.Contains(got, "hunter2") {
 		t.Errorf("String() = %q, must not contain the password", got)
+	}
+}
+
+// Modal's rate is the GPU row PLUS the separately metered CPU and memory, and a CPU-only
+// sandbox is priced from those two alone — the case catalog.Base refuses outright.
+func TestPricePerHour_AddsCPUAndMemory(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	od := nebulav1alpha1.CapacityOnDemand
+
+	// 4 cores at $0.0473 = $0.1892; 8 GiB at $0.0080 = $0.0640.
+	const cpuAndMem = 4*0.0473 + 8*0.0080
+
+	cases := map[string]struct {
+		req  provider.PriceRequest
+		want float64
+	}{
+		"gpu plus metered resources": {
+			provider.PriceRequest{AcceleratorType: "H100", Count: 2, CapacityType: od, CPUCores: 4, MemoryMiB: 8192},
+			2*3.95 + cpuAndMem,
+		},
+		"gpu with no reservation is the row alone": {
+			provider.PriceRequest{AcceleratorType: "H100", Count: 1, CapacityType: od},
+			3.95,
+		},
+		"cpu-only is the metered resources alone": {
+			provider.PriceRequest{CPUCores: 4, MemoryMiB: 8192},
+			cpuAndMem,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := p.PricePerHour(tc.req)
+			if err != nil {
+				t.Fatalf("PricePerHour(%+v): %v", tc.req, err)
+			}
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("PricePerHour(%+v) = %v, want %v", tc.req, got, tc.want)
+			}
+		})
+	}
+}
+
+// A CPU-only sandbox reserving nothing runs on Modal's own defaults, which we do not know:
+// unpriced is honest, 0 would read as free. An unknown accelerator still comes back as
+// Base's ErrNoPrice rather than silently costing only its CPU and memory.
+func TestPricePerHour_NoPrice(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+
+	for name, req := range map[string]provider.PriceRequest{
+		"cpu-only reserving nothing": {},
+		"unknown accelerator": {
+			AcceleratorType: "TPU-v4", Count: 1,
+			CapacityType: nebulav1alpha1.CapacityOnDemand, CPUCores: 4, MemoryMiB: 8192,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := p.PricePerHour(req)
+			if !errors.Is(err, provider.ErrNoPrice) {
+				t.Fatalf("PricePerHour(%+v) err = %v, want ErrNoPrice", req, err)
+			}
+			if got != 0 {
+				t.Fatalf("PricePerHour(%+v) = %v, want 0 alongside the error", req, got)
+			}
+		})
 	}
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package catalog
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -268,6 +269,122 @@ func TestBaseMapAccelerator_SkipsUnavailable(t *testing.T) {
 
 	if got, ok := base.MapAccelerator("H100", 8); ok || len(got) > 0 {
 		t.Fatalf("MapAccelerator(H100, 8) = (%v, %v), want (nil, false) — every row unavailable", got, ok)
+	}
+}
+
+// The two catalog shapes price differently: a GPUCount 0 row (Modal) quotes ONE
+// accelerator and scales with the count, while a row carrying a count (AWS) quotes the
+// whole instance and must not be scaled.
+func TestBasePricePerHour_Shapes(t *testing.T) {
+	od, sp := nebulav1alpha1.CapacityOnDemand, nebulav1alpha1.CapacitySpot
+	type pr = provider.PriceRequest
+	rows := []provider.Offering{
+		{AcceleratorType: "H100", CapacityType: od, PricePerHour: 3.95, Available: true},
+		{
+			AcceleratorType: "L4", AcceleratorID: "g6.48xlarge", GPUCount: 8,
+			CapacityType: od, PricePerHour: 13.350, Available: true,
+		},
+		{
+			AcceleratorType: "L4", AcceleratorID: "g6.48xlarge", GPUCount: 8,
+			CapacityType: sp, PricePerHour: 4.672, Available: true,
+		},
+		{
+			AcceleratorType: "L4", AcceleratorID: "g6.xlarge", GPUCount: 1,
+			CapacityType: od, PricePerHour: 0.805, Available: true,
+		},
+	}
+	base := Base{ProviderName: "p", Catalog: fakeLookup{rows: rows}}
+
+	cases := map[string]struct {
+		req  provider.PriceRequest
+		want float64
+	}{
+		"per-accelerator row scales with count": {pr{AcceleratorType: "H100", Count: 2, CapacityType: od}, 7.90},
+		"per-instance row does not scale":       {pr{AcceleratorType: "L4", Count: 8, CapacityType: od}, 13.350},
+		"count selects the row":                 {pr{AcceleratorType: "L4", Count: 1, CapacityType: od}, 0.805},
+		"capacity type selects the row":         {pr{AcceleratorType: "L4", Count: 8, CapacityType: sp}, 4.672},
+		// An empty tier is the pool-declares-nothing candidate, priced as OnDemand rather
+		// than as whichever row comes first.
+		"empty tier is OnDemand": {pr{AcceleratorType: "L4", Count: 8}, 13.350},
+		"case insensitive":       {pr{AcceleratorType: "h100", Count: 1, CapacityType: od}, 3.95},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := base.PricePerHour(tc.req)
+			if err != nil {
+				t.Fatalf("PricePerHour(%+v): %v", tc.req, err)
+			}
+			if got != tc.want {
+				t.Fatalf("PricePerHour(%+v) = %v, want %v", tc.req, got, tc.want)
+			}
+		})
+	}
+}
+
+// Every unpriceable request must come back as ErrNoPrice so a caller can swallow it the
+// way it swallows a provider with no Pricer at all — except a malformed one, which is a
+// bug and must stay loud.
+func TestBasePricePerHour_NoPrice(t *testing.T) {
+	od := nebulav1alpha1.CapacityOnDemand
+	base := Base{ProviderName: "p", Catalog: fakeLookup{rows: []provider.Offering{
+		{AcceleratorType: "H100", CapacityType: od, PricePerHour: 3.95, Available: true},
+		{AcceleratorType: "A100-80GB", CapacityType: od, PricePerHour: 2.50, Available: false},
+		{AcceleratorType: "B200", CapacityType: od, PricePerHour: 0, Available: true},
+	}}}
+
+	noPrice := map[string]provider.PriceRequest{
+		"cpu-only workload": {Count: 0},
+		"unknown type":      {AcceleratorType: "TPU-v4", Count: 1, CapacityType: od},
+		"unavailable row":   {AcceleratorType: "A100-80GB", Count: 1, CapacityType: od},
+		"unpriced row":      {AcceleratorType: "B200", Count: 1, CapacityType: od},
+		"tier has no row":   {AcceleratorType: "H100", Count: 1, CapacityType: nebulav1alpha1.CapacitySpot},
+		"unknown tier":      {AcceleratorType: "H100", Count: 1, CapacityType: "Reserved"},
+	}
+	for name, req := range noPrice {
+		t.Run(name, func(t *testing.T) {
+			got, err := base.PricePerHour(req)
+			if !errors.Is(err, provider.ErrNoPrice) {
+				t.Fatalf("PricePerHour(%+v) err = %v, want ErrNoPrice", req, err)
+			}
+			if got != 0 {
+				t.Fatalf("PricePerHour(%+v) = %v, want 0 alongside the error", req, got)
+			}
+		})
+	}
+
+	// A counted accelerator with no count is contradictory input, not a missing price:
+	// swallowing it as ErrNoPrice would report a GPU workload as costing nothing.
+	_, err := base.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 0, CapacityType: od})
+	if err == nil || errors.Is(err, provider.ErrNoPrice) {
+		t.Fatalf("PricePerHour(H100 x0) err = %v, want a loud non-ErrNoPrice error", err)
+	}
+}
+
+// The embedded CSVs must price through unchanged, which is what pins the per-GPU (Modal)
+// against per-instance (AWS) reading of price_per_hour to the real data.
+func TestBasePricePerHour_EmbeddedCatalog(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	od := nebulav1alpha1.CapacityOnDemand
+
+	modal := Base{ProviderName: "modal", Catalog: c}
+	got, err := modal.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 2, CapacityType: od})
+	if err != nil {
+		t.Fatalf("modal H100 x2: %v", err)
+	}
+	if got != 2*3.95 {
+		t.Fatalf("modal H100 x2 = %v, want %v (per-GPU rate x count)", got, 2*3.95)
+	}
+
+	aws := Base{ProviderName: "aws", Catalog: c}
+	got, err = aws.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: od})
+	if err != nil {
+		t.Fatalf("aws H100 x8: %v", err)
+	}
+	if got != 98.320 {
+		t.Fatalf("aws H100 x8 = %v, want 98.320 (whole-instance rate, unscaled)", got)
 	}
 }
 

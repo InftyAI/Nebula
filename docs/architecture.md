@@ -568,7 +568,12 @@ Two design rules are worth knowing here, because they constrain the code above:
   `Handler.metricLabels` and `placementLabels` are field-for-field mirrors.
 - Every label is bounded by **configuration** (NodePools, provider catalogs), never by
   workload. Nothing derived from a Pod name, UID, namespace or unresolved user-supplied
-  pool label is ever a label value.
+  pool label is ever a label value. Cost is no exception, which is why per-instance spend
+  is a NodeClaim status field rather than a label on the counter. Cost *attribution* is the
+  single opt-in breach of that rule — `--cost-labels` promotes chosen Pod labels onto the
+  counter — so it ships off by default, and warns rather than capping when the series count
+  says an operator chose badly: a billing metric that rewrote its own labels to defend
+  itself would be wrong where nobody could see it.
 
 See [metrics.md](metrics.md) for the full series list, label semantics, example queries
 and the two known gaps.

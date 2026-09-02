@@ -18,6 +18,8 @@ package util
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -77,6 +79,25 @@ func AcceleratorPool(accelerator string, count int32) string {
 		return ""
 	}
 	return fmt.Sprintf("%s%s%d", accelerator, acceleratorSep, count)
+}
+
+// SplitAcceleratorPool is the inverse of AcceleratorPool: it recovers the type and count
+// from a "type:count" pool identity. For readers that hold only the joined form —
+// NodeClaimSpec.Accelerator — and need the two apart, as metrics labels do so both
+// "every H100 size" and "every 8-GPU request" stay aggregatable.
+//
+// ("", 0) for an empty pool (a CPU-only claim) and for anything not in the grammar, so a
+// hand-edited claim degrades to "no accelerator" rather than minting a garbage label value.
+func SplitAcceleratorPool(pool string) (accelerator string, count int32) {
+	typ, n, found := strings.Cut(pool, acceleratorSep)
+	if !found || typ == "" {
+		return "", 0
+	}
+	parsed, err := strconv.ParseInt(n, 10, 32)
+	if err != nil || parsed <= 0 {
+		return "", 0
+	}
+	return typ, int32(parsed)
 }
 
 // gpuCount returns the largest nvidia.com/gpu quantity requested across the

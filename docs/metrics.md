@@ -19,12 +19,13 @@ placed (gate removed)         nebula_placement_decisions_total
 instance accepted
         |  nebula_instance_ready_duration_seconds
         v
-Running
+Running                       nebula_cost_usd_total      <- dollars, while it bills
 ```
 
 Those are the parts whose cost and failure modes are otherwise invisible: placement can
-silently leave a Pod gated forever, and provisioning runs against a third party, takes
-seconds to minutes, bills money, and fails for reasons the Pod status flattens away.
+silently leave a Pod gated forever, provisioning runs against a third party, takes
+seconds to minutes, bills money, and fails for reasons the Pod status flattens away, and
+the instance it produces keeps charging whether or not anything is using it.
 Everything else is already covered elsewhere and deliberately not duplicated here —
 reconcile counts, queue depth and API latency by controller-runtime's own collectors, and
 Pod-population questions ("how many Pods are gated right now?") by kube-state-metrics.
@@ -32,6 +33,8 @@ Pod-population questions ("how many Pods are gated right now?") by kube-state-me
 - [Where they are served](#where-they-are-served)
 - [Placement](#placement)
 - [Provisioning](#provisioning)
+- [Cost](#cost)
+- [Attribution](#attribution)
 - [Label semantics](#label-semantics)
 - [Example queries](#example-queries)
 - [Known gaps](#known-gaps)
@@ -39,7 +42,8 @@ Pod-population questions ("how many Pods are gated right now?") by kube-state-me
 ## Where they are served
 
 Every collector registers into controller-runtime's registry (see `pkg/metrics`; the
-`init` in each file is what registers them, so importing the package is the only wiring),
+`init` in each file is what registers them, so importing the package is the only wiring —
+except the cost counter, whose labels are not known until `--cost-labels` is parsed),
 which means they are served on the manager's existing `--metrics-bind-address` endpoint
 alongside the standard controller and workqueue metrics. In the default overlay that is
 `:8443` with authn/authz, so a scrape needs a bearer token whose subject is bound to the
@@ -111,6 +115,179 @@ Fine-grained detail is deliberately *not* here: it stays where it is already ava
 (the Pod's `Failed` status message and the `vnode-handler` error log). These labels exist
 to answer "are we losing capacity, or are our credentials broken?" at a glance.
 
+## Cost
+
+What the fleet has actually spent.
+
+| Metric | Type | What it answers |
+| --- | --- | --- |
+| `nebula_cost_usd_total{phase,...}` | counter | Dollars the fleet has run up, added one accrual window at a time. Also carries whatever `--cost-labels` names (see [Attribution](#attribution)). |
+
+```promql
+# Dollars spent yesterday, by provider.
+sum by (provider) (increase(nebula_cost_usd_total[1d]))
+
+# What the last accrual window cost, fleet-wide.
+sum(increase(nebula_cost_usd_total[5m]))
+
+# Burn rate in USD/hour.
+sum(rate(nebula_cost_usd_total[30m])) * 3600
+```
+
+**Per shape, not per instance.** One series per candidate — the labels in [Label
+semantics](#label-semantics), plus `phase` — with no claim identity on it. That is what makes the
+metric *billable* rather than merely observable: `increase(...[w])` is a pure function of the
+window `w`, so a billing service replaying an old window re-derives the same dollars and can
+upsert them idempotently. A per-claim counter would give up exactly that — differencing a
+cumulative per-claim series needs a sample at each window boundary, and an instance that lived
+and died between two boundaries has neither, so its spend would be unbillable. Per-claim spend
+lives on the claim instead (below).
+
+**Instance-level** cost — infrastructure spend, blind to the workload on top, charging each
+claim's whole rate.
+
+**Every number here is an estimate.** Both the counter and the field are Nebula's own arithmetic
+over a hand-maintained list price — cost *incurred*, which is what "accrued" means, not cost any
+provider has confirmed. Nothing below has been invoiced.
+
+**One arithmetic, two views.** A leader-elected loop closes each claim's window every 5 minutes:
+it charges `priceUSDPerHour × (now − status.lastAccruedAt)`, adds it to
+`NodeClaim.status.estimatedCostUSD` (the `EST_COST` column) and re-anchors, then books the *same*
+window on the counter. So the counter is the fleet's stream of charges and the field is the
+per-claim rollup of them, and "what did this one instance cost" is a `kubectl get` rather than a
+query:
+
+```
+NAME               PROVIDER   ACCELERATOR   PRICE/HR   EST_COST   PHASE
+nc-train-0         modal      H100:8        23.7000    148.1250   Bound
+```
+
+The counter is advanced only *after* the field's patch lands. A counter has no idempotency key, so
+a window booked before its write was durable would be charged twice: the anchor would not have
+moved, and the next tick would re-derive the same window. The persisted anchor is also why no time
+is lost to a restart — the first tick back charges the whole gap, downtime included — and why the
+window is measured from `status`, not from how long the loop actually slept.
+
+**Teardown closes the last window too.** No checkpoint can close it — the object is going away, so
+there is nothing left to re-anchor — but it is still booked on the counter, gated by the same rule:
+strictly after the finalizer removal is accepted. That `Update` is a compare-and-swap, so it lands
+at most once and only for a claim whose ledger is current, which is the same exactly-once guarantee
+the anchor gives the checkpoint path. Without it the metric would miss far more than one window: an
+instance that died before its first accrual tick would be billed **nothing at all**, making short
+workloads look free while long ones stayed accurate.
+
+`EST_COST` does *not* get that last window, so it understates a reclaimed instance's lifetime by up
+to one interval while the counter has the whole of it. The lifetime figure also goes to the log
+(`instance reclaimed`), the only record that outlives both the object and Prometheus retention.
+
+**Where the number comes from.** `NodeClaim.status.priceUSDPerHour`, resolved from the
+provider's catalog (`pkg/provider/catalog/data/*.csv`) against the served Pod's shape and
+written once, on the claim's first reconcile — pinned so a catalog edit cannot retroactively
+reprice a running instance. These are hand-maintained list prices: no committed-use discounts,
+no private pricing, no gap between a Spot quote and the actual charge. Reconcile against the
+provider's billing export before anyone gets invoiced.
+
+**Which claims are charged.** Only `Bound` and `Terminating` hold an instance (see
+`NodeClaimPhase`), so only they accrue; a `Terminated` claim's `EST_COST` is its frozen final
+total, and nothing more is booked against it. `Provisioning` is excluded, undercounting by about
+one poll interval per instance.
+
+`Terminating` still bills until teardown finishes, which is what makes the `phase` label worth
+having:
+
+```promql
+# Dollars burned on instances whose workload was already gone. Rising steadily means the
+# teardown backstop is stuck.
+sum(increase(nebula_cost_usd_total{phase="Terminating"}[1d]))
+```
+
+A claim with no usable price (no `Pricer`, or no catalog row) accrues **nothing**, never `0` — a
+zero would be summed and averaged as a real "this costs nothing". Fleet totals therefore
+under-report by whatever cannot be priced; an empty `PRICE/HR` in `kubectl get nc` finds those
+claims.
+
+## Attribution
+
+Who to charge. Off by default; `--cost-labels` turns it on:
+
+```
+--cost-labels=org_id,team_id
+```
+
+Each name is used **verbatim** as both the Pod label key and the metric label, so there is no
+mapping to keep in sync — and no way for the two to disagree. That costs you qualified keys:
+`nebula.inftyai.com/org-id` is a legal Pod label and an illegal Prometheus label, so the name has
+to satisfy both grammars (letters, digits, underscores; starting with a letter). A name that does
+not, or that shadows a label the metric already has, is rejected at startup rather than silently
+reporting every tenant as `none`.
+
+Two names nothing rejects but you should still avoid: **`job` and `instance`**. Prometheus attaches
+its own at scrape time, and with the default `honor_labels: false` it renames yours to
+`exported_job` / `exported_instance` — so `sum by (job)` would quietly report the scrape job instead
+of the tenant, with no error anywhere. `job_id` or `workload` if that is the breakdown you want.
+
+The values are read off the served Pod once — when the claim first becomes chargeable, in the same
+status patch that opens its billing window — and pinned on
+`NodeClaim.status.costLabels`:
+
+```yaml
+status:
+  costLabels:
+    org_id: acme
+    team_id: ml
+```
+
+Three things follow from pinning them there rather than reading the Pod at accrual time:
+
+- **Spend cannot be re-attributed.** Relabelling a Pod does not move dollars already reported
+  under another tenant, exactly as a catalog edit cannot reprice a running instance.
+- **The last window is attributable.** A `Terminating` claim's Pod is often already gone, and that
+  window is [booked at teardown](#cost) — from `status`, which is still there.
+- **The breakdown is auditable per claim.** `kubectl get nodeclaim -o yaml` shows who a given
+  instance was charged to, which no aggregate metric can answer.
+
+A claim serves exactly one Pod, UID-pinned (`spec.podRef`), so its whole rate belongs to that one
+workload: nothing is split, and nothing is counted twice.
+
+```promql
+# Yesterday's bill, per tenant.
+sum by (org_id) (increase(nebula_cost_usd_total[1d]))
+
+# One team's burn rate, in USD/hour.
+sum(rate(nebula_cost_usd_total{org_id="acme",team_id="ml"}[30m])) * 3600
+```
+
+**Values are tenant-controlled, which is a cardinality risk** — and the only one on this endpoint,
+since every other label is bounded by configuration. A counter never releases a series, so a
+workload generator emitting a fresh `org_id` per Pod leaks one series per Pod for the life of the
+process. **Nothing caps this.** Past 5000 cost series the manager logs a warning once:
+
+```
+WARNING: the cost metric has passed its expected series budget, which usually means an
+attribution label is carrying a per-Pod value. Nothing is dropped or merged, so the dollars
+stay correct, but memory and every scrape grow until this process restarts.
+```
+
+Warning rather than enforcing is deliberate. Merging tenants into an `overflow` bucket, or dropping
+the window, each corrupts a metric an external billing service reads as truth — and silently, in
+the one direction its consumer cannot detect. A metric that is too *big* is an operator's problem
+with an obvious fix (constrain the values at admission — a webhook or a policy engine); a metric
+that quietly rewrote its own labels is nobody's problem until invoicing.
+
+Prometheus knows the real number, so alert on it there rather than trusting the log line to be seen:
+
+```promql
+count(nebula_cost_usd_total) > 5000
+```
+
+A Pod that carries none of the configured labels reports `none`, the same placeholder every other
+absent label uses.
+
+**Changing `--cost-labels` changes the identity of every cost series.** Adding a name resets each
+one to zero and starts a new set, which `increase()` reads as a reset and handles, but no
+historical series will carry the new label. Roll it out at a boundary you are happy to see in a
+dashboard.
+
 ## Label semantics
 
 Every series except the `{pool,reason}` and `{provider,capacity_type,region,reason}`
@@ -120,9 +297,10 @@ diagnostics carries the same label set:
 provider  region  capacity_type  accelerator  accelerator_count
 ```
 
-That is on purpose: a placement and the provisioning attempt it led to carry **identical
-label values**, so the two join in PromQL without label surgery — "placed on Spot but
-never provisioned" is one query. For the same reason the two duration histograms measure
+That is on purpose: a placement, the provisioning attempt it led to, and the cost of the
+instance it produced carry **identical label values**, so they join in PromQL without label
+surgery — "placed on Spot but never provisioned" is one query, and so is "what did our
+Spot fallbacks cost us". For the same reason the two duration histograms measure
 adjacent legs of one journey: `placement_wait` ends exactly where `instance_ready`
 begins, so together they cover `kubectl apply` to `Running`.
 
@@ -154,9 +332,14 @@ Five label values are load-bearing:
   than in the label. A spike here alongside flat `capacity`/`auth` series is the shape of a
   network or provider outage.
 
-Cardinality is bounded by *configuration*, not by workload: providers x regions x tiers x
-accelerator pools, all of which come from NodePools and provider catalogs. Nothing
-derived from a Pod name, UID or namespace is ever a label.
+Cardinality is bounded by *configuration*, not by workload, on every label above: providers x
+regions x tiers x accelerator pools, all of which come from NodePools and provider catalogs. That
+is what makes it safe that they are in-process counters whose series live until the process exits —
+including cost, which is why it carries no claim identity.
+
+The one exception is [attribution](#attribution), whose values come from Pod labels. It is off by
+default, and warns rather than caps when on — so if you enable it, the bound is whatever your
+admission policy puts on those label values.
 
 ## Example queries
 
@@ -185,16 +368,55 @@ sum by (provider) (rate(nebula_provision_failures_total{reason="other"}[6h]))
 
 # Requests nobody is retrying their way out of: a human has to fix these.
 sum by (reason) (rate(nebula_placement_deferrals_total{reason=~"no_pool|invalid_request"}[1h]))
+
+# What the Spot fallback actually cost over the last week: the same candidate labels, so this
+# joins the placement decision to the bill.
+sum by (capacity_type) (increase(nebula_cost_usd_total[7d]))
+
+# Dollars per placement, by candidate. Rising without a price change means instances are
+# being held longer per workload.
+sum by (provider, accelerator) (increase(nebula_cost_usd_total[1d]))
+  / sum by (provider, accelerator) (increase(nebula_placement_decisions_total[1d]))
+
+# Current burn rate in USD/hour, by accelerator.
+sum by (accelerator) (rate(nebula_cost_usd_total[30m])) * 3600
 ```
 
 ## Known gaps
 
-Both are deliberate, and both bias toward looking *better* than reality — worth knowing
-before trusting a dashboard.
+All of these are deliberate, and all bias toward looking *better* than reality — worth
+knowing before trusting a dashboard.
 
-- **Counters reset on restart.** Every collector is in-process. This is ordinary Prometheus
-  semantics — `rate()` and `increase()` detect resets — but no cumulative history survives
-  a redeploy; the scrape backend owns durability.
+- **Counters reset on restart.** Every counter and histogram here is in-process, cost included:
+  a redeploy or a leader handoff starts it at zero. This is ordinary Prometheus semantics —
+  `rate()` and `increase()` detect resets, and no window is lost across one, since the anchor in
+  `status` survives — but no cumulative history survives a redeploy; the scrape backend owns
+  durability. Aggregate as `sum(increase(...))`, never `increase(sum(...))`: only the former sees
+  the per-series reset.
+- **`EST_COST` understates a reclaimed instance; the metric does not.** The field is not written on
+  the deletion path (the object is going away), so it misses the window still open at teardown —
+  which the counter *does* book (see [Cost](#cost)). The two therefore disagree by up to one
+  interval on any claim that has been reclaimed, the counter being the complete figure and the log
+  line agreeing with it. `EST_COST` also lags live spend by up to one interval while a claim is
+  running — a freshness limit, not an error, since a window not charged now is charged in full next
+  tick.
+- **A crash between the teardown write and the booking loses that window.** The final window is
+  booked in-process right after the finalizer removal lands, and unlike a checkpoint it has no
+  anchor to fall back on, so a process that dies in between charges it nowhere. Exactly-once in the
+  direction that matters — it cannot double-charge — but it can drop one partial window per
+  unlucky teardown.
+- **Cost is a list price, and misses two windows** — `Provisioning` claims, and any claim the
+  provider cannot price. See [Cost](#cost); reconcile against the billing export before
+  invoicing anyone.
+- **Attribution is only as good as the Pod's labels, and is frozen.** A Pod that was missing its
+  `org_id` when the claim became chargeable is booked to `none` for its whole life; labelling it
+  afterwards does not backfill, by design (see [Attribution](#attribution)). Enforce the labels at
+  admission — a webhook or a policy engine — rather than trusting the metric to notice.
+- **Attribution cardinality is unbounded.** Enabling `--cost-labels` promotes tenant-controlled
+  values onto a counter that never releases a series, and nothing caps it: a bad label choice grows
+  manager memory and the scrape payload until a restart. The 5000-series warning is a smoke alarm,
+  not a limit — see [Attribution](#attribution) for why it does not enforce, and alert on
+  `count(nebula_cost_usd_total)`.
 - **`instance_ready_duration` under-samples slow boots.** The start timestamp lives only in
   the virtual node's in-memory tracking map, so a provision still in flight when the
   manager restarts is re-adopted without one and is never observed. A missing sample beats

@@ -38,4 +38,6 @@ A100-80GB,,,OnDemand,2.50,true,,2026-07-25
 # "H100!", not "H100": Modal silently upgrades a bare H100 request onto an H200, and
 # the "!" suffix is its documented opt-out.
 H100,H100!,,OnDemand,3.95,true,,2026-07-25
-H200,,,OnDemand,4.55,true,,2026-07-25
+H200,,,OnDemand,4.54,true,,2026-08-31
+B200,,,OnDemand,6.25,true,,2026-08-31
+B300,,,OnDemand,7.10,true,,2026-08-31

@@ -56,6 +56,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -328,6 +329,35 @@ func (p *Provider) ExpandRegions(declared []string) []string {
 		return nil // unconstrained: the widest and cheapest case
 	}
 	return []string{strings.Join(regions, regionSeparator)}
+}
+
+// PricePerHour overrides catalog.Base's all-in reading of the catalog, because Modal
+// meters CPU and memory SEPARATELY from the accelerator: a modal.csv row prices ONE GPU
+// and nothing else, so the sandbox's real rate is that plus what its reservation costs.
+// (AWS needs no override — a p5.48xlarge's price already covers its vCPU and RAM.)
+//
+// It also prices the CPU-ONLY sandbox that Base refuses. Base can only reject an empty
+// accelerator type, having nothing but per-accelerator rows to match; Modal genuinely runs
+// CPU-only work, and here the two non-accelerator rates are the whole price.
+//
+// ErrNoPrice for a CPU-only sandbox that reserves neither CPU nor memory: Modal then
+// applies its own defaults, and we do not know them. Unpriced is the honest answer — a 0
+// would be read as free. A GPU sandbox in that state still prices, understating by those
+// same defaults, which is immaterial beside the accelerator.
+func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
+
+	if req.AcceleratorType == "" {
+		if metered <= 0 {
+			return 0, fmt.Errorf("modal: cpu-only sandbox reserves no cpu or memory: %w", provider.ErrNoPrice)
+		}
+		return metered, nil
+	}
+	gpu, err := p.Base.PricePerHour(req)
+	if err != nil {
+		return 0, err // ErrNoPrice or a malformed request, both already worded by Base
+	}
+	return gpu + metered, nil
 }
 
 // Capabilities implements provider.Provider. See the package doc for why each

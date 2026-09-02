@@ -18,18 +18,24 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -78,9 +84,9 @@ type NodeClaimReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// Providers resolves a provider name (NodeClaim.spec.provider) to its
-	// backend, used ONLY on the teardown path. Defaults to the process-wide
-	// registry; overridable in tests.
+	// Providers resolves a provider name (NodeClaim.spec.provider) to its backend, for
+	// the teardown path (Terminate) and for pricing (the optional provider.Pricer).
+	// Defaults to the process-wide registry; overridable in tests.
 	Providers func(name string) (provider.Provider, bool)
 }
 
@@ -246,12 +252,16 @@ func (r *NodeClaimReconciler) findInstanceID(ctx context.Context, prov provider.
 }
 
 // releaseFinalizer removes the terminate finalizer, allowing the API server to
-// delete the NodeClaim.
+// delete the NodeClaim — and settles what the instance cost over its whole life on the
+// way out, since status.estimatedCostUSD goes with the object.
 func (r *NodeClaimReconciler) releaseFinalizer(ctx context.Context, nc *nebulav1alpha1.NodeClaim) (ctrl.Result, error) {
 	if controllerutil.RemoveFinalizer(nc, nebulav1alpha1.TerminateInstanceFinalizer) {
 		if err := r.Update(ctx, nc); err != nil {
 			return ctrl.Result{}, err
 		}
+		// Strictly after the update, which is what makes the cost booking inside exactly-once:
+		// this branch is unreachable on a retry, since the finalizer is already gone.
+		settleFinalCost(ctx, nc)
 	}
 	return ctrl.Result{}, nil
 }
@@ -302,12 +312,12 @@ func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *co
 }
 
 // markPhase reflects the served Pod into the claim's status: the coarse phase
-// desiredPhase maps it to, plus best-effort status.InstanceID, in one idempotent
-// write. An empty desiredPhase means "leave the phase as-is" (the Bound-flap hold);
-// the id is still refreshed. The provider id is the one datum that must not be lost —
-// the teardown backstop reclaims the instance by it even if VK (which otherwise holds
-// it only in memory) has died — so it is captured as soon as the Pod carries it,
-// regardless of phase. A no-op (phase unchanged and id already set) writes nothing.
+// desiredPhase maps it to, plus best-effort status.InstanceID and status.PriceUSDPerHour,
+// in one idempotent write. An empty desiredPhase means "leave the phase as-is" (the
+// Bound-flap hold); the id is still refreshed. The provider id is the one datum that must
+// not be lost — the teardown backstop reclaims the instance by it even if VK (which
+// otherwise holds it only in memory) has died — so it is captured as soon as the Pod
+// carries it, regardless of phase. A no-op (nothing to change) writes nothing.
 func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) error {
 	changed := false
 	if phase := r.desiredPhase(nc, pod); phase != "" && nc.Status.Phase != phase {
@@ -315,6 +325,18 @@ func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.
 		changed = true
 	}
 	if recordInstanceID(nc, pod) {
+		changed = true
+	}
+	if r.recordPrice(ctx, nc, pod) {
+		changed = true
+	}
+	if stampCostLabels(nc, pod) {
+		changed = true
+	}
+	// Last, so it sees the phase and price the two calls above just set: the window opens the
+	// moment those make the claim chargeable — and in the same patch as the attribution above,
+	// so no window is ever charged before we know who to charge it to.
+	if stampAccrualStart(nc) {
 		changed = true
 	}
 	if !changed {
@@ -343,6 +365,67 @@ func recordInstanceID(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) bool {
 		return false
 	}
 	nc.Status.InstanceID = id
+	return true
+}
+
+// priceDecimals is how many fractional digits status.PriceUSDPerHour keeps. Four, not two:
+// the cheapest catalog rows are sub-cent per hour (a T4 fraction, Modal's memory
+// component), and rounding those to cents would price them at 0.00 — indistinguishable
+// from the UNPRICED empty string.
+const priceDecimals = 4
+
+// recordPrice resolves the hourly cost of what this claim runs and records it, returning
+// whether it mutated the claim. Set ONCE: a claim already carrying a price keeps it, which
+// is what pins the rate against a later catalog edit (see Status.PriceUSDPerHour).
+//
+// Here rather than at claim creation because the status subresource strips status on Create,
+// and here rather than in the optimizer because the price must describe what was actually
+// launched — the Pod's own CPU/memory reservation included, which only a provider metering
+// them apart from the accelerator charges for.
+//
+// Unpriceable is not a failure: a provider with no Pricer, or a candidate with no catalog
+// row, leaves the field empty and every consumer skips the claim. Pricing NEVER fails a
+// reconcile — a wrong-looking cost column must not stop a teardown ledger from doing its
+// actual job.
+func (r *NodeClaimReconciler) recordPrice(ctx context.Context, nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) bool {
+	if nc.Status.PriceUSDPerHour != "" || pod == nil {
+		return false
+	}
+	prov, ok := r.provider(nc.Spec.Provider)
+	if !ok {
+		return false
+	}
+	pricer, ok := prov.(provider.Pricer)
+	if !ok {
+		return false // this provider cannot price its instances
+	}
+
+	log := logf.FromContext(ctx)
+	accelerator, count, err := util.AcceleratorRequest(pod)
+	if err != nil {
+		// A contradictory request (a GPU count with no type). Provision rejects it too, so
+		// there is nothing here worth more than a trace.
+		log.V(1).Info("skipping price: unreadable accelerator request", "error", err)
+		return false
+	}
+	cpuCores, memoryMiB := util.PodReservation(pod)
+	rate, err := pricer.PricePerHour(provider.PriceRequest{
+		AcceleratorType: accelerator,
+		Count:           count,
+		CapacityType:    nc.Spec.CapacityType,
+		CPUCores:        cpuCores,
+		MemoryMiB:       memoryMiB,
+	})
+	if err != nil {
+		if errors.Is(err, provider.ErrNoPrice) {
+			log.V(1).Info("no price for claim", "provider", nc.Spec.Provider, "accelerator", nc.Spec.Accelerator)
+		} else {
+			// A malformed request, i.e. our bug: loud, but still not fatal to the reconcile.
+			log.Error(err, "pricing claim", "provider", nc.Spec.Provider)
+		}
+		return false
+	}
+	nc.Status.PriceUSDPerHour = strconv.FormatFloat(rate, 'f', priceDecimals, 64)
 	return true
 }
 
@@ -400,7 +483,7 @@ func (r *NodeClaimReconciler) patchStatus(ctx context.Context, nc *nebulav1alpha
 // requeue.
 func (r *NodeClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&nebulav1alpha1.NodeClaim{}).
+		For(&nebulav1alpha1.NodeClaim{}, builder.WithPredicates(ignoreCostAccrual())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.claimsForPod)).
 		Named("nodeclaim").
 		// One claim per Pod, and the teardown path is the expensive one: per claim a
@@ -409,6 +492,32 @@ func (r *NodeClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// benchmark by a wide margin (see concurrentReconciles).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentReconciles}).
 		Complete(r)
+}
+
+// ignoreCostAccrual drops the update events whose ONLY change is a cost checkpoint (see
+// CostAccrual). Without it every claim in the fleet is re-enqueued on the accrual cadence for a
+// reconcile that has nothing to do — at 500 claims, a few hundred wasted reconciles every
+// interval into the workqueue that is already this controller's bottleneck at scale.
+//
+// Deliberately narrow: it compares the whole object with the cost fields neutralized, rather
+// than filtering on generation, so the finalizer update this reconciler relies on for its own
+// requeue still comes through. Anything else that changed alongside the cost is not dropped.
+func ignoreCostAccrual() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			before, okOld := e.ObjectOld.(*nebulav1alpha1.NodeClaim)
+			after, okNew := e.ObjectNew.(*nebulav1alpha1.NodeClaim)
+			if !okOld || !okNew {
+				return true
+			}
+			rest := after.DeepCopy()
+			rest.Status.EstimatedCostUSD = before.Status.EstimatedCostUSD
+			rest.Status.LastAccruedAt = before.Status.LastAccruedAt
+			rest.ResourceVersion = before.ResourceVersion
+			rest.ManagedFields = before.ManagedFields
+			return !equality.Semantic.DeepEqual(before, rest)
+		},
+	}
 }
 
 // claimsForPod maps a Pod event to the claim that serves it. The name is DERIVED rather

@@ -138,6 +138,67 @@ type NodeClaimStatus struct {
 	// Endpoint is the reachable address (e.g. SSH host:port) once ready.
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// PriceUSDPerHour is what this instance costs per hour in USD, as a decimal string
+	// ("7.9000"), resolved from the provider's catalog against the served Pod's shape.
+	// Status, not spec: it is a derived result nobody can declare up front. A string
+	// because it is written to be READ — a print column can only echo a field, never
+	// scale a fixed-point integer back into currency.
+	//
+	// Empty means UNPRICED, not free: the provider implements no provider.Pricer, or its
+	// catalog has no row for this candidate. Consumers must skip such a claim rather than
+	// count it as $0.
+	//
+	// Written once and never refreshed, so a catalog edit cannot retroactively reprice a
+	// running instance and rewrite the cost history it has already reported.
+	// +optional
+	PriceUSDPerHour string `json:"priceUSDPerHour,omitempty"`
+
+	// EstimatedCostUSD is what this instance has cost SO FAR, as a decimal string ("412.9400")
+	// — PriceUSDPerHour integrated over the time it has held an instance. A string for the same
+	// reason the rate is one: it exists to be read off a print column.
+	//
+	// ESTIMATED, and the name says so on purpose: it is our own arithmetic over a list price
+	// (see PriceUSDPerHour), not a figure any provider has confirmed. Nothing here has been
+	// invoiced. Reconcile against the provider's billing export before anyone is charged.
+	//
+	// Within those limits it is the AUTHORITATIVE total, not the Prometheus counter: it is
+	// written exactly once per window and survives a restart. It is also only LIVE cost — it
+	// dies with the claim, so it is not a history. The metric is what outlives an instance.
+	// +optional
+	EstimatedCostUSD string `json:"estimatedCostUSD,omitempty"`
+
+	// LastAccruedAt is how far cost accrual has counted: an ANCHOR for the next measurement,
+	// not a note about the last one. "Accrued" in the accounting sense — cost incurred but not
+	// yet invoiced, which is all EstimatedCostUSD ever holds.
+	//
+	// It is the reason a restart loses nothing: the next window is rate x (now - LastAccruedAt),
+	// so time that passed while Nebula was down is still counted on recovery instead of vanishing
+	// with the in-memory total.
+	//
+	// The invariant that makes it safe: this NEVER moves past cost that has been durably
+	// recorded, because it advances only in the same patch that writes EstimatedCostUSD. A
+	// failed write therefore loses nothing — the same window is counted next time.
+	//
+	// Unset means "not counting yet". Never treat it as the epoch, which would charge decades
+	// on the first tick.
+	// +optional
+	LastAccruedAt *metav1.Time `json:"lastAccruedAt,omitempty"`
+
+	// CostLabels attributes this claim's spend to whoever asked for it: the values the served
+	// Pod carried for the label names the operator configured (--cost-labels). Keyed by the
+	// label name, which is the same token on the Pod and on the metric.
+	//
+	// Status rather than spec because it is observed from the Pod, and it sits with the rest of
+	// the billing record for a reason: it is stamped in the SAME patch that opens the accrual
+	// anchor, so no window can ever be charged before its attribution is known.
+	//
+	// Written once, on first observation, and never refreshed — relabeling a Pod must not
+	// retroactively re-attribute spend already reported under the old values. A name the
+	// current --cost-labels no longer lists is ignored rather than cleaned up; one it lists but
+	// this map lacks reports as "none".
+	// +optional
+	CostLabels map[string]string `json:"costLabels,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -147,6 +208,8 @@ type NodeClaimStatus struct {
 // +kubebuilder:printcolumn:name="Region",type=string,JSONPath=`.spec.region`
 // +kubebuilder:printcolumn:name="ACCELERATOR",type=string,JSONPath=`.spec.accelerator`
 // +kubebuilder:printcolumn:name="CAPACITY_TYPE",type=string,JSONPath=`.spec.capacityType`
+// +kubebuilder:printcolumn:name="PRICE/HR",type=string,JSONPath=`.status.priceUSDPerHour`
+// +kubebuilder:printcolumn:name="EST_COST",type=string,JSONPath=`.status.estimatedCostUSD`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Instance",type=string,JSONPath=`.status.instanceID`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
