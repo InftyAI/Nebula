@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -139,6 +140,9 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if spec.Image == "" {
 		return "", Credential{}, fmt.Errorf("modal: empty image in sandbox spec")
 	}
+	log := logf.FromContext(ctx)
+
+	buildStart := time.Now()
 	image, err := c.imageFor(ctx, spec)
 	if err != nil {
 		return "", Credential{}, err
@@ -149,6 +153,7 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
+	imageBuild := time.Since(buildStart)
 
 	probe, err := modalProbe(spec.ReadinessProbe)
 	if err != nil {
@@ -160,6 +165,7 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		return "", Credential{}, err
 	}
 
+	createStart := time.Now()
 	sb, err := c.mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 		Command: spec.Command,
 		// Env is the whole environment, including values resolved from this cluster's
@@ -190,10 +196,18 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	if err != nil {
 		return "", Credential{}, err
 	}
+	// Emitted here rather than folded into one line at the end, so a call killed by
+	// ProvisionTimeout still records how far it got and how long the earlier legs took.
+	log.V(1).Info("modal sandbox created", "sandboxID", sb.SandboxID,
+		"imageBuild", imageBuild.String(), "create", time.Since(createStart).String())
+
+	mintStart := time.Now()
 	cred, err := c.mintCredential(ctx, sb, firstPort(spec.Ports))
 	if err != nil {
 		return "", Credential{}, err
 	}
+	log.V(1).Info("modal connect credential minted", "sandboxID", sb.SandboxID,
+		"mint", time.Since(mintStart).String())
 	return sb.SandboxID, cred, nil
 }
 
