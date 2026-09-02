@@ -1759,8 +1759,10 @@ func TestPricePerHour_AddsCPUAndMemory(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	od := nebulav1alpha1.CapacityOnDemand
 
-	// 4 cores at $0.0473 = $0.1892; 8 GiB at $0.0080 = $0.0640.
-	const cpuAndMem = 4*0.0473 + 8*0.0080
+	// Modal's published per-second sandbox rates: 4 cores = $0.567648/hr, 8 GiB = $0.192096/hr.
+	// Transcribed again here rather than imported from data, so a slip in those constants fails
+	// this test instead of being multiplied through it.
+	const cpuAndMem = 4*0.00003942*60*60 + 8*0.00000667*60*60
 
 	cases := map[string]struct {
 		req  provider.PriceRequest

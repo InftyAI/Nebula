@@ -24,15 +24,22 @@ package data
 // price (p5.48xlarge's $98.320/hr already covers its vCPU and RAM), so a provider with
 // no rates here is one whose CSV price is already all-in.
 //
-// Hourly, not per-second: Modal publishes $0.0000131/core/s and $0.00000222/GiB/s, but
-// those are rounded renderings of the rates below (0.0473/3600 = 1.314e-5), and every
-// price downstream of provider.Offering.PricePerHour is hourly.
+// Modal publishes these PER SECOND, so the literal stays exactly as printed on the price
+// page and the scaling to an hour is left in the expression: the number a reviewer compares
+// is the number Modal wrote, and the conversion is a compile-time constant fold. Hourly at
+// all because every price downstream of provider.Offering.PricePerHour is.
+//
+// These are the SANDBOX/NOTEBOOK rates, ~3x Modal's standard Function rates ($0.0000131
+// and $0.00000222 per second). The tier follows what we create, not what is cheapest: a
+// NodeClaim becomes one Modal Sandbox (see modal.Client.CreateSandbox). Getting it wrong is
+// nearly invisible on a GPU sandbox, where the accelerator dominates, and a 3x undercount
+// on a CPU-only one, where these two rates are the whole bill.
 //
 // The GPU price is deliberately absent: it is a modal.csv row (H100 at $3.95 per GPU
 // per hour), so each number keeps a single source of truth.
 const (
-	ModalCPUPricePerCoreHour   = 0.0473
-	ModalMemoryPricePerGiBHour = 0.0080
+	ModalCPUPricePerCoreHour   = 0.00003942 * 60 * 60
+	ModalMemoryPricePerGiBHour = 0.00000667 * 60 * 60
 )
 
 // mibPerGiB converts a Pod's MiB request to the GiB the memory rate is quoted in.
