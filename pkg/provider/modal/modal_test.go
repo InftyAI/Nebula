@@ -194,11 +194,10 @@ func TestProvision_GPUPod(t *testing.T) {
 	if id != "sb-1" {
 		t.Fatalf("id = %q, want sb-1", id)
 	}
-	// Create only means the control plane ACCEPTED the sandbox — the GPU may still be
-	// queued — so a fresh sandbox is never reserved. Claiming otherwise would let the
-	// Pod report Initializing while nothing has been allocated.
-	if reserved {
-		t.Fatal("reserved = true; a freshly created sandbox may still be queued for capacity")
+	// A returning CreateSandbox means the sandbox is PLACED, not merely accepted: the
+	// credential mint inside it blocks until Modal assigns a worker (see mintCredential).
+	if !reserved {
+		t.Fatal("reserved = false for a created sandbox; the mint only returns once it is placed")
 	}
 	if f.lastSpec.GPU != "H100" || f.lastSpec.GPUCount != 2 {
 		t.Fatalf("spec GPU=%q count=%d, want H100/2", f.lastSpec.GPU, f.lastSpec.GPUCount)

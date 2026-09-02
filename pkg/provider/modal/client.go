@@ -277,6 +277,11 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 // credential belongs in an access-controlled Secret, and this layer has no cluster
 // access, so it hands the pair up to the virtual kubelet, which writes it.
 //
+// CreateConnectToken BLOCKS until Modal has assigned the sandbox a worker, and that wait is
+// load-bearing: it is what makes a returning CreateSandbox proof of a placed GPU rather than
+// of an accepted request (see Provision). Modal caps it itself, at ~3m40s, so a queue longer
+// than the cap fails a Pod whose sandbox would have been placed.
+//
 // A failure is REPORTED, never swallowed into a zero credential. Minting is one-shot with
 // no read-back, so a dropped error loses the credential of a sandbox that exists and is
 // billing — silently, since a caller handed an empty pair has nothing to log. The Pod fails

@@ -80,9 +80,10 @@ var (
 	// inside the call (so a capacity shortage shows up as latency HERE), Modal
 	// builds the image inside it (so a cache miss does).
 	//
-	// The top bucket tracks the largest Capabilities.ProvisionTimeout — Modal's 10
-	// minutes. A lower ceiling would bury every slow build in +Inf; at 600s, +Inf
-	// means one thing only: a call outran its own deadline.
+	// The buckets run past the largest Capabilities.ProvisionTimeout (Modal's 5
+	// minutes), rather than stopping at it: a ceiling AT the deadline would bury every
+	// slow build in +Inf, while this way the 300s bucket is where a call killed by its
+	// own deadline lands and anything above it is overshoot.
 	ProvisionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "nebula_provision_duration_seconds",
 		Help: "Latency of the provider's Provision call, by provider, region, capacity type, " +

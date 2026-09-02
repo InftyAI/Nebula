@@ -54,10 +54,10 @@ type Provider interface {
 	// credential. Reserved means the provider committed real capacity, not merely accepted
 	// the request — two different guarantees an id alone cannot express:
 	//
-	//   - AWS reserves: an *instant* CreateFleet is synchronous, so an id means EC2 found
-	//     capacity and the instance is booting; a shortfall is an error.
-	//   - Modal does not: Create returns once the control plane accepts the sandbox, and
-	//     the GPU may stay queued for minutes on a large shape.
+	//   - AWS reserves in its API: an *instant* CreateFleet is synchronous, so an id means EC2
+	//     found capacity and the instance is booting; a shortfall is an error.
+	//   - Modal's create does not — it accepts a sandbox whose GPU may stay queued for minutes
+	//     — so its adapter WAITS on a later call that Modal holds until a worker is assigned.
 	//
 	// Callers use it for honest status: an unreserved instance is not yet initializing, so
 	// its Pod stays at the provisioning reason. It says nothing about readiness, which is
