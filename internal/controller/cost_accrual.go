@@ -240,7 +240,7 @@ func settleFinalCost(ctx context.Context, nc *nebulav1alpha1.NodeClaim) {
 	// Zero once the instance is already gone (Terminated freezes the total), which RecordWindow
 	// drops rather than minting a series for.
 	metrics.RecordWindow(claimLabels(nc), string(nc.Status.Phase), nc.Status.CostLabels, total-costSoFar(nc))
-	logf.FromContext(ctx).Info("instance reclaimed", "TotalTimeCostUSD", formatCost(total))
+	logf.FromContext(ctx).Info("claim finalized", "phase", nc.Status.Phase, "TotalTimeCostUSD", formatCost(total))
 }
 
 // costNow is what a claim has cost as of now: the persisted ledger plus the window still open
