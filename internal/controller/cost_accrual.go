@@ -35,13 +35,18 @@ import (
 
 // accrualInterval is how often spend is checkpointed. It is a WRITE cadence, not an accounting
 // resolution: every window is measured from the persisted anchor, so a longer interval trades
-// freshness of the EST_COST column for fewer writes, never accuracy. Five minutes is ~1.7
-// writes/s across a 500-claim fleet.
-const accrualInterval = 5 * time.Minute
+// freshness of the EST_COST column for fewer writes, never accuracy. One minute is ~8.3 writes/s
+// across a 500-claim fleet, about a sixth of the client's rate budget (see the QPS in cmd/main.go)
+// — the point where this stops being free and starts competing with the reconcilers for it.
+const accrualInterval = time.Minute
 
 // accrualTimeout bounds one whole tick, List plus every write. A tick that cannot finish loses
 // nothing: the anchors it did not reach are still where they were, so the next tick charges the
 // same windows.
+//
+// Now equal to accrualInterval, which is safe rather than tidy: ticks run sequentially and a
+// time.Ticker drops the ticks a slow receiver missed instead of queueing them, so the worst case is
+// back-to-back ticks, and re-deriving a window from its anchor cannot double-charge it.
 const accrualTimeout = time.Minute
 
 // CostAccrual advances each claim's durable spend ledger on a ticker.

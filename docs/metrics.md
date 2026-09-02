@@ -127,7 +127,9 @@ What the fleet has actually spent.
 # Dollars spent yesterday, by provider.
 sum by (provider) (increase(nebula_cost_usd_total[1d]))
 
-# What the last accrual window cost, fleet-wide.
+# Recent spend, fleet-wide. Keep the range well above BOTH the accrual interval (1m) and the
+# scrape interval: increase() needs two samples inside the range, so [1m] against a 60s scrape
+# usually returns nothing at all.
 sum(increase(nebula_cost_usd_total[5m]))
 
 # Burn rate in USD/hour.
@@ -150,7 +152,7 @@ claim's whole rate.
 over a hand-maintained list price — cost *incurred*, which is what "accrued" means, not cost any
 provider has confirmed. Nothing below has been invoiced.
 
-**One arithmetic, two views.** A leader-elected loop closes each claim's window every 5 minutes:
+**One arithmetic, two views.** A leader-elected loop closes each claim's window every minute:
 it charges `priceUSDPerHour × (now − status.lastAccruedAt)`, adds it to
 `NodeClaim.status.estimatedCostUSD` (the `EST_COST` column) and re-anchors, then books the *same*
 window on the counter. So the counter is the fleet's stream of charges and the field is the
