@@ -285,14 +285,14 @@ func claimLabels(nc *nebulav1alpha1.NodeClaim) metrics.Labels {
 // alongside stampAccrualStart in one patch, so attribution is durable before the first window it
 // has to explain.
 func stampCostLabels(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) bool {
-	names := metrics.CostLabelNames()
-	if nc.Status.CostLabels != nil || pod == nil || len(names) == 0 {
+	keys := metrics.CostLabelKeys()
+	if nc.Status.CostLabels != nil || pod == nil || len(keys) == 0 {
 		return false
 	}
 	stamped := map[string]string{}
-	for _, name := range names {
-		if v := pod.Labels[name]; v != "" {
-			stamped[name] = v
+	for _, key := range keys {
+		if v := pod.Labels[key]; v != "" {
+			stamped[key] = v
 		}
 	}
 	// An empty map, not nil: a Pod carrying none of the configured labels is a settled fact, and

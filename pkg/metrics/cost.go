@@ -38,13 +38,16 @@ var CostTotal = newCostTotal(nil)
 // Deliberately no init here: CostTotal cannot self-register the way every other metric in this
 // package does, because its label names are not known until --cost-labels is parsed. See InitCost.
 
-func newCostTotal(attribution []string) *prometheus.CounterVec {
+func newCostTotal(podKeys []string) *prometheus.CounterVec {
+	// The DERIVED names, not the Pod keys the operator configured: a qualified key is not a legal
+	// Prometheus label name. Derived here rather than stored, so the counter's shape and what
+	// CostLabelKeys hands the stamper cannot disagree.
 	return prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "nebula_cost_usd_total",
 			Help: "Cumulative USD billed by external instances, added window by window as it accrues.",
 		},
-		withExtra(append([]string{"phase"}, attribution...)...),
+		withExtra(append([]string{"phase"}, metricNames(podKeys)...)...),
 	)
 }
 
@@ -59,19 +62,21 @@ func newCostTotal(attribution []string) *prometheus.CounterVec {
 // before the manager starts.
 //
 // Not safe against concurrent recording.
-func InitCost(attribution []string) error {
-	configureCost(attribution)
+func InitCost(podKeys []string) error {
+	configureCost(podKeys)
 	if err := ctrlmetrics.Registry.Register(CostTotal); err != nil {
-		return fmt.Errorf("registering cost counter with labels %v: %w", attribution, err)
+		// The derived names, since those are what the registry objected to — a shadowing key looks
+		// innocent until you see what it emits as.
+		return fmt.Errorf("registering cost counter with labels %v: %w", metricNames(podKeys), err)
 	}
 	return nil
 }
 
 // configureCost rebuilds the counter for a label set. Split out so tests can swap the dimension
 // without touching the process-wide registry, which would refuse the second shape it ever saw.
-func configureCost(attribution []string) {
-	CostTotal = newCostTotal(attribution)
-	costLabelNames = attribution
+func configureCost(podKeys []string) {
+	CostTotal = newCostTotal(podKeys)
+	costLabelKeys = podKeys
 
 	costSeriesMu.Lock()
 	defer costSeriesMu.Unlock()

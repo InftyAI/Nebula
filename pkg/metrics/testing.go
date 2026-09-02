@@ -16,15 +16,24 @@ limitations under the License.
 
 package metrics
 
-// ConfigureCostForTest points the cost counter at a label set, for tests in other packages that
-// exercise attribution. Not for production use: InitCost is the real entry point.
+import "strings"
+
+// ConfigureCostForTest points the cost counter at a set of Pod label keys, for tests in other
+// packages that exercise attribution. Not for production use: InitCost is the real entry point.
 //
 // It exists because InitCost can only ever succeed ONCE per process — a registry remembers a
 // metric name's label dimensions for the life of the process — so a test binary cannot try two
 // label sets through it. This skips registration; testutil collects from the collector directly.
 //
+// Keys go through the real ParseCostLabels, so a test cannot configure a shape the flag could not,
+// and an unparseable key panics rather than silently configuring nothing.
+//
 // Pass nil to restore the unconfigured default, and do so in a Cleanup: the counter is a package
 // variable, so a test that leaves it swapped changes what every later test measures.
-func ConfigureCostForTest(attribution []string) {
-	configureCost(attribution)
+func ConfigureCostForTest(podKeys []string) {
+	labels, err := ParseCostLabels(strings.Join(podKeys, ","))
+	if err != nil {
+		panic("metrics: ConfigureCostForTest: " + err.Error())
+	}
+	configureCost(labels)
 }

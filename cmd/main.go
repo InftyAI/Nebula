@@ -122,12 +122,13 @@ func main() {
 			"client certificate is not portable across distributions; restrict the port with a "+
 			"NetworkPolicy, or set this to your API server's kubelet client CA.")
 	flag.StringVar(&costLabels, "cost-labels", "",
-		"Comma-separated Pod label names whose values attribute cost, e.g. \"org_id,team_id\". Each name "+
-			"is used verbatim as both the Pod label key and the metric label, so it must be legal as "+
-			"both: letters, digits and underscores, starting with a letter. Empty (the default) reports "+
-			"cost by candidate shape only. Changing this changes the identity of every cost series. "+
-			"Values come from Pod labels and are NOT capped: the manager warns once if they push the "+
-			"cost metric past 5000 series, but pick names an admission policy constrains.")
+		"Comma-separated Pod label keys whose values attribute cost, e.g. "+
+			"\"example.com/org-id,team_id\". Qualified keys are fine: the metric label is derived from the "+
+			"key's name part with '-' and '.' folded to '_' (example.com/org-id is queried as org_id), so "+
+			"two keys that would collide there are rejected at startup. Empty (the default) reports cost "+
+			"by candidate shape only. Changing this changes the identity of every cost series. Values "+
+			"come from Pod labels and are NOT capped: the manager warns once if they push the cost "+
+			"metric past 5000 series, but pick keys an admission policy constrains.")
 	opts := zap.Options{
 		Development: true,
 	}

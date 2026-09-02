@@ -355,30 +355,37 @@ nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="Sp
 
 // Attribution is copied off the Pod once and then frozen: spend already reported under one tenant
 // must not move to another because somebody relabelled a Pod.
+//
+// Configured with QUALIFIED keys, which is what a real deployment uses: the stamp must be keyed by
+// the key the Pod carries, prefix and all, not by the name the metric emits under.
 func TestStampCostLabels(t *testing.T) {
 	t.Cleanup(func() { metrics.ConfigureCostForTest(nil) })
-	metrics.ConfigureCostForTest([]string{"org_id", "team_id"})
+	metrics.ConfigureCostForTest([]string{"example.com/org-id", "example.com/team-id"})
 
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Labels: map[string]string{"org_id": "acme", "team_id": "ml", "unconfigured": "ignored"},
-	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		"example.com/org-id":  "acme",
+		"example.com/team-id": "ml",
+		// The derived metric name is not a Pod key, so it must not be read as one.
+		"org_id":       "ignored",
+		"unconfigured": "ignored",
+	}}}
 
 	nc := billingClaim("bound", "10.0000", nil)
 	if !stampCostLabels(nc, pod) {
 		t.Fatal("stampCostLabels reported no change on an unstamped claim")
 	}
-	want := map[string]string{"org_id": "acme", "team_id": "ml"}
+	want := map[string]string{"example.com/org-id": "acme", "example.com/team-id": "ml"}
 	if !reflect.DeepEqual(nc.Status.CostLabels, want) {
-		t.Fatalf("stamped %v, want %v — only configured names are copied", nc.Status.CostLabels, want)
+		t.Fatalf("stamped %v, want %v — only configured keys are copied", nc.Status.CostLabels, want)
 	}
 
 	// A relabelled Pod must not re-attribute the claim.
-	pod.Labels["org_id"] = "someone-else"
+	pod.Labels["example.com/org-id"] = "someone-else"
 	if stampCostLabels(nc, pod) {
 		t.Fatal("stampCostLabels rewrote attribution that was already settled")
 	}
-	if nc.Status.CostLabels["org_id"] != "acme" {
-		t.Fatalf("org_id moved to %q", nc.Status.CostLabels["org_id"])
+	if nc.Status.CostLabels["example.com/org-id"] != "acme" {
+		t.Fatalf("org-id moved to %q", nc.Status.CostLabels["example.com/org-id"])
 	}
 
 	// A Pod carrying none of them is a settled fact too, or every later reconcile re-checks it.
@@ -401,13 +408,16 @@ func TestStampCostLabels_NotConfigured(t *testing.T) {
 
 // The window booked carries the claim's stamped attribution, which is the whole point of pinning
 // it in status: the Pod is long gone by the time a Terminating window is charged.
+//
+// End to end on the key/name split: the claim is keyed "example.com/org-id" and the series comes out
+// as org_id.
 func TestCostAccrual_BooksAttribution(t *testing.T) {
 	t.Cleanup(func() { metrics.ConfigureCostForTest(nil) })
-	metrics.ConfigureCostForTest([]string{"org_id"})
+	metrics.ConfigureCostForTest([]string{"example.com/org-id"})
 
 	hour := time.Hour
 	nc := billingClaim("bound", "10.0000", &hour)
-	nc.Status.CostLabels = map[string]string{"org_id": "acme"}
+	nc.Status.CostLabels = map[string]string{"example.com/org-id": "acme"}
 	a, _ := newAccrual(t, nc)
 
 	a.accrueAll(context.Background())

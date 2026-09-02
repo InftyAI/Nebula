@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -34,82 +35,131 @@ import (
 // roughly a megabyte of exposition text — far more than any fleet reaches by candidate shape alone.
 const costSeriesWarnThreshold = 5000
 
-// costLabelName is the intersection of two grammars, because one token is used as both a
-// Kubernetes label key and a Prometheus label name: Prometheus forbids '-' and '.' and a
-// leading digit, Kubernetes forbids a leading or trailing '_'. Anything outside the overlap is
-// rejected at startup rather than mangled, since a silently normalised name that collides with
-// another is a mis-attribution nobody would notice.
-var costLabelName = regexp.MustCompile(`^[a-zA-Z]([a-zA-Z0-9_]*[a-zA-Z0-9])?$`)
+// promLabelName is Prometheus's own label-name grammar, applied to the DERIVED name rather than to
+// the Pod key. The one legal Kubernetes key it still rejects is a name part starting with a digit
+// ("2team"), which nothing here can repair without inventing a prefix.
+var promLabelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
-// ParseCostLabels turns the --cost-labels value ("org_id,team_id") into the attribution
+// metricNameFor derives the Prometheus label name a Pod label key is emitted under: the key's name
+// part, with '-' and '.' folded to '_'.
+//
+// The domain prefix is dropped because it answers no question a dashboard asks — "example.com/org-id"
+// and "org-id" mean the same thing, and `sum by (example_com_org_id)` is nobody's idea of a query.
+// What that costs is two prefixes sharing a name part, which ParseCostLabels rejects outright rather
+// than letting one silently absorb the other's spend.
+func metricNameFor(podKey string) (string, error) {
+	name := podKey
+	if slash := strings.IndexByte(name, '/'); slash >= 0 {
+		name = name[slash+1:]
+	}
+	name = strings.NewReplacer("-", "_", ".", "_").Replace(name)
+	if !promLabelName.MatchString(name) {
+		return "", fmt.Errorf("cost label %q emits as %q, which Prometheus will not accept as a label "+
+			"name (it must start with a letter or underscore)", podKey, name)
+	}
+	return name, nil
+}
+
+// ParseCostLabels turns the --cost-labels value ("example.com/org-id,team_id") into the attribution
 // dimension, in the order given. Empty input means no attribution, which is the default.
 //
-// Each entry names BOTH the Pod label to read and the metric label to emit — one token, so what
-// the manifest configures is exactly what appears in PromQL. It fails rather than skipping a bad
-// entry: silently dropping one would be discovered at invoicing time, when every series has
-// already been recorded as "none".
+// Each entry is a POD LABEL KEY, qualified or not; the metric label it emits under is derived from
+// it, so a key is configured as the Pod carries it and queried as PromQL can express it. It fails
+// rather than skipping a bad entry: silently dropping one would be discovered at invoicing time,
+// when every series has already been recorded as "none".
 //
-// Only the NAME is checked here. An entry that shadows a dimension the counter already carries
-// ("provider", "phase") parses, then fails at InitCost, where the registry rejects a duplicate
-// label name — still at startup, just with a less pointed message.
+// Four rejections, all at startup: a key Kubernetes would not accept, one whose derived name
+// Prometheus would not, the same key twice, and — the price of dropping the domain prefix — two
+// keys deriving the SAME name. A derived name that shadows a dimension the counter already carries
+// ("provider", "phase") gets through here and fails at InitCost, where the registry rejects a
+// duplicate label name; still at startup, just with a less pointed message.
 //
 // Setting this at all is what makes cost the only metric here whose CARDINALITY is not bounded by
 // configuration: the values come from Pod labels. Nothing caps them — noteSeries only warns — so
-// pick names whose value set the cluster's admission policy actually constrains.
+// pick keys whose value set the cluster's admission policy actually constrains.
 func ParseCostLabels(spec string) ([]string, error) {
 	fields := strings.Split(spec, ",")
-	names := make([]string, 0, len(fields))
-	seen := map[string]struct{}{}
+	keys := make([]string, 0, len(fields))
+	seenKey := map[string]struct{}{}
+	claimedBy := map[string]string{} // derived name -> the key that got there first
 	for _, raw := range fields {
-		name := strings.TrimSpace(raw)
-		if name == "" {
+		key := strings.TrimSpace(raw)
+		if key == "" {
 			continue
 		}
-		if len(name) > 63 {
-			return nil, fmt.Errorf("cost label %q is longer than the 63-character Kubernetes label limit", name)
+		// IsQualifiedName carries the whole Kubernetes key grammar — the 253-character prefix, the
+		// 63-character name, and the alphanumeric-at-both-ends rule — so none of it is restated here.
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("cost label %q is not a valid Pod label key: %s", key, strings.Join(errs, "; "))
 		}
-		if !costLabelName.MatchString(name) {
-			return nil, fmt.Errorf("cost label %q must match %s — it is used as both a Pod label key "+
-				"and a Prometheus label name, so '-', '.' and a leading digit are all out", name, costLabelName)
+		name, err := metricNameFor(key)
+		if err != nil {
+			return nil, err
 		}
-		if _, dup := seen[name]; dup {
-			return nil, fmt.Errorf("cost label %q is listed twice", name)
+		if _, dup := seenKey[key]; dup {
+			return nil, fmt.Errorf("cost label %q is listed twice", key)
 		}
-		seen[name] = struct{}{}
-		names = append(names, name)
+		if first, clash := claimedBy[name]; clash {
+			return nil, fmt.Errorf("cost labels %q and %q both emit as %q, which would merge two "+
+				"tenants' spend into one series; drop one or rename its name part", first, key, name)
+		}
+		seenKey[key] = struct{}{}
+		claimedBy[name] = key
+		keys = append(keys, key)
 	}
-	if len(names) == 0 {
+	if len(keys) == 0 {
 		// nil rather than an empty slice: "unconfigured" is a state callers compare against.
 		return nil, nil
 	}
-	return names, nil
+	return keys, nil
 }
 
-// costLabelNames is the configured attribution dimension, in emit order. Read on every
-// recording and written only by InitCost, before the manager starts.
+// costLabelKeys is the configured attribution dimension, as POD LABEL KEYS in emit order. Read on
+// every recording and written only by configureCost, before the manager starts.
 //
-// The ORDER lives here rather than in the stamped NodeClaim, which is what makes attribution
-// safe against a flag change: values are looked up BY NAME at emit time, so adding, removing or
+// Only the keys are kept. The Prometheus names are a pure function of them (metricNameFor) and are
+// needed in exactly one place, when the counter is constructed, so storing them here would be a
+// second copy of a derivable fact — one that could go stale against this one.
+//
+// The ORDER lives here rather than in the stamped NodeClaim, which is what makes attribution safe
+// against a flag change: values are looked up BY KEY at emit time, so adding, removing or
 // reordering --cost-labels can never slide a team_id into the org_id column.
-var costLabelNames []string
+var costLabelKeys []string
 
-// CostLabelNames is the configured attribution dimension. Exported so the controller that stamps
-// the values onto a claim reads the SAME list the metric emits, rather than keeping a second copy
-// that could disagree with it.
-func CostLabelNames() []string {
-	return costLabelNames
+// CostLabelKeys is the Pod label keys attribution reads, in emit order. Exported so the controller
+// that stamps the values onto a claim reads the SAME list the metric emits, rather than keeping a
+// second copy that could disagree with it.
+//
+// POD KEYS, not the metric's label names — the two differ whenever a key is qualified. Stamping a
+// claim needs the former; building the counter needs metricNames.
+func CostLabelKeys() []string {
+	return costLabelKeys
+}
+
+// metricNames is the Prometheus label names a set of Pod keys is emitted under, in the same order.
+//
+// The error metricNameFor can return is dropped: ParseCostLabels has already rejected any key that
+// fails, and if a caller ever bypassed it, prometheus.Register refuses an illegal label name — so
+// the invariant is enforced twice over without an unreachable error path here.
+func metricNames(podKeys []string) []string {
+	names := make([]string, 0, len(podKeys))
+	for _, key := range podKeys {
+		name, _ := metricNameFor(key)
+		names = append(names, name)
+	}
+	return names
 }
 
 // attributionValues renders the configured dimension from a claim's stamped labels, in
-// costLabelNames order. A name the claim never carried reports "none" rather than being
-// omitted, which would move the sample to a different series.
+// costLabelKeys order. A key the claim never carried reports "none" rather than being omitted,
+// which would move the sample to a different series.
 func attributionValues(stamped map[string]string) []string {
-	if len(costLabelNames) == 0 {
+	if len(costLabelKeys) == 0 {
 		return nil
 	}
-	values := make([]string, 0, len(costLabelNames))
-	for _, name := range costLabelNames {
-		values = append(values, orNone(stamped[name]))
+	values := make([]string, 0, len(costLabelKeys))
+	for _, key := range costLabelKeys {
+		values = append(values, orNone(stamped[key]))
 	}
 	return values
 }
@@ -132,7 +182,7 @@ var (
 // nobody's problem until invoicing. Skipped entirely without attribution, where every dimension is
 // bounded by NodePools and provider catalogs.
 func noteSeries(values []string) {
-	if len(costLabelNames) == 0 {
+	if len(costLabelKeys) == 0 {
 		return
 	}
 
@@ -156,6 +206,6 @@ func noteSeries(values []string) {
 		"budget, which usually means an attribution label is carrying a per-Pod value. Nothing is "+
 		"dropped or merged, so the dollars stay correct, but memory and every scrape grow until this "+
 		"process restarts. Constrain these label values at admission.",
-		"series", len(costSeries), "threshold", costSeriesWarnThreshold, "costLabels", costLabelNames)
+		"series", len(costSeries), "threshold", costSeriesWarnThreshold, "costLabels", costLabelKeys)
 	costSeries = nil
 }

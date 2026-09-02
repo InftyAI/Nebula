@@ -213,15 +213,27 @@ claims.
 Who to charge. Off by default; `--cost-labels` turns it on:
 
 ```
---cost-labels=org_id,team_id
+--cost-labels=example.com/org-id,example.com/team-id
 ```
 
-Each name is used **verbatim** as both the Pod label key and the metric label, so there is no
-mapping to keep in sync — and no way for the two to disagree. That costs you qualified keys:
-`nebula.inftyai.com/org-id` is a legal Pod label and an illegal Prometheus label, so the name has
-to satisfy both grammars (letters, digits, underscores; starting with a letter). A name that does
-not, or that shadows a label the metric already has, is rejected at startup rather than silently
-reporting every tenant as `none`.
+Each entry is a **Pod label key**, written exactly as the Pod carries it. The metric label is
+*derived* from it: the key's name part, with `-` and `.` folded to `_`, and the domain prefix
+dropped.
+
+| `--cost-labels` entry | Pod label read | PromQL label |
+| --- | --- | --- |
+| `example.com/org-id` | `example.com/org-id` | `org_id` |
+| `team.id` | `team.id` | `team_id` |
+| `org_id` | `org_id` | `org_id` |
+
+So a key is configured the way Kubernetes spells it and queried the way PromQL can express it —
+nobody has to write `sum by (example_com_org_id)`. What dropping the prefix costs is that two keys
+can want the same name; `a.com/org-id,b.com/org-id` is **rejected at startup** rather than merging
+two tenants' spend into one series. Also rejected there: a key Kubernetes would not accept, a name
+part no folding can rescue (`2team` — Prometheus label names cannot start with a digit), the same
+key twice, and one whose derived name shadows a label the metric already carries (`provider`,
+`region`, `phase`, …). Every one of those fails the process at boot instead of silently reporting
+every tenant as `none`.
 
 Two names nothing rejects but you should still avoid: **`job` and `instance`**. Prometheus attaches
 its own at scrape time, and with the default `honor_labels: false` it renames yours to
@@ -229,14 +241,14 @@ its own at scrape time, and with the default `honor_labels: false` it renames yo
 of the tenant, with no error anywhere. `job_id` or `workload` if that is the breakdown you want.
 
 The values are read off the served Pod once — when the claim first becomes chargeable, in the same
-status patch that opens its billing window — and pinned on
-`NodeClaim.status.costLabels`:
+status patch that opens its billing window — and pinned on `NodeClaim.status.costLabels`, keyed by
+the **Pod** key rather than the derived one, so the record reads like the Pod it came from:
 
 ```yaml
 status:
   costLabels:
-    org_id: acme
-    team_id: ml
+    example.com/org-id: acme
+    example.com/team-id: ml
 ```
 
 Three things follow from pinning them there rather than reading the Pod at accrual time:
