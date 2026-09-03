@@ -145,6 +145,26 @@ func TestLoadFrom_OptionalColumnsAndComments(t *testing.T) {
 	}
 }
 
+// ParseFloat accepts these as numbers, so only an explicit check keeps them out. Refused at load
+// rather than downstream: the rate is pinned onto a claim and integrated from there, into a durable
+// ledger and a counter that cannot be corrected afterwards.
+func TestLoadFrom_RejectsNonFinitePrice(t *testing.T) {
+	for _, price := range []string{"NaN", "+Inf", "Infinity", "-Inf"} {
+		t.Run(price, func(t *testing.T) {
+			dir := t.TempDir()
+			csv := "accelerator_type,capacity_type,price_per_hour,available,updated\n" +
+				"H100,OnDemand," + price + ",true,2026-07-25\n"
+			if err := os.WriteFile(filepath.Join(dir, "modal.csv"), []byte(csv), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := LoadFrom(dir); err == nil {
+				t.Fatalf("LoadFrom accepted price_per_hour %q, want an error", price)
+			}
+		})
+	}
+}
+
 func TestLoadFrom_OverrideDir(t *testing.T) {
 	dir := t.TempDir()
 	csv := "accelerator_type,capacity_type,price_per_hour,available,updated\n" +

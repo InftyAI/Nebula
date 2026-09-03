@@ -18,6 +18,7 @@ package metrics
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -93,7 +94,12 @@ func configureCost(podKeys []string) {
 func RecordWindow(l Labels, phase string, attribution map[string]string, usd float64) {
 	// A zero window is the ordinary case for a claim whose anchor was just opened, and a
 	// negative one would panic. Neither is worth a series.
-	if usd <= 0 {
+	//
+	// Non-finite is checked separately because it passes every comparison above: a counter cannot
+	// be decremented, so one NaN added here is permanent, and it spreads — any sum() spanning that
+	// series is NaN too, taking the whole fleet's cost query with it. Cheaper to refuse here than
+	// to trust every caller's own parsing (see controller.finalRate).
+	if usd <= 0 || math.IsNaN(usd) || math.IsInf(usd, 0) {
 		return
 	}
 	values := l.values(append([]string{phase}, attributionValues(attribution)...)...)

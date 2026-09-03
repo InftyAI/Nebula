@@ -77,3 +77,18 @@ func TestRecordWindow_DropsNonPositive(t *testing.T) {
 		t.Fatalf("collected %d series on a non-positive window, want 0", n)
 	}
 }
+
+// NaN and Inf pass every ordering comparison, so the non-positive guard does not stop them. A
+// counter cannot be decremented: one of these lands permanently, and every sum() over the fleet
+// that spans the series reads NaN with it.
+func TestRecordWindow_DropsNonFinite(t *testing.T) {
+	CostTotal.Reset()
+
+	RecordWindow(Labels{Provider: "modal"}, "Bound", nil, 1)
+	for _, usd := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		RecordWindow(Labels{Provider: "modal"}, "Bound", nil, usd)
+	}
+	if got := testutil.ToFloat64(CostTotal); got != 1 {
+		t.Fatalf("counter reads %v after non-finite windows, want the 1 it legitimately took", got)
+	}
+}

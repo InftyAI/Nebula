@@ -224,6 +224,10 @@ func TestCostAccrual_SkipsNonBilling(t *testing.T) {
 		unbilled("unpriced", "", nebulav1alpha1.NodeClaimBound),
 		unbilled("malformed", "cheap", nebulav1alpha1.NodeClaimBound),
 		unbilled("nonpositive", "0.0000", nebulav1alpha1.NodeClaimBound),
+		// ParseFloat reads these as valid floats and they outrank every ordering check, so
+		// without an explicit test the guard against them is one refactor from vanishing.
+		unbilled("nan", "NaN", nebulav1alpha1.NodeClaimBound),
+		unbilled("inf", "+Inf", nebulav1alpha1.NodeClaimBound),
 	}
 	a, c := newAccrual(t, claims...)
 
@@ -236,6 +240,29 @@ func TestCostAccrual_SkipsNonBilling(t *testing.T) {
 	}
 	if n := testutil.CollectAndCount(metrics.CostTotal); n != 0 {
 		t.Fatalf("collected %d series, want 0 — no non-billing claim may accrue", n)
+	}
+}
+
+// A ledger that already holds a non-finite total recovers on the next tick. Without this the claim
+// would stay poisoned for the rest of its life even after the bad price was fixed, because every
+// total is derived from reading the previous one back.
+func TestCostAccrual_RecoversFromPoisonedLedger(t *testing.T) {
+	halfHour := 30 * time.Minute
+	nc := billingClaim("poisoned", "10.0000", &halfHour)
+	nc.Status.EstimatedCostUSD = "NaN"
+	a, c := newAccrual(t, nc)
+
+	a.accrueAll(context.Background())
+
+	want := 10 * 0.5
+	total, _ := ledger(t, c, "poisoned")
+	// Tested for finiteness FIRST: every comparison against NaN is false, so an ordinary
+	// tolerance check would pass on the very value this test exists to catch.
+	if math.IsNaN(total) || math.IsInf(total, 0) || math.Abs(total-want) > 1e-3 {
+		t.Fatalf("status.estimatedCostUSD %v, want %v — the poisoned total must be dropped, not carried", total, want)
+	}
+	if got := booked(t); math.IsNaN(got) || math.Abs(got-total) > 1e-9 {
+		t.Fatalf("booked %v, want %v", got, total)
 	}
 }
 

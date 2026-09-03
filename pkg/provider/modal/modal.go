@@ -357,8 +357,8 @@ func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
 	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
 
 	if req.AcceleratorType == "" {
-		if metered <= 0 {
-			return 0, fmt.Errorf("modal: cpu-only sandbox reserves no cpu or memory: %w", provider.ErrNoPrice)
+		if req.CPUCores <= 0 || req.MemoryMiB <= 0 {
+			return 0, fmt.Errorf("modal: cpu-only sandbox has an unpriced default cpu or memory reservation: %w", provider.ErrNoPrice)
 		}
 		return metered, nil
 	}

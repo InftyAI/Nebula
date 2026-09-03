@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"time"
 
@@ -193,7 +194,10 @@ func billingRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 // only place left that can book it. Nothing else may use this.
 func finalRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	rate, err := strconv.ParseFloat(nc.Status.PriceUSDPerHour, 64)
-	if err != nil || rate <= 0 {
+	// ParseFloat accepts "NaN" and "Inf" without an error, and both slip past rate <= 0. Left
+	// unchecked, one such value reaches the ledger, and from there it is unrecoverable: the total
+	// is re-read every tick, so NaN + x stays NaN even after the price is fixed.
+	if err != nil || math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 {
 		return 0, false
 	}
 	return rate, true
@@ -204,7 +208,10 @@ func finalRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 // and under-reporting the fleet forever.
 func costSoFar(nc *nebulav1alpha1.NodeClaim) float64 {
 	total, err := strconv.ParseFloat(nc.Status.EstimatedCostUSD, 64)
-	if err != nil || total < 0 {
+	// Non-finite is what makes the zero here load-bearing rather than tidy: a ledger already
+	// holding "NaN" (see finalRate) would otherwise stay poisoned for the claim's whole life,
+	// since every later total is derived from this read.
+	if err != nil || math.IsNaN(total) || math.IsInf(total, 0) || total < 0 {
 		return 0
 	}
 	return total
