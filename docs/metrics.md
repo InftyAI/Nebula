@@ -160,9 +160,14 @@ per-claim rollup of them, and "what did this one instance cost" is a `kubectl ge
 query:
 
 ```
-NAME               PROVIDER   ACCELERATOR   PRICE/HR   EST_COST   PHASE
-nc-train-0         modal      H100:8        23.7000    148.1250   Bound
+NAME               PROVIDER   ACCELERATOR   PRICE/HR   EST_COST       PHASE
+nc-train-0         modal      H100:8        23.7000    148.12500000   Bound
 ```
+
+`EST_COST` carries eight decimals to the rate's four because each checkpoint measures its window
+from the field it wrote last time, so digits dropped there are money dropped, not display noise: at
+four decimals a claim under $0.003/hour rounded back to its previous value every minute and never
+accrued at all. Round it when you show it.
 
 The counter is advanced only *after* the field's patch lands. A counter has no idempotency key, so
 a window booked before its write was durable would be charged twice: the anchor would not have
@@ -190,9 +195,15 @@ no private pricing, no gap between a Spot quote and the actual charge. Reconcile
 provider's billing export before anyone gets invoiced.
 
 **Which claims are charged.** Only `Bound` and `Terminating` hold an instance (see
-`NodeClaimPhase`), so only they accrue; a `Terminated` claim's `EST_COST` is its frozen final
-total, and nothing more is booked against it. `Provisioning` is excluded, undercounting by about
-one poll interval per instance.
+`NodeClaimPhase`), so only they accrue; a `Terminated` claim's `EST_COST` is its frozen final total.
+`Provisioning` is excluded, undercounting by about one poll interval per instance.
+
+An instance that ends on its own — a preemption, a crashed sandbox — reaches `Terminated` without
+passing through `Terminating`, and the loop will not touch it again. Teardown books the time since
+its last checkpoint anyway, under `phase="Terminated"`, capped at one accrual interval: the claim
+then waits in that phase until its Pod is deleted, and charging the wait would bill idle hours at GPU
+rates. So that series is a real one, accurate to ±1 interval, and it separates spend that ended by
+itself from spend we ended.
 
 `Terminating` still bills until teardown finishes, which is what makes the `phase` label worth
 having:
@@ -405,12 +416,15 @@ sum by (accelerator) (rate(nebula_cost_usd_total[30m])) * 3600
 All of these are deliberate, and all bias toward looking *better* than reality — worth
 knowing before trusting a dashboard.
 
-- **Counters reset on restart.** Every counter and histogram here is in-process, cost included:
-  a redeploy or a leader handoff starts it at zero. This is ordinary Prometheus semantics —
-  `rate()` and `increase()` detect resets, and no window is lost across one, since the anchor in
-  `status` survives — but no cumulative history survives a redeploy; the scrape backend owns
-  durability. Aggregate as `sum(increase(...))`, never `increase(sum(...))`: only the former sees
-  the per-series reset.
+- **Counters reset on restart, and lose their unscraped tail.** Every counter and histogram here is
+  in-process, cost included: a redeploy or a leader handoff starts it at zero. `rate()` and
+  `increase()` detect the reset, but the increments booked *since the last scrape* were never
+  observed by anyone, and for cost they cannot be re-booked — the next leader measures from
+  `status.lastAccruedAt`, which has already advanced past them. So an unclean exit drops up to one
+  scrape interval of spend from the counter, and a crash landing between a checkpoint's write and its
+  booking drops that window too. **`status.estimatedCostUSD` is what survives this** — cross-check
+  against it after a redeploy rather than treating the counter as durable. Aggregate as
+  `sum(increase(...))`, never `increase(sum(...))`: only the former sees the per-series reset.
 - **`EST_COST` understates a reclaimed instance; the metric does not.** The field is not written on
   the deletion path (the object is going away), so it misses the window still open at teardown —
   which the counter *does* book (see [Cost](#cost)). The two therefore disagree by up to one
@@ -418,6 +432,12 @@ knowing before trusting a dashboard.
   line agreeing with it. `EST_COST` also lags live spend by up to one interval while a claim is
   running — a freshness limit, not an error, since a window not charged now is charged in full next
   tick.
+- **The last window of a self-terminated instance is capped, not measured.** A `Terminated` claim's
+  anchor froze when the instance died, and nothing since distinguishes "died a minute ago" from
+  "died while the manager was down three hours ago", so teardown charges one interval either way
+  (see [Cost](#cost)). The cap is the safe direction — it cannot bill idle hours — but a preemption
+  during an outage is undercharged by the whole outage. Nothing is booked at all if the Pod object
+  never goes away, since teardown is what triggers it.
 - **A crash between the teardown write and the booking loses that window.** The final window is
   booked in-process right after the finalizer removal lands, and unlike a checkpoint it has no
   anchor to fall back on, so a process that dies in between charges it nowhere. Exactly-once in the

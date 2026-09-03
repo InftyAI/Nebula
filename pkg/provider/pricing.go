@@ -38,6 +38,7 @@ var ErrNoPrice = errors.New("provider: no price for request")
 // No region axis, because no catalog row is region-partitioned today (every CSV leaves
 // the column empty), so a price is uniform across a provider's regions. Add the axis back
 // alongside the first region-varying row.
+// TODO: maybe need to support region in the future.
 type PriceRequest struct {
 	// AcceleratorType is the canonical type ("H100"), empty for a CPU-only workload.
 	AcceleratorType string

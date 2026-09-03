@@ -154,9 +154,14 @@ type NodeClaimStatus struct {
 	// +optional
 	PriceUSDPerHour string `json:"priceUSDPerHour,omitempty"`
 
-	// EstimatedCostUSD is what this instance has cost SO FAR, as a decimal string ("412.9400")
+	// EstimatedCostUSD is what this instance has cost SO FAR, as a decimal string ("412.94000000")
 	// — PriceUSDPerHour integrated over the time it has held an instance. A string for the same
 	// reason the rate is one: it exists to be read off a print column.
+	//
+	// More decimals than the rate, and they are not decoration: each checkpoint re-reads this field
+	// to measure the next window, so digits dropped here are money dropped, and a cheap enough claim
+	// would round back to where it started every minute and never accrue at all. Round it for
+	// display; never round it back into this field.
 	//
 	// ESTIMATED, and the name says so on purpose: it is our own arithmetic over a list price
 	// (see PriceUSDPerHour), not a figure any provider has confirmed. Nothing here has been
@@ -199,8 +204,14 @@ type NodeClaimStatus struct {
 	// retroactively re-attribute spend already reported under the old values. A name the
 	// current --cost-labels no longer lists is ignored rather than cleaned up; one it lists but
 	// this map lacks reports as "none".
+	//
+	// Nil and EMPTY differ, which is why this field has no omitempty: nil means nothing has been
+	// observed yet (or --cost-labels is unset), while an empty map is the settled fact that the
+	// Pod carried none of the configured keys. With omitempty an empty map would not survive the
+	// write, so every reconcile would re-read the Pod and a label added later could still move
+	// the claim's attribution.
 	// +optional
-	CostLabels map[string]string `json:"costLabels,omitempty"`
+	CostLabels map[string]string `json:"costLabels"`
 }
 
 // +kubebuilder:object:root=true

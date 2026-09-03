@@ -151,6 +151,42 @@ func TestCostAccrual_AccumulatesAcrossTicks(t *testing.T) {
 	}
 }
 
+// Every checkpoint re-reads the ledger to measure the next window, so the digits it keeps ARE the
+// accounting resolution — see costDecimals. Driven at the real cadence, a cheap claim is where that
+// shows: at four decimals $0.0028/hr froze at $0.0001 and never moved again, while $0.01/hr was
+// charged a rounded-up step every minute and ran 20% over.
+func TestCostAccrual_ChargesCheapClaimsAtTheirRealRate(t *testing.T) {
+	// Modal's CPU-only components: a 20-millicore reservation, a 64MiB one, and one whole core.
+	for _, rate := range []string{"0.0028", "0.0100", "0.1419"} {
+		t.Run(rate, func(t *testing.T) {
+			none := time.Duration(0)
+			nc := billingClaim("cheap", rate, &none)
+			base := nc.Status.LastAccruedAt.Time
+			a, c := newAccrual(t, nc)
+
+			const ticks = 240 // four hours at the one-minute write cadence
+			for i := 1; i <= ticks; i++ {
+				at := base.Add(time.Duration(i) * accrualInterval)
+				a.now = func() time.Time { return at }
+				a.accrueAll(context.Background())
+			}
+
+			hourly, err := strconv.ParseFloat(rate, 64)
+			if err != nil {
+				t.Fatalf("bad rate %q: %v", rate, err)
+			}
+			want := hourly * float64(ticks) * accrualInterval.Hours()
+			total, _ := ledger(t, c, "cheap")
+			if math.Abs(total-want)/want > 1e-4 {
+				t.Fatalf("status.estimatedCostUSD %v after %d ticks at $%s/hr, want %v", total, ticks, rate, want)
+			}
+			if got := booked(t); math.Abs(got-total) > 1e-9 {
+				t.Fatalf("booked %v, want %v — the counter must take exactly what the ledger did", got, total)
+			}
+		})
+	}
+}
+
 // A claim that became billable before the ledger existed has no anchor. Opening one must not
 // invent spend for the window whose length nobody knows.
 func TestCostAccrual_StampsMissingAnchorWithoutCharging(t *testing.T) {
@@ -314,20 +350,52 @@ func TestSettleFinalCost_BooksTheOpenWindow(t *testing.T) {
 	}
 }
 
-// Once the instance is gone there is no open window, and re-booking the frozen total would charge
-// the claim's whole life a second time.
-func TestSettleFinalCost_BooksNothingOnceGone(t *testing.T) {
+// An instance that ended on its own reaches Terminated, which the accrual loop refuses to touch, so
+// the time since its last checkpoint is booked here or nowhere. The clamp is what keeps that safe:
+// the claim then sits in Terminated until its Pod is deleted, and charging that wait would bill idle
+// hours at GPU rates.
+func TestSettleFinalCost_BooksTheLastWindowOfADeadInstance(t *testing.T) {
+	// Half a window, so the first case measures the real gap rather than tripping the clamp.
+	halfWindow, day := accrualInterval/2, 24*time.Hour
+	cases := map[string]struct {
+		ago  time.Duration
+		want float64
+	}{
+		"the window since the last checkpoint": {ago: halfWindow, want: 10 * halfWindow.Hours()},
+		"never longer than one interval":       {ago: day, want: 10 * accrualInterval.Hours()},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			metrics.CostTotal.Reset()
+
+			nc := billingClaim("settled", "10.0000", &tc.ago)
+			nc.Status.Phase = nebulav1alpha1.NodeClaimTerminated
+			nc.Status.EstimatedCostUSD = "5.0000"
+
+			settleFinalCost(context.Background(), nc)
+
+			// billingClaim truncates the anchor to the second, so the real window is up to a
+			// second longer than ago. Two seconds of spend covers that and the test's own time.
+			if got := booked(t); math.Abs(got-tc.want) > 10*(2*time.Second).Hours() {
+				t.Fatalf("booked %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Unpriced is absent spend, not zero — a claim that was never chargeable must not mint a series on
+// its way out either.
+func TestSettleFinalCost_BooksNothingUnpriced(t *testing.T) {
 	metrics.CostTotal.Reset()
 
 	hour := time.Hour
-	settled := billingClaim("settled", "10.0000", &hour)
-	settled.Status.Phase = nebulav1alpha1.NodeClaimTerminated
-	settled.Status.EstimatedCostUSD = "5.0000"
+	nc := billingClaim("unpriced", "", &hour)
+	nc.Status.Phase = nebulav1alpha1.NodeClaimTerminated
 
-	settleFinalCost(context.Background(), settled)
+	settleFinalCost(context.Background(), nc)
 
 	if n := testutil.CollectAndCount(metrics.CostTotal); n != 0 {
-		t.Fatalf("collected %d series for an instance already gone, want 0", n)
+		t.Fatalf("collected %d series for a claim that was never priced, want 0", n)
 	}
 }
 

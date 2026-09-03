@@ -184,6 +184,14 @@ func billingRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	default:
 		return 0, false
 	}
+	return finalRate(nc)
+}
+
+// finalRate is billingRate without the phase gate. Terminated is excluded there because a claim
+// sits in that phase until its Pod is deleted and charging those idle hours would be wrong — but the
+// window between the last checkpoint and the instance's death is real, and settleFinalCost is the
+// only place left that can book it. Nothing else may use this.
+func finalRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	rate, err := strconv.ParseFloat(nc.Status.PriceUSDPerHour, 64)
 	if err != nil || rate <= 0 {
 		return 0, false
@@ -202,8 +210,17 @@ func costSoFar(nc *nebulav1alpha1.NodeClaim) float64 {
 	return total
 }
 
+// costDecimals is how many fractional digits the LEDGER keeps — more than priceDecimals, because a
+// rate is an input that is written once while a total is an accumulator that is re-read and
+// re-written every minute. Rounding it at each checkpoint would quantize the effective rate onto the
+// grid: the residue is discarded rather than carried, so a claim cheaper than half a grid step per
+// window freezes forever (at four digits, anything under $0.003/hr — a Modal CPU-only sandbox), and
+// one just above it is charged the rounded-UP step every tick. Eight digits puts that error below
+// 0.01% at any rate a catalog carries, at the cost of a wider EST_COST column.
+const costDecimals = 8
+
 func formatCost(usd float64) string {
-	return strconv.FormatFloat(usd, 'f', priceDecimals, 64)
+	return strconv.FormatFloat(usd, 'f', costDecimals, 64)
 }
 
 // stampAccrualStart opens the billing window the moment a claim first becomes chargeable,
@@ -235,20 +252,29 @@ func stampAccrualStart(nc *nebulav1alpha1.NodeClaim) bool {
 //
 // The lifetime figure itself only goes to the log; status is deleted with the object.
 func settleFinalCost(ctx context.Context, nc *nebulav1alpha1.NodeClaim) {
-	// The absent/zero distinction costNow reports is for the ledger; a log line may say $0.
-	total, _ := costNow(nc, time.Now())
-	// Zero once the instance is already gone (Terminated freezes the total), which RecordWindow
-	// drops rather than minting a series for.
-	metrics.RecordWindow(claimLabels(nc), string(nc.Status.Phase), nc.Status.CostLabels, total-costSoFar(nc))
-	logf.FromContext(ctx).Info("claim finalized", "phase", nc.Status.Phase, "totalTimeCostUSD", formatCost(total))
+	var final float64
+	if rate, ok := finalRate(nc); ok && nc.Status.LastAccruedAt != nil {
+		open := time.Since(nc.Status.LastAccruedAt.Time)
+		// Clamped in Terminated alone: its anchor froze when the instance died and the claim may
+		// have sat for days since. A Terminating claim is still running, so its whole open window is
+		// real money — including hours recovered after a manager outage.
+		if nc.Status.Phase == nebulav1alpha1.NodeClaimTerminated && open > accrualInterval {
+			open = accrualInterval
+		}
+		if open > 0 {
+			final = rate * open.Hours()
+		}
+	}
+	// Zero for a claim that was never priced or never anchored, which RecordWindow drops rather
+	// than minting a series for.
+	metrics.RecordWindow(claimLabels(nc), string(nc.Status.Phase), nc.Status.CostLabels, final)
+	logf.FromContext(ctx).Info("claim finalized", "phase", nc.Status.Phase,
+		"totalTimeCostUSD", formatCost(costSoFar(nc)+final))
 }
 
 // costNow is what a claim has cost as of now: the persisted ledger plus the window still open
 // since its anchor. False means the claim has no cost to report AT ALL — neither billable nor
 // ever charged, which is absent spend rather than zero spend (see billingRate).
-//
-// Both the checkpoint and the final log line read through here, so the ledger and the number a
-// reclaimed instance reports cannot drift.
 func costNow(nc *nebulav1alpha1.NodeClaim, now time.Time) (float64, bool) {
 	rate, billing := billingRate(nc)
 	total := costSoFar(nc)
@@ -296,7 +322,8 @@ func stampCostLabels(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) bool {
 		}
 	}
 	// An empty map, not nil: a Pod carrying none of the configured labels is a settled fact, and
-	// nil would make every later reconcile look it up again.
+	// nil would make every later reconcile look it up again. Durable only because the field has no
+	// omitempty — see NodeClaimStatus.CostLabels.
 	nc.Status.CostLabels = stamped
 	return true
 }
