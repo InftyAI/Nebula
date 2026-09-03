@@ -27,7 +27,8 @@ import (
 // CostTotal accumulates spend one CLOSED WINDOW at a time, which is what makes it billable:
 // increase(...[w]) over any window is a pure function of that window, so a consumer replaying
 // an old window re-derives the same dollars and can upsert them idempotently. That holds only for a
-// series scraped before its first charge, which is what TouchSeries is for.
+// series scraped before its first charge, which is what TouchSeries is for — and not at all for one
+// born after that pass has run.
 //
 // Deliberately carries no claim identity. A per-claim series would churn — one per instance ever
 // created, retained until the process exits — and worse, a claim that lived and died between two
@@ -121,9 +122,10 @@ func RecordWindow(l Labels, phase string, attribution map[string]string, usd flo
 // something cost nothing; a zero COUNTER only says nothing has been charged here yet, and publishing
 // it is the ordinary way to make rate() work over label values not known until runtime.
 //
-// Call it when the claim becomes chargeable, one window ahead of its first charge. That still needs
-// a scrape to land in between, so an instance born and gone inside one scrape interval is beyond
-// help — see docs/metrics.md.
+// Series are PROCESS-local, so the baseline has to be republished by whatever process is doing the
+// charging — see controller.CostAccrual.seedBaselines, which is the one caller. A scrape still has to
+// land between the baseline and the charge, so a claim that becomes chargeable after the seeding pass
+// is not covered at all; see docs/metrics.md.
 func TouchSeries(l Labels, attribution map[string]string, phases ...string) {
 	for _, phase := range phases {
 		values := l.values(append([]string{phase}, attributionValues(attribution)...)...)

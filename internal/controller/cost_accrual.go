@@ -83,6 +83,8 @@ func (a *CostAccrual) Start(ctx context.Context) error {
 	log := logf.Log.WithName("cost-accrual")
 	log.Info("starting cost accrual", "interval", a.interval)
 
+	a.seedBaselines(ctx)
+
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
 
@@ -94,6 +96,46 @@ func (a *CostAccrual) Start(ctx context.Context) error {
 			a.accrueAll(ctx)
 		}
 	}
+}
+
+// seedBaselines publishes a zero-valued series for every claim that was already chargeable when
+// this process took over, before the first tick can charge one.
+//
+// Counter series are process-local, so without this the first post-restart window of the WHOLE FLEET
+// lands on a newborn series, which increase() cannot difference (see metrics.TouchSeries). Prometheus
+// recovers some of that by reset detection, but only for an unchanged scrape target: a redeploy's new
+// Pod carries a new instance label, and a handoff to another replica is a different target entirely.
+//
+// Its position in Start is both the once-per-process guard and the ordering that matters — leader
+// election makes it the moment this process starts charging, and the first tick is an interval later,
+// so a scrape lands between a baseline and the window it explains. A claim that becomes chargeable
+// after this pass gets no baseline; see docs/metrics.md, Known gaps.
+//
+// Best-effort: a failed List costs one window's visibility, never the window itself, which the anchor
+// still carries.
+func (a *CostAccrual) seedBaselines(ctx context.Context) {
+	log := logf.Log.WithName("cost-accrual")
+
+	ctx, cancel := context.WithTimeout(ctx, accrualTimeout)
+	defer cancel()
+
+	var claims nebulav1alpha1.NodeClaimList
+	if err := a.List(ctx, &claims); err != nil {
+		log.Error(err, "listing nodeclaims to seed cost baselines")
+		return
+	}
+	seeded := 0
+	for i := range claims.Items {
+		nc := &claims.Items[i]
+		// finalRate rather than billingRate: a Terminated claim still books a window when its Pod
+		// is finally deleted (see settleFinalCost), so it needs a baseline as much as a live one.
+		if _, ok := finalRate(nc); !ok || nc.Status.LastAccruedAt == nil {
+			continue
+		}
+		metrics.TouchSeries(claimLabels(nc), nc.Status.CostLabels, billingPhases...)
+		seeded++
+	}
+	log.Info("seeded cost baselines", "claims", seeded)
 }
 
 // accrueAll checkpoints every billing claim once. Errors are logged per claim and never
@@ -189,9 +231,9 @@ func billingRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 }
 
 // billingPhases is every phase a window can be booked under: the two billingRate admits, plus
-// Terminated for the last window settleFinalCost closes. Named here so metrics.TouchSeries can
-// publish all three baselines up front — one of them stays empty for the whole claim, since a
-// reclaimed instance passes through Terminating and a self-terminated one does not.
+// Terminated for the last window settleFinalCost closes. seedBaselines publishes all three up front
+// rather than guessing: one always stays empty, since a reclaimed instance passes through Terminating
+// and a self-terminated one does not, and which of the two it will be is not knowable in advance.
 var billingPhases = []string{
 	string(nebulav1alpha1.NodeClaimBound),
 	string(nebulav1alpha1.NodeClaimTerminating),
@@ -201,7 +243,8 @@ var billingPhases = []string{
 // finalRate is billingRate without the phase gate. Terminated is excluded there because a claim
 // sits in that phase until its Pod is deleted and charging those idle hours would be wrong — but the
 // window between the last checkpoint and the instance's death is real, and settleFinalCost is the
-// only place left that can book it. Nothing else may use this.
+// only place left that can book it. Nothing may use this to decide that a claim ACCRUES; seedBaselines
+// is the one other caller, and it only asks whether a window could ever be booked.
 func finalRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	rate, err := strconv.ParseFloat(nc.Status.PriceUSDPerHour, 64)
 	// ParseFloat accepts "NaN" and "Inf" without an error, and both slip past rate <= 0. Left

@@ -586,16 +586,6 @@ func TestMarkPhase_StampsAttributionThatIsThenBooked(t *testing.T) {
 	if got.Status.LastAccruedAt == nil {
 		t.Fatal("no accrual anchor was opened; the window before the first checkpoint is lost")
 	}
-	// Published with the anchor and BEFORE any charge, which is the only ordering that makes the
-	// first window differenceable — one series per billing phase, all still at zero.
-	if n := testutil.CollectAndCount(metrics.CostTotal); n != len(billingPhases) {
-		t.Fatalf("collected %d series after the window opened, want %d baselines", n, len(billingPhases))
-	}
-	bound := metrics.CostTotal.WithLabelValues("fake", "us-east-1", "OnDemand", "H100", "1", "Bound", "acme")
-	if got := testutil.ToFloat64(bound); got != 0 {
-		t.Fatalf("the Bound baseline holds %v, want 0 — a baseline may not invent spend", got)
-	}
-
 	// Everything is settled, so a second pass over the same Pod must write nothing.
 	reconcileClaim(t, r, "c1")
 	if writes != 1 {
@@ -610,21 +600,92 @@ func TestMarkPhase_StampsAttributionThatIsThenBooked(t *testing.T) {
 	}
 	NewCostAccrual(c).accrueAll(context.Background())
 
-	// The two zeros are the baselines the reconcile published for the phases this claim has not
-	// reached yet (see metrics.TouchSeries): without them, the first window booked under either would
-	// be a series' first sample and invisible to increase().
+	// No baseline anywhere: accrueAll is driven directly, so nothing here has seeded one. That is the
+	// gap this claim would fall into if it had been born mid-process — see seedBaselines.
 	//
-	// The exposition format is line-oriented, so these cannot be wrapped.
+	// The exposition format is line-oriented, so this cannot be wrapped.
 	//nolint:lll
 	wantSeries := `
 # HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
 # TYPE nebula_cost_usd_total counter
 nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Bound",provider="fake",region="us-east-1"} 10
-nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Terminated",provider="fake",region="us-east-1"} 0
-nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Terminating",provider="fake",region="us-east-1"} 0
 `
 	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(wantSeries)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A restart throws away every series markPhase baselined when these claims were born, and it will
+// not run again for a claim that is already anchored. Seeding is what stops the whole fleet's first
+// post-restart window from landing on newborn series that increase() cannot difference.
+func TestSeedBaselines(t *testing.T) {
+	hour := time.Hour
+
+	// Every claim gets a shape of its own, or a claim wrongly skipped would hide behind the series
+	// another one seeded — only "same-shape" shares deliberately.
+	shape := billingClaim("same-shape", "10.0000", &hour)
+	// Anchored and priced, so its last window is still booked at teardown: it needs a baseline as
+	// much as a running claim does, which is why seeding asks finalRate rather than billingRate.
+	terminated := billingClaim("terminated", "10.0000", &hour)
+	terminated.Status.Phase = nebulav1alpha1.NodeClaimTerminated
+	terminated.Spec.Accelerator = "A100:2"
+	unanchored := billingClaim("unanchored", "10.0000", nil)
+	unanchored.Spec.Accelerator = "L4:1"
+	unpriced := billingClaim("unpriced", "", &hour)
+	unpriced.Spec.Accelerator = "T4:1"
+	cpu := billingClaim("cpu", "0.1000", &hour)
+	cpu.Spec.Accelerator = ""
+
+	a, _ := newAccrual(t, billingClaim("bound", "10.0000", &hour), shape, terminated, unanchored, unpriced, cpu)
+	a.seedBaselines(context.Background())
+
+	// Three shapes, three phases each. The two claims sharing H100:1 collapse onto one set of series
+	// — a baseline is per SERIES, not per claim — while L4 and T4 are absent entirely: no window can
+	// ever be booked for a claim with no anchor or no price, so a baseline would be an empty promise.
+	//
+	// The exposition format is line-oriented, so these cannot be wrapped.
+	//nolint:lll
+	want := `
+# HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
+# TYPE nebula_cost_usd_total counter
+nebula_cost_usd_total{accelerator="A100",accelerator_count="2",capacity_type="none",phase="Bound",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="A100",accelerator_count="2",capacity_type="none",phase="Terminated",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="A100",accelerator_count="2",capacity_type="none",phase="Terminating",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",phase="Bound",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",phase="Terminated",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",phase="Terminating",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="none",accelerator_count="none",capacity_type="none",phase="Bound",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="none",accelerator_count="none",capacity_type="none",phase="Terminated",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="none",accelerator_count="none",capacity_type="none",phase="Terminating",provider="modal",region="none"} 0
+`
+	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(want)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Seeding must land BEFORE the first tick, or it baselines a series the same tick already charged
+// and buys nothing. Only Start guarantees that ordering, so it is asserted through Start — with a
+// claim whose whole hour is chargeable, so a tick that beat the seed would show up as a value.
+func TestStart_SeedsBeforeCharging(t *testing.T) {
+	hour := time.Hour
+	a, _ := newAccrual(t, billingClaim("bound", "10.0000", &hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Start(ctx) }()
+
+	// a.interval is a minute, so anything observed within seconds is the seed, not a tick.
+	deadline := time.Now().Add(5 * time.Second)
+	for testutil.CollectAndCount(metrics.CostTotal) < len(billingPhases) {
+		if time.Now().After(deadline) {
+			t.Fatalf("collected %d series, want %d baselines seeded on the way to the first tick",
+				testutil.CollectAndCount(metrics.CostTotal), len(billingPhases))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := testutil.ToFloat64(metrics.CostTotal.WithLabelValues(
+		"modal", "none", "none", "H100", "1", "Bound")); got != 0 {
+		t.Fatalf("the Bound baseline holds %v, want 0 — seeding may not charge anything", got)
 	}
 }
 
