@@ -180,7 +180,7 @@ workloads look free while long ones stayed accurate.
 
 `EST_COST` does *not* get that last window, so it understates a reclaimed instance's lifetime by up
 to one interval while the counter has the whole of it. The lifetime figure also goes to the log
-(`instance reclaimed`), the only record that outlives both the object and Prometheus retention.
+(`claim finalized`), the only record that outlives both the object and Prometheus retention.
 
 **Where the number comes from.** `NodeClaim.status.priceUSDPerHour`, resolved from the
 provider's catalog (`pkg/provider/catalog/data/*.csv`) against the served Pod's shape and
@@ -217,21 +217,25 @@ Who to charge. Off by default; `--cost-labels` turns it on:
 ```
 
 Each entry is a **Pod label key**, written exactly as the Pod carries it. The metric label is
-*derived* from it: the key's name part, with `-` and `.` folded to `_`, and the domain prefix
-dropped.
+*derived* from it: the whole key, with `/`, `-` and `.` folded to `_`.
 
 | `--cost-labels` entry | Pod label read | PromQL label |
 | --- | --- | --- |
-| `example.com/org-id` | `example.com/org-id` | `org_id` |
+| `example.com/org-id` | `example.com/org-id` | `example_com_org_id` |
 | `team.id` | `team.id` | `team_id` |
 | `org_id` | `org_id` | `org_id` |
 
-So a key is configured the way Kubernetes spells it and queried the way PromQL can express it —
-nobody has to write `sum by (example_com_org_id)`. What dropping the prefix costs is that two keys
-can want the same name; `a.com/org-id,b.com/org-id` is **rejected at startup** rather than merging
-two tenants' spend into one series. Also rejected there: a key Kubernetes would not accept, a name
-part no folding can rescue (`2team` — Prometheus label names cannot start with a digit), the same
-key twice, and one whose derived name shadows a label the metric already carries (`provider`,
+So a key is configured the way Kubernetes spells it and emitted under a name Prometheus accepts,
+with nothing thrown away in between — the same convention kube-state-metrics
+(`label_app_kubernetes_io_name`) and Prometheus service discovery
+(`__meta_kubernetes_pod_label_…`) follow. Keeping the prefix is what makes `a.com/org-id` and
+`b.com/org-id` two distinct series rather than a collision, and what keeps a qualified key from
+quietly shadowing a label the metric already carries.
+
+Rejected at startup: a key Kubernetes would not accept, one whose derived name Prometheus would not
+(anything starting with a digit — a bare `2team`, or a domain like `4paradigm.com/org-id`; use an
+unqualified Pod label there), the same key twice, two keys folding to the same name (`org-id` and
+`org.id` still meet), and a bare key that shadows a label the metric already carries (`provider`,
 `region`, `phase`, …). Every one of those fails the process at boot instead of silently reporting
 every tenant as `none`.
 
@@ -265,10 +269,10 @@ workload: nothing is split, and nothing is counted twice.
 
 ```promql
 # Yesterday's bill, per tenant.
-sum by (org_id) (increase(nebula_cost_usd_total[1d]))
+sum by (example_com_org_id) (increase(nebula_cost_usd_total[1d]))
 
 # One team's burn rate, in USD/hour.
-sum(rate(nebula_cost_usd_total{org_id="acme",team_id="ml"}[30m])) * 3600
+sum(rate(nebula_cost_usd_total{example_com_org_id="acme",example_com_team_id="ml"}[30m])) * 3600
 ```
 
 **Values are tenant-controlled, which is a cardinality risk** — and the only one on this endpoint,

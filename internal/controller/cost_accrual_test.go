@@ -38,6 +38,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/metrics"
+	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // billingClaim is a claim holding a priced instance, anchored ago in the past. A nil ago leaves
@@ -426,9 +427,93 @@ func TestCostAccrual_BooksAttribution(t *testing.T) {
 	want := `
 # HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
 # TYPE nebula_cost_usd_total counter
-nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",org_id="acme",phase="Bound",provider="modal",region="none"} 10
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",example_com_org_id="acme",phase="Bound",provider="modal",region="none"} 10
 `
 	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(want)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The whole chain --cost-labels exists for, through a real reconcile: a label on the served Pod
+// reaches the claim's status, and the window charged later comes out under it. Nothing is stamped
+// by hand here, so the two halves are only connected if markPhase picks the attribution up and
+// opens the accrual anchor in the SAME write it records the phase and price with.
+func TestMarkPhase_StampsAttributionThatIsThenBooked(t *testing.T) {
+	t.Cleanup(func() { metrics.ConfigureCostForTest(nil) })
+	metrics.ConfigureCostForTest([]string{"example.com/org-id"})
+	metrics.CostTotal.Reset()
+
+	pod := gpuPod("H100", 1, "1", "1Gi")
+	pod.Labels["example.com/org-id"] = "acme"
+	withInstanceID(pod, "sb-1")
+
+	nc := newClaim("c1", "p1", "default", "uid-1", "fake")
+	nc.Spec.Accelerator = "H100:1"
+	nc.Spec.Region = "us-east-1"
+	nc.Spec.CapacityType = nebulav1alpha1.CapacityOnDemand
+
+	// Status writes are counted, not merely observed: a window charged before the attribution
+	// explaining it is durable is spend nobody can bill, so the four fields must land together.
+	writes := 0
+	s := testScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(pod, nc).
+		WithStatusSubresource(&nebulav1alpha1.NodeClaim{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string,
+				obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				writes++
+				return cl.SubResource(sub).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	pp := &pricedProvider{fakeProvider: &fakeProvider{name: "fake"}, rate: 10}
+	r := &NodeClaimReconciler{Client: c, Scheme: s, Providers: func(name string) (provider.Provider, bool) {
+		return pp, name == pp.name
+	}}
+
+	reconcileClaim(t, r, "c1")
+
+	if writes != 1 {
+		t.Fatalf("%d status writes, want 1 — the attribution and the anchor must ride one patch", writes)
+	}
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimBound || got.Status.PriceUSDPerHour != "10.0000" {
+		t.Fatalf("phase %q price %q, want Bound / 10.0000", got.Status.Phase, got.Status.PriceUSDPerHour)
+	}
+	want := map[string]string{"example.com/org-id": "acme"}
+	if !reflect.DeepEqual(got.Status.CostLabels, want) {
+		t.Fatalf("status.costLabels = %v, want %v", got.Status.CostLabels, want)
+	}
+	// The anchor opens only once the claim is Bound AND priced, so its presence is also the
+	// evidence that stampAccrualStart ran after the two calls it reads — not before them.
+	if got.Status.LastAccruedAt == nil {
+		t.Fatal("no accrual anchor was opened; the window before the first checkpoint is lost")
+	}
+
+	// Everything is settled, so a second pass over the same Pod must write nothing.
+	reconcileClaim(t, r, "c1")
+	if writes != 1 {
+		t.Fatalf("%d status writes after a second reconcile, want 1", writes)
+	}
+
+	// Rewind the anchor an hour (truncated, as the accrual's own clock is) so a whole window is
+	// chargeable without sleeping, then let the loop charge it.
+	got.Status.LastAccruedAt = &metav1.Time{Time: time.Now().Add(-time.Hour).Truncate(time.Second)}
+	if err := c.Status().Update(context.Background(), got); err != nil {
+		t.Fatalf("rewind the anchor: %v", err)
+	}
+	NewCostAccrual(c).accrueAll(context.Background())
+
+	// The exposition format is line-oriented, so this cannot be wrapped.
+	//nolint:lll
+	wantSeries := `
+# HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
+# TYPE nebula_cost_usd_total counter
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Bound",provider="fake",region="us-east-1"} 10
+`
+	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(wantSeries)); err != nil {
 		t.Fatal(err)
 	}
 }

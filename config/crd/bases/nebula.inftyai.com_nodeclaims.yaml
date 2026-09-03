@@ -153,9 +153,9 @@ spec:
                 description: |-
                   CostLabels attributes this claim's spend to whoever asked for it: the values the served
                   Pod carried for the label keys the operator configured (--cost-labels). Keyed by the POD
-                  label key, verbatim — so this map reads like the Pod it came from, including any domain
-                  prefix. The metric emits under a derived name Prometheus accepts
-                  ("example.com/org-id" here is org_id there), so do not expect the two to match by string.
+                  label key, verbatim — so this map reads like the Pod it came from. The metric emits under a
+                  derived name Prometheus accepts ("example.com/org-id" here is example_com_org_id there), so
+                  do not expect the two to match by string.
 
                   Status rather than spec because it is observed from the Pod, and it sits with the rest of
                   the billing record for a reason: it is stamped in the SAME patch that opens the accrual

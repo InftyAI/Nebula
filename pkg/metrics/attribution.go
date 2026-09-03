@@ -36,23 +36,20 @@ import (
 const costSeriesWarnThreshold = 5000
 
 // promLabelName is Prometheus's own label-name grammar, applied to the DERIVED name rather than to
-// the Pod key. The one legal Kubernetes key it still rejects is a name part starting with a digit
-// ("2team"), which nothing here can repair without inventing a prefix.
+// the Pod key. The legal Kubernetes keys it still rejects are the ones STARTING with a digit — a
+// bare "2team", or a digit-leading domain like "4paradigm.com/org-id" — which nothing here can
+// repair without inventing a prefix of its own.
 var promLabelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
-// metricNameFor derives the Prometheus label name a Pod label key is emitted under: the key's name
-// part, with '-' and '.' folded to '_'.
+// metricNameFor derives the Prometheus label name a Pod label key is emitted under: the WHOLE key,
+// with '/', '-' and '.' folded to '_' — so "example.com/org-id" is queried as example_com_org_id.
 //
-// The domain prefix is dropped because it answers no question a dashboard asks — "example.com/org-id"
-// and "org-id" mean the same thing, and `sum by (example_com_org_id)` is nobody's idea of a query.
-// What that costs is two prefixes sharing a name part, which ParseCostLabels rejects outright rather
-// than letting one silently absorb the other's spend.
+// Keeping the domain prefix is what every Kubernetes exporter does (kube-state-metrics emits
+// label_app_kubernetes_io_name, Prometheus service discovery __meta_kubernetes_pod_label_…), and
+// for the reason that the prefix is part of the key's identity: two tenants' keys stay distinct,
+// and the name in a dashboard is one that appears verbatim in `kubectl get pod --show-labels`.
 func metricNameFor(podKey string) (string, error) {
-	name := podKey
-	if slash := strings.IndexByte(name, '/'); slash >= 0 {
-		name = name[slash+1:]
-	}
-	name = strings.NewReplacer("-", "_", ".", "_").Replace(name)
+	name := strings.NewReplacer("/", "_", "-", "_", ".", "_").Replace(podKey)
 	if !promLabelName.MatchString(name) {
 		return "", fmt.Errorf("cost label %q emits as %q, which Prometheus will not accept as a label "+
 			"name (it must start with a letter or underscore)", podKey, name)
@@ -69,10 +66,12 @@ func metricNameFor(podKey string) (string, error) {
 // when every series has already been recorded as "none".
 //
 // Four rejections, all at startup: a key Kubernetes would not accept, one whose derived name
-// Prometheus would not, the same key twice, and — the price of dropping the domain prefix — two
-// keys deriving the SAME name. A derived name that shadows a dimension the counter already carries
-// ("provider", "phase") gets through here and fails at InitCost, where the registry rejects a
-// duplicate label name; still at startup, just with a less pointed message.
+// Prometheus would not, the same key twice, and two keys folding to the SAME name. That last one is
+// a corner case now that the prefix is kept ("org-id" and "org.id" still meet), but it would merge
+// two tenants' spend into one series, so it fails rather than being tolerated. A derived name that
+// shadows a dimension the counter already carries ("provider", "phase") gets through here and fails
+// at InitCost, where the registry rejects a duplicate label name; still at startup, just with a
+// less pointed message.
 //
 // Setting this at all is what makes cost the only metric here whose CARDINALITY is not bounded by
 // configuration: the values come from Pod labels. Nothing caps them — noteSeries only warns — so
@@ -101,7 +100,7 @@ func ParseCostLabels(spec string) ([]string, error) {
 		}
 		if first, clash := claimedBy[name]; clash {
 			return nil, fmt.Errorf("cost labels %q and %q both emit as %q, which would merge two "+
-				"tenants' spend into one series; drop one or rename its name part", first, key, name)
+				"tenants' spend into one series; drop one or rename it", first, key, name)
 		}
 		seenKey[key] = struct{}{}
 		claimedBy[name] = key

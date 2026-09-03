@@ -123,8 +123,8 @@ func main() {
 			"NetworkPolicy, or set this to your API server's kubelet client CA.")
 	flag.StringVar(&costLabels, "cost-labels", "",
 		"Comma-separated Pod label keys whose values attribute cost, e.g. "+
-			"\"example.com/org-id,team_id\". Qualified keys are fine: the metric label is derived from the "+
-			"key's name part with '-' and '.' folded to '_' (example.com/org-id is queried as org_id), so "+
+			"\"example.com/org-id,team_id\". Qualified keys are fine: the metric label is the whole key "+
+			"with '/', '-' and '.' folded to '_' (example.com/org-id is queried as example_com_org_id), so "+
 			"two keys that would collide there are rejected at startup. Empty (the default) reports cost "+
 			"by candidate shape only. Changing this changes the identity of every cost series. Values "+
 			"come from Pod labels and are NOT capped: the manager warns once if they push the cost "+
