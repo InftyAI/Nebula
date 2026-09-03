@@ -383,9 +383,9 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 
 	// Only a RESERVED instance advances: capacity is committed and it is booting. An
-	// unreserved id (a Modal sandbox accepted but still queued for a GPU) stays at the
-	// Provisioning stamped above, which is exactly true — the id is real and must be
-	// reclaimed, but nothing is allocated yet.
+	// unreserved id (a Modal sandbox re-attached by its idempotency branch while still queued
+	// for a GPU) stays at the Provisioning stamped above, which is exactly true — the id is
+	// real and must be reclaimed, but nothing is allocated yet.
 	//
 	// store runs either way: an id means the instance exists. markStatus first, because
 	// store deep-copies and would otherwise track a copy without the new status.

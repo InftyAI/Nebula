@@ -43,11 +43,13 @@ const none = "none"
 // recoverable as accelerator + ":" + accelerator_count.
 var candidateLabels = []string{"provider", "region", "capacity_type", "accelerator", "accelerator_count"}
 
-// withExtra returns candidateLabels plus one trailing dimension (result, reason), for
-// the collectors that carry an outcome. It copies, because appending to a package-level
-// slice would let two collectors share and overwrite one backing array.
-func withExtra(name string) []string {
-	return append(append([]string{}, candidateLabels...), name)
+// withExtra returns candidateLabels plus the trailing dimensions a collector carries of
+// its own (result, reason, claim, phase). Variadic to pair with Labels.values, which takes
+// the matching values the same way — the two are positional, so they must be given in the
+// same order. It copies, because appending to a package-level slice would let two
+// collectors share and overwrite one backing array.
+func withExtra(names ...string) []string {
+	return append(append([]string{}, candidateLabels...), names...)
 }
 
 // Labels identifies the candidate one placement or provisioning attempt was made

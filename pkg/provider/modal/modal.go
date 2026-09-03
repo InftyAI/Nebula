@@ -56,6 +56,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -66,11 +67,16 @@ import (
 // different ceiling sets spec.activeDeadlineSeconds, which maps straight through.
 const defaultSandboxTimeout = 24 * time.Hour
 
-// provisionTimeout raises the vnode handler's generic Provision deadline, because Provision
-// here BLOCKS on the image build (see sdkClient.buildImage): a cold image is pulled into
-// Modal's cache on this call, and the create and credential legs only get what the build
-// leaves them.
-const provisionTimeout = 10 * time.Minute
+// provisionTimeout raises the vnode handler's generic Provision deadline, because Provision here
+// BLOCKS twice: a cold image is pulled into Modal's cache on this call (see sdkClient.buildImage),
+// and the credential mint then waits for a worker (see sdkClient.mintCredential).
+//
+// The two legs SHARE this budget, and the mint is the greedy one: Modal caps it at ~3m43s of its
+// own accord, so it always fails before this deadline does and the build is left roughly the
+// remaining minute. That is the cost of a tight ceiling here — a cold pull of a large image can
+// outrun it — and it is deliberate: a call that will die at 3m43s anyway should not hold a
+// pod-controller worker for ten minutes first.
+const provisionTimeout = 5 * time.Minute
 
 // compile-time assertions that Provider satisfies the interfaces. LogStreamer and
 // Executor are the optional halves: they are what make `kubectl logs` and `kubectl exec`
@@ -87,7 +93,11 @@ var (
 // real implementation (Modal SDK/HTTP) and a fake (tests) are interchangeable.
 type Client interface {
 	// CreateSandbox launches one sandbox from spec and returns its Modal id plus the
-	// connect credential minted for it. Minting is one-shot and there is no read-back, so
+	// connect credential minted for it. It returns only once Modal has PLACED the sandbox on
+	// a worker, because the mint blocks on that (see sdkClient.mintCredential) — so a queued
+	// GPU is a call that blocks for minutes, and a successful return means real capacity.
+	//
+	// Minting is one-shot and there is no read-back, so
 	// a caller that drops the credential can only get another from MintConnectCredential.
 	// A sandbox that could not be given one is unreachable, so a failed mint is an ERROR
 	// with no id, not a zero credential — the sandbox may exist, and the claim tag is what
@@ -330,6 +340,36 @@ func (p *Provider) ExpandRegions(declared []string) []string {
 	return []string{strings.Join(regions, regionSeparator)}
 }
 
+// PricePerHour overrides catalog.Base's all-in reading of the catalog, because Modal
+// meters CPU and memory SEPARATELY from the accelerator: a modal.csv row prices ONE GPU
+// and nothing else, so the sandbox's real rate is that plus what its reservation costs.
+// (AWS needs no override — a p5.48xlarge's price already covers its vCPU and RAM.)
+//
+// It also prices the CPU-ONLY sandbox that Base refuses. Base can only reject an empty
+// accelerator type, having nothing but per-accelerator rows to match; Modal genuinely runs
+// CPU-only work, and here the two non-accelerator rates are the whole price.
+//
+// ErrNoPrice for a CPU-only sandbox that reserves neither CPU nor memory: Modal then
+// applies its own defaults, and we do not know them. Unpriced is the honest answer — a 0
+// would be read as free. A GPU sandbox in that state still prices, understating by those
+// same defaults, which is immaterial beside the accelerator.
+func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
+
+	if req.AcceleratorType == "" {
+		if req.CPUCores <= 0 || req.MemoryMiB <= 0 {
+			return 0, fmt.Errorf("modal: cpu-only sandbox has an unpriced default cpu or memory reservation: %w",
+				provider.ErrNoPrice)
+		}
+		return metered, nil
+	}
+	gpu, err := p.Base.PricePerHour(req)
+	if err != nil {
+		return 0, err // ErrNoPrice or a malformed request, both already worded by Base
+	}
+	return gpu + metered, nil
+}
+
 // Capabilities implements provider.Provider. See the package doc for why each
 // trait is set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
@@ -340,18 +380,17 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		NativeTags:           true,             // sandbox tags carry identity
 		PreemptionNotice:     0,                // no push; poll-based detection
 		PollInterval:         0,                // OnDemand-only (never preempts) → the default cadence is fine
-		ProvisionTimeout:     provisionTimeout, // Provision blocks on the image build
+		ProvisionTimeout:     provisionTimeout, // Provision blocks on the build, then on placement
 	}
 }
 
 // Provision implements provider.Provider. The Pod is the source of truth for
 // the workload; req carries only the claim identity and capacity tier.
 //
-// A fresh sandbox is NEVER reserved. Create returns as soon as Modal accepts it: the id is
-// real (listable, terminable, fully on the hook for teardown) but the GPU may be queued for
-// minutes. So id and capacity are two separate facts here, unlike AWS, and reserved=false
-// is what keeps the Pod at the provisioning reason instead of claiming to be initializing.
-// The queued→running transition is then observed through the poll loop's List.
+// A fresh sandbox comes back RESERVED, but not because Modal's create says so — it accepts a
+// sandbox whose GPU is still queued. The mint is what waits (see mintCredential), so id and
+// capacity arrive together, at the price of a call that blocks for as long as the queue does —
+// bounded by Modal's own ~3m43s cap on the mint, not by provisionTimeout.
 //
 // The connect credential comes back on this call and only this call, since Modal mints it
 // once with no read-back. The caller must persist it or it is lost; see mintCredential.
@@ -368,9 +407,9 @@ func (p *Provider) Provision(
 	// Idempotency: if a sandbox already carries this claim tag, return it rather
 	// than creating a second (guards against a retry after a partial create).
 	//
-	// Unlike a fresh create, this sandbox has been OBSERVED, so its state is known: one
-	// the poll loop reports Running has capacity, one still queued does not. That is more
-	// information than a create can return, so report it rather than a flat false.
+	// Unlike a fresh create, nothing here waits for placement, so the OBSERVED state is the only
+	// evidence of capacity: one the poll loop reports Running has it, one still queued does not.
+	// This is therefore the one branch that can report reserved=false.
 	//
 	// No credential comes back, per the Provider contract: minting is one-shot with no
 	// read-back, and a fresh token revokes nothing, so re-minting for a sandbox whose token is
@@ -394,7 +433,7 @@ func (p *Provider) Provision(
 	}
 	return provider.ProvisionResult{
 		InstanceID:   id,
-		Reserved:     false,
+		Reserved:     true, // mintCredential is a blocking call, so the GPU is reserved on return
 		ConnectURL:   cred.URL,
 		ConnectToken: cred.Token,
 	}, nil
