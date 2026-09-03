@@ -211,6 +211,7 @@ type NodeClaimStatus struct {
 	// write, so every reconcile would re-read the Pod and a label added later could still move
 	// the claim's attribution.
 	// +optional
+	// +kubebuilder:validation:Nullable
 	CostLabels map[string]string `json:"costLabels"`
 }
 
