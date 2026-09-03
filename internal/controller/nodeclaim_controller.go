@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
@@ -336,13 +337,22 @@ func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.
 	// Last, so it sees the phase and price the two calls above just set: the window opens the
 	// moment those make the claim chargeable — and in the same patch as the attribution above,
 	// so no window is ever charged before we know who to charge it to.
-	if stampAccrualStart(nc) {
+	opened := stampAccrualStart(nc)
+	if opened {
 		changed = true
 	}
 	if !changed {
 		return nil
 	}
-	return r.patchStatus(ctx, nc)
+	if err := r.patchStatus(ctx, nc); err != nil {
+		return err
+	}
+	if opened {
+		// Only once the attribution this reads is durable, and only on the transition, so a requeue
+		// cannot re-touch: the zero is harmless to repeat, but the cardinality warning counts it.
+		metrics.TouchSeries(claimLabels(nc), nc.Status.CostLabels, billingPhases...)
+	}
+	return nil
 }
 
 // recordInstanceID copies the instance id off the served Pod into status.InstanceID when it

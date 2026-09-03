@@ -188,6 +188,16 @@ func billingRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	return finalRate(nc)
 }
 
+// billingPhases is every phase a window can be booked under: the two billingRate admits, plus
+// Terminated for the last window settleFinalCost closes. Named here so metrics.TouchSeries can
+// publish all three baselines up front — one of them stays empty for the whole claim, since a
+// reclaimed instance passes through Terminating and a self-terminated one does not.
+var billingPhases = []string{
+	string(nebulav1alpha1.NodeClaimBound),
+	string(nebulav1alpha1.NodeClaimTerminating),
+	string(nebulav1alpha1.NodeClaimTerminated),
+}
+
 // finalRate is billingRate without the phase gate. Terminated is excluded there because a claim
 // sits in that phase until its Pod is deleted and charging those idle hours would be wrong — but the
 // window between the last checkpoint and the instance's death is real, and settleFinalCost is the

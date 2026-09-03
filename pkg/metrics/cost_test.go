@@ -78,6 +78,57 @@ func TestRecordWindow_DropsNonPositive(t *testing.T) {
 	}
 }
 
+// The baseline exists so increase() has an earlier sample to difference against, which means it must
+// be a series that COLLECTS at zero — not merely a child object the counter knows about.
+func TestTouchSeries_PublishesAZeroBaseline(t *testing.T) {
+	CostTotal.Reset()
+
+	l := Labels{Provider: "modal", Accelerator: "H100", AcceleratorCount: 1}
+	TouchSeries(l, nil, "Bound", "Terminating", "Terminated")
+
+	// The exposition format is line-oriented, so these cannot be wrapped.
+	//nolint:lll
+	want := `
+# HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
+# TYPE nebula_cost_usd_total counter
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",phase="Bound",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",phase="Terminated",provider="modal",region="none"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="none",phase="Terminating",provider="modal",region="none"} 0
+`
+	if err := testutil.CollectAndCompare(CostTotal, strings.NewReader(want)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A baseline must not displace the charge that follows it, on the series it opened or on a repeat
+// touch — the whole point is that the first real window still reads as a rise from zero.
+func TestTouchSeries_DoesNotDisplaceTheFirstCharge(t *testing.T) {
+	CostTotal.Reset()
+
+	l := Labels{Provider: "modal"}
+	TouchSeries(l, nil, "Bound")
+	RecordWindow(l, "Bound", nil, 3.95)
+	TouchSeries(l, nil, "Bound")
+
+	if got := testutil.ToFloat64(CostTotal.WithLabelValues(l.values("Bound")...)); got != 3.95 {
+		t.Fatalf("series reads %v, want 3.95", got)
+	}
+}
+
+// The baseline is what makes a tenant-scoped series billable, so it has to land on the SAME series
+// the charge will — attribution and all, or it buys nothing.
+func TestTouchSeries_Attribution(t *testing.T) {
+	withAttribution(t, "org_id")
+
+	l := Labels{Provider: "modal"}
+	TouchSeries(l, map[string]string{"org_id": "acme"}, "Bound")
+	RecordWindow(l, "Bound", map[string]string{"org_id": "acme"}, 1)
+
+	if n := testutil.CollectAndCount(CostTotal); n != 1 {
+		t.Fatalf("collected %d series, want 1 — the baseline and the charge must share one", n)
+	}
+}
+
 // NaN and Inf pass every ordering comparison, so the non-positive guard does not stop them. A
 // counter cannot be decremented: one of these lands permanently, and every sum() over the fleet
 // that spans the series reads NaN with it.

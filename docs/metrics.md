@@ -145,6 +145,13 @@ cumulative per-claim series needs a sample at each window boundary, and an insta
 and died between two boundaries has neither, so its spend would be unbillable. Per-claim spend
 lives on the claim instead (below).
 
+Sharing series across claims narrows that problem rather than removing it, because `increase()`
+still needs a sample from *before* the charge and a series' first sample has none. So the moment a
+claim becomes chargeable, Nebula publishes its label set at `0` under all three billing phases —
+a baseline for the first window each will ever book. What is left is [one scrape
+interval](#known-gaps): an instance born and gone inside a single scrape is invisible to
+`increase()` however the series are shaped.
+
 **Instance-level** cost — infrastructure spend, blind to the workload on top, charging each
 claim's whole rate.
 
@@ -310,7 +317,8 @@ count(nebula_cost_usd_total) > 5000
 ```
 
 A Pod that carries none of the configured labels reports `none`, the same placeholder every other
-absent label uses.
+absent label uses. A Pod that carries the label with an *empty* value reports `none` too: an empty
+tenant id names no payer, so it is folded into the unattributed pool rather than splitting it.
 
 **Changing `--cost-labels` changes the identity of every cost series.** Adding a name resets each
 one to zero and starts a new set, which `increase()` reads as a reset and handles, but no
@@ -339,7 +347,8 @@ Five label values are load-bearing:
   (unconstrained), no capacity tier (the provider's default), no accelerator (a CPU-only
   Pod). An explicit token beats an empty string, which in PromQL is indistinguishable from
   a label that was never set and silently matches `{region=""}` selectors nobody meant to
-  write.
+  write. It is a plain word rather than an unforgeable token, which a real value can therefore
+  collide with — see [Known gaps](#known-gaps).
 - **`pool`** on the deferral counter is only ever the name of a NodePool that *exists*, or
   `none`. The pool a Pod asks for is a Pod label — user-controlled and unbounded — so the
   `no_pool` deferral files `none` rather than the unresolved string; a mislabeled workload
@@ -425,6 +434,15 @@ knowing before trusting a dashboard.
   booking drops that window too. **`status.estimatedCostUSD` is what survives this** — cross-check
   against it after a redeploy rather than treating the counter as durable. Aggregate as
   `sum(increase(...))`, never `increase(sum(...))`: only the former sees the per-series reset.
+- **An instance shorter than one scrape interval is invisible to `increase()`.** A counter's first
+  sample carries no information — `increase()` recovers a *rise* between two samples — so dollars
+  that arrive on a series' first sample are in `nebula_cost_usd_total` but in no `increase()` or
+  `rate()` query over it. Nebula heads this off by publishing every chargeable claim's label set at
+  `0` when the window opens (see [Cost](#cost)), which covers any claim that survives a scrape; a
+  claim whose baseline and whole spend land between two scrapes is not covered, and with
+  `--cost-labels` on — where the series is one tenant's — that tenant's entire bill can read as zero.
+  Cross-check against `status.estimatedCostUSD` and the `claim finalized` log, which are the durable
+  records. Closing it properly means a durable per-window event stream, not a counter.
 - **`EST_COST` understates a reclaimed instance; the metric does not.** The field is not written on
   the deletion path (the object is going away), so it misses the window still open at teardown —
   which the counter *does* book (see [Cost](#cost)). The two therefore disagree by up to one
@@ -450,11 +468,19 @@ knowing before trusting a dashboard.
   `org_id` when the claim became chargeable is booked to `none` for its whole life; labelling it
   afterwards does not backfill, by design (see [Attribution](#attribution)). Enforce the labels at
   admission — a webhook or a policy engine — rather than trusting the metric to notice.
+- **`none` is a placeholder a real value can forge.** A Pod whose attribution label reads literally
+  `none` shares a series with every Pod that carries no such label, merging that tenant's spend into
+  the unattributed pool. The alternatives were each worse in a way that mattered more: an unforgeable
+  token (`<none>`) is unreadable and vanishes wherever a label value reaches HTML, and the empty
+  string is what PromQL uses for "label absent", so `{org_id=""}` could no longer select the
+  unattributed bucket on its own. Pick attribution keys whose values your admission policy
+  constrains.
 - **Attribution cardinality is unbounded.** Enabling `--cost-labels` promotes tenant-controlled
   values onto a counter that never releases a series, and nothing caps it: a bad label choice grows
   manager memory and the scrape payload until a restart. The 5000-series warning is a smoke alarm,
   not a limit — see [Attribution](#attribution) for why it does not enforce, and alert on
-  `count(nebula_cost_usd_total)`.
+  `count(nebula_cost_usd_total)`. Budget three series per distinct label set, not one: the baselines
+  above are published for all three billing phases, and a claim only ever spends under two of them.
 - **`instance_ready_duration` under-samples slow boots.** The start timestamp lives only in
   the virtual node's in-memory tracking map, so a provision still in flight when the
   manager restarts is re-adopted without one and is never observed. A missing sample beats

@@ -586,6 +586,15 @@ func TestMarkPhase_StampsAttributionThatIsThenBooked(t *testing.T) {
 	if got.Status.LastAccruedAt == nil {
 		t.Fatal("no accrual anchor was opened; the window before the first checkpoint is lost")
 	}
+	// Published with the anchor and BEFORE any charge, which is the only ordering that makes the
+	// first window differenceable — one series per billing phase, all still at zero.
+	if n := testutil.CollectAndCount(metrics.CostTotal); n != len(billingPhases) {
+		t.Fatalf("collected %d series after the window opened, want %d baselines", n, len(billingPhases))
+	}
+	bound := metrics.CostTotal.WithLabelValues("fake", "us-east-1", "OnDemand", "H100", "1", "Bound", "acme")
+	if got := testutil.ToFloat64(bound); got != 0 {
+		t.Fatalf("the Bound baseline holds %v, want 0 — a baseline may not invent spend", got)
+	}
 
 	// Everything is settled, so a second pass over the same Pod must write nothing.
 	reconcileClaim(t, r, "c1")
@@ -601,12 +610,18 @@ func TestMarkPhase_StampsAttributionThatIsThenBooked(t *testing.T) {
 	}
 	NewCostAccrual(c).accrueAll(context.Background())
 
-	// The exposition format is line-oriented, so this cannot be wrapped.
+	// The two zeros are the baselines the reconcile published for the phases this claim has not
+	// reached yet (see metrics.TouchSeries): without them, the first window booked under either would
+	// be a series' first sample and invisible to increase().
+	//
+	// The exposition format is line-oriented, so these cannot be wrapped.
 	//nolint:lll
 	wantSeries := `
 # HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
 # TYPE nebula_cost_usd_total counter
 nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Bound",provider="fake",region="us-east-1"} 10
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Terminated",provider="fake",region="us-east-1"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Terminating",provider="fake",region="us-east-1"} 0
 `
 	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(wantSeries)); err != nil {
 		t.Fatal(err)
