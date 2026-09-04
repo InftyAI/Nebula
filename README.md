@@ -26,6 +26,14 @@ per-cloud glue. The API follows a Karpenter-style split:
   <img src="site/images/arch.png" alt="Nebula architecture: the operator's webhook, virtual kubelet and placement controller drive NodePools and NodeClaims onto hyperscalers, NeoClouds, Kubernetes clusters and on-prem servers" width="90%">
 </p>
 
+## Features
+
+- **Kubernetes-native experience.** Existing Deployments and Jobs opt in via labels; no new workload type and no per-cloud glue.
+- **Multi-provider support.** Modal and AWS today, with more to come.
+- **Policy-driven placement.** Flexible NodePool spec to pick providers by cost, availability, and region, with failover and network egress policy.
+- **Cost tracking.** Out-of-the-box per-instance cost tracking.
+- **Observability.** Rich metrics and logs for placement, provisioning, and instance lifecycle.
+
 ## How it works
 
 1. **Opt in.** You label a Pod to request an accelerator.
@@ -64,6 +72,11 @@ spec:
   strategy: Ordered        # try providers in listed order (or LowestPrice)
   failover:
     blocklistTTL: 10m      # how long a failed placement is skipped
+  egress:                  # outbound policy; omitted = Open
+    mode: Allowlist        # or Blocked to permit nothing
+    targets:               # CIDRs, bare IPs and domains, wildcards allowed
+    - 10.0.0.0/8
+    - "*.huggingface.co"
 ```
 
 ## Opting a workload in
