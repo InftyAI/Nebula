@@ -116,10 +116,14 @@ spec:
           - secretRef:
               name: nebula-aws-credentials
               optional: true
-          # Add one secretRef per provider as adapters land, e.g.:
-          # - secretRef:
-          #     name: nebula-runpod-credentials
-          #     optional: true
+          # RunPod: a single API key (RUNPOD_API_KEY). Unlike AWS there is no ambient
+          # identity to fall back on, so an absent Secret means the provider is simply
+          # skipped at registration. Regions come from the NodePool, so this is the only
+          # RunPod config here.
+          - secretRef:
+              name: nebula-runpod-credentials
+              optional: true
+          # Add one secretRef per provider as adapters land, following the pattern above.
         ports:
         # The kubelet API the API server dials for `kubectl logs` (10250, like a real
         # kubelet). Declaring it is documentation and NetworkPolicy surface; the
