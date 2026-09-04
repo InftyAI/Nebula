@@ -339,10 +339,16 @@ func (r *NodeClaimReconciler) markPhase(ctx context.Context, nc *nebulav1alpha1.
 	if stampAccrualStart(nc) {
 		changed = true
 	}
-	if !changed {
-		return nil
+	if changed {
+		if err := r.patchStatus(ctx, nc); err != nil {
+			return err
+		}
 	}
-	return r.patchStatus(ctx, nc)
+	// After the patch, and on every pass rather than only the one that stamps: the anchor has to be
+	// durable before a baseline claims a window exists, and re-publishing is what makes this cover a
+	// restart too (see seedClaimBaseline). Idempotent — a series that exists is left where it is.
+	seedClaimBaseline(nc)
+	return nil
 }
 
 // recordInstanceID copies the instance id off the served Pod into status.InstanceID when it

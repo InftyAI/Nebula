@@ -31,10 +31,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/metrics"
@@ -600,32 +602,121 @@ func TestMarkPhase_StampsAttributionThatIsThenBooked(t *testing.T) {
 	}
 	NewCostAccrual(c).accrueAll(context.Background())
 
-	// No baseline anywhere: accrueAll is driven directly, so nothing here has seeded one. That is the
-	// gap this claim would fall into if it had been born mid-process — see seedBaselines.
+	// The two zeroes are the point, not noise. They are what stands between this claim's first
+	// window and a series whose first sample already holds money: with them, the 10 below is a RISE
+	// that increase() can difference; without them it is invisible to every billing query.
 	//
-	// The exposition format is line-oriented, so this cannot be wrapped.
+	// The exposition format is line-oriented, so these cannot be wrapped.
 	//nolint:lll
 	wantSeries := `
 # HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
 # TYPE nebula_cost_usd_total counter
 nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Bound",provider="fake",region="us-east-1"} 10
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Terminated",provider="fake",region="us-east-1"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",example_com_org_id="acme",phase="Terminating",provider="fake",region="us-east-1"} 0
 `
 	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(wantSeries)); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// A restart throws away every series markPhase baselined when these claims were born, and it will
-// not run again for a claim that is already anchored. Seeding is what stops the whole fleet's first
-// post-restart window from landing on newborn series that increase() cannot difference.
-func TestSeedBaselines(t *testing.T) {
+// Seeding follows the patch, never the stamp. An anchor that failed to persist opens no window, so a
+// series minted alongside it advertises spend that cannot arrive — and for a claim whose writes keep
+// failing it is pure cardinality on a counter that never releases a series.
+//
+// The last pass is the restart: series are process-local, so a claim that is already anchored — one
+// this process never stamped — has to be re-seeded off the initial sync, without a status write.
+// That is why the seed is level-triggered rather than riding the stamp's once-per-claim gate.
+func TestMarkPhase_SeedsBaseline(t *testing.T) {
+	metrics.CostTotal.Reset()
+
+	pod := gpuPod("H100", 1, "1", "1Gi")
+	withInstanceID(pod, "sb-1")
+
+	nc := newClaim("c1", "p1", "default", "uid-1", "fake")
+	nc.Spec.Accelerator = "H100:1"
+	nc.Spec.Region = "us-east-1"
+	nc.Spec.CapacityType = nebulav1alpha1.CapacityOnDemand
+
+	refuse := true
+	writes := 0
+	s := testScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(pod, nc).
+		WithStatusSubresource(&nebulav1alpha1.NodeClaim{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string,
+				obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if refuse {
+					return apierrors.NewInternalError(errors.New("status write refused"))
+				}
+				writes++
+				return cl.SubResource(sub).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	pp := &pricedProvider{fakeProvider: &fakeProvider{name: "fake"}, rate: 10}
+	r := &NodeClaimReconciler{Client: c, Scheme: s, Providers: func(name string) (provider.Provider, bool) {
+		return pp, name == pp.name
+	}}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "c1"},
+	}); err == nil {
+		t.Fatal("reconcile succeeded with the status write refused; the error must reach the caller")
+	}
+	if n := testutil.CollectAndCount(metrics.CostTotal); n != 0 {
+		t.Fatalf("%d series after a failed patch, want 0 — the seed must not outrun the anchor", n)
+	}
+
+	refuse = false
+	reconcileClaim(t, r, "c1")
+
+	if got := getClaim(t, c, "c1"); got.Status.LastAccruedAt == nil {
+		t.Fatal("no accrual anchor persisted; the seed below would have nothing to baseline")
+	}
+	// Zero, not absent: the dollars come later, and a baseline's whole job is to be the sample
+	// before them. See metrics.TouchSeries for why RecordWindow still refuses a zero WINDOW.
+	//
+	// The exposition format is line-oriented, so these cannot be wrapped.
+	//nolint:lll
+	want := `
+# HELP nebula_cost_usd_total Cumulative USD billed by external instances, added window by window as it accrues.
+# TYPE nebula_cost_usd_total counter
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",phase="Bound",provider="fake",region="us-east-1"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",phase="Terminated",provider="fake",region="us-east-1"} 0
+nebula_cost_usd_total{accelerator="H100",accelerator_count="1",capacity_type="OnDemand",phase="Terminating",provider="fake",region="us-east-1"} 0
+`
+	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(want)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reset stands in for a restart or a leader handoff: the claim is untouched and still anchored,
+	// but every series this process published is gone. Nothing here needs a write — the anchor is
+	// already durable — so a seed gated on the stamp would leave the whole fleet's first
+	// post-restart window landing on newborn series, an interval before the accrual loop's first tick.
+	metrics.CostTotal.Reset()
+	reconcileClaim(t, r, "c1")
+
+	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(want)); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("%d status writes, want 1 — re-seeding a settled claim must not patch it", writes)
+	}
+}
+
+// Which claims get a baseline at all, over the shapes one reconcile pass cannot cover.
+func TestSeedClaimBaseline(t *testing.T) {
+	metrics.CostTotal.Reset()
 	hour := time.Hour
 
 	// Every claim gets a shape of its own, or a claim wrongly skipped would hide behind the series
 	// another one seeded — only "same-shape" shares deliberately.
 	shape := billingClaim("same-shape", "10.0000", &hour)
 	// Anchored and priced, so its last window is still booked at teardown: it needs a baseline as
-	// much as a running claim does, which is why seeding asks finalRate rather than billingRate.
+	// much as a running claim does, which is why seeding asks parsePrice rather than billingRate.
 	terminated := billingClaim("terminated", "10.0000", &hour)
 	terminated.Status.Phase = nebulav1alpha1.NodeClaimTerminated
 	terminated.Spec.Accelerator = "A100:2"
@@ -636,8 +727,11 @@ func TestSeedBaselines(t *testing.T) {
 	cpu := billingClaim("cpu", "0.1000", &hour)
 	cpu.Spec.Accelerator = ""
 
-	a, _ := newAccrual(t, billingClaim("bound", "10.0000", &hour), shape, terminated, unanchored, unpriced, cpu)
-	a.seedBaselines(context.Background())
+	for _, nc := range []*nebulav1alpha1.NodeClaim{
+		billingClaim("bound", "10.0000", &hour), shape, terminated, unanchored, unpriced, cpu,
+	} {
+		seedClaimBaseline(nc)
+	}
 
 	// Three shapes, three phases each. The two claims sharing H100:1 collapse onto one set of series
 	// — a baseline is per SERIES, not per claim — while L4 and T4 are absent entirely: no window can
@@ -660,32 +754,6 @@ nebula_cost_usd_total{accelerator="none",accelerator_count="none",capacity_type=
 `
 	if err := testutil.CollectAndCompare(metrics.CostTotal, strings.NewReader(want)); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// Seeding must land BEFORE the first tick, or it baselines a series the same tick already charged
-// and buys nothing. Only Start guarantees that ordering, so it is asserted through Start — with a
-// claim whose whole hour is chargeable, so a tick that beat the seed would show up as a value.
-func TestStart_SeedsBeforeCharging(t *testing.T) {
-	hour := time.Hour
-	a, _ := newAccrual(t, billingClaim("bound", "10.0000", &hour))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = a.Start(ctx) }()
-
-	// a.interval is a minute, so anything observed within seconds is the seed, not a tick.
-	deadline := time.Now().Add(5 * time.Second)
-	for testutil.CollectAndCount(metrics.CostTotal) < len(billingPhases) {
-		if time.Now().After(deadline) {
-			t.Fatalf("collected %d series, want %d baselines seeded on the way to the first tick",
-				testutil.CollectAndCount(metrics.CostTotal), len(billingPhases))
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := testutil.ToFloat64(metrics.CostTotal.WithLabelValues(
-		"modal", "none", "none", "H100", "1", "Bound")); got != 0 {
-		t.Fatalf("the Bound baseline holds %v, want 0 — seeding may not charge anything", got)
 	}
 }
 

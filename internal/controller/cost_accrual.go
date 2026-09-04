@@ -83,8 +83,6 @@ func (a *CostAccrual) Start(ctx context.Context) error {
 	log := logf.Log.WithName("cost-accrual")
 	log.Info("starting cost accrual", "interval", a.interval)
 
-	a.seedBaselines(ctx)
-
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
 
@@ -96,46 +94,6 @@ func (a *CostAccrual) Start(ctx context.Context) error {
 			a.accrueAll(ctx)
 		}
 	}
-}
-
-// seedBaselines publishes a zero-valued series for every claim that was already chargeable when
-// this process took over, before the first tick can charge one.
-//
-// Counter series are process-local, so without this the first post-restart window of the WHOLE FLEET
-// lands on a newborn series, which increase() cannot difference (see metrics.TouchSeries). Prometheus
-// recovers some of that by reset detection, but only for an unchanged scrape target: a redeploy's new
-// Pod carries a new instance label, and a handoff to another replica is a different target entirely.
-//
-// Its position in Start is both the once-per-process guard and the ordering that matters — leader
-// election makes it the moment this process starts charging, and the first tick is an interval later,
-// so a scrape lands between a baseline and the window it explains. A claim that becomes chargeable
-// after this pass gets no baseline; see docs/metrics.md, Known gaps.
-//
-// Best-effort: a failed List costs one window's visibility, never the window itself, which the anchor
-// still carries.
-func (a *CostAccrual) seedBaselines(ctx context.Context) {
-	log := logf.Log.WithName("cost-accrual")
-
-	ctx, cancel := context.WithTimeout(ctx, accrualTimeout)
-	defer cancel()
-
-	var claims nebulav1alpha1.NodeClaimList
-	if err := a.List(ctx, &claims); err != nil {
-		log.Error(err, "listing nodeclaims to seed cost baselines")
-		return
-	}
-	seeded := 0
-	for i := range claims.Items {
-		nc := &claims.Items[i]
-		// finalRate rather than billingRate: a Terminated claim still books a window when its Pod
-		// is finally deleted (see settleFinalCost), so it needs a baseline as much as a live one.
-		if _, ok := finalRate(nc); !ok || nc.Status.LastAccruedAt == nil {
-			continue
-		}
-		metrics.TouchSeries(claimLabels(nc), nc.Status.CostLabels, billingPhases...)
-		seeded++
-	}
-	log.Info("seeded cost baselines", "claims", seeded)
 }
 
 // accrueAll checkpoints every billing claim once. Errors are logged per claim and never
@@ -227,25 +185,28 @@ func billingRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	default:
 		return 0, false
 	}
-	return finalRate(nc)
+	return parsePrice(nc)
 }
 
 // billingPhases is every phase a window can be booked under: the two billingRate admits, plus
-// Terminated for the last window settleFinalCost closes. seedBaselines publishes all three up front
-// rather than guessing: one always stays empty, since a reclaimed instance passes through Terminating
-// and a self-terminated one does not, and which of the two it will be is not knowable in advance.
+// Terminated for the last window settleFinalCost closes. seedClaimBaseline publishes all three up
+// front rather than guessing: one always stays empty, since a reclaimed instance passes through
+// Terminating and a self-terminated one does not, and which of the two it will be is not knowable
+// in advance.
 var billingPhases = []string{
 	string(nebulav1alpha1.NodeClaimBound),
 	string(nebulav1alpha1.NodeClaimTerminating),
 	string(nebulav1alpha1.NodeClaimTerminated),
 }
 
-// finalRate is billingRate without the phase gate. Terminated is excluded there because a claim
-// sits in that phase until its Pod is deleted and charging those idle hours would be wrong — but the
-// window between the last checkpoint and the instance's death is real, and settleFinalCost is the
-// only place left that can book it. Nothing may use this to decide that a claim ACCRUES; seedBaselines
-// is the one other caller, and it only asks whether a window could ever be booked.
-func finalRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
+// parsePrice is billingRate without the phase gate: whether an instance of this shape costs money,
+// not whether this claim is accruing right now. Nothing may use it to decide that a claim ACCRUES.
+//
+// Both callers want the ungated form because of Terminated — the phase billingRate refuses, since a
+// claim sits there until its Pod is deleted and charging those idle hours would be wrong.
+// settleFinalCost books the one window that is real, between the last checkpoint and the instance's
+// death; seedClaimBaseline only asks whether a window could ever be booked at all.
+func parsePrice(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 	rate, err := strconv.ParseFloat(nc.Status.PriceUSDPerHour, 64)
 	// ParseFloat accepts "NaN" and "Inf" without an error, and both slip past rate <= 0. Left
 	// unchecked, one such value reaches the ledger, and from there it is unrecoverable: the total
@@ -262,7 +223,7 @@ func finalRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
 func costSoFar(nc *nebulav1alpha1.NodeClaim) float64 {
 	total, err := strconv.ParseFloat(nc.Status.EstimatedCostUSD, 64)
 	// Non-finite is what makes the zero here load-bearing rather than tidy: a ledger already
-	// holding "NaN" (see finalRate) would otherwise stay poisoned for the claim's whole life,
+	// holding "NaN" (see parsePrice) would otherwise stay poisoned for the claim's whole life,
 	// since every later total is derived from this read.
 	if err != nil || math.IsNaN(total) || math.IsInf(total, 0) || total < 0 {
 		return 0
@@ -301,6 +262,31 @@ func stampAccrualStart(nc *nebulav1alpha1.NodeClaim) bool {
 	return true
 }
 
+// seedClaimBaseline publishes a zero-valued series for each phase this claim could ever book a
+// window under, so the first charge has an earlier sample to be differenced against — without one,
+// those dollars are in the counter but in no increase() query, which is what a billing consumer
+// runs (see metrics.TouchSeries).
+//
+// LEVEL-TRIGGERED on purpose, which is why one call site covers two problems that look separate.
+// A claim born mid-process is seeded when it first becomes chargeable; and because counter series
+// are process-local, a restart or leader handoff re-seeds the whole fleet off the initial sync,
+// well before the accrual loop's first tick an interval later. A once-at-startup pass covers only
+// the second, and only for claims that existed by then.
+//
+// parsePrice rather than billingRate: a Terminated claim still books a window when its Pod is
+// finally deleted (see settleFinalCost), so it needs a baseline as much as a live one. Both gates
+// are omissions — no anchor or no price means no window can ever be booked here, and a baseline
+// for one would be an empty promise that only costs cardinality.
+//
+// Worth nothing unless the scrape interval is shorter than accrualInterval: the gap this opens is
+// one tick, and a scrape has to land inside it. See docs/metrics.md, Known gaps.
+func seedClaimBaseline(nc *nebulav1alpha1.NodeClaim) {
+	if _, ok := parsePrice(nc); !ok || nc.Status.LastAccruedAt == nil {
+		return
+	}
+	metrics.TouchSeries(claimLabels(nc), nc.Status.CostLabels, billingPhases...)
+}
+
 // settleFinalCost books the window still open at teardown and logs what the instance cost over its
 // whole life.
 //
@@ -313,7 +299,7 @@ func stampAccrualStart(nc *nebulav1alpha1.NodeClaim) bool {
 // The lifetime figure itself only goes to the log; status is deleted with the object.
 func settleFinalCost(ctx context.Context, nc *nebulav1alpha1.NodeClaim) {
 	var final float64
-	if rate, ok := finalRate(nc); ok && nc.Status.LastAccruedAt != nil {
+	if rate, ok := parsePrice(nc); ok && nc.Status.LastAccruedAt != nil {
 		open := time.Since(nc.Status.LastAccruedAt.Time)
 		// Clamped in Terminated alone: its anchor froze when the instance died and the claim may
 		// have sat for days since. A Terminating claim is still running, so its whole open window is
