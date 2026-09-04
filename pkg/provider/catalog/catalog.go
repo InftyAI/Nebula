@@ -192,8 +192,8 @@ func parseCSV(r io.Reader) ([]provider.Offering, error) {
 		// ParseFloat takes "NaN" and "Inf" as valid floats. Refused at the boundary because a rate
 		// is pinned onto the claim and integrated from there — the damage is downstream, in a
 		// durable ledger and a counter that cannot be corrected, not in this row.
-		if math.IsNaN(price) || math.IsInf(price, 0) {
-			return nil, fmt.Errorf("row %d: price_per_hour %q is not a finite number", i, field(rec, colPrice))
+		if math.IsNaN(price) || math.IsInf(price, 0) || price < 0 {
+			return nil, fmt.Errorf("row %d: price_per_hour %q must be a non-negative finite number", i, field(rec, colPrice))
 		}
 		available, err := strconv.ParseBool(field(rec, colAvailable))
 		if err != nil {
