@@ -148,14 +148,16 @@ lives on the claim instead (below).
 Sharing series across claims narrows that problem rather than removing it, because `increase()`
 still needs a sample from *before* the charge and a series' first sample has none. Counter series are
 also **process-local**: a redeploy or a leader handoff starts the new process with none of them. So
-when the accrual loop starts — which under leader election is the moment this process starts charging
-— it publishes every already-anchored, priced claim's label set at `0` under all three billing
-phases, a baseline for the first window any of them will book. The seeding pass is one interval ahead
-of the first tick, so a scrape lands in between.
+`markPhase` publishes every priced, anchored claim's label set at `0` under all three billing phases
+— a baseline for the first window any of them will book — on **every** reconcile pass rather than
+once at startup.
 
-That covers the fleet across a restart, which is where the money is. It does **not** cover a label
-set appearing *after* the pass — a shape or a tenant seen for the first time mid-process — whose
-first window is still booked onto a newborn series. See [Known gaps](#known-gaps).
+Being level-triggered is what makes one seeding point cover two problems that look separate. A claim
+born mid-process, carrying a shape or a tenant seen for the first time, is baselined the moment it
+becomes chargeable; and a restart re-baselines the whole fleet off the informer's initial sync, well
+before the accrual loop's first tick an interval later. Either way the baseline precedes the first
+charge by about one accrual interval, so the whole mechanism assumes a scrape interval shorter than
+that; see [Known gaps](#known-gaps).
 
 **Instance-level** cost — infrastructure spend, blind to the workload on top, charging each
 claim's whole rate.
@@ -442,18 +444,19 @@ knowing before trusting a dashboard.
 - **A series' first charge is invisible to `increase()`.** A counter's first sample carries no
   information — `increase()` recovers a *rise* between two samples — so dollars that arrive on a
   series' first sample are in `nebula_cost_usd_total` but in no `increase()` or `rate()` query over
-  it. The baselines seeded when the accrual loop starts (see [Cost](#cost)) cover every claim already
-  billing, so a restart does not cost the fleet a window. Two cases remain, both of them worse with
-  `--cost-labels` on, where a series belongs to one tenant rather than a whole shape:
-  - a **label set first seen mid-process** — a new tenant, or a shape nothing was running on at
-    startup — gets no baseline at all, so its first window is lost to `increase()` for the life of
-    that process. Nothing re-seeds; the accrual loop seeds once.
-  - an **instance born and gone inside one scrape interval**, which no baseline can help: the
-    baseline and the charge land in the same scrape either way.
+  it. Baselines are what keep a claim from relying on sharing a series with another: `markPhase`
+  re-publishes them on every pass, so a mid-process label set — a new tenant, or a shape nothing was
+  running on at startup — is covered as well as a claim that predates the process. But the mechanism
+  is worth nothing unless **the scrape interval is shorter than `accrualInterval`**: the gap between a
+  baseline and the first window charged on it is one tick, and a scrape has to land inside it. At a
+  60s scrape it will not.
 
-  Both bias toward *undercounting*, and a tenant whose only job is short can read as zero spend.
-  Cross-check against `status.estimatedCostUSD` and the `claim finalized` log, which are the durable
-  records. Closing this properly means a durable per-window event stream, not a counter.
+  One case no baseline can help: an **instance born and gone inside one scrape interval**, where the
+  baseline and the charge land in the same scrape regardless. It biases toward *undercounting*, and
+  with `--cost-labels` on — where a series belongs to one tenant rather than a whole shape — a tenant
+  whose only job is that short can read as zero spend. Cross-check against
+  `status.estimatedCostUSD` and the `claim finalized` log, which are the durable records. Closing it
+  properly means a durable per-window event stream, not a counter.
 - **`EST_COST` understates a reclaimed instance; the metric does not.** The field is not written on
   the deletion path (the object is going away), so it misses the window still open at teardown —
   which the counter *does* book (see [Cost](#cost)). The two therefore disagree by up to one

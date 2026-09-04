@@ -27,8 +27,7 @@ import (
 // CostTotal accumulates spend one CLOSED WINDOW at a time, which is what makes it billable:
 // increase(...[w]) over any window is a pure function of that window, so a consumer replaying
 // an old window re-derives the same dollars and can upsert them idempotently. That holds only for a
-// series scraped before its first charge, which is what TouchSeries is for — and not at all for one
-// born after that pass has run.
+// series scraped before its first charge, which is what TouchSeries is for.
 //
 // Deliberately carries no claim identity. A per-claim series would churn — one per instance ever
 // created, retained until the process exits — and worse, a claim that lived and died between two
@@ -100,7 +99,7 @@ func RecordWindow(l Labels, phase string, attribution map[string]string, usd flo
 	// Non-finite is checked separately because it passes every comparison above: a counter cannot
 	// be decremented, so one NaN added here is permanent, and it spreads — any sum() spanning that
 	// series is NaN too, taking the whole fleet's cost query with it. Cheaper to refuse here than
-	// to trust every caller's own parsing (see controller.finalRate).
+	// to trust every caller's own parsing (see controller.parsePrice).
 	if usd <= 0 || math.IsNaN(usd) || math.IsInf(usd, 0) {
 		return
 	}
@@ -123,9 +122,9 @@ func RecordWindow(l Labels, phase string, attribution map[string]string, usd flo
 // it is the ordinary way to make rate() work over label values not known until runtime.
 //
 // Series are PROCESS-local, so the baseline has to be republished by whatever process is doing the
-// charging — see controller.CostAccrual.seedBaselines, which is the one caller. A scrape still has to
-// land between the baseline and the charge, so a claim that becomes chargeable after the seeding pass
-// is not covered at all; see docs/metrics.md.
+// charging, on every pass rather than once at startup — see controller.seedClaimBaseline, the one
+// caller. A scrape still has to land between the baseline and the first charge, which is what keeps
+// this a mitigation rather than a fix; see docs/metrics.md.
 func TouchSeries(l Labels, attribution map[string]string, phases ...string) {
 	for _, phase := range phases {
 		values := l.values(append([]string{phase}, attributionValues(attribution)...)...)
