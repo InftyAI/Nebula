@@ -36,19 +36,23 @@ import (
 
 // accrualInterval is how often spend is checkpointed. It is a WRITE cadence, not an accounting
 // resolution: every window is measured from the persisted anchor, so a longer interval trades
-// freshness of the EST_COST column for fewer writes, never accuracy. One minute is ~8.3 writes/s
-// across a 500-claim fleet, about a sixth of the client's rate budget (see the QPS in cmd/main.go)
-// — the point where this stops being free and starts competing with the reconcilers for it.
-const accrualInterval = time.Minute
+// freshness of the EST_COST column for fewer writes, never accuracy.
+//
+// What it does bound is the gap a baseline has to survive — a scrape must land between a series'
+// zero sample and its first charge, one tick later, or those dollars reach no increase() query at
+// all (see seedClaimBaseline). Thirty seconds keeps that reachable for the usual 15s scrape, at
+// ~16.7 writes/s across a 500-claim fleet: a third of the client's rate budget (see the QPS in
+// cmd/main.go), which is where this stops being free and starts competing with the reconcilers.
+const accrualInterval = 30 * time.Second
 
 // accrualTimeout bounds one whole tick, List plus every write. A tick that cannot finish loses
 // nothing: the anchors it did not reach are still where they were, so the next tick charges the
 // same windows.
 //
-// Now equal to accrualInterval, which is safe rather than tidy: ticks run sequentially and a
+// Equal to accrualInterval, which is safe rather than tidy: ticks run sequentially and a
 // time.Ticker drops the ticks a slow receiver missed instead of queueing them, so the worst case is
 // back-to-back ticks, and re-deriving a window from its anchor cannot double-charge it.
-const accrualTimeout = time.Minute
+const accrualTimeout = accrualInterval
 
 // CostAccrual advances each claim's durable spend ledger on a ticker.
 //
@@ -233,11 +237,13 @@ func costSoFar(nc *nebulav1alpha1.NodeClaim) float64 {
 
 // costDecimals is how many fractional digits the LEDGER keeps — more than priceDecimals, because a
 // rate is an input that is written once while a total is an accumulator that is re-read and
-// re-written every minute. Rounding it at each checkpoint would quantize the effective rate onto the
+// re-written every window. Rounding it at each checkpoint would quantize the effective rate onto the
 // grid: the residue is discarded rather than carried, so a claim cheaper than half a grid step per
-// window freezes forever (at four digits, anything under $0.003/hr — a Modal CPU-only sandbox), and
-// one just above it is charged the rounded-UP step every tick. Eight digits puts that error below
-// 0.01% at any rate a catalog carries, at the cost of a wider EST_COST column.
+// window freezes forever (at four digits and a 30s tick, anything under $0.006/hr — a Modal CPU-only
+// sandbox), and one just above it is charged the rounded-UP step every tick. A shorter interval only
+// sharpens that, since it shrinks the charge and not the step. Eight digits holds the drift under
+// 0.03% at the cheapest rate a catalog carries and far under it everywhere else, at the cost of a
+// wider EST_COST column.
 const costDecimals = 8
 
 func formatCost(usd float64) string {

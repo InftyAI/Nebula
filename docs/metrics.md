@@ -166,7 +166,7 @@ claim's whole rate.
 over a hand-maintained list price — cost *incurred*, which is what "accrued" means, not cost any
 provider has confirmed. Nothing below has been invoiced.
 
-**One arithmetic, two views.** A leader-elected loop closes each claim's window every minute:
+**One arithmetic, two views.** A leader-elected loop closes each claim's window every 30 seconds:
 it charges `priceUSDPerHour × (now − status.lastAccruedAt)`, adds it to
 `NodeClaim.status.estimatedCostUSD` (the `EST_COST` column) and re-anchors, then books the *same*
 window on the counter. So the counter is the fleet's stream of charges and the field is the
@@ -180,8 +180,8 @@ nc-train-0         modal      H100:8        23.7000    148.12500000   Bound
 
 `EST_COST` carries eight decimals to the rate's four because each checkpoint measures its window
 from the field it wrote last time, so digits dropped there are money dropped, not display noise: at
-four decimals a claim under $0.003/hour rounded back to its previous value every minute and never
-accrued at all. Round it when you show it.
+four decimals a claim under $0.006/hour rounds back to its previous value every tick and never
+accrues at all. Round it when you show it.
 
 The counter is advanced only *after* the field's patch lands. A counter has no idempotency key, so
 a window booked before its write was durable would be charged twice: the anchor would not have
@@ -448,8 +448,9 @@ knowing before trusting a dashboard.
   re-publishes them on every pass, so a mid-process label set — a new tenant, or a shape nothing was
   running on at startup — is covered as well as a claim that predates the process. But the mechanism
   is worth nothing unless **the scrape interval is shorter than `accrualInterval`**: the gap between a
-  baseline and the first window charged on it is one tick, and a scrape has to land inside it. At a
-  60s scrape it will not.
+  baseline and the first window charged on it is one tick, and a scrape has to land inside it. The
+  tick is 30s, so a 15s scrape clears it and a 60s one does not — verify yours before trusting any
+  `increase()` figure here.
 
   One case no baseline can help: an **instance born and gone inside one scrape interval**, where the
   baseline and the charge land in the same scrape regardless. It biases toward *undercounting*, and
@@ -465,7 +466,7 @@ knowing before trusting a dashboard.
   running — a freshness limit, not an error, since a window not charged now is charged in full next
   tick.
 - **The last window of a self-terminated instance is capped, not measured.** A `Terminated` claim's
-  anchor froze when the instance died, and nothing since distinguishes "died a minute ago" from
+  anchor froze when the instance died, and nothing since distinguishes "died 30 seconds ago" from
   "died while the manager was down three hours ago", so teardown charges one interval either way
   (see [Cost](#cost)). The cap is the safe direction — it cannot bill idle hours — but a preemption
   during an outage is undercharged by the whole outage. Nothing is booked at all if the Pod object
