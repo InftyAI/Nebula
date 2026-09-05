@@ -155,8 +155,8 @@ func TestCostAccrual_AccumulatesAcrossTicks(t *testing.T) {
 
 // Every checkpoint re-reads the ledger to measure the next window, so the digits it keeps ARE the
 // accounting resolution — see costDecimals. Driven at the real cadence, a cheap claim is where that
-// shows: at four decimals $0.0028/hr froze at $0.0001 and never moved again, while $0.01/hr was
-// charged a rounded-up step every minute and ran 20% over.
+// shows: at four decimals and the one-minute cadence this ran at then, $0.0028/hr froze at $0.0001
+// and never moved again, while $0.01/hr was charged a rounded-up step every tick and ran 20% over.
 func TestCostAccrual_ChargesCheapClaimsAtTheirRealRate(t *testing.T) {
 	// Modal's CPU-only components: a 20-millicore reservation, a 64MiB one, and one whole core.
 	for _, rate := range []string{"0.0028", "0.0100", "0.1419"} {
@@ -166,7 +166,7 @@ func TestCostAccrual_ChargesCheapClaimsAtTheirRealRate(t *testing.T) {
 			base := nc.Status.LastAccruedAt.Time
 			a, c := newAccrual(t, nc)
 
-			const ticks = 240 // four hours at the one-minute write cadence
+			const ticks = 480 // four hours at the 30s write cadence
 			for i := 1; i <= ticks; i++ {
 				at := base.Add(time.Duration(i) * accrualInterval)
 				a.now = func() time.Time { return at }
@@ -179,7 +179,11 @@ func TestCostAccrual_ChargesCheapClaimsAtTheirRealRate(t *testing.T) {
 			}
 			want := hourly * float64(ticks) * accrualInterval.Hours()
 			total, _ := ledger(t, c, "cheap")
-			if math.Abs(total-want)/want > 1e-4 {
+			// Half a rounding step is discarded per tick and never carried, so the bar is that
+			// residue against the SMALLEST per-window charge a catalog produces — $0.0028/hr over
+			// 30s, i.e. ~2e-4 relative. Anything worse means costDecimals is too coarse for the
+			// interval, which is the failure this test exists to catch.
+			if math.Abs(total-want)/want > 3e-4 {
 				t.Fatalf("status.estimatedCostUSD %v after %d ticks at $%s/hr, want %v", total, ticks, rate, want)
 			}
 			if got := booked(t); math.Abs(got-total) > 1e-9 {
