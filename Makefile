@@ -140,6 +140,24 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	$(GOLANGCI_LINT) config verify
 
+##@ Components
+
+# Each component under components/ is its own Go module, so `./...` here cannot see any of it --
+# not for build, test, vet or lint. This delegates any target to every component by name:
+# `make components-lint`, `make components-test`. Adding a component needs no edit here.
+#
+# Without this, a nested module is simply never checked, which is the usual way one rots.
+# Discovered by Makefile rather than by directory, which is both the contract (see
+# components/README.md) and immune to make 3.81's wildcard not filtering on a trailing slash.
+COMPONENTS := $(patsubst %/,%,$(dir $(wildcard components/*/Makefile)))
+
+.PHONY: components-%
+components-%: ## Run the named target in every component, e.g. make components-test.
+	@for c in $(COMPONENTS); do \
+		echo "==> $$c: $*"; \
+		$(MAKE) -C $$c $* || exit 1; \
+	done
+
 ##@ Build
 
 .PHONY: build
