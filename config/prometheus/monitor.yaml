@@ -13,6 +13,11 @@ spec:
     - path: /metrics
       port: https # Ensure this is the name of the port that exposes HTTPS metrics
       scheme: https
+      # Coupled to accrualInterval (30s), not a taste in freshness: a cost series is published at 0
+      # and first charged one accrual tick later, and a scrape has to land in between or those
+      # dollars reach no increase() query. Omitting this inherits the Prometheus global — 30s in
+      # kube-prometheus-stack, which leaves no margin for jitter. See docs/metrics.md, Known gaps.
+      interval: 15s
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
       tlsConfig:
         # TODO(user): The option insecureSkipVerify: true is not recommended for production since it disables

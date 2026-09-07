@@ -297,7 +297,7 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 //     still reclaims by asking the provider what exists.
 func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) nebulav1alpha1.NodeClaimPhase {
 	switch {
-	case isTerminal(pod.Status.Phase):
+	case util.IsTerminalPodPhase(pod.Status.Phase):
 		return nebulav1alpha1.NodeClaimTerminated
 	case !pod.DeletionTimestamp.IsZero():
 		return nebulav1alpha1.NodeClaimTerminating
@@ -441,11 +441,6 @@ func (r *NodeClaimReconciler) recordPrice(ctx context.Context, nc *nebulav1alpha
 func (r *NodeClaimReconciler) wasBound(nc *nebulav1alpha1.NodeClaim) bool {
 	return nc.Status.Phase == nebulav1alpha1.NodeClaimBound ||
 		nc.Status.Phase == nebulav1alpha1.NodeClaimTerminated
-}
-
-// isTerminal reports whether a Pod phase is an end state that will not progress.
-func isTerminal(phase corev1.PodPhase) bool {
-	return phase == corev1.PodFailed || phase == corev1.PodSucceeded
 }
 
 // deleteSelf deletes the claim, which triggers reconcileDelete (the backstop)

@@ -127,7 +127,7 @@ What the fleet has actually spent.
 # Dollars spent yesterday, by provider.
 sum by (provider) (increase(nebula_cost_usd_total[1d]))
 
-# Recent spend, fleet-wide. Keep the range well above BOTH the accrual interval (1m) and the
+# Recent spend, fleet-wide. Keep the range well above BOTH the accrual interval (30s) and the
 # scrape interval: increase() needs two samples inside the range, so [1m] against a 60s scrape
 # usually returns nothing at all.
 sum(increase(nebula_cost_usd_total[5m]))
@@ -447,10 +447,14 @@ knowing before trusting a dashboard.
   it. Baselines are what keep a claim from relying on sharing a series with another: `markPhase`
   re-publishes them on every pass, so a mid-process label set — a new tenant, or a shape nothing was
   running on at startup — is covered as well as a claim that predates the process. But the mechanism
-  is worth nothing unless **the scrape interval is shorter than `accrualInterval`**: the gap between a
-  baseline and the first window charged on it is one tick, and a scrape has to land inside it. The
-  tick is 30s, so a 15s scrape clears it and a 60s one does not — verify yours before trusting any
-  `increase()` figure here.
+  needs **a scrape interval shorter than `accrualInterval`**, and even then it improves the odds
+  rather than clearing the problem. The gap a scrape has to land in is not one tick: the baseline is
+  published the moment a claim becomes chargeable and the first charge lands at the *next* accrual
+  tick, so the gap is anywhere from nothing to a full interval, averaging 15s against a 30s tick.
+  Roughly three quarters of new series get a usable baseline at a 15s scrape, half at 30s, a quarter
+  at 60s. So a slower scrape makes this worse but no scrape makes it go away, and what it leaves
+  behind is an undercount — verify yours before trusting any `increase()` figure here, and see
+  `config/prometheus/monitor.yaml` for where the interval is set.
 
   One case no baseline can help: an **instance born and gone inside one scrape interval**, where the
   baseline and the charge land in the same scrape regardless. It biases toward *undercounting*, and
