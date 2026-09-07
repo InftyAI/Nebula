@@ -54,8 +54,12 @@ Records go to **stdout**, one per line; every diagnostic goes to stderr. Each re
 stamps only its own identity:
 
 ```console
-{"time":"...","log":"training step 1","kubernetes":{"pod_name":"exp-1-sandbox-0","labels":{...}}}
+{"time":"...","log":"{\"level\":\"INFO\",\"category\":\"user\",\"id\":\"1-7\",\"message\":\"training step 1\"}","kubernetes":{"pod_name":"exp-1-sandbox-0","labels":{...}}}
 ```
+
+`log` is itself JSON because the consumer parses it and hides anything it cannot — see design.md. A
+sandbox line that is *already* such an envelope keeps its own `level` and `category` and only gains the
+`id`; the `INFO`/`user` above are fallbacks for plain output.
 
 Name and labels are the whole of it — no namespace, because the consumer identifies a line by pod name
 and labels alone.

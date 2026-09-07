@@ -218,6 +218,15 @@ bearing.** `buildLine` defaults a `log` it cannot parse to category `private`, a
 hidden from every caller without the developer-view role — so a line shipped as bare text lands
 durably and is *invisible* in the UI. A wrong-but-valid envelope fails the same way, silently.
 
+**A line that is already an envelope is adopted, not nested.** `buildLine` unwraps `log` exactly
+once, so wrapping a workload's own `{level, category, message}` in ours made ours the only one read:
+every sandbox line arrived as `INFO`/`user` with the real envelope stranded inside `message` as text —
+missing from a `category=system` query, and rendered in the UI as raw JSON. So `id` is spliced into
+the workload's object instead, with `category` added only when it has none, and `level` never, since
+the consumer defaults that itself. The bar for adopting is the consumer's own decode rather than
+validity: an object it cannot decode into three strings, or one carrying no `message`, is wrapped as
+before — adopting it would land it in `private` and hide a line the wrap shows.
+
 That is what logship writes. What arrives in CloudWatch is that object nested under `log_processed`
 inside one of the agent's own, per [The handoff](#the-handoff) — so the same JSON, read one level
 deeper. The double encoding survives: `$.log_processed.log` is still a *string* of JSON, because

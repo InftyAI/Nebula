@@ -149,6 +149,76 @@ func TestRecordFormatter_MatchesTheConsumersSchema(t *testing.T) {
 	}
 }
 
+func TestRecordFormatter_KeepsTheWorkloadsOwnLevelAndCategory(t *testing.T) {
+	// The consumer unwraps log exactly once, so an envelope nested inside ours is never read: every
+	// sandbox line arrived as INFO/user with the real envelope stranded in message as text. A workload
+	// that logs `system` is then absent from a system query while its user query doubles.
+	format := Record{Pod: "p"}.Formatter()
+	data := `{"level":"WARN","category":"system","message":"loading checkpoint"}`
+
+	rec := decodeRecord(t, format(Line{Data: data, At: t1, Cursor: "100-0"}))
+	if rec.inner.Level != "WARN" || rec.inner.Category != "system" {
+		t.Fatalf("level/category = %q/%q, want WARN/system", rec.inner.Level, rec.inner.Category)
+	}
+	if rec.inner.Message != "loading checkpoint" {
+		t.Fatalf("message = %q, want the text, not the envelope", rec.inner.Message)
+	}
+	if rec.inner.ID != "100-0" {
+		t.Fatalf("id = %q, want the cursor", rec.inner.ID)
+	}
+}
+
+func TestRecordFormatter_SuppliesOnlyTheCategoryAnEnvelopeLacks(t *testing.T) {
+	// Category is the visibility gate — an envelope without one is read as private and hidden from
+	// every caller lacking the developer-view role. Level needs no such fallback: the consumer
+	// defaults it to INFO itself, so adding one would only overwrite what the workload meant.
+	format := Record{Pod: "p"}.Formatter()
+
+	rec := decodeRecord(t, format(Line{Data: `{"level":"DEBUG","message":"x"}`, At: t1, Cursor: "1-0"}))
+	if rec.inner.Category != CategoryUser {
+		t.Fatalf("category = %q, want %q", rec.inner.Category, CategoryUser)
+	}
+	if rec.inner.Level != "DEBUG" {
+		t.Fatalf("level = %q, want the workload's", rec.inner.Level)
+	}
+}
+
+func TestRecordFormatter_WrapsWhatTheConsumerCouldNotRead(t *testing.T) {
+	// Adopting an object the consumer cannot decode into {level, category, message} strings would be
+	// worse than wrapping it: its decode fails, the category falls back to private, and the line
+	// disappears. So the bar is not "valid JSON" but "an envelope that survives that decode".
+	for _, data := range []string{
+		"training step 1",  // the ordinary case: not JSON at all
+		`  {"message":"x"`, // truncated, e.g. a line the sandbox was killed mid-write
+		`{"message":42}`,   // decodes to nothing the consumer can render
+		`{"level":{},"message":"x"}`,
+		`{"message":null}`,
+		`{"level":"WARN"}`, // an object, but no text to show
+		`[{"message":"x"}]`,
+		`{"message":"x"} trailing`,
+	} {
+		rec := decodeRecord(t, Record{Pod: "p"}.Formatter()(Line{Data: data, At: t1, Cursor: "1-0"}))
+		if rec.inner.Message != data {
+			t.Fatalf("%q: message = %q, want the line verbatim", data, rec.inner.Message)
+		}
+		if rec.inner.Category != CategoryUser || rec.inner.Level != LevelInfo {
+			t.Fatalf("%q: level/category = %q/%q, want the fallbacks", data, rec.inner.Level, rec.inner.Category)
+		}
+	}
+}
+
+func TestRecordFormatter_CursorOutranksAWorkloadsOwnID(t *testing.T) {
+	// Duplicate keys are legal and every decoder keeps the last, which is why the cursor is appended
+	// rather than prepended: a workload logging its own id would otherwise shadow the only thing that
+	// can resume a stream.
+	format := Record{Pod: "p"}.Formatter()
+
+	rec := decodeRecord(t, format(Line{Data: `{"id":"theirs","message":"x"}`, At: t1, Cursor: "100-0"}))
+	if rec.inner.ID != "100-0" {
+		t.Fatalf("id = %q, want the cursor", rec.inner.ID)
+	}
+}
+
 func TestRecordFormatter_EscapesWhatWouldBreakAQuery(t *testing.T) {
 	// Twice over: the text is escaped into log, and log is escaped into the record. A quote in the
 	// output reaches CloudWatch as `\\\"`, and getting either layer wrong loses the whole line.
