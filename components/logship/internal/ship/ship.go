@@ -80,7 +80,8 @@ func NewAssembler(collapseFrames bool) *Assembler {
 }
 
 // Add returns the lines this batch completed. A trailing fragment is held for a later batch, or for
-// Flush, unless it grows past maxFragment — in which case it is emitted as its own line, split.
+// Flush, unless it reaches maxFragment — where it is split, because one chunk can be megabytes and a
+// Line that size defeats every bound below this one.
 func (a *Assembler) Add(b Batch) []Line {
 	a.cursor = b.Cursor
 
@@ -98,10 +99,23 @@ func (a *Assembler) Add(b Batch) []Line {
 			out = append(out, a.take())
 			data = data[i+1:]
 		}
-		a.write(e.At, data)
-		if a.buf.Len() >= maxFragment {
+		// Split at the cap rather than writing the chunk and checking after: one Modal item can be
+		// megabytes, and a single write of it emits a Line that size. A CR in a later piece still
+		// discards what an earlier one left pending, so collapsing is unaffected within the buffer —
+		// what it cannot do any more is reach back past a piece already emitted, which is the bound.
+		for {
+			room := maxFragment - a.buf.Len()
+			if len(data) < room {
+				break
+			}
+			// Rounded down so a cut never lands inside a rune. Zero means the pending fragment left
+			// room for less than one rune, and taking it is what makes room.
+			n := runeBoundary(data, room)
+			a.write(e.At, data[:n])
 			out = append(out, a.take())
+			data = data[n:]
 		}
+		a.write(e.At, data)
 	}
 	return out
 }

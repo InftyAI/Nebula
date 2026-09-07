@@ -62,6 +62,11 @@ type Config struct {
 	// the record half of read -> put -> record: without it a restart replays from the beginning,
 	// which the consumer shows as duplicated lines.
 	Shipped func(cursor string)
+
+	// Log reports a failure worth an operator's attention, and matches supervise's signature so cmd
+	// passes the same function to both. Nil is silent, which is fine for tests: the counters still
+	// hold what happened.
+	Log func(msg string, keysAndValues ...any)
 }
 
 // Stats is one stream's counters. Dropped and Failed are the two ways a line does not arrive, and
@@ -174,8 +179,9 @@ func (p *Pipeline) put(ctx context.Context, events []Event) {
 	if len(events) == 0 {
 		return
 	}
+	var err error
 	for attempt := range maxPutAttempts {
-		err := p.cfg.Sink.Put(ctx, events)
+		err = p.cfg.Sink.Put(ctx, events)
 		if err == nil {
 			p.record(func(s *Stats) { s.Events += len(events) })
 			if p.cfg.Shipped != nil {
@@ -190,13 +196,34 @@ func (p *Pipeline) put(ctx context.Context, events []Event) {
 			break
 		}
 	}
-	p.record(func(s *Stats) { s.Failed += len(events) })
+	if p.fail(len(events)) {
+		p.log("the sink refused a batch and these lines are lost", "events", len(events), "err", err)
+	}
 }
 
 func (p *Pipeline) record(f func(*Stats)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	f(&p.stats)
+}
+
+// fail counts a lost batch and reports whether it is this stream's first.
+//
+// Only the first, because the sink is shared by every stream: a broken one loses the whole fleet's
+// logs at once, and a line per batch would bury that under the flood it announces. Until this, a lost
+// batch had no account but the stats line printed at exit.
+func (p *Pipeline) fail(events int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	first := p.stats.Failed == 0
+	p.stats.Failed += events
+	return first
+}
+
+func (p *Pipeline) log(msg string, kv ...any) {
+	if p.cfg.Log != nil {
+		p.cfg.Log(msg, kv...)
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
@@ -210,12 +237,18 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// lineOverhead is what a queued Line costs beyond its payload: the struct is 56 bytes, and the slice
+// holding it carries doubling slack on top. Counted so the bound is a memory bound — a blank line is
+// real output with no payload, so without this a stream printing only newlines queues without limit,
+// which is the unbounded line count the byte bound exists to avoid.
+const lineOverhead = 64
+
 // queue holds lines between the reader and the shipper.
 //
 // Bounded in bytes rather than in lines, because a line's size is unbounded and 1,000 streams each
-// holding "a few thousand lines" is not a number anyone can size a Deployment from. wake is a
-// one-slot signal rather than the queue itself, so a full buffer never makes the reader wait for a
-// receiver.
+// holding "a few thousand lines" is not a number anyone can size a Deployment from. The bytes are
+// memory rather than payload; see lineOverhead. wake is a one-slot signal rather than the queue
+// itself, so a full buffer never makes the reader wait for a receiver.
 type queue struct {
 	mu    sync.Mutex
 	lines []Line
@@ -238,13 +271,16 @@ func newQueue(max int) *queue {
 func (q *queue) push(lines []Line) {
 	q.mu.Lock()
 	for _, l := range lines {
-		if q.max > 0 && q.bytes+len(l.Data) > q.max && len(q.lines) > 0 {
+		size := len(l.Data) + lineOverhead
+		if q.max > 0 && q.bytes+size > q.max && len(q.lines) > 0 {
 			q.dropped++
+			// Payload only: this counter answers how much log was lost, not how much memory was
+			// refused.
 			q.droppedBytes += len(l.Data)
 			continue
 		}
 		q.lines = append(q.lines, l)
-		q.bytes += len(l.Data)
+		q.bytes += size
 	}
 	q.mu.Unlock()
 

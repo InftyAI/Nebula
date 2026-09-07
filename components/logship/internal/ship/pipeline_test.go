@@ -150,6 +150,30 @@ func TestPipeline_DropsRatherThanStallingTheReader(t *testing.T) {
 	}
 }
 
+func TestPipeline_CountsWhatAQueuedLineCostsBesidesItsBytes(t *testing.T) {
+	// A blank line is real output with no payload, so a payload-only bound does not bound it at all:
+	// 2,000 of them would sit inside a 500-byte buffer, which is the unbounded line count the byte
+	// bound replaced.
+	src := &fakeSource{batches: []Batch{
+		{Entries: []Entry{{Data: strings.Repeat("\n", 2000), At: t1}}, Cursor: "1-0"},
+	}}
+	p := New(Config{Source: src, Sink: &fakeSink{}, Format: FormatCompact, MaxPendingBytes: 500})
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	s := p.Stats()
+	if s.Lines != 2000 {
+		t.Fatalf("Lines = %d, want one per newline", s.Lines)
+	}
+	if s.Dropped == 0 {
+		t.Fatal("2,000 blank lines fit a 500-byte buffer, so the bound is not a memory bound")
+	}
+	if s.Events+s.Dropped != s.Lines {
+		t.Fatalf("%d shipped + %d dropped != %d read", s.Events, s.Dropped, s.Lines)
+	}
+}
+
 func TestPipeline_AdmitsALineBiggerThanTheWholeBuffer(t *testing.T) {
 	// Otherwise a line over the bound is unshippable forever rather than merely awkward, and the
 	// assembler emits exactly such a line at maxFragment.
@@ -212,6 +236,35 @@ func TestPipeline_DropsWhatTheSinkRefusesWithoutRetrying(t *testing.T) {
 	// at the next restart instead of recoverable.
 	if len(shipped) != 0 {
 		t.Fatalf("recorded %q for a batch that never landed", shipped)
+	}
+}
+
+func TestPipeline_SaysSoOnceWhenTheSinkRefuses(t *testing.T) {
+	// The sink is shared by every stream, so a broken one loses the whole fleet's logs with the
+	// process still up. One line rather than one per batch, or the flood buries what it announces.
+	src := &fakeSource{batches: []Batch{
+		{Entries: []Entry{{Data: "a\nb\nc\n", At: t1}}, Cursor: "1-0"},
+	}}
+	sink := &fakeSink{failures: 10, err: errors.New("invalid")}
+	var logged int
+	p := New(Config{
+		Source: src, Sink: sink, Format: FormatCompact,
+		// One event per put, so the dedup is actually exercised rather than hidden by batching.
+		Limits: Limits{MaxEvents: 1},
+		Log:    func(string, ...any) { logged++ },
+	})
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sink.attempts() != 3 {
+		t.Fatalf("%d puts, want one per line", sink.attempts())
+	}
+	if s := p.Stats(); s.Failed != 3 {
+		t.Fatalf("Stats = %+v, want every lost line counted", s)
+	}
+	if logged != 1 {
+		t.Fatalf("logged %d times for 3 refused batches, want 1", logged)
 	}
 }
 

@@ -52,7 +52,9 @@ type fleet struct {
 	// checkpoint, which is why it is a function rather than a string.
 	cursor func(inst supervise.Instance, stream string) string
 
-	log func(msg string, keysAndValues ...any)
+	// Only failures are reported from here, hence errf rather than a general logger: every one of
+	// them means an instance's logs are not being shipped.
+	errf func(msg string, keysAndValues ...any)
 }
 
 // Ensure starts copying an instance, after making room for it.
@@ -66,35 +68,14 @@ type fleet struct {
 // Either failure skips the instance rather than shipping it: with no backend there is nothing to read
 // it, and with no capacity its streams would wait forever with nothing said.
 func (f *fleet) Ensure(inst supervise.Instance) {
-	if !f.reserve(inst.Provider, f.sup.Stats().Instances+1) {
-		f.log("NOT shipping this instance", "provider", inst.Provider, "instance", inst.ID, "pod", inst.Pod)
+	if !f.reserve(inst.Provider, f.sup.InstanceCount()+1) {
+		f.errf("NOT shipping this instance", "provider", inst.Provider, "instance", inst.ID, "pod", inst.Pod)
 		return
 	}
 	f.sup.Ensure(inst)
 }
 
 func (f *fleet) Forget(id string) { f.sup.Forget(id) }
-
-func (f *fleet) Sync(want []supervise.Instance) {
-	// The whole set's size against every provider in it, once each. Over-reserving is deliberate and
-	// cheap (see provider.Provider.Reserve): attributing the count per provider would mean keeping a
-	// second tally of the fleet beside the supervisor's, and the two could then disagree about who
-	// has room.
-	done := make(map[string]bool, 1)
-	for _, inst := range want {
-		if done[inst.Provider] {
-			continue
-		}
-		done[inst.Provider] = true
-		if !f.reserve(inst.Provider, len(want)) {
-			// Skipping the whole Sync rather than a prefix of it: dropping some would also drop the
-			// deletes it carries, which is what stops instances whose Pods are gone.
-			f.log("NOT syncing the fleet", "provider", inst.Provider, "found", len(want))
-			return
-		}
-	}
-	f.sup.Sync(want)
-}
 
 // streams is supervise.Config.Streams: the provider's own stream names, because they are the names it
 // will have to recognise again in Source.
@@ -136,6 +117,7 @@ func (f *fleet) build(inst supervise.Instance, stream string) (*ship.Pipeline, e
 		Format: record.Formatter(),
 		Limits: emit.Limits(0),
 		Cursor: cursor,
+		Log:    f.errf,
 		// No Throttled: a write to stdout has no rate to back off from. The agent owns retrying the
 		// one hop that does, which is the point of shipping this way.
 	}), nil
@@ -146,11 +128,11 @@ func (f *fleet) build(inst supervise.Instance, stream string) (*ship.Pipeline, e
 func (f *fleet) reserve(name string, instances int) bool {
 	p, err := f.set.Get(name)
 	if err != nil {
-		f.log("no log provider for this instance", "provider", name, "err", err)
+		f.errf("no log provider for this instance", "provider", name, "err", err)
 		return false
 	}
 	if err := p.Reserve(instances); err != nil {
-		f.log("cannot make room for this instance", "provider", name, "instances", instances, "err", err)
+		f.errf("cannot make room for this instance", "provider", name, "instances", instances, "err", err)
 		return false
 	}
 	return true

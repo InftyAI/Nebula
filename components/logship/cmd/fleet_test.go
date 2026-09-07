@@ -106,25 +106,25 @@ func (endedStream) Follow(context.Context, string, func(ship.Batch) error) error
 func newTestFleet(t *testing.T, set *provider.Set) (*fleet, *[]string) {
 	t.Helper()
 
-	var logged []string
+	var errs []string
 	f := &fleet{
 		set:  set,
 		sink: emit.New(io.Discard),
-		log:  func(msg string, _ ...any) { logged = append(logged, msg) },
+		errf: func(msg string, _ ...any) { errs = append(errs, msg) },
 	}
 	f.sup = supervise.New(context.Background(), supervise.Config{Streams: f.streams, Build: f.build})
 	t.Cleanup(f.sup.Shutdown)
-	return f, &logged
+	return f, &errs
 }
 
 func TestAnInstanceOnAnUnknownProviderIsNotShipped(t *testing.T) {
 	// Nebula gaining a provider before this build does. Nothing can read the instance, and the only
 	// other symptom is a run whose logs never arrive.
-	f, logged := newTestFleet(t, provider.NewSet())
+	f, errs := newTestFleet(t, provider.NewSet())
 
 	f.Ensure(supervise.Instance{Provider: "aws", ID: "i-0abc", Pod: "exp-1-sandbox-0"})
 
-	if len(*logged) == 0 {
+	if len(*errs) == 0 {
 		t.Error("an unreadable instance was skipped without a word")
 	}
 	if st := f.sup.Stats(); st.Started != 0 {

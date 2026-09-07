@@ -127,7 +127,6 @@ type recorder struct {
 	mu      sync.Mutex
 	ensured []string
 	forgot  []string
-	synced  [][]string
 }
 
 func (r *recorder) Ensure(inst supervise.Instance) {
@@ -140,16 +139,6 @@ func (r *recorder) Forget(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.forgot = append(r.forgot, id)
-}
-
-func (r *recorder) Sync(want []supervise.Instance) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]string, 0, len(want))
-	for _, inst := range want {
-		ids = append(ids, inst.ID)
-	}
-	r.synced = append(r.synced, ids)
 }
 
 func (r *recorder) waitFor(t *testing.T, what string, cond func() bool) {
@@ -166,7 +155,7 @@ func (r *recorder) waitFor(t *testing.T, what string, cond func() bool) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t.Fatalf("timed out waiting for %s (ensured=%v forgot=%v synced=%v)", what, r.ensured, r.forgot, r.synced)
+	t.Fatalf("timed out waiting for %s (ensured=%v forgot=%v)", what, r.ensured, r.forgot)
 }
 
 func TestWatcherDrivesTheFleet(t *testing.T) {
@@ -185,10 +174,6 @@ func TestWatcherDrivesTheFleet(t *testing.T) {
 	rec.waitFor(t, "the existing pod to be ensured", func() bool {
 		return len(rec.ensured) == 1 && rec.ensured[0] == "sb-existing"
 	})
-	rec.waitFor(t, "the startup sync", func() bool {
-		return len(rec.synced) == 1 && len(rec.synced[0]) == 1 && rec.synced[0][0] == "sb-existing"
-	})
-
 	// The ordinary path: a Pod is created before it has an id, and gains one when Provision returns.
 	pending := sandboxPod("exp-1-sandbox-1", "")
 	delete(pending.Annotations, InstanceIDAnnotation)
@@ -223,8 +208,8 @@ func TestWatcherDrivesTheFleet(t *testing.T) {
 }
 
 // Re-provisioning rewrites the annotation on the SAME Pod, so the instance it displaced never gets a
-// delete event. Nothing else takes it out: the startup Sync has already run, and an instance is
-// forgotten by id, not by Pod.
+// delete event. Nothing else takes it out: an instance is forgotten by id, and every delete names the
+// id the Pod carries now.
 func TestAReplacedInstanceIsForgotten(t *testing.T) {
 	pod := sandboxPod("exp-1-sandbox-0", "sb-old")
 	client := fake.NewSimpleClientset(pod)

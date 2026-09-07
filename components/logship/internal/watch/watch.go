@@ -56,8 +56,13 @@ const (
 	EnabledValue = "true"
 )
 
-// DefaultResync bounds how long a lost watch event can go uncorrected. The informer relists on it and
-// synthesizes the deletes it missed, which is the only thing here that repairs a dropped event.
+// DefaultResync is how often the informer re-delivers the Pods it already has as updates. It is NOT a
+// relist: nothing is fetched, so it cannot notice a Pod that disappeared. A dropped event is repaired
+// only when the watch itself drops and the reflector re-lists, which is what synthesizes a missed
+// delete.
+//
+// It is load-bearing for the other direction: an instance the fleet refused for want of capacity is
+// retried by no other path, since Ensure on an already-tracked instance is a no-op.
 const DefaultResync = 10 * time.Minute
 
 // instanceFor decides whether a Pod is one to ship, and builds its Instance.
@@ -101,7 +106,6 @@ func instanceFor(pod *corev1.Pod) (supervise.Instance, bool) {
 type fleet interface {
 	Ensure(inst supervise.Instance)
 	Forget(id string)
-	Sync(want []supervise.Instance)
 }
 
 // Watcher drives a fleet from the Pods of one cluster. Client and Fleet are required.
@@ -115,16 +119,14 @@ type Watcher struct {
 	// Log matches supervise's, so cmd passes the same function to both. Nil is silent.
 	Log func(msg string, keysAndValues ...any)
 
-	// mu guards shipped. The handlers are serialized against each other, but Run calls reconcile once
-	// the cache has synced, by which time they are already firing.
 	mu sync.Mutex
 
 	// shipped is the instance each Pod was last started for, keyed namespace/name because instance Pod
 	// names repeat across the one-namespace-per-org layout.
 	//
 	// It exists to notice a REPLACED id: re-provisioning rewrites the annotation in place, so the
-	// instance it displaced gets no delete event of its own, and Sync — the only other thing that
-	// prunes — runs once at startup.
+	// instance it displaced gets no delete event of its own, and nothing else would ever forget it —
+	// a delete only ever names the id the Pod carries now.
 	shipped map[string]string
 }
 
@@ -155,10 +157,17 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 
 	factory.Start(ctx.Done())
+	// Waited on so that an API server that never answers is an error here rather than a process that
+	// sits shipping nothing. The initial list arrives through AddFunc like any other event, so there
+	// is nothing to read out of the store afterwards.
 	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+		// It also returns false on a cancelled ctx, which is a shutdown during startup rather than a
+		// failure -- and a routine one, since it polls every 100ms and a signal can beat the tick.
+		if ctx.Err() != nil {
+			return nil
+		}
 		return fmt.Errorf("pod cache did not sync")
 	}
-	w.reconcile(informer.GetStore().List())
 
 	<-ctx.Done()
 	return nil
@@ -204,31 +213,6 @@ func (w *Watcher) forget(obj any) {
 	if started != "" {
 		w.Fleet.Forget(started)
 	}
-}
-
-// reconcile hands the fleet the whole desired set, for the startup case: nothing can deliver a delete
-// event for a Pod that disappeared while this process was down.
-func (w *Watcher) reconcile(objs []any) {
-	var want []supervise.Instance
-	fresh := make(map[string]string, len(objs))
-	for _, obj := range objs {
-		pod, ok := obj.(*corev1.Pod)
-		if !ok {
-			continue
-		}
-		if inst, ok := instanceFor(pod); ok {
-			want = append(want, inst)
-			fresh[podKey(pod)] = inst.ID
-		}
-	}
-	// Replaced wholesale, not merged: Sync is about to make the tracked set exactly want, so any id
-	// this map still remembers is one Sync is about to forget.
-	w.mu.Lock()
-	w.shipped = fresh
-	w.mu.Unlock()
-
-	w.log("syncing", "instances", len(want))
-	w.Fleet.Sync(want)
 }
 
 // replace records the instance now on this Pod and returns the one it displaced, if any.

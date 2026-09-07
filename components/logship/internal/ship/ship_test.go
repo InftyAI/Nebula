@@ -137,6 +137,45 @@ func TestAssembler_CapsAnUnterminatedLine(t *testing.T) {
 	}
 }
 
+func TestAssembler_SplitsAChunkThatIsItselfOverTheCap(t *testing.T) {
+	// The cap has to bound the line, not merely flush after it: one Modal item can be megabytes, and
+	// a Line that size rides the queue's oversized-line escape and is re-split 16 KiB at a time.
+	a := NewAssembler(false)
+	got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{
+		{Data: strings.Repeat("x", 5*maxFragment/2), At: t1},
+	}})
+
+	if len(got) != 2 {
+		t.Fatalf("%d lines for 2.5x the cap, want 2", len(got))
+	}
+	for i, l := range got {
+		if len(l.Data) != maxFragment {
+			t.Fatalf("line %d is %d bytes, want the cap %d", i, len(l.Data), maxFragment)
+		}
+	}
+	if rest := a.Flush(); len(rest) != 1 || len(rest[0].Data) != maxFragment/2 {
+		t.Fatalf("Flush gave %v, want the remaining half-cap fragment", data(rest))
+	}
+}
+
+func TestAssembler_ACarriageReturnCannotReachPastAnEmittedPiece(t *testing.T) {
+	// The one thing splitting at the cap costs, asserted so it is a decision rather than a surprise:
+	// collapsing still discards what is pending, but a piece already emitted cannot be un-emitted, so
+	// a CR reaches back maxFragment rather than without limit. Honouring it further is the unbounded
+	// buffer the cap exists to prevent.
+	a := NewAssembler(true)
+	got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{
+		{Data: strings.Repeat("x", 2*maxFragment) + "\rdone", At: t1},
+	}})
+
+	if len(got) != 2 {
+		t.Fatalf("%d lines, want the two full pieces emitted before the CR arrived", len(got))
+	}
+	if rest := a.Flush(); len(rest) != 1 || rest[0].Data != "done" {
+		t.Fatalf("Flush gave %v, want the CR to have collapsed what was still pending", data(rest))
+	}
+}
+
 func TestAssembler_CollapsingKeepsAProgressBarBounded(t *testing.T) {
 	// The other half of the cap's argument: with frames collapsed, a bar that never terminates
 	// holds one frame rather than accumulating toward maxFragment at all.

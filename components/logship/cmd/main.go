@@ -100,7 +100,7 @@ func shipCluster(ctx context.Context, set *provider.Set) error {
 // newFleet wires the supervisor to the providers. Nothing is dialled here: a provider opens when the
 // first Pod on it arrives, so a cluster using one of them needs no credentials for the others.
 func newFleet(ctx context.Context, set *provider.Set) *fleet {
-	f := &fleet{set: set, sink: emit.New(os.Stdout), log: logf}
+	f := &fleet{set: set, sink: emit.New(os.Stdout), errf: errf}
 	f.sup = supervise.New(ctx, supervise.Config{
 		Streams: f.streams,
 		Build:   f.build,
@@ -114,8 +114,14 @@ func (f *fleet) shutdown() {
 	fmt.Fprintf(os.Stderr, "logship: %+v\n", f.sup.Stats())
 }
 
-// Stderr, not stdout: stdout carries the records. A diagnostic printed there would reach CloudWatch
-// as a record the consumer cannot parse.
+// logf prints an operational message, on stderr because stdout is the record channel: a diagnostic
+// printed there would reach CloudWatch as a record the consumer cannot parse.
 func logf(msg string, kv ...any) {
 	fmt.Fprintln(os.Stderr, append([]any{"logship:", msg}, kv...)...)
+}
+
+// errf marks a message as a failure. Same channel as logf; what it adds is the ERROR token, which is
+// what an operator greps for -- these are the paths where shipping stops and nothing else says so.
+func errf(msg string, kv ...any) {
+	logf("ERROR "+msg, kv...)
 }

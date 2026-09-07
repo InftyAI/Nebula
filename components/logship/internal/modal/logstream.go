@@ -59,9 +59,8 @@ type Entry struct {
 	// Data is a raw chunk, NOT a line: it may hold several newlines, or half of one. Assembling
 	// lines is the caller's, because whether a line is even the unit depends on the sink.
 	Data string
-	// At is the item's own timestamp, zero if the server sent neither form. A caller that needs a
-	// timestamp regardless decides what to substitute; guessing read time here would smear every
-	// replay and make a restart look like a burst.
+	// At is the item's timestamp. If the server sent neither timestamp field, it falls back to
+	// time.Now() so downstream sinks always get a non-zero time.
 	At time.Time
 	FD pb.FileDescriptor
 }

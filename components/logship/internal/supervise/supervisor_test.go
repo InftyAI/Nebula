@@ -49,6 +49,27 @@ func TestEnsure_StartsOnePipelinePerStream(t *testing.T) {
 	}
 }
 
+func TestInstanceCount_AgreesWithStats(t *testing.T) {
+	// The fleet reserves capacity from InstanceCount on every watch event and reports Stats once at
+	// shutdown. Two counters of the same thing, so the cheap one has to answer what the fold would.
+	b := &builder{block: true}
+	s := New(context.Background(), Config{Streams: only("stdout"), Build: b.build})
+	defer s.Shutdown()
+
+	s.Ensure(Instance{ID: "sb-1", Pod: "p"})
+	s.Ensure(Instance{ID: "sb-2", Pod: "p"})
+	waitFor(t, "both instances running", func() bool { return b.running() == 2 })
+	if got, want := s.InstanceCount(), s.Stats().Instances; got != want || got != 2 {
+		t.Fatalf("InstanceCount() = %d, Stats().Instances = %d, want 2", got, want)
+	}
+
+	s.Forget("sb-1")
+
+	if got, want := s.InstanceCount(), s.Stats().Instances; got != want || got != 1 {
+		t.Fatalf("after Forget: InstanceCount() = %d, Stats().Instances = %d, want 1", got, want)
+	}
+}
+
 func TestEnsure_IsIdempotentOnTheInstanceID(t *testing.T) {
 	// A watch re-delivers the same Pod on every unrelated update; a second set of pipelines would
 	// replay the instance from the beginning.
@@ -201,24 +222,6 @@ func TestForget_IsHarmlessForAnInstanceItNeverKnew(t *testing.T) {
 	}
 }
 
-func TestSync_StartsWhatIsMissingAndForgetsWhatIsGone(t *testing.T) {
-	// Startup and resync: a per-object event has no chance of firing for an instance that disappeared
-	// while the process was down.
-	b := &builder{block: true}
-	s := New(context.Background(), Config{Streams: only("stdout"), Build: b.build})
-	defer s.Shutdown()
-
-	s.Sync([]Instance{{ID: "sb-1"}, {ID: "sb-2"}})
-	waitFor(t, "two instances running", func() bool { return b.running() == 2 })
-
-	s.Sync([]Instance{{ID: "sb-2"}, {ID: "sb-3"}})
-
-	waitFor(t, "sb-1 stopped and sb-3 started", func() bool { return b.count() == 3 && b.running() == 2 })
-	if st := s.Stats(); st.Instances != 2 || st.Started != 3 {
-		t.Fatalf("Stats() = %+v, want 2 tracked of 3 ever started", st)
-	}
-}
-
 func TestStats_SurviveTheStreamThatProducedThem(t *testing.T) {
 	// A restart replaces the Pipeline that holds the counters, so retire has to fold them into the
 	// fleet total — otherwise a restart resets the numbers a metric is built on.
@@ -261,7 +264,8 @@ func TestShutdown_StopsEverythingAndWaits(t *testing.T) {
 	b := &builder{block: true}
 	s := New(context.Background(), Config{Streams: only("stdout", "stderr"), Build: b.build})
 
-	s.Sync([]Instance{{ID: "sb-1"}, {ID: "sb-2"}})
+	s.Ensure(Instance{ID: "sb-1"})
+	s.Ensure(Instance{ID: "sb-2"})
 	waitFor(t, "four streams running", func() bool { return b.running() == 4 })
 
 	s.Shutdown()

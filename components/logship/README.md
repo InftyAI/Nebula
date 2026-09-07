@@ -42,7 +42,6 @@ not an error.
 $ export MODAL_TOKEN_ID=ak-... MODAL_TOKEN_SECRET=as-...
 $ make run
 logship: watching Pods enabled nebula.inftyai.com/enabled instanceID nebula.inftyai.com/instance-id providers [modal]
-logship: syncing instances 1
 ```
 
 There is deliberately no way to name an instance — not to ship one, and not to read one either. A

@@ -204,31 +204,6 @@ func (s *Supervisor) Forget(id string) {
 	}
 }
 
-// Sync makes the tracked set exactly want: it starts what is missing and forgets what is gone.
-//
-// For a resync and for startup, where a per-object event has no chance of firing for an instance
-// that disappeared while the process was down.
-func (s *Supervisor) Sync(want []Instance) {
-	keep := make(map[string]bool, len(want))
-	for _, inst := range want {
-		keep[inst.ID] = true
-		s.Ensure(inst)
-	}
-
-	s.mu.Lock()
-	var stale []string
-	for id := range s.known {
-		if !keep[id] {
-			stale = append(stale, id)
-		}
-	}
-	s.mu.Unlock()
-
-	for _, id := range stale {
-		s.Forget(id)
-	}
-}
-
 // Shutdown cancels every stream and waits. The pipelines will fail their final puts against the
 // cancelled context, so a caller that wants the tails shipped drains before calling this.
 func (s *Supervisor) Shutdown() {
@@ -261,6 +236,17 @@ func (s *Supervisor) Stats() Stats {
 		}
 	}
 	return out
+}
+
+// InstanceCount is how many instances are tracked, for a caller that needs the size without the fold.
+//
+// Separate from Stats because Stats walks every live pipeline and takes each one's lock — the same
+// lock a pipeline holds to account for the lines it ships — which is the wrong shape for something
+// called once per watch event.
+func (s *Supervisor) InstanceCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats.Instances
 }
 
 // follow runs one stream, restarting it on failure until the budget is spent.
