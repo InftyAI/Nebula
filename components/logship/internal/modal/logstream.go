@@ -175,7 +175,7 @@ func itemTime(item *pb.TaskLogs) time.Time {
 	if sec := item.GetTimestamp(); sec > 0 {
 		return time.Unix(0, int64(sec*float64(time.Second)))
 	}
-	return time.Time{}
+	return time.Now()
 }
 
 // retryable mirrors the SDK's classification. Canceled is in it there and stays here: a server

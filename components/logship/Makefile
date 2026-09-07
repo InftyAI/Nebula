@@ -58,6 +58,7 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes.
 
 .PHONY: build
 build: fmt vet ## Build the logship binary.
+	mkdir -p bin
 	go build -o bin/logship ./cmd
 
 .PHONY: run
