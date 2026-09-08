@@ -102,7 +102,12 @@ PROVIDER_SECRETS=(
   # instance role (the preferred path). Region is NON-SECRET (on the manager
   # Deployment); the adapter self-configures the rest (GPU AMI + subnets).
   "nebula-aws-credentials|AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY|"
-  # "nebula-runpod-credentials|RUNPOD_API_KEY|"
+  # RunPod: one API key, and the only credential it has — there is no ambient identity to
+  # fall back on as AWS has, so a blank key skips the Secret AND the provider. Mint it at
+  # https://console.runpod.io/user/settings with read+write on Pods; a read-only key
+  # registers fine and then fails every create with an auth error, which blocklists the
+  # whole provider.
+  "nebula-runpod-credentials|RUNPOD_API_KEY|"
 )
 
 # create_provider_secret <secret-name> <required-keys> <optional-keys>
