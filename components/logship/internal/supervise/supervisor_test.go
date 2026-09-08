@@ -63,7 +63,7 @@ func TestInstanceCount_AgreesWithStats(t *testing.T) {
 		t.Fatalf("InstanceCount() = %d, Stats().Instances = %d, want 2", got, want)
 	}
 
-	s.Forget("sb-1")
+	s.Forget(Ref{ID: "sb-1"})
 
 	if got, want := s.InstanceCount(), s.Stats().Instances; got != want || got != 1 {
 		t.Fatalf("after Forget: InstanceCount() = %d, Stats().Instances = %d, want 1", got, want)
@@ -91,9 +91,39 @@ func TestEnsure_IsIdempotentOnTheInstanceID(t *testing.T) {
 	}
 }
 
+func TestSupervisor_TellsTwoProvidersApartOnTheSameID(t *testing.T) {
+	// An id is minted by the provider that owns it, so nothing stops two backends from using the same
+	// string — see Ref. Keyed by the id alone, the second Ensure was a silent no-op that shipped none of
+	// that instance's logs, and either Forget cancelled the other one's streams.
+	one := Instance{Provider: "modal", ID: "sb-1", Pod: "p"}
+	two := Instance{Provider: "aws", ID: "sb-1", Pod: "q"}
+
+	b := &builder{block: true}
+	s := New(context.Background(), Config{Streams: only("stdout"), Build: b.build})
+	defer s.Shutdown()
+
+	s.Ensure(one)
+	s.Ensure(two)
+
+	waitFor(t, "both instances running", func() bool { return b.running() == 2 })
+	if st := s.Stats(); st.Instances != 2 || st.Started != 2 {
+		t.Fatalf("Stats() = %+v, want both instances tracked", st)
+	}
+
+	s.Forget(one.Ref())
+
+	waitFor(t, "only the forgotten instance stopped", func() bool { return b.runningFor(one.Ref()) == 0 })
+	if got := b.runningFor(two.Ref()); got != 1 {
+		t.Fatalf("%d streams running for the other provider's instance, want 1", got)
+	}
+	if st := s.Stats(); st.Instances != 1 {
+		t.Fatalf("Instances = %d, want the other provider's still tracked", st.Instances)
+	}
+}
+
 func TestEnsure_IgnoresAnInstanceWithNoID(t *testing.T) {
-	// The id is the map key and the identity. A Pod whose instance-id annotation has not landed yet is
-	// not an instance called "" — it is an instance we cannot track, and the next resync will get it.
+	// The provider half of a Ref is no identity on its own. A Pod whose instance-id annotation has not
+	// landed yet is not an instance called "" — it is one we cannot track, and the next resync gets it.
 	b := &builder{block: true}
 	s := New(context.Background(), Config{Streams: only("stdout"), Build: b.build})
 	defer s.Shutdown()
@@ -203,7 +233,7 @@ func TestForget_CancelsTheStreamsAndUntracksTheInstance(t *testing.T) {
 	s.Ensure(Instance{ID: "sb-1"})
 	waitFor(t, "both streams running", func() bool { return b.running() == 2 })
 
-	s.Forget("sb-1")
+	s.Forget(Ref{ID: "sb-1"})
 
 	waitFor(t, "both streams stopped", func() bool { return b.running() == 0 })
 	if st := s.Stats(); st.Instances != 0 || st.Streams != 0 {
@@ -219,7 +249,7 @@ func TestForget_IsHarmlessForAnInstanceItNeverKnew(t *testing.T) {
 	s := New(context.Background(), Config{Streams: only("stdout"), Build: (&builder{}).build})
 	defer s.Shutdown()
 
-	s.Forget("sb-unknown")
+	s.Forget(Ref{ID: "sb-unknown"})
 
 	if st := s.Stats(); st.Instances != 0 {
 		t.Fatalf("Instances = %d after forgetting an unknown id", st.Instances)
@@ -365,6 +395,9 @@ type builder struct {
 	built    int
 	byStream map[string]int
 	live     int
+	// liveByRef is live broken down by the instance the stream belongs to, for the tests where which
+	// instance is still running is the whole question.
+	liveByRef map[Ref]int
 }
 
 func (b *builder) build(inst Instance, stream string) (*ship.Pipeline, error) {
@@ -381,7 +414,7 @@ func (b *builder) build(inst Instance, stream string) (*ship.Pipeline, error) {
 		return nil, b.buildErr
 	}
 	return ship.New(ship.Config{
-		Source:   &fakeSource{owner: b, block: b.block, fail: attempt <= b.failures, lines: b.lines},
+		Source:   &fakeSource{owner: b, ref: inst.Ref(), block: b.block, fail: attempt <= b.failures, lines: b.lines},
 		Sink:     fakeSink{},
 		Limits:   ship.Limits{MaxEvents: 100, MaxBytes: 1 << 20, MaxEventBytes: 1 << 10},
 		Interval: time.Millisecond,
@@ -410,22 +443,33 @@ func (b *builder) streams() map[string]int {
 	return out
 }
 
-func (b *builder) enter(delta int) {
+func (b *builder) runningFor(ref Ref) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.liveByRef[ref]
+}
+
+func (b *builder) enter(ref Ref, delta int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.live += delta
+	if b.liveByRef == nil {
+		b.liveByRef = map[Ref]int{}
+	}
+	b.liveByRef[ref] += delta
 }
 
 type fakeSource struct {
 	owner *builder
+	ref   Ref
 	block bool
 	fail  bool
 	lines int
 }
 
 func (s *fakeSource) Follow(ctx context.Context, cursor string, fn func(ship.Batch) error) error {
-	s.owner.enter(1)
-	defer s.owner.enter(-1)
+	s.owner.enter(s.ref, 1)
+	defer s.owner.enter(s.ref, -1)
 
 	for i := range s.lines {
 		err := fn(ship.Batch{

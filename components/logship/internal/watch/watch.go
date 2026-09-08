@@ -105,7 +105,7 @@ func instanceFor(pod *corev1.Pod) (supervise.Instance, bool) {
 // calls without building real pipelines.
 type fleet interface {
 	Ensure(inst supervise.Instance)
-	Forget(id string)
+	Forget(ref supervise.Ref)
 }
 
 // Watcher drives a fleet from the Pods of one cluster. Client and Fleet are required.
@@ -124,10 +124,10 @@ type Watcher struct {
 	// shipped is the instance each Pod was last started for, keyed namespace/name because instance Pod
 	// names repeat across the one-namespace-per-org layout.
 	//
-	// It exists to notice a REPLACED id: re-provisioning rewrites the annotation in place, so the
-	// instance it displaced gets no delete event of its own, and nothing else would ever forget it —
-	// a delete only ever names the id the Pod carries now.
-	shipped map[string]string
+	// It exists to notice a REPLACED instance: re-provisioning rewrites the annotation in place, so the
+	// one it displaced gets no delete event of its own, and nothing else would ever forget it — a delete
+	// only ever names the instance the Pod carries now.
+	shipped map[string]supervise.Ref
 }
 
 // Run watches until ctx is cancelled, and returns early only if the Pod cache never syncs.
@@ -157,6 +157,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 
 	factory.Start(ctx.Done())
+	defer factory.Shutdown()
 	// Waited on so that an API server that never answers is an error here rather than a process that
 	// sits shipping nothing. The initial list arrives through AddFunc like any other event, so there
 	// is nothing to read out of the store afterwards.
@@ -182,12 +183,12 @@ func (w *Watcher) ensure(obj any) {
 	if !ok {
 		return
 	}
-	if old := w.replace(podKey(pod), inst.ID); old != "" {
+	if old, ok := w.replace(podKey(pod), inst.Ref()); ok {
 		// This cuts the replaced instance's streams off mid-flight, losing whatever tail had not
 		// shipped — the same loss the drain finalizer will close. Stopping it anyway: the Pod no longer
 		// claims that instance, so leaving it running ships two instances' output under one pod name,
 		// and nothing else would ever take it out of the tracked set.
-		w.log("this Pod's instance was replaced", "pod", pod.Name, "was", old, "now", inst.ID)
+		w.log("this Pod's instance was replaced", "pod", pod.Name, "was", old.ID, "now", inst.ID)
 		w.Fleet.Forget(old)
 	}
 	w.Fleet.Ensure(inst)
@@ -195,9 +196,9 @@ func (w *Watcher) ensure(obj any) {
 
 // forget stops an instance when its Pod goes.
 //
-// Both the id on the object and the one this Pod was started for, because they differ exactly when the
-// update that rewrote the annotation is the event that got dropped. Forgetting an id nothing was
-// started for is a no-op, so the union is free and the alternative leaks.
+// Both the instance on the object and the one this Pod was started for, because they differ exactly
+// when the update that rewrote the annotation is the event that got dropped. Forgetting something
+// nothing was started for is a no-op, so the union is free and the alternative leaks.
 func (w *Watcher) forget(obj any) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
@@ -207,31 +208,33 @@ func (w *Watcher) forget(obj any) {
 		return
 	}
 	started := w.drop(podKey(pod))
-	if id := pod.Annotations[InstanceIDAnnotation]; id != "" && id != started {
-		w.Fleet.Forget(id)
+	// Both halves, as instanceFor requires: an id without the provider that minted it is not a Ref this
+	// fleet could ever have tracked.
+	on := supervise.Ref{Provider: pod.Spec.NodeSelector[ProviderSelector], ID: pod.Annotations[InstanceIDAnnotation]}
+	if on.Provider != "" && on.ID != "" && on != started {
+		w.Fleet.Forget(on)
 	}
-	if started != "" {
+	if started.ID != "" {
 		w.Fleet.Forget(started)
 	}
 }
 
-// replace records the instance now on this Pod and returns the one it displaced, if any.
-func (w *Watcher) replace(key, id string) string {
+// replace records the instance now on this Pod and returns the one it displaced, if there was one.
+func (w *Watcher) replace(key string, ref supervise.Ref) (supervise.Ref, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.shipped == nil {
-		w.shipped = map[string]string{}
+		w.shipped = map[string]supervise.Ref{}
 	}
 	old := w.shipped[key]
-	w.shipped[key] = id
-	if old == id {
-		return ""
-	}
-	return old
+	w.shipped[key] = ref
+	// The whole Ref, not the id: a Pod that changed providers displaced the old one just as surely, and
+	// comparing the pair covers that without a case for it.
+	return old, old.ID != "" && old != ref
 }
 
 // drop stops tracking the Pod, returning the instance it was started for.
-func (w *Watcher) drop(key string) string {
+func (w *Watcher) drop(key string) supervise.Ref {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	started := w.shipped[key]

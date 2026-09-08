@@ -54,6 +54,17 @@ type Instance struct {
 	Labels map[string]string
 }
 
+// Ref is what an instance is tracked under. An ID alone will not do: it is minted by the provider that
+// owns it, so two backends can mint the same string — see Instance.Provider. Keyed by the pair, that
+// collision is two tracked instances; keyed by the ID alone, the second Ensure was a silent no-op and
+// either Forget stopped the other one's streams.
+type Ref struct {
+	Provider string
+	ID       string
+}
+
+func (i Instance) Ref() Ref { return Ref{Provider: i.Provider, ID: i.ID} }
+
 // Builder makes the pipeline for one stream of one instance.
 //
 // Called again on every restart, and it has to be: a Pipeline is single-use — Run closes its queue —
@@ -114,7 +125,7 @@ type Supervisor struct {
 	ctx context.Context
 
 	mu      sync.Mutex
-	known   map[string]*tracked
+	known   map[Ref]*tracked
 	stats   Stats
 	stopped bool
 
@@ -146,12 +157,12 @@ func New(ctx context.Context, cfg Config) *Supervisor {
 	if cfg.MaxBackoff < cfg.MinBackoff {
 		cfg.MaxBackoff = max(DefaultMaxBackoff, cfg.MinBackoff)
 	}
-	return &Supervisor{ctx: ctx, cfg: cfg, known: map[string]*tracked{}}
+	return &Supervisor{ctx: ctx, cfg: cfg, known: map[Ref]*tracked{}}
 }
 
 // Ensure starts copying inst, and does nothing if it is already known.
 //
-// Idempotent on the id, deliberately: a watch re-delivers the same Pod on every unrelated update,
+// Idempotent on the Ref, deliberately: a watch re-delivers the same Pod on every unrelated update,
 // and treating one of those as new would start a second set of pipelines that replay the instance
 // from the beginning. An instance whose streams have all finished stays known for the same reason —
 // only Forget takes it out.
@@ -164,14 +175,16 @@ func (s *Supervisor) Ensure(inst Instance) {
 		return
 	}
 
+	ref := inst.Ref()
+
 	s.mu.Lock()
-	if s.stopped || inst.ID == "" || s.known[inst.ID] != nil {
+	if s.stopped || ref.ID == "" || s.known[ref] != nil {
 		s.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	t := &tracked{inst: inst, cancel: cancel, live: map[string]*ship.Pipeline{}}
-	s.known[inst.ID] = t
+	s.known[ref] = t
 	s.stats.Instances++
 	s.stats.Started++
 	// The whole count, and before the unlock: Shutdown takes this same lock and then waits on the
@@ -194,11 +207,11 @@ func (s *Supervisor) Ensure(inst Instance) {
 // Returns immediately; the goroutines wind down on their own. In-flight puts are cut off, which is
 // why the drain finalizer exists — it is what keeps a Pod's deletion from reaching here before the
 // tail of the log has shipped.
-func (s *Supervisor) Forget(id string) {
+func (s *Supervisor) Forget(ref Ref) {
 	s.mu.Lock()
-	t := s.known[id]
+	t := s.known[ref]
 	if t != nil {
-		delete(s.known, id)
+		delete(s.known, ref)
 		s.stats.Instances--
 	}
 	s.mu.Unlock()
@@ -214,9 +227,9 @@ func (s *Supervisor) Shutdown() {
 	s.mu.Lock()
 	s.stopped = true
 	cancels := make([]context.CancelFunc, 0, len(s.known))
-	for id, t := range s.known {
+	for ref, t := range s.known {
 		cancels = append(cancels, t.cancel)
-		delete(s.known, id)
+		delete(s.known, ref)
 	}
 	s.stats.Instances = 0
 	s.mu.Unlock()
@@ -271,7 +284,7 @@ func (s *Supervisor) follow(ctx context.Context, t *tracked, name string) {
 			// Logged before the counter it belongs to, because Abandoned is the counter an operator
 			// alerts on: published first, it points at an explanation that has not been written yet.
 			s.log("abandoning stream after exhausting its restart budget",
-				"instance", t.inst.ID, "stream", name, "restarts", attempt, "err", err)
+				"provider", t.inst.Provider, "instance", t.inst.ID, "stream", name, "restarts", attempt, "err", err)
 			s.record(func(st *Stats) { st.Abandoned++ })
 			return
 		}

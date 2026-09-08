@@ -121,12 +121,18 @@ func TestInstanceFor(t *testing.T) {
 	})
 }
 
+// modalRef is what a sandboxPod's instance is tracked under: the provider travels with the id, so a
+// Forget names both — see supervise.Ref.
+func modalRef(id string) supervise.Ref {
+	return supervise.Ref{Provider: "modal", ID: id}
+}
+
 // recorder stands in for the Supervisor: the watch's contract is which calls it makes, not what the
 // pipelines then do.
 type recorder struct {
 	mu      sync.Mutex
 	ensured []string
-	forgot  []string
+	forgot  []supervise.Ref
 }
 
 func (r *recorder) Ensure(inst supervise.Instance) {
@@ -135,10 +141,10 @@ func (r *recorder) Ensure(inst supervise.Instance) {
 	r.ensured = append(r.ensured, inst.ID)
 }
 
-func (r *recorder) Forget(id string) {
+func (r *recorder) Forget(ref supervise.Ref) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.forgot = append(r.forgot, id)
+	r.forgot = append(r.forgot, ref)
 }
 
 func (r *recorder) waitFor(t *testing.T, what string, cond func() bool) {
@@ -198,7 +204,7 @@ func TestWatcherDrivesTheFleet(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec.waitFor(t, "the delete to forget it", func() bool {
-		return len(rec.forgot) == 1 && rec.forgot[0] == "sb-new"
+		return len(rec.forgot) == 1 && rec.forgot[0] == modalRef("sb-new")
 	})
 
 	cancel()
@@ -229,7 +235,7 @@ func TestAReplacedInstanceIsForgotten(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec.waitFor(t, "the replaced instance to be forgotten", func() bool {
-		return len(rec.forgot) == 1 && rec.forgot[0] == "sb-old"
+		return len(rec.forgot) == 1 && rec.forgot[0] == modalRef("sb-old")
 	})
 	rec.waitFor(t, "the replacement to ship", func() bool {
 		for _, id := range rec.ensured {
@@ -246,7 +252,7 @@ func TestAReplacedInstanceIsForgotten(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec.waitFor(t, "the delete", func() bool {
-		return len(rec.forgot) == 2 && rec.forgot[1] == "sb-new"
+		return len(rec.forgot) == 2 && rec.forgot[1] == modalRef("sb-new")
 	})
 }
 
@@ -255,14 +261,21 @@ func TestAReplacedInstanceIsForgotten(t *testing.T) {
 // restart it from the beginning of its history.
 func TestAnUnchangedIdIsNotAReplacement(t *testing.T) {
 	w := &Watcher{Fleet: &recorder{}}
-	if old := w.replace("ns/pod", "sb-1"); old != "" {
-		t.Errorf("first sighting displaced %q, want nothing", old)
+	first := modalRef("sb-1")
+
+	if old, ok := w.replace("ns/pod", first); ok {
+		t.Errorf("first sighting displaced %v, want nothing", old)
 	}
-	if old := w.replace("ns/pod", "sb-1"); old != "" {
-		t.Errorf("re-delivery displaced %q, want nothing", old)
+	if old, ok := w.replace("ns/pod", first); ok {
+		t.Errorf("re-delivery displaced %v, want nothing", old)
 	}
-	if old := w.replace("ns/pod", "sb-2"); old != "sb-1" {
-		t.Errorf("replacement displaced %q, want sb-1", old)
+	if old, ok := w.replace("ns/pod", modalRef("sb-2")); !ok || old != first {
+		t.Errorf("replacement displaced %v (ok=%t), want %v", old, ok, first)
+	}
+	// Not reachable through a Pod, whose nodeSelector cannot change. Asserted because the comparison is
+	// on the whole Ref: an unchanged id is not by itself what makes this a re-delivery.
+	if old, ok := w.replace("ns/pod", supervise.Ref{Provider: "aws", ID: "sb-2"}); !ok || old.Provider != "modal" {
+		t.Errorf("a second provider on the same id displaced %v (ok=%t), want the modal one", old, ok)
 	}
 }
 

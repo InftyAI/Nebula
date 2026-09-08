@@ -75,7 +75,7 @@ func (f *fleet) Ensure(inst supervise.Instance) {
 	f.sup.Ensure(inst)
 }
 
-func (f *fleet) Forget(id string) { f.sup.Forget(id) }
+func (f *fleet) Forget(ref supervise.Ref) { f.sup.Forget(ref) }
 
 // streams is supervise.Config.Streams: the provider's own stream names, because they are the names it
 // will have to recognise again in Source.
