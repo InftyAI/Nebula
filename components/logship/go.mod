@@ -1,6 +1,6 @@
 module github.com/InftyAI/Nebula/components/logship
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/modal-labs/modal-client/go v0.9.0
