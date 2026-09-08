@@ -174,10 +174,14 @@ func (s *Supervisor) Ensure(inst Instance) {
 	s.known[inst.ID] = t
 	s.stats.Instances++
 	s.stats.Started++
+	// The whole count, and before the unlock: Shutdown takes this same lock and then waits on the
+	// group, so a counter raised after the unlock lets it find zero and return while these streams are
+	// still starting — against a provider its caller is about to close. Nothing may return between here
+	// and the loop below, or Wait never comes back.
+	s.wg.Add(len(streams))
 	s.mu.Unlock()
 
 	for _, name := range streams {
-		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			s.follow(ctx, t, name)
@@ -264,9 +268,11 @@ func (s *Supervisor) follow(ctx context.Context, t *tracked, name string) {
 			return
 		}
 		if attempt >= s.cfg.MaxRestarts {
-			s.record(func(st *Stats) { st.Abandoned++ })
+			// Logged before the counter it belongs to, because Abandoned is the counter an operator
+			// alerts on: published first, it points at an explanation that has not been written yet.
 			s.log("abandoning stream after exhausting its restart budget",
 				"instance", t.inst.ID, "stream", name, "restarts", attempt, "err", err)
+			s.record(func(st *Stats) { st.Abandoned++ })
 			return
 		}
 		s.record(func(st *Stats) { st.Restarts++ })
@@ -329,6 +335,7 @@ func add(dst *ship.Stats, src ship.Stats) {
 	dst.DroppedBytes += src.DroppedBytes
 	dst.Failed += src.Failed
 	dst.Clamped += src.Clamped
+	dst.Oversized += src.Oversized
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {

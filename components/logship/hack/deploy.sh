@@ -177,7 +177,7 @@ cat >&2 <<EOF
 
 $(log "deployed. Checks, in the order they can fail:")
   0. there is anything to ship     ${KUBECTL} get pods -A -l nebula.inftyai.com/enabled=true
-  1. it found them                 ${KUBECTL} -n ${DEPLOY_NS} logs deployment/${NAME} | grep 'syncing'
+  1. the watch started              ${KUBECTL} -n ${DEPLOY_NS} logs deployment/${NAME} | grep 'watching Pods'
   2. a record is well-formed       ${KUBECTL} -n ${DEPLOY_NS} logs deployment/${NAME} | grep -v '^logship:' | tail -1 | jq .
   3. the agent picked it up        aws logs filter-log-events --log-group-name <group> --filter-pattern '{ \$.log_processed.kubernetes.pod_name = "*" }'
   4. no restarts (each one replays) ${KUBECTL} -n ${DEPLOY_NS} get pods -l app.kubernetes.io/instance=${NAME}

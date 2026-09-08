@@ -56,7 +56,7 @@ func TestPool_SpreadsStreamsEvenly(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := p.Client()
+			c, _ := p.Client() // not released: all 300 streams are live at once
 			mu.Lock()
 			counts[c]++
 			mu.Unlock()
@@ -71,6 +71,67 @@ func TestPool_SpreadsStreamsEvenly(t *testing.T) {
 		if n != 100 {
 			t.Errorf("connection %p took %d streams, want 100", c, n)
 		}
+	}
+}
+
+func TestPool_HoldsTheCapWhileItGrows(t *testing.T) {
+	// The fleet's real sequence: Reserve widens the pool BEFORE each instance's streams open, two
+	// streams per instance. Modulo round-robin passed the one-connection case and then drifted, because
+	// a pool that gains a connection re-partitions the residues without moving the streams already
+	// handed out — at 200 instances it left 208 streams on the first connection against a cap of 100.
+	p, err := NewPool(Credentials{ServerURL: "http://localhost:1"}, len(Descriptors))
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	const instances = 200
+	live := map[LogsClient]int{}
+	for k := 1; k <= instances; k++ {
+		if err := p.Grow(k * len(Descriptors)); err != nil {
+			t.Fatalf("Grow(%d): %v", k*len(Descriptors), err)
+		}
+		for range len(Descriptors) {
+			c, _ := p.Client() // held: every one of these streams is still running
+			live[c]++
+		}
+	}
+
+	want := instances * len(Descriptors) / StreamsPerConn
+	if p.Len() != want || len(live) != want {
+		t.Fatalf("%d connections and %d used, want %d of each", p.Len(), len(live), want)
+	}
+	for c, n := range live {
+		if n > StreamsPerConn {
+			t.Errorf("connection %p carries %d streams, over the %d cap", c, n, StreamsPerConn)
+		}
+	}
+}
+
+func TestPool_ReleaseFreesTheSlot(t *testing.T) {
+	// Without a release the pool counts a finished stream forever, and since every retry builds a fresh
+	// Source, a fleet that never grew would still walk its connections up past the cap.
+	p, err := NewPool(Credentials{ServerURL: "http://localhost:1"}, 2*StreamsPerConn)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	first, release := p.Client()
+	if second, _ := p.Client(); second == first {
+		t.Fatal("the second stream took the connection already carrying one")
+	}
+	release()
+	if again, _ := p.Client(); again != first {
+		t.Fatal("after a release the emptiest connection was not the one picked")
+	}
+
+	release()
+	release()
+	// Read directly: a double release must not invent capacity, and a negative count would make this
+	// connection win every pick from here on — the exact overload the count exists to prevent.
+	if p.live[0] != 1 {
+		t.Fatalf("live[0] = %d after repeated releases, want 1", p.live[0])
 	}
 }
 

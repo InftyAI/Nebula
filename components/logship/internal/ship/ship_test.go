@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -89,6 +90,77 @@ func TestAssembler_StripsTheCarriageReturnOfACRLF(t *testing.T) {
 	}
 }
 
+func TestAssembler_StripsACRLFSplitBetweenChunks(t *testing.T) {
+	// The two bytes need not arrive together. Resolved without its LF in view, the CR is either left in
+	// the line or — once frames collapse — read as a frame separator, which discards the line's text and
+	// ships an empty line in its place.
+	for _, collapse := range []bool{false, true} {
+		a := NewAssembler(collapse)
+		got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{
+			{Data: "windows\r", At: t1},
+			{Data: "\n", At: t2},
+		}})
+
+		if !equalData(got, []string{"windows"}) {
+			t.Fatalf("collapseFrames=%v: got %v, want what an unsplit CRLF gives", collapse, data(got))
+		}
+	}
+}
+
+func TestAssembler_HoldsATrailingCRAcrossBatches(t *testing.T) {
+	// The likelier of the two boundaries, since a batch ends wherever the source's page does — and the
+	// held CR has to survive between Add calls, not merely between the entries of one.
+	for _, collapse := range []bool{false, true} {
+		a := NewAssembler(collapse)
+		if got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: "windows\r", At: t1}}}); len(got) != 0 {
+			t.Fatalf("collapseFrames=%v: %v completed on the CR alone", collapse, data(got))
+		}
+
+		got := a.Add(Batch{Cursor: "200-0", Entries: []Entry{{Data: "\nnext\n", At: t2}}})
+		if !equalData(got, []string{"windows", "next"}) {
+			t.Fatalf("collapseFrames=%v: got %v, want both lines", collapse, data(got))
+		}
+		// Completed in the second batch, so that is the cursor a resume must not pass — see Line.
+		if got[0].Cursor != "200-0" {
+			t.Fatalf("collapseFrames=%v: cursor = %q, want the completing batch's", collapse, got[0].Cursor)
+		}
+	}
+}
+
+func TestAssembler_ATrailingCRIsStillAFrameSeparator(t *testing.T) {
+	// The other half of holding a CR back: one that turns out NOT to precede an LF has to behave exactly
+	// as it would have arriving in one piece. Otherwise fixing CRLF would break every progress bar whose
+	// chunk happens to end on the separator, which is where tqdm's writes land.
+	entries := []Entry{
+		{Data: " 10%|## \r", At: t1},
+		{Data: " 50%|##### \r", At: t1},
+		{Data: "100%|##########\n", At: t2},
+	}
+
+	a := NewAssembler(true)
+	if got := a.Add(Batch{Cursor: "100-0", Entries: entries}); !equalData(got, []string{"100%|##########"}) {
+		t.Fatalf("collapsed: got %v, want only the final frame", data(got))
+	}
+	b := NewAssembler(false)
+	want := " 10%|## \r 50%|##### \r100%|##########"
+	if got := b.Add(Batch{Cursor: "100-0", Entries: entries}); !equalData(got, []string{want}) {
+		t.Fatalf("verbatim: got %q, want every frame", data(got))
+	}
+}
+
+func TestAssembler_FlushDropsAHeldCR(t *testing.T) {
+	// Nothing follows to overwrite what the CR separated, so collapsing on it here would erase text that
+	// was still on the terminal when the sandbox exited.
+	for _, collapse := range []bool{false, true} {
+		a := NewAssembler(collapse)
+		a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: "half a line\r", At: t1}}})
+
+		if got := a.Flush(); !equalData(got, []string{"half a line"}) {
+			t.Fatalf("collapseFrames=%v: got %v, want the text without its CR", collapse, data(got))
+		}
+	}
+}
+
 func TestAssembler_ProgressFrames(t *testing.T) {
 	// What tqdm actually emits: a frame per update, carriage-returned, with no newline until the
 	// bar is done.
@@ -138,8 +210,8 @@ func TestAssembler_CapsAnUnterminatedLine(t *testing.T) {
 }
 
 func TestAssembler_SplitsAChunkThatIsItselfOverTheCap(t *testing.T) {
-	// The cap has to bound the line, not merely flush after it: one Modal item can be megabytes, and
-	// a Line that size rides the queue's oversized-line escape and is re-split 16 KiB at a time.
+	// The cap has to bound the line, not merely flush after it: one Modal item can be megabytes, and a
+	// Line that size rides the queue's oversized-line escape only to be dropped by the batcher.
 	a := NewAssembler(false)
 	got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{
 		{Data: strings.Repeat("x", 5*maxFragment/2), At: t1},
@@ -155,6 +227,82 @@ func TestAssembler_SplitsAChunkThatIsItselfOverTheCap(t *testing.T) {
 	}
 	if rest := a.Flush(); len(rest) != 1 || len(rest[0].Data) != maxFragment/2 {
 		t.Fatalf("Flush gave %v, want the remaining half-cap fragment", data(rest))
+	}
+}
+
+func TestAssembler_CapsALineItsOwnNewlineTerminated(t *testing.T) {
+	// The terminated case used to skip the cap entirely, because the newline path wrote its whole prefix
+	// before the bounded loop ever saw it. That matters at the queue rather than here: it admits any one
+	// line into an empty buffer, so a Line over the cap turns a 64 KiB byte bound into "one longest
+	// line", and 1,000 streams of those is a memory figure nobody can size a Deployment from.
+	a := NewAssembler(false)
+	got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{
+		{Data: strings.Repeat("x", 5*maxFragment/2) + "\n", At: t1},
+	}})
+
+	if len(got) != 3 {
+		t.Fatalf("%d lines for 2.5x the cap plus its newline, want 3", len(got))
+	}
+	var total int
+	for i, l := range got {
+		if len(l.Data) > maxFragment {
+			t.Fatalf("line %d is %d bytes, over the cap %d", i, len(l.Data), maxFragment)
+		}
+		total += len(l.Data)
+	}
+	// Split, not truncated: the newline is the only byte that should be missing.
+	if total != 5*maxFragment/2 {
+		t.Fatalf("the pieces hold %d bytes, want the line's %d", total, 5*maxFragment/2)
+	}
+	if rest := a.Flush(); rest != nil {
+		t.Fatalf("Flush gave %v, want nothing — the newline took the last piece", data(rest))
+	}
+}
+
+func TestAssembler_AdvancesWhenNoRuneBoundaryExists(t *testing.T) {
+	// runeBoundary walks down to zero when the window holds no rune start, and taking the pending line
+	// cannot conjure one — so this used to spin, emitting empty lines until the process died. A stream
+	// of continuation bytes is invalid UTF-8 either way; the cut is the lesser failure.
+	a := NewAssembler(false)
+	flood := strings.Repeat("\x80", 2*maxFragment)
+
+	got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: flood, At: t1}}})
+	got = append(got, a.Flush()...)
+
+	var joined strings.Builder
+	for i, l := range got {
+		if len(l.Data) > maxFragment {
+			t.Fatalf("piece %d is %d bytes, over the cap %d", i, len(l.Data), maxFragment)
+		}
+		joined.WriteString(l.Data)
+	}
+	// Passed through as it arrived rather than replaced by U+FFFD: the durable copy is the evidence.
+	if joined.String() != flood {
+		t.Fatalf("reassembled %d bytes, want the %d that arrived", joined.Len(), len(flood))
+	}
+}
+
+func TestAssembler_CutsAFragmentOnRuneBoundaries(t *testing.T) {
+	// A cut inside a multi-byte rune reaches the sink as U+FFFD, which corrupts the durable copy
+	// rather than merely splitting it. The leading chunk is swept because whether the cap lands
+	// mid-rune depends on what is already pending as much as on the data.
+	body := strings.Repeat("日本語", maxFragment/9+16) // 9 bytes a repeat, so comfortably over the cap
+	for pad := 0; pad < 9; pad++ {
+		a := NewAssembler(false)
+		want := strings.Repeat("a", pad) + body
+		got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: want, At: t1}}})
+		got = append(got, a.Flush()...)
+
+		var joined strings.Builder
+		for i, l := range got {
+			if !utf8.ValidString(l.Data) {
+				t.Fatalf("pad %d: piece %d is not valid UTF-8", pad, i)
+			}
+			joined.WriteString(l.Data)
+		}
+		if joined.String() != want {
+			t.Fatalf("pad %d: reassembled %d bytes, want %d", pad, joined.Len(), len(want))
+		}
 	}
 }
 

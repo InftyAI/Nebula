@@ -19,7 +19,6 @@ package modal
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 
 	"google.golang.org/grpc"
 )
@@ -37,16 +36,22 @@ const StreamsPerConn = 100
 
 // Pool spreads log streams across several connections to Modal.
 //
-// Round-robin and nothing cleverer: every stream is one long-lived RPC of near-identical cost, so
-// the only imbalance a smarter policy could fix is one that does not arise. Safe for concurrent use.
+// Least-loaded, and every stream is one long-lived RPC of near-identical cost, so a count of live
+// streams IS the load — which is why Client hands back a release. Round-robin will not do here: a
+// modulo over a pool that has gained a connection re-partitions the residues without moving the
+// streams already handed out, so the first connection keeps its whole historical share and ends up
+// several times over StreamsPerConn, which is the silent-queueing case that constant exists to
+// prevent. Safe for concurrent use.
 type Pool struct {
 	creds Credentials
 
-	mu      sync.RWMutex
+	// One plain Mutex: picking a connection writes the count that made the pick correct, so there is
+	// no read-only path left for an RWMutex to help.
+	mu      sync.Mutex
 	conns   []*grpc.ClientConn
 	clients []LogsClient
-
-	next atomic.Uint64
+	// live counts the streams holding each client, parallel to clients.
+	live []int
 }
 
 // NewPool dials enough connections for streams. It rounds up, and always dials at least one.
@@ -86,25 +91,51 @@ func (p *Pool) Grow(streams int) error {
 		}
 		p.conns = append(p.conns, conn)
 		p.clients = append(p.clients, client)
+		p.live = append(p.live, 0)
 	}
 	return nil
 }
 
-// Client returns the next connection's client. Callers hold on to it for the life of their stream:
-// re-picking per RPC would move a re-opened stream to a different connection every 55 seconds and
-// make the distribution drift.
-func (p *Pool) Client() LogsClient {
-	i := p.next.Add(1) - 1
+// Client picks the connection carrying the fewest streams, and returns it with the release that gives
+// the slot back.
+//
+// Callers hold the client for the life of their stream — re-picking per RPC would move a re-opened
+// stream to a different connection every 55 seconds and make the distribution drift — and must call
+// release when that stream ends, or the pool never learns the connection is free again. Release is
+// idempotent, so a defer that overlaps an error path cannot double-count a slot into existence.
+//
+// A pool whose every connection already sits at StreamsPerConn still hands out the least-bad one
+// rather than failing. Grow is what reserves capacity ahead of demand; refusing here would abandon an
+// instance's logs entirely over an overshoot whose actual cost is some queueing.
+func (p *Pool) Client() (LogsClient, func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.clients[i%uint64(len(p.clients))]
+	i := 0
+	for j, n := range p.live {
+		if n < p.live[i] {
+			i = j
+		}
+	}
+	p.live[i]++
+
+	var once sync.Once
+	return p.clients[i], func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			// Close empties live, so a stream ending after it has nothing left to give back.
+			if i < len(p.live) && p.live[i] > 0 {
+				p.live[i]--
+			}
+		})
+	}
 }
 
 // Len is the number of connections, which is what a caller checks a stream count against.
 func (p *Pool) Len() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return len(p.conns)
 }
 
@@ -116,6 +147,6 @@ func (p *Pool) Close() error {
 	for _, c := range p.conns {
 		errs = append(errs, c.Close())
 	}
-	p.conns, p.clients = nil, nil
+	p.conns, p.clients, p.live = nil, nil, nil
 	return errors.Join(errs...)
 }

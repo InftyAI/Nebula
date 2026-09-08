@@ -17,6 +17,7 @@ limitations under the License.
 package ship
 
 import (
+	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,8 +27,8 @@ import (
 type Event struct {
 	Message string
 	At      time.Time
-	// Cursor is the source cursor of the line this came from, repeated across every piece of a
-	// split line, so the pieces stay attributable to each other.
+	// Cursor is the source cursor of the line this came from, which is what lets a reader collapse
+	// the duplicates a replay produces.
 	Cursor string
 }
 
@@ -85,7 +86,7 @@ func encodeJSONString(b *strings.Builder, s string) {
 			b.WriteByte(hex[c&0xf])
 		default:
 			// Written bytewise, so invalid UTF-8 passes through as it arrived rather than becoming
-			// U+FFFD. A split line is reassembled by concatenation, and that has to survive it.
+			// U+FFFD: the durable copy is sometimes the evidence.
 			b.WriteByte(c)
 		}
 	}
@@ -107,8 +108,9 @@ type Batcher struct {
 	bytes   int
 	// last is the highest timestamp emitted so far. PutLogEvents rejects an entire request if one
 	// event is out of order, so a batch has to be non-decreasing.
-	last    time.Time
-	clamped int
+	last      time.Time
+	clamped   int
+	oversized int
 }
 
 func NewBatcher(limits Limits, format Formatter) *Batcher {
@@ -148,6 +150,10 @@ func (b *Batcher) Flush() []Event {
 // alternative is a rejected request or a reordered log.
 func (b *Batcher) Clamped() int { return b.clamped }
 
+// Oversized counts lines dropped for exceeding the per-event cap, each replaced by a notice. Nonzero
+// means text is missing from the durable copy on purpose — see messages.
+func (b *Batcher) Oversized() int { return b.oversized }
+
 func (b *Batcher) events(l Line) []Event {
 	at := l.At
 	if at.Before(b.last) {
@@ -164,12 +170,14 @@ func (b *Batcher) events(l Line) []Event {
 	return out
 }
 
-// messages formats a line, splitting it if the result exceeds the per-event cap.
+// messages formats a line, replacing it with a notice if the result exceeds the per-event cap.
 //
-// The split is of the line's DATA and each piece is formatted separately, so every event is
-// independently well-formed — splitting the formatted message instead would cut a JSON envelope in
-// half and leave two events that no query can parse. Pieces share the line's id, which is what marks
-// them as one line: concatenating the `msg` of same-id events reassembles it.
+// Dropped rather than split, and the loss is deliberate. A split has to cut the line's DATA, and an
+// envelope has no decodable prefix — Record.Formatter's adopt is all-or-nothing, so every piece would
+// be re-wrapped with the Record's fallbacks, INFO/user. The consumer gates visibility on that category
+// and hides `private` from callers without the developer-view role, so splitting a private line
+// publishes it. Losing the text is the lesser failure; the notice is what keeps it from being a silent
+// one.
 func (b *Batcher) messages(l Line) []string {
 	limit := b.limits.MaxEventBytes - b.limits.PerEventOverhead
 	msg := b.format(l)
@@ -177,40 +185,18 @@ func (b *Batcher) messages(l Line) []string {
 		return []string{msg}
 	}
 
-	var out []string
-	for data := l.Data; ; {
-		piece := b.fit(l, data, limit)
-		out = append(out, b.format(withData(l, piece)))
-		data = data[len(piece):]
-		if data == "" {
-			return out
-		}
+	b.oversized++
+	// The line's own timestamp and cursor, so the gap is locatable in the stream — but no part of the
+	// line itself, since whatever made it too long is exactly what must not be published unlabelled.
+	notice := b.format(withData(l, fmt.Sprintf(
+		"logship dropped a %d-byte line: over the %d-byte event limit", len(l.Data), limit)))
+	if len(notice) > limit {
+		// A cap below the record's own envelope, which is a misconfiguration rather than a long line.
+		// Nothing is shipped at all: emitting an over-cap event is the one thing the cap forbids, and
+		// the counter is what says so.
+		return nil
 	}
-}
-
-// fit returns the longest prefix of data whose formatted message fits in limit.
-//
-// It measures by formatting rather than by arithmetic on the envelope, because a Formatter may
-// expand what it is given — escaping does — and only the formatter knows by how much. Costly, and
-// deliberately only on this path: an ordinary line never reaches it.
-func (b *Batcher) fit(l Line, data string, limit int) string {
-	n := min(len(data), limit)
-	for {
-		n = runeBoundary(data, n)
-		if n == 0 {
-			// The envelope alone exceeds the cap, which needs a cursor of absurd length. Emit one
-			// rune rather than spinning; the sink's error will name the real problem.
-			return data[:runeLen(data)]
-		}
-		over := len(b.format(withData(l, data[:n]))) - limit
-		if over <= 0 {
-			return data[:n]
-		}
-		n -= max(over, 1)
-		if n < 0 {
-			n = 0
-		}
-	}
+	return []string{notice}
 }
 
 // runeBoundary rounds n down to a rune boundary. A cut inside a multi-byte rune reaches the sink as
@@ -219,11 +205,6 @@ func runeBoundary(s string, n int) int {
 	for n > 0 && n < len(s) && !utf8.RuneStart(s[n]) {
 		n--
 	}
-	return n
-}
-
-func runeLen(s string) int {
-	_, n := utf8.DecodeRuneInString(s)
 	return n
 }
 

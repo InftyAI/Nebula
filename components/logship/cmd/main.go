@@ -57,6 +57,9 @@ func run() error {
 	// No flags to define, and Parse stays regardless: it rejects an argument instead of ignoring one,
 	// so an out-of-date invocation fails loudly rather than quietly shipping the whole cluster.
 	flag.Parse()
+	if flag.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %v", flag.Args())
+	}
 
 	// A running instance never ends its stream, so Ctrl-C is the ordinary way out.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

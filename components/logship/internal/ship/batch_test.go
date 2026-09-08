@@ -21,7 +21,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 )
 
 func TestBatcher_CountsPerEventOverhead(t *testing.T) {
@@ -57,63 +56,83 @@ func TestBatcher_CapsTheEventCount(t *testing.T) {
 	}
 }
 
-func TestBatcher_SplitsAnOversizedLine(t *testing.T) {
-	// Split rather than dropped: an over-long line is usually a stack trace or a serialized tensor
-	// shape, which is exactly the thing someone is reading the durable copy for.
-	b := NewBatcher(Limits{MaxEventBytes: 40}, FormatCompact)
-	line := Line{Data: strings.Repeat("x", 100), At: t1, Cursor: "100-0"}
+func TestBatcher_DropsAnOversizedLine(t *testing.T) {
+	b := NewBatcher(Limits{MaxEventBytes: 100}, FormatCompact)
+	line := Line{Data: strings.Repeat("x", 500), At: t1, Cursor: "100-0"}
 
 	b.Add(line)
 	events := b.Flush()
-	if len(events) < 3 {
-		t.Fatalf("%d events, want 100 bytes of data cut into at least 3", len(events))
+	if len(events) != 1 {
+		t.Fatalf("%d events, want one notice", len(events))
 	}
-	var joined strings.Builder
-	for _, e := range events {
-		if len(e.Message) > 40 {
-			t.Fatalf("event of %d bytes exceeds the cap", len(e.Message))
-		}
-		// Every piece keeps the line's cursor and time, so the pieces stay attributable to each
-		// other and a split cannot reorder a line against itself.
-		if e.Cursor != "100-0" || !e.At.Equal(t1) {
-			t.Fatalf("piece carries %q at %v, want the line's own", e.Cursor, e.At)
-		}
-		// Each piece is a whole message in its own right — the envelope is re-emitted per piece,
-		// not cut in half — so reassembly strips it rather than concatenating raw messages.
-		prefix := "100-0 "
-		if !strings.HasPrefix(e.Message, prefix) {
-			t.Fatalf("piece %q is not independently well-formed", e.Message)
-		}
-		joined.WriteString(strings.TrimPrefix(e.Message, prefix))
+	e := events[0]
+	if len(e.Message) > 100 {
+		t.Fatalf("the notice itself is %d bytes, over the cap", len(e.Message))
 	}
-	if joined.String() != line.Data {
-		t.Fatalf("reassembled %q, want %q", joined.String(), line.Data)
+	// The notice stands in for the line, so it has to be findable where the line was.
+	if e.Cursor != "100-0" || !e.At.Equal(t1) {
+		t.Fatalf("notice carries %q at %v, want the line's own", e.Cursor, e.At)
+	}
+	if !strings.Contains(e.Message, "dropped") || !strings.Contains(e.Message, "500") {
+		t.Fatalf("notice %q does not say what was dropped", e.Message)
+	}
+	if b.Oversized() != 1 {
+		t.Fatalf("Oversized() = %d, want 1", b.Oversized())
 	}
 }
 
-func TestBatcher_SplitKeepsEachPieceValidJSON(t *testing.T) {
-	// The reason the split is of the data and not of the formatted message: cutting a JSON envelope
-	// in half leaves two events that no Insights query can parse, which is worse than not splitting.
-	// The record format nests one envelope inside another, so there are two ways to get this wrong.
+func TestBatcher_DropDoesNotRelabelAnEnvelope(t *testing.T) {
+	// The whole reason an oversized line is dropped rather than split. A cut envelope has no decodable
+	// prefix, so adopt would reject every piece and Record.Formatter would wrap each with its own
+	// fallbacks — INFO/user. The consumer shows category user to everyone and private only to the
+	// developer-view role, so a split would publish the text of a private line.
 	format := Record{Pod: "p", Labels: map[string]string{"app": "sandbox"}}.Formatter()
-	b := NewBatcher(Limits{MaxEventBytes: 160}, format)
-	line := Line{Data: strings.Repeat(`a"b\c`, 40), At: t1, Cursor: "100-0"}
+	b := NewBatcher(Limits{MaxEventBytes: 400}, format)
+	const secret = "PRIVATE-TRACEBACK-"
+	data := `{"level":"ERROR","category":"private","message":"` + strings.Repeat(secret, 100) + `"}`
+
+	b.Add(Line{Data: data, At: t1, Cursor: "100-0"})
+	events := b.Flush()
+	if len(events) != 1 {
+		t.Fatalf("%d events, want one notice", len(events))
+	}
+	if strings.Contains(events[0].Message, secret) {
+		t.Fatalf("the dropped line's own text was shipped: %q", events[0].Message)
+	}
+	if len(events[0].Message) > 400 {
+		t.Fatalf("the notice itself is %d bytes, over the cap", len(events[0].Message))
+	}
+	rec := decodeRecord(t, events[0].Message)
+	if rec.inner.ID != "100-0" {
+		t.Fatalf("notice carries id %q, want the line's", rec.inner.ID)
+	}
+}
+
+func TestBatcher_ShipsNothingWhenEvenTheNoticeCannotFit(t *testing.T) {
+	// A cap below the record envelope is a misconfiguration, and the invariant still holds: whatever
+	// else happens, no event over the cap is emitted. The counter is the only trace left.
+	b := NewBatcher(Limits{MaxEventBytes: 20}, FormatCompact)
+
+	b.Add(Line{Data: strings.Repeat("x", 100), At: t1, Cursor: "100-0"})
+	if events := b.Flush(); events != nil {
+		t.Fatalf("shipped %v, want nothing", events)
+	}
+	if b.Oversized() != 1 {
+		t.Fatalf("Oversized() = %d, want 1", b.Oversized())
+	}
+}
+
+func TestBatcher_KeepsALineThatFits(t *testing.T) {
+	b := NewBatcher(Limits{MaxEventBytes: 40}, FormatCompact)
+	line := Line{Data: strings.Repeat("x", 10), At: t1, Cursor: "1-0"}
 
 	b.Add(line)
 	events := b.Flush()
-	if len(events) < 2 {
-		t.Fatalf("%d events, want a split", len(events))
+	if len(events) != 1 || events[0].Message != "1-0 "+line.Data {
+		t.Fatalf("got %v, want the line unchanged", events)
 	}
-	var joined strings.Builder
-	for _, e := range events {
-		rec := decodeRecord(t, e.Message)
-		if rec.inner.ID != "100-0" {
-			t.Fatalf("piece carries id %q, want the line's", rec.inner.ID)
-		}
-		joined.WriteString(rec.inner.Message)
-	}
-	if joined.String() != line.Data {
-		t.Fatalf("reassembled %q, want %q", joined.String(), line.Data)
+	if b.Oversized() != 0 {
+		t.Fatalf("Oversized() = %d, want 0", b.Oversized())
 	}
 }
 
@@ -272,33 +291,6 @@ type recordShape struct {
 		Category string `json:"category"`
 		Message  string `json:"message"`
 		ID       string `json:"id"`
-	}
-}
-
-func TestBatcher_SplitFallsOnRuneBoundaries(t *testing.T) {
-	// A cut inside a multi-byte rune reaches the sink as U+FFFD, which is a corrupted durable copy
-	// rather than a split one. The cap is swept because whether a naive cut lands mid-rune depends
-	// on the prefix length as much as on the data.
-	line := Line{Data: strings.Repeat("日本語", 8), At: t1, Cursor: "1-0"}
-	want := line.Data
-
-	for limit := 8; limit <= 20; limit++ {
-		b := NewBatcher(Limits{MaxEventBytes: limit}, FormatCompact)
-		b.Add(line)
-		events := b.Flush()
-		if len(events) < 2 {
-			t.Fatalf("limit %d: %d events, want a split", limit, len(events))
-		}
-		var joined strings.Builder
-		for _, e := range events {
-			if !utf8.ValidString(e.Message) {
-				t.Fatalf("limit %d: piece %q is not valid UTF-8", limit, e.Message)
-			}
-			joined.WriteString(strings.TrimPrefix(e.Message, "1-0 "))
-		}
-		if joined.String() != want {
-			t.Fatalf("limit %d: reassembled %q, want %q", limit, joined.String(), want)
-		}
 	}
 }
 

@@ -158,18 +158,22 @@ func TestFollow_GivesUpWhenTheRestartBudgetIsSpent(t *testing.T) {
 
 	s.Ensure(Instance{ID: "sb-1"})
 
-	waitFor(t, "stream abandoned", func() bool { return s.Stats().Abandoned == 1 })
+	// Both halves, because abandoning silently is the failure worth catching and nothing else reports
+	// it — and waiting on the counter alone would race the log it is published alongside.
+	waitFor(t, "stream abandoned and said so", func() bool {
+		if s.Stats().Abandoned != 1 {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return logged > 0
+	})
 	if st := s.Stats(); st.Restarts != 3 || st.Completed != 0 {
 		t.Fatalf("Stats() = %+v, want 3 restarts and nothing completed", st)
 	}
 	// 4 attempts for 3 restarts: the budget counts retries, not tries.
 	if got := b.count(); got != 4 {
 		t.Fatalf("%d attempts, want 4", got)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if logged == 0 {
-		t.Fatal("abandoned a stream silently; nothing else will report it")
 	}
 }
 

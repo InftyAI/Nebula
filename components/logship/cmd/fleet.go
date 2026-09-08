@@ -118,6 +118,11 @@ func (f *fleet) build(inst supervise.Instance, stream string) (*ship.Pipeline, e
 		Limits: emit.Limits(0),
 		Cursor: cursor,
 		Log:    f.errf,
+		// On because off loses the bar entirely: an un-collapsed progress bar never sends a newline,
+		// so the assembler holds every frame until maxFragment and emits one 64 KiB line, which the
+		// batcher then drops for exceeding the per-event cap. Collapsed, each frame replaces the last,
+		// so the line stays small and arrives — as the bar's final state rather than its history.
+		CollapseFrames: true,
 		// No Throttled: a write to stdout has no rate to back off from. The agent owns retrying the
 		// one hop that does, which is the point of shipping this way.
 	}), nil

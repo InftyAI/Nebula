@@ -33,12 +33,23 @@ type Source struct {
 	Client  LogsClient
 	Sandbox string
 	FD      pb.FileDescriptor
+
+	// release returns Client's slot to the pool it came from; nil for a Source built without one.
+	// Unexported because only Provider.Source can pair it with the Client it accounts for.
+	release func()
 }
 
 // Follow implements ship.Source. It drops the per-entry FD: the stream was opened for one, so every
 // entry in it has the same one, and repeating it per line would be the only thing ship had to know
 // about Modal's proto.
+//
+// This call is the stream's whole life, which is why the pool's slot goes back here rather than on a
+// Close the port does not have: a Pipeline is single-use, so each retry builds a fresh Source and
+// Follows it exactly once.
 func (s Source) Follow(ctx context.Context, cursor string, fn func(ship.Batch) error) error {
+	if s.release != nil {
+		defer s.release()
+	}
 	return Follow(ctx, s.Client, s.Sandbox, s.FD, cursor, func(b Batch) error {
 		entries := make([]ship.Entry, 0, len(b.Entries))
 		for _, e := range b.Entries {

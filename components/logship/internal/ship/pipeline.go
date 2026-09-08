@@ -81,6 +81,10 @@ type Stats struct {
 	Failed int
 	// Clamped counts lines whose timestamp was raised to keep a batch ordered. See Batcher.
 	Clamped int
+	// Oversized counts lines dropped for exceeding the per-event cap, each shipped as a notice
+	// instead. A third way a line does not arrive, and separate for the same reason: this one is our
+	// own format's cap, not backpressure or the sink. See Batcher.messages.
+	Oversized int
 }
 
 // Pipeline copies one stream: source -> assembler -> batcher -> sink.
@@ -162,12 +166,12 @@ func (p *Pipeline) deliver(ctx context.Context) {
 			}
 			if !open {
 				p.put(ctx, b.Flush())
-				p.record(func(s *Stats) { s.Clamped = b.Clamped() })
+				p.record(func(s *Stats) { s.Clamped, s.Oversized = b.Clamped(), b.Oversized() })
 				return
 			}
 		case <-tick.C:
 			p.put(ctx, b.Flush())
-			p.record(func(s *Stats) { s.Clamped = b.Clamped() })
+			p.record(func(s *Stats) { s.Clamped, s.Oversized = b.Clamped(), b.Oversized() })
 		}
 	}
 }

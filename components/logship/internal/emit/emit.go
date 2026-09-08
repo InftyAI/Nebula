@@ -112,6 +112,9 @@ func (s *Sink) Put(_ context.Context, events []ship.Event) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.w.Write(b.Bytes())
+	n, err := s.w.Write(b.Bytes())
+	if err == nil && n != b.Len() {
+		return io.ErrShortWrite
+	}
 	return err
 }

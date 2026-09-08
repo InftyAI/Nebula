@@ -47,13 +47,15 @@ func Open() (*Provider, error) {
 func (p *Provider) Streams() []string { return Descriptors }
 
 // Source picks the connection this stream keeps for its life. See Pool.Client for why it is not
-// re-picked per RPC.
+// re-picked per RPC, and Source.Follow for where the slot goes back.
 func (p *Provider) Source(instanceID, stream string) (ship.Source, error) {
 	fd, err := ParseDescriptor(stream)
 	if err != nil {
+		// Before Client, so a name that maps to no descriptor cannot leak a slot.
 		return nil, err
 	}
-	return Source{Client: p.pool.Client(), Sandbox: instanceID, FD: fd}, nil
+	client, release := p.pool.Client()
+	return Source{Client: client, Sandbox: instanceID, FD: fd, release: release}, nil
 }
 
 // Reserve widens the pool for instances sandboxes. See Pool.Grow: the ordering — before the streams
