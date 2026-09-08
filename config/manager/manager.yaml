@@ -67,12 +67,14 @@ spec:
         name: manager
         imagePullPolicy: IfNotPresent
         env:
-          # Point the price catalog at the mounted ConfigMap so prices can be
-          # edited live (kubectl edit configmap nebula-catalog) without a
-          # rebuild. If unset/absent, the manager falls back to the CSVs
-          # embedded in the binary.
-          - name: NEBULA_CATALOG_DIR
-            value: /etc/nebula/catalog
+          # The manager reads the price catalog from the CSVs embedded in the binary.
+          # Uncomment this — together with the catalog volume/volumeMount below AND
+          # `- ../catalog` in config/default/kustomization.yaml — to override them from
+          # a ConfigMap instead, which lets ops edit prices live without a rebuild.
+          # All three or none: the env var alone points at an empty mount, and catalog.Load
+          # takes an existing-but-empty dir as the whole catalog (no error, no offerings).
+          # - name: NEBULA_CATALOG_DIR
+          #   value: /etc/nebula/catalog
           # The namespace the manager runs in, needed by the webhook cert rotator
           # (pkg/cert): it scopes both the cert Secret and the cert's DNS name
           # (<service>.<namespace>.svc). Projected via fieldRef rather than hardcoded
@@ -170,17 +172,22 @@ spec:
           requests:
             cpu: "1"
             memory: 1Gi
-        volumeMounts:
-          - name: catalog
-            mountPath: /etc/nebula/catalog
-            readOnly: true
-      volumes:
-        - name: catalog
-          configMap:
-            # Unprefixed on purpose: config/default's namePrefix rewrites this
-            # reference to the generated "nebula-catalog" ConfigMap. optional so
-            # the manager still starts (embedded-CSV fallback) if it's absent.
-            name: catalog
-            optional: true
+        # Empty, not absent: config/default appends the cert mounts here with a JSON
+        # patch (`.../volumeMounts/-`), which needs the key to exist.
+        volumeMounts: []
+        #   # The catalog ConfigMap mount, off with NEBULA_CATALOG_DIR above.
+        #   - name: catalog
+        #     mountPath: /etc/nebula/catalog
+        #     readOnly: true
+      volumes: []
+      #   - name: catalog
+      #     configMap:
+      #       # Unprefixed on purpose: config/default's namePrefix rewrites this
+      #       # reference to the generated "nebula-catalog" ConfigMap, which it only
+      #       # does while `- ../catalog` is in that kustomization. optional so the
+      #       # manager still starts when the ConfigMap is absent — but see the env
+      #       # var above: it then starts with an EMPTY catalog, not the embedded one.
+      #       name: catalog
+      #       optional: true
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
