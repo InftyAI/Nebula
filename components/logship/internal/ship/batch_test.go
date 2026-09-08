@@ -122,6 +122,32 @@ func TestBatcher_ShipsNothingWhenEvenTheNoticeCannotFit(t *testing.T) {
 	}
 }
 
+func TestBatcher_TreatsOnlyAnUnsetCapAsUnlimited(t *testing.T) {
+	// A cap at or below PerEventOverhead leaves no room for a payload, which is a tighter version of the
+	// case above and must not come out the other side as "no cap at all". Reading it that way made the
+	// guard fail open on exactly the misconfiguration it exists to catch — and inconsistently, since one
+	// byte looser already shipped nothing.
+	line := Line{Data: strings.Repeat("x", 100), At: t1, Cursor: "100-0"}
+
+	for _, mb := range []int{1, 26, 27} {
+		b := NewBatcher(Limits{MaxEventBytes: mb, PerEventOverhead: 26}, FormatCompact)
+		b.Add(line)
+		if events := b.Flush(); events != nil {
+			t.Fatalf("MaxEventBytes=%d shipped %v, want nothing", mb, events)
+		}
+		if b.Oversized() != 1 {
+			t.Fatalf("MaxEventBytes=%d: Oversized() = %d, want 1", mb, b.Oversized())
+		}
+	}
+
+	// Unset is still the documented way to disable it — see Limits.
+	b := NewBatcher(Limits{PerEventOverhead: 26}, FormatCompact)
+	b.Add(line)
+	if events := b.Flush(); len(events) != 1 || events[0].Message != "100-0 "+line.Data {
+		t.Fatalf("got %v, want the line unchanged", events)
+	}
+}
+
 func TestBatcher_KeepsALineThatFits(t *testing.T) {
 	b := NewBatcher(Limits{MaxEventBytes: 40}, FormatCompact)
 	line := Line{Data: strings.Repeat("x", 10), At: t1, Cursor: "1-0"}

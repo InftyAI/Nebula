@@ -86,8 +86,8 @@ func NewAssembler(collapseFrames bool) *Assembler {
 }
 
 // Add returns the lines this batch completed. A trailing fragment is held for a later batch, or for
-// Flush; anything that reaches maxFragment is split instead, whether a newline terminated it or not —
-// see fill.
+// Flush; anything that would exceed maxFragment is split instead, whether a newline terminated it or
+// not — see fill.
 func (a *Assembler) Add(b Batch) []Line {
 	a.cursor = b.Cursor
 
@@ -119,7 +119,7 @@ func (a *Assembler) Add(b Batch) []Line {
 	return out
 }
 
-// fill writes s into the pending line, taking it whenever it reaches maxFragment.
+// fill writes s into the pending line, taking it whenever it would exceed maxFragment.
 //
 // Both of Add's paths go through here, because whether a chunk ends in a newline only decides WHICH
 // bound a Line the size of that chunk defeats: the queue admits any single line into an empty buffer —
@@ -132,7 +132,9 @@ func (a *Assembler) Add(b Batch) []Line {
 func (a *Assembler) fill(out []Line, at time.Time, s string) []Line {
 	for {
 		room := maxFragment - a.buf.Len()
-		if len(s) < room {
+		// Not `<`: an exact fit is not over the cap, and emitting it would leave Add's newline path
+		// taking an empty buffer as a blank line. A dump of any power-of-two size lands exactly here.
+		if len(s) <= room {
 			break
 		}
 		// Rounded down so a cut never lands inside a rune. Zero means the pending fragment left room

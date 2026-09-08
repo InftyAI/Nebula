@@ -200,12 +200,48 @@ func TestAssembler_CapsAnUnterminatedLine(t *testing.T) {
 	if lines := a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: chunk, At: t1}}}); len(lines) != 0 {
 		t.Fatalf("%d lines below the cap, want none", len(lines))
 	}
-	got := a.Add(Batch{Cursor: "200-0", Entries: []Entry{{Data: chunk, At: t2}}})
-	if len(got) != 1 || len(got[0].Data) != maxFragment {
-		t.Fatalf("%d lines of %d bytes, want one of %d", len(got), len(got[0].Data), maxFragment)
+	// Held at exactly the cap rather than emitted, because a fragment that fills it is not over it —
+	// see fill. One more byte takes it, so the bound this test exists for is unaffected.
+	if got := a.Add(Batch{Cursor: "200-0", Entries: []Entry{{Data: chunk, At: t2}}}); len(got) != 0 {
+		t.Fatalf("%d lines at exactly the cap, want it held", len(got))
 	}
-	if lines := a.Flush(); len(lines) != 0 {
-		t.Fatalf("Flush gave %v, want nothing left behind", data(lines))
+	if lines := a.Flush(); len(lines) != 1 || len(lines[0].Data) != maxFragment {
+		t.Fatalf("Flush gave %v, want one line of %d bytes", data(lines), maxFragment)
+	}
+}
+
+func TestAssembler_DoesNotFollowAnExactCapWithABlankLine(t *testing.T) {
+	// Emitting at exactly the cap left the buffer empty, and the newline path takes unconditionally —
+	// so a line whose length was a multiple of the cap shipped a spurious blank record after it. Not the
+	// 1-in-65536 accident it looks like: maxFragment is 64 KiB, so every power-of-two-sized dump lands
+	// on the boundary exactly.
+	exact := strings.Repeat("x", maxFragment)
+
+	for _, collapse := range []bool{false, true} {
+		a := NewAssembler(collapse)
+		got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: exact + "\n", At: t1}}})
+		if !equalData(got, []string{exact}) {
+			t.Fatalf("collapseFrames=%v: %d lines of %v bytes, want one of %d",
+				collapse, len(got), lengths(got), maxFragment)
+		}
+
+		// The likelier arrival, since a batch ends wherever the source's page does.
+		b := NewAssembler(collapse)
+		b.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: exact, At: t1}}})
+		if got := b.Add(Batch{Cursor: "200-0", Entries: []Entry{{Data: "\n", At: t2}}}); !equalData(got, []string{exact}) {
+			t.Fatalf("collapseFrames=%v: a newline in a later batch gave %v bytes, want one line of %d",
+				collapse, lengths(got), maxFragment)
+		}
+	}
+
+	// And no blank between the pieces of a longer multiple, nor after the last one.
+	a := NewAssembler(false)
+	got := a.Add(Batch{Cursor: "100-0", Entries: []Entry{{Data: strings.Repeat("x", 3*maxFragment) + "\n", At: t1}}})
+	if len(got) != 3 {
+		t.Fatalf("%d lines for 3x the cap plus its newline, want 3: %v", len(got), lengths(got))
+	}
+	if rest := a.Flush(); rest != nil {
+		t.Fatalf("Flush gave %v, want nothing", data(rest))
 	}
 }
 
@@ -355,6 +391,15 @@ func data(lines []Line) []string {
 	out := make([]string, 0, len(lines))
 	for _, l := range lines {
 		out = append(out, l.Data)
+	}
+	return out
+}
+
+// lengths is for failures where the byte counts are the whole story and the data is 64 KiB of "x".
+func lengths(lines []Line) []int {
+	out := make([]int, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, len(l.Data))
 	}
 	return out
 }

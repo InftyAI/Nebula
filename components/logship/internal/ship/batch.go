@@ -85,8 +85,11 @@ func encodeJSONString(b *strings.Builder, s string) {
 			b.WriteByte(hex[c>>4])
 			b.WriteByte(hex[c&0xf])
 		default:
-			// Written bytewise, so invalid UTF-8 passes through as it arrived rather than becoming
-			// U+FFFD: the durable copy is sometimes the evidence.
+			// Written bytewise, so an invalid UTF-8 byte goes out as it arrived. That makes the record
+			// technically not JSON (RFC 8259 requires UTF-8), and it does NOT preserve the byte the way
+			// it looks like it does: the consumer's encoding/json accepts the record and coerces it to
+			// U+FFFD anyway. Kept because the alternative is escaping to \u00XX, which is 6 bytes for
+			// every byte and pushes a binary-ish line into the oversized drop at MaxEventBytes.
 			b.WriteByte(c)
 		}
 	}
@@ -179,9 +182,15 @@ func (b *Batcher) events(l Line) []Event {
 // publishes it. Losing the text is the lesser failure; the notice is what keeps it from being a silent
 // one.
 func (b *Batcher) messages(l Line) []string {
-	limit := b.limits.MaxEventBytes - b.limits.PerEventOverhead
 	msg := b.format(l)
-	if limit <= 0 || len(msg) <= limit {
+	// Only the unset cap disables this. A positive MaxEventBytes below PerEventOverhead leaves no room
+	// for any payload at all, and reading that as "unlimited" would ship an event guaranteed to breach
+	// the cap — failing open on the one misconfiguration this guard exists to catch.
+	if b.limits.MaxEventBytes <= 0 {
+		return []string{msg}
+	}
+	limit := b.limits.MaxEventBytes - b.limits.PerEventOverhead
+	if len(msg) <= limit {
 		return []string{msg}
 	}
 
