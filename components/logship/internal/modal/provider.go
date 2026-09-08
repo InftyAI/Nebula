@@ -61,10 +61,17 @@ func (p *Provider) Source(instanceID, stream string) (ship.Source, error) {
 // Reserve widens the pool for instances sandboxes. See Pool.Grow: the ordering — before the streams
 // open — is the whole contract, and growing past what is needed costs an unconnected socket.
 //
+// Floored at what the pool is already carrying plus this instance's own streams, because an instance
+// count is not that: Supervisor.Forget drops an instance before its streams release their slots, so a
+// replacement arriving while the pool sits exactly on a connection boundary would open into a pool
+// sized as if the departing streams were already gone. A floor and not a lock — concurrent Ensures can
+// still overshoot, which Pool.Client tolerates on purpose.
+//
 // The connection count rides in the error because the caller reports the failure and does not
 // otherwise know the shape of what failed.
 func (p *Provider) Reserve(instances int) error {
-	if err := p.pool.Grow(instances * len(Descriptors)); err != nil {
+	streams := max(instances*len(Descriptors), p.pool.Live()+len(Descriptors))
+	if err := p.pool.Grow(streams); err != nil {
 		return fmt.Errorf("widening the pool past its %d connections: %w", p.pool.Len(), err)
 	}
 	return nil

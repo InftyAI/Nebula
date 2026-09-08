@@ -132,6 +132,21 @@ func (p *Pool) Client() (LogsClient, func()) {
 	}
 }
 
+// Live is how many slots are handed out and not yet returned.
+//
+// It is what reserving capacity has to count against, because a cancelled stream keeps its slot until
+// its RPC unwinds: any figure derived from a tracked-instance count runs ahead of this one during a
+// teardown. See Provider.Reserve.
+func (p *Pool) Live() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, c := range p.live {
+		n += c
+	}
+	return n
+}
+
 // Len is the number of connections, which is what a caller checks a stream count against.
 func (p *Pool) Len() int {
 	p.mu.Lock()

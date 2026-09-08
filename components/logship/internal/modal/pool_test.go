@@ -108,6 +108,43 @@ func TestPool_HoldsTheCapWhileItGrows(t *testing.T) {
 	}
 }
 
+func TestReserve_CountsTheStreamsStillDrainingAfterAForget(t *testing.T) {
+	// Supervisor.Forget untracks an instance before its streams give their slots back, and watch.ensure
+	// forgets and re-ensures in the same handler — so a replacement reserved from the decremented count
+	// used to open into a pool sized as if the departing streams had already gone. It bites only with the
+	// pool exactly on a connection boundary, which is where an even fleet size sits.
+	p, err := NewPool(Credentials{ServerURL: "http://localhost:1"}, StreamsPerConn)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	for range StreamsPerConn {
+		p.Client() // held: one connection exactly full, nothing released
+	}
+	// The fleet that fits in those slots. Unchanged by the churn, since Forget already decremented and
+	// the replacement adds itself back.
+	prov := &Provider{pool: p}
+	if err := prov.Reserve(StreamsPerConn / len(Descriptors)); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	for range len(Descriptors) {
+		p.Client()
+	}
+
+	if p.Len() != 2 {
+		t.Errorf("Len() = %d, want the reserve to have dialed for the draining streams", p.Len())
+	}
+	for i, n := range p.live {
+		if n > StreamsPerConn {
+			t.Errorf("connection %d carries %d streams, over the %d cap", i, n, StreamsPerConn)
+		}
+	}
+	if got := p.Live(); got != StreamsPerConn+len(Descriptors) {
+		t.Errorf("Live() = %d, want every held slot counted", got)
+	}
+}
+
 func TestPool_ReleaseFreesTheSlot(t *testing.T) {
 	// Without a release the pool counts a finished stream forever, and since every retry builds a fresh
 	// Source, a fleet that never grew would still walk its connections up past the cap.
