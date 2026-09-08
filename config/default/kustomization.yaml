@@ -18,9 +18,10 @@ resources:
 - ../crd
 - ../rbac
 - ../manager
-# Price/availability catalog ConfigMap, rendered from the checked-in CSVs and
-# mounted by the manager at /etc/nebula/catalog.
-- ../catalog
+# Price/availability catalog ConfigMap, rendered from the checked-in CSVs. Off:
+# the manager uses the CSVs embedded in its binary. Uncommenting this also needs
+# the catalog env var and volume in config/manager/manager.yaml.
+# - ../catalog
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 - ../webhook
