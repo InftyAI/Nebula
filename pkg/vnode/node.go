@@ -183,14 +183,17 @@ func (r *Runner) Start(ctx context.Context) error {
 			o.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", r.nodeName).String()
 		}),
 	)
-	// Cluster-wide factory for the config/secret/service informers the pod
-	// controller needs to resolve pod references.
+	// Cluster-wide factory for the config/secret informers the pod controller needs
+	// to resolve pod references.
 	scmFactory := informers.NewSharedInformerFactoryWithOptions(r.client, informerResync)
+
+	// Services come from their own factory; see noServiceLinksFactory.
+	svcFactory := noServiceLinksFactory(r.client)
 
 	podInformer := podFactory.Core().V1().Pods()
 	secretInformer := scmFactory.Core().V1().Secrets()
 	configMapInformer := scmFactory.Core().V1().ConfigMaps()
-	serviceInformer := scmFactory.Core().V1().Services()
+	serviceInformer := svcFactory.Core().V1().Services()
 
 	eb := record.NewBroadcaster()
 	recorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: r.nodeName + "/pod-controller"})
@@ -232,6 +235,7 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	go podFactory.Start(ctx.Done())
 	go scmFactory.Start(ctx.Done())
+	go svcFactory.Start(ctx.Done())
 
 	log.Info("starting virtual node")
 	if err := r.run(ctx, pc, nc, nodeSpec, np); err != nil && ctx.Err() == nil {
@@ -282,6 +286,31 @@ func (r *Runner) run(
 	case <-pc.Done():
 		return pc.Err()
 	}
+}
+
+// noSuchServiceName cannot name a Service: a Service name is a DNS-1035 label, so the dot makes
+// it unrepresentable rather than merely unused.
+const noSuchServiceName = "nebula.no-service-links"
+
+// noServiceLinksFactory is the Services source the pod controller gets, and its lister is empty
+// by construction.
+//
+// The pod controller populates each container's env before calling CreatePod, and part of what it
+// populates is kubelet's service links: ~8 vars per Service in the Pod's namespace, plus
+// default/kubernetes whatever enableServiceLinks says. Every one of them is a ClusterIP an
+// off-cluster instance cannot route to, so all they do is hand a third party the cluster's
+// internal topology and hand the workload an address that black-holes. An empty service lister is
+// how that is turned off — enableServiceLinks cannot, since the master service ignores it.
+//
+// A separate factory because the selector would otherwise narrow the Secret and ConfigMap
+// informers too, and those must be real: a missing MANDATORY reference fails CreatePod.
+func noServiceLinksFactory(client kubernetes.Interface) informers.SharedInformerFactory {
+	return informers.NewSharedInformerFactoryWithOptions(
+		client, informerResync,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("metadata.name", noSuchServiceName).String()
+		}),
+	)
 }
 
 // nodeSpec produces the Node object for a provider's virtual node: the
