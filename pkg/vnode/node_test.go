@@ -91,7 +91,10 @@ func TestServiceLinksNeverReachTheProvider(t *testing.T) {
 			}
 			var links []string
 			for name := range env {
-				if strings.Contains(name, "_SERVICE_HOST") || strings.Contains(name, "_PORT_8080_TCP") {
+				if strings.HasPrefix(name, "KUBERNETES_") ||
+					strings.Contains(name, "_SERVICE_") ||
+					strings.Contains(name, "_PORT_") ||
+					strings.HasSuffix(name, "_PORT") {
 					links = append(links, name)
 				}
 			}
