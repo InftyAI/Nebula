@@ -399,11 +399,12 @@ const nvidiaGPUResource = "nvidia.com/gpu"
 // (amd.com/gpu, a typed MIG key) would have its GPU Pods rejected before provisioning;
 // when one lands, have Capabilities declare its resource keys and build capacity from
 // that.
+// Support at least 1k workloads with 64 cpu, 256 Gib, 8GPU per virtual node.
 func virtualCapacity() corev1.ResourceList {
 	return corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse("1k"),
-		corev1.ResourceMemory: resource.MustParse("10Ti"),
+		corev1.ResourceCPU:    resource.MustParse("64k"),
+		corev1.ResourceMemory: resource.MustParse("250Ti"),
 		corev1.ResourcePods:   resource.MustParse("1k"),
-		nvidiaGPUResource:     resource.MustParse("1k"),
+		nvidiaGPUResource:     resource.MustParse("8k"),
 	}
 }
