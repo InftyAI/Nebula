@@ -5,7 +5,7 @@
 **The Control Plane for GPUaaS**
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/7WTUuFqyS6)
-![Go Version](https://img.shields.io/badge/go-1.24-00ADD8?logo=go&logoColor=white)
+![Go Version](https://img.shields.io/badge/go-1.25-00ADD8?logo=go&logoColor=white)
 [![Go Reference](https://pkg.go.dev/badge/github.com/InftyAI/Nebula.svg)](https://pkg.go.dev/github.com/InftyAI/Nebula)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
