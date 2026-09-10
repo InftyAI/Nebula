@@ -445,8 +445,11 @@ func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		// Copy the status and endpoint just in case the update failed,
-		// so we do not lose them in the tracked copy.
+		// VK's Pod comes from the API server, so it may predate our own metadata patch. The
+		// status and endpoint are carried across or the tracked copy — what the poll loop
+		// re-emits, and so the only retry — loses them for good; the endpoint has no other
+		// in-memory home. The instance id deliberately has no line here: persistMetadata falls
+		// back to trackedPod.instance, which this never touches.
 		status := tp.pod.Status
 		endpoint := tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation]
 		tp.pod = pod.DeepCopy()
@@ -758,9 +761,14 @@ func setEndpoint(pod *corev1.Pod, endpoint string) {
 	setAnnotation(pod, nebulav1alpha1.EndpointAnnotation, endpoint)
 }
 
-// setInstanceID stamps the provider's instance id on the Pod. One writer only —
-// CreatePod, the moment Provision returns it — because that is the only place it is
-// learned; the poll loop matches instances by CLAIM NAME and never re-derives the id.
+// setInstanceID stamps the provider's instance id on the Pod. One stamping site —
+// CreatePod, the moment Provision returns it — and, unlike the endpoint, no read-path
+// site that re-applies it every tick.
+//
+// So this is not the only way the id reaches etcd, and must not become it: a re-adopted
+// pod (see GetPod) learns its id from the provider's List without any Pod to stamp, which
+// is why persistMetadata falls back to trackedPod.instance. Anything that drops the
+// annotation from a tracked copy depends on that fallback to recover.
 //
 // It rides the Pod so the NodeClaim controller can record it from an object it already
 // has, instead of asking the provider for a full instance list on every reconcile (see
@@ -875,6 +883,19 @@ func (h *Handler) persistMetadata(ctx context.Context, pod *corev1.Pod) {
 	// An untracked pod has nothing to compare against, so everything it carries is
 	// patched: these annotations are the only place those values reach a reader.
 	if tp, tracked := h.tracked[key(pod.Namespace, pod.Name)]; tracked {
+		// The ANNOTATION wins: it is the value already offered to readers, so etcd stays the
+		// source of truth. trackedPod.instance is the fallback for the paths that hold an id
+		// without one ever being stamped on the Pod — a re-adopted pod (see GetPod), and one
+		// whose copy UpdatePod replaced from the API server before the patch landed. They are
+		// the same value wherever both exist.
+		//
+		// Load-bearing, not belt-and-braces: nothing re-derives this annotation later (see
+		// setInstanceID), so an id missing here is missing for the instance's whole life, and
+		// with it status.InstanceID — leaving teardown to search the provider by claim name
+		// and logship to skip the Pod entirely.
+		if want.instanceID == "" {
+			want.instanceID = tp.instance
+		}
 		want = want.minus(tp.patchedMeta)
 	}
 	h.mu.Unlock()

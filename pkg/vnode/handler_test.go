@@ -950,6 +950,85 @@ func TestCreatePod_PersistsInstanceIDAlongsideEndpoint(t *testing.T) {
 	}
 }
 
+// A pod re-adopted after a VK restart is the case the create-path stamp cannot cover: GetPod
+// builds a fresh Pod from the provider's List, so the id exists only in trackedPod.instance and
+// there is no annotation to re-offer. Nothing re-derives it later either (see setInstanceID), so
+// without persistMetadata's fallback status.InstanceID stays empty for the instance's whole life —
+// leaving teardown to search the provider by claim name and logship to skip the Pod.
+func TestReadoptedPod_PersistsInstanceIDFromTracking(t *testing.T) {
+	pod := testPod("default", "p1")
+	client := fake.NewSimpleClientset(pod)
+
+	var patches int
+	client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		patches++
+		return false, nil, nil // fall through to the tracker so the object updates
+	})
+
+	fp := &fakeProvider{list: []provider.Instance{
+		{ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning},
+	}}
+	h := NewHandler(fp, client, nil, openCluster())
+	h.NotifyPods(context.Background(), func(*corev1.Pod) {})
+
+	// Cold tracking map, live instance: VK's existence check re-adopts it. No emit here, so
+	// nothing is written yet — the id is in tracking alone.
+	if _, err := h.GetPod(context.Background(), "default", "p1"); err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	h.reconcileOnce(context.Background())
+
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get patched pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.InstanceIDAnnotation]; got != "inst-1" {
+		t.Fatalf("instance id annotation = %q, want inst-1 — a re-adopted pod's id never reaches "+
+			"a reader otherwise", got)
+	}
+
+	// The fallback feeds the same dedup as a stamped value, or every tick re-patches the fleet.
+	h.reconcileOnce(context.Background())
+	if patches != 1 {
+		t.Fatalf("an unchanged instance id must not re-patch; got %d patches", patches)
+	}
+}
+
+// The dedup is only safe because the write is a MERGE patch: a body carrying one annotation
+// leaves every other one alone. So once the endpoint has been patched, minus drops it from every
+// later body and the id travels by itself without erasing the address. Sending "" for the omitted
+// field instead — the obvious-looking alternative to podMeta.annotations omitting it — would
+// overwrite a working address with an empty string.
+func TestPersistMetadata_OneFieldPatchLeavesTheOtherAlone(t *testing.T) {
+	const dns = "ec2-1-2-3-4.compute.amazonaws.com"
+	pod := testPod("default", "p1")
+	pod.Annotations = map[string]string{nebulav1alpha1.EndpointAnnotation: dns}
+	client := fake.NewSimpleClientset(pod)
+
+	h := NewHandler(&fakeProvider{}, client, nil, openCluster())
+	// The endpoint is already durable, the id is not — the state after any tick that patched
+	// the address before the id was known.
+	h.tracked[key("default", "p1")] = &trackedPod{
+		pod:         pod.DeepCopy(),
+		claimName:   "default-p1",
+		instance:    "inst-1",
+		patchedMeta: podMeta{endpoint: dns},
+	}
+
+	h.persistMetadata(context.Background(), pod.DeepCopy())
+
+	live, err := client.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get patched pod: %v", err)
+	}
+	if got := live.Annotations[nebulav1alpha1.InstanceIDAnnotation]; got != "inst-1" {
+		t.Fatalf("instance id annotation = %q, want inst-1", got)
+	}
+	if got := live.Annotations[nebulav1alpha1.EndpointAnnotation]; got != dns {
+		t.Fatalf("endpoint annotation = %q, want %q — a patch that omits a field must not clear it", got, dns)
+	}
+}
+
 // connectSecret fetches the connect Secret for a pod, or nil when absent.
 func connectSecret(t *testing.T, client *fake.Clientset, ns, podName string) *corev1.Secret {
 	t.Helper()
