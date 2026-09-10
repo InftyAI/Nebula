@@ -173,6 +173,12 @@ type NodeClaimStatus struct {
 	// +optional
 	EstimatedCostUSD string `json:"estimatedCostUSD,omitempty"`
 
+	// ProvisionedAt is when this claim was first observed holding a chargeable instance — the
+	// instant billing began. Written once, in the same patch that opens LastAccruedAt, and never
+	// refreshed afterwards.
+	// +optional
+	ProvisionedAt *metav1.Time `json:"provisionedAt,omitempty"`
+
 	// LastAccruedAt is how far cost accrual has counted: an ANCHOR for the next measurement,
 	// not a note about the last one. "Accrued" in the accounting sense — cost incurred but not
 	// yet invoiced, which is all EstimatedCostUSD ever holds.

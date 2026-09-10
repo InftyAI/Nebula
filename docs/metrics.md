@@ -212,6 +212,11 @@ provider's billing export before anyone gets invoiced.
 `NodeClaimPhase`), so only they accrue; a `Terminated` claim's `EST_COST` is its frozen final total.
 `Provisioning` is excluded, undercounting by about one poll interval per instance.
 
+`Terminating` bills only to *continue* a window that was already open, which `status.provisionedAt`
+records — the instant a claim was first seen holding a chargeable instance. Deleting a Pod promotes
+its claim straight from `Provisioning` to `Terminating`, so without that field the teardown of an
+instance that never existed would be charged at the full GPU rate.
+
 An instance that ends on its own — a preemption, a crashed sandbox — reaches `Terminated` without
 passing through `Terminating`, and the loop will not touch it again. Teardown books the time since
 its last checkpoint anyway, under `phase="Terminated"`, capped at one accrual interval: the claim

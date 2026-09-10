@@ -44,7 +44,8 @@ import (
 )
 
 // billingClaim is a claim holding a priced instance, anchored ago in the past. A nil ago leaves
-// the anchor unset, i.e. never checkpointed.
+// the anchor unset, i.e. never checkpointed — and with it ProvisionedAt, which is written in the
+// same patch and so never exists without one.
 func billingClaim(name, price string, ago *time.Duration) *nebulav1alpha1.NodeClaim {
 	nc := &nebulav1alpha1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -55,7 +56,9 @@ func billingClaim(name, price string, ago *time.Duration) *nebulav1alpha1.NodeCl
 		},
 	}
 	if ago != nil {
-		nc.Status.LastAccruedAt = &metav1.Time{Time: time.Now().Add(-*ago).Truncate(time.Second)}
+		at := metav1.Time{Time: time.Now().Add(-*ago).Truncate(time.Second)}
+		nc.Status.ProvisionedAt = &at
+		nc.Status.LastAccruedAt = at.DeepCopy()
 	}
 	return nc
 }
@@ -93,6 +96,16 @@ func ledger(t *testing.T, c client.Client, name string) (float64, *metav1.Time) 
 		t.Fatalf("status.estimatedCostUSD %q is not a number: %v", nc.Status.EstimatedCostUSD, err)
 	}
 	return total, nc.Status.LastAccruedAt
+}
+
+// provisioned reads back the durable record that this claim ever billed.
+func provisioned(t *testing.T, c client.Client, name string) *metav1.Time {
+	t.Helper()
+	var nc nebulav1alpha1.NodeClaim
+	if err := c.Get(context.Background(), client.ObjectKey{Name: name}, &nc); err != nil {
+		t.Fatalf("get claim %q: %v", name, err)
+	}
+	return nc.Status.ProvisionedAt
 }
 
 // booked is the dollars the cost counter holds across every series.
@@ -193,19 +206,26 @@ func TestCostAccrual_ChargesCheapClaimsAtTheirRealRate(t *testing.T) {
 	}
 }
 
-// A claim that became billable before the ledger existed has no anchor. Opening one must not
-// invent spend for the window whose length nobody knows.
-func TestCostAccrual_StampsMissingAnchorWithoutCharging(t *testing.T) {
+// A billable claim with no anchor is left entirely alone: the window before this tick has an
+// unknown length, so charging it would invent spend, and opening one would have to invent
+// ProvisionedAt too — the field that decides whether teardown is billable. stampAccrualStart is
+// the only opener; nothing here may quietly become a second one.
+func TestCostAccrual_LeavesAnUnanchoredClaimAlone(t *testing.T) {
 	a, c := newAccrual(t, billingClaim("bound", "98.3200", nil))
 
+	a.accrueAll(context.Background())
+	a.now = func() time.Time { return time.Now().Add(accrualInterval) }
 	a.accrueAll(context.Background())
 
 	total, anchor := ledger(t, c, "bound")
 	if total != 0 {
 		t.Fatalf("status.estimatedCostUSD %v on an unanchored claim, want 0", total)
 	}
-	if anchor == nil {
-		t.Fatal("no anchor was written, so the next tick will charge nothing either")
+	if anchor != nil {
+		t.Fatalf("an anchor was opened outside markPhase: %v", anchor)
+	}
+	if at := provisioned(t, c, "bound"); at != nil {
+		t.Fatalf("status.provisionedAt %v was invented from a tick", at)
 	}
 	if n := testutil.CollectAndCount(metrics.CostTotal); n != 0 {
 		t.Fatalf("collected %d series, want 0 — nothing was charged", n)
@@ -246,6 +266,54 @@ func TestCostAccrual_SkipsNonBilling(t *testing.T) {
 	}
 	if n := testutil.CollectAndCount(metrics.CostTotal); n != 0 {
 		t.Fatalf("collected %d series, want 0 — no non-billing claim may accrue", n)
+	}
+}
+
+// A Terminating claim with no previously opened window must remain unbillable, because it may
+// never have held an instance.
+func TestCostAccrual_TerminatingWithoutAWindowNeverStarts(t *testing.T) {
+	nc := billingClaim("terminating", "98.3200", nil)
+	nc.Status.Phase = nebulav1alpha1.NodeClaimTerminating
+	a, c := newAccrual(t, nc)
+
+	a.accrueAll(context.Background())
+	a.now = func() time.Time { return time.Now().Add(accrualInterval) }
+	a.accrueAll(context.Background())
+
+	total, anchor := ledger(t, c, "terminating")
+	if anchor != nil {
+		t.Fatalf("an accrual window was opened in Terminating (anchor %v); nothing here ever held "+
+			"an instance", anchor)
+	}
+	if at := provisioned(t, c, "terminating"); at != nil {
+		t.Fatalf("status.provisionedAt %v on a claim that never billed", at)
+	}
+	if total != 0 {
+		t.Fatalf("status.estimatedCostUSD %v, want 0", total)
+	}
+	if n := testutil.CollectAndCount(metrics.CostTotal); n != 0 {
+		t.Fatalf("collected %d series, want 0 — no window may be booked in Terminating", n)
+	}
+}
+
+// The other half of the same rule: a claim that WAS billing keeps billing through teardown, which
+// is the only reason Terminating is a billing phase at all. A gate that looked at the phase alone
+// would stop the meter while the instance is still alive and still costing money.
+func TestCostAccrual_TerminatingKeepsAnOpenWindowRunning(t *testing.T) {
+	halfHour := 30 * time.Minute
+	nc := billingClaim("terminating", "10.0000", &halfHour)
+	nc.Status.Phase = nebulav1alpha1.NodeClaimTerminating
+	a, c := newAccrual(t, nc)
+
+	a.accrueAll(context.Background())
+
+	total, anchor := ledger(t, c, "terminating")
+	if math.Abs(total-5) > 1e-2 {
+		t.Fatalf("status.estimatedCostUSD %v, want 5 (0.5h at $10/hr) — teardown of a live instance "+
+			"is still billed", total)
+	}
+	if anchor == nil || time.Since(anchor.Time) > time.Minute {
+		t.Fatalf("anchor was not moved forward: %v", anchor)
 	}
 }
 
@@ -328,6 +396,9 @@ func TestCostNow(t *testing.T) {
 	settled.Status.Phase = nebulav1alpha1.NodeClaimTerminated
 	settled.Status.EstimatedCostUSD = "5.0000"
 
+	terminatingUnanchored := billingClaim("torn-down", "10.0000", nil)
+	terminatingUnanchored.Status.Phase = nebulav1alpha1.NodeClaimTerminating
+
 	cases := map[string]struct {
 		claim  *nebulav1alpha1.NodeClaim
 		want   float64
@@ -338,6 +409,9 @@ func TestCostNow(t *testing.T) {
 		"unanchored charges nothing":  {claim: billingClaim("fresh", "10.0000", nil), want: 0, report: true},
 		// Never billable and never charged: absent cost, which must not be reported as zero.
 		"unpriced is absent, not zero": {claim: billingClaim("unpriced", "", &hour), want: 0, report: false},
+		// Terminating with no window ever opened is the same kind of absence: reporting $0 would
+		// assert that the teardown was free rather than that nothing was ever billable here.
+		"terminating with no window is absent": {claim: terminatingUnanchored, want: 0, report: false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -779,6 +853,14 @@ func TestStampAccrualStart(t *testing.T) {
 		claim *nebulav1alpha1.NodeClaim
 		want  bool
 	}{claim: provisioning, want: false}
+	// Terminating BILLS but must not OPEN: a claim reaching it with nothing stamped never held an
+	// instance, so a window opened here would charge the teardown of something that never ran.
+	terminating := billingClaim("e", "3.9500", nil)
+	terminating.Status.Phase = nebulav1alpha1.NodeClaimTerminating
+	cases["terminating with no window already open"] = struct {
+		claim *nebulav1alpha1.NodeClaim
+		want  bool
+	}{claim: terminating, want: false}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -786,10 +868,74 @@ func TestStampAccrualStart(t *testing.T) {
 			if got := stampAccrualStart(tc.claim); got != tc.want {
 				t.Fatalf("stampAccrualStart = %v, want %v", got, tc.want)
 			}
-			if !tc.want && tc.claim.Status.LastAccruedAt != before {
-				t.Fatal("the anchor was rewritten")
+			if !tc.want {
+				if tc.claim.Status.LastAccruedAt != before {
+					t.Fatal("the anchor was rewritten")
+				}
+				// Nothing may record that this claim started billing when it did not: billingRate
+				// reads ProvisionedAt to decide whether teardown is chargeable.
+				if before == nil && tc.claim.Status.ProvisionedAt != nil {
+					t.Fatalf("status.provisionedAt %v on a claim that opened no window",
+						tc.claim.Status.ProvisionedAt)
+				}
+				return
+			}
+			// The pair, at one instant: an anchor without ProvisionedAt has its teardown refused as
+			// never-billed, and the two are only comparable because they come from one patch.
+			at, start := tc.claim.Status.LastAccruedAt, tc.claim.Status.ProvisionedAt
+			if start == nil || !start.Equal(at) {
+				t.Fatalf("status.provisionedAt %v, want the anchor's %v", start, at)
 			}
 		})
+	}
+}
+
+// Deleting a claim that never got capacity must cost nothing, through the real reconcile.
+//
+// The path that made this a leak is not obvious from either half: a Provisioning claim is not
+// billable, but deleting its Pod promotes it straight past Bound to Terminating (desiredPhase
+// checks the deletion before the Bound hold), and Terminating IS billable — so the same patch
+// opened the claim's first accrual window, and teardown was then charged at the full GPU rate for
+// an instance that never existed.
+func TestMarkPhase_TerminatingAProvisioningClaimOpensNoWindow(t *testing.T) {
+	metrics.CostTotal.Reset()
+
+	// Pending with no Initializing reason: nothing was ever placed. The finalizer is what lets the
+	// fake client hold a Pod with a deletionTimestamp instead of dropping it.
+	pod := gpuPod("L4", 1, "64", "128Gi")
+	pod.Status.Phase = corev1.PodPending
+	pod.Finalizers = []string{"test.nebula.inftyai.com/hold"}
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+
+	nc := newClaim("c1", "p1", "default", "uid-1", "fake")
+	nc.Spec.Accelerator = "L4:1"
+	nc.Spec.CapacityType = nebulav1alpha1.CapacityOnDemand
+	nc.Status.Phase = nebulav1alpha1.NodeClaimProvisioning
+	nc.Status.PriceUSDPerHour = "12.9559"
+
+	pp := &pricedProvider{fakeProvider: &fakeProvider{name: "fake"}, rate: 12.9559}
+	r, c := newPricedReconciler(t, []client.Object{pod, nc}, pp)
+
+	reconcileClaim(t, r, "c1")
+
+	got := getClaim(t, c, "c1")
+	if got.Status.Phase != nebulav1alpha1.NodeClaimTerminating {
+		t.Fatalf("phase %q, want Terminating — the rest of this test asserts nothing otherwise",
+			got.Status.Phase)
+	}
+	if got.Status.LastAccruedAt != nil {
+		t.Fatalf("an accrual window was opened at teardown (anchor %v); a claim that never held an "+
+			"instance must not start billing on its way out", got.Status.LastAccruedAt)
+	}
+	if total, _ := ledger(t, c, "c1"); total != 0 {
+		t.Fatalf("status.estimatedCostUSD %v, want 0", total)
+	}
+
+	// And the window settleFinalCost would close on the way out is nothing, not one tick's worth.
+	settleFinalCost(context.Background(), got)
+	if charged := booked(t); charged != 0 {
+		t.Fatalf("settleFinalCost booked $%v for an instance that never ran, want 0", charged)
 	}
 }
 
