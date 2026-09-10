@@ -241,6 +241,13 @@ spec:
                   Written once and never refreshed, so a catalog edit cannot retroactively reprice a
                   running instance and rewrite the cost history it has already reported.
                 type: string
+              provisionedAt:
+                description: |-
+                  ProvisionedAt is when this claim was first observed holding a chargeable instance — the
+                  instant billing began. Written once, in the same patch that opens LastAccruedAt, and never
+                  refreshed afterwards.
+                format: date-time
+                type: string
             type: object
         type: object
     served: true

@@ -149,16 +149,22 @@ func (a *CostAccrual) accrue(ctx context.Context, nc *nebulav1alpha1.NodeClaim) 
 	// never drift.
 	now := a.now().Truncate(time.Second)
 
+	// No anchor: nothing is counting yet, and this loop is deliberately not what starts it.
+	// stampAccrualStart is the only opener, and it rides the patch that makes a claim Bound —
+	// markPhase being the only writer of status.phase, and one that requeues if that patch fails,
+	// so a billable claim reaching this line without an anchor has no path left to produce it.
+	// Opening one here would also have to invent ProvisionedAt, which is what refuses to bill a
+	// teardown that never billed (see billingRate).
+	at := nc.Status.LastAccruedAt
+	if at == nil {
+		return nil
+	}
 	// An anchor in the future — a wall-clock jump, or a hand-edited field. Charging the negative
 	// window would rewind the ledger. Left in place rather than pulled back to now, so billing
 	// resumes by itself once the clock passes it, having lost only the bogus window.
-	if at := nc.Status.LastAccruedAt; at != nil && !now.After(at.Time) {
+	if !now.After(at.Time) {
 		return nil
 	}
-	// A claim with no anchor at all — one that became billable before this build, or whose Bound
-	// patch did not carry the stamp — falls through with nothing added: the window before this
-	// point has an unknown length, and guessing it would invent spend. Opening one here is the
-	// whole write.
 	prev := costSoFar(nc)
 	total, _ := costNow(nc, now)
 	nc.Status.EstimatedCostUSD = formatCost(total)
@@ -179,13 +185,19 @@ func (a *CostAccrual) accrue(ctx context.Context, nc *nebulav1alpha1.NodeClaim) 
 // a real "this costs nothing", while absent spend is honestly unknown:
 //
 //   - Phase. Only Bound and Terminating hold an instance that exists (see NodeClaimPhase).
-//     Terminating still bills until teardown finishes. Provisioning is excluded and undercounts
-//     by roughly one poll tick, the same lag the phase itself carries.
+//     Terminating bills only to CONTINUE what was already being charged, which is what
+//     ProvisionedAt records — without it, deleting a Provisioning claim opens its FIRST window at
+//     teardown (see desiredPhase) and charges the reclaim of an instance that never existed.
+//     Provisioning is excluded and undercounts by roughly one poll tick, the same lag the phase
+//     itself carries.
 //   - Price. Empty means UNPRICED, not free (see Status.PriceUSDPerHour): no Pricer, or no
 //     catalog row. An unparseable value is a corrupted claim and is treated the same.
+//
+// Bound cannot require ProvisionedAt: it is the phase that creates it (see stampAccrualStart).
 func billingRate(nc *nebulav1alpha1.NodeClaim) (float64, bool) {
-	switch nc.Status.Phase {
-	case nebulav1alpha1.NodeClaimBound, nebulav1alpha1.NodeClaimTerminating:
+	switch {
+	case nc.Status.Phase == nebulav1alpha1.NodeClaimBound,
+		nc.Status.Phase == nebulav1alpha1.NodeClaimTerminating && nc.Status.ProvisionedAt != nil:
 	default:
 		return 0, false
 	}
@@ -253,10 +265,20 @@ func formatCost(usd float64) string {
 // stampAccrualStart opens the billing window the moment a claim first becomes chargeable,
 // returning whether it mutated the claim.
 //
-// Load-bearing rather than an optimisation: it is what makes a crash BEFORE the first
-// checkpoint lossless. The anchor is what recovery measures from, so without it a claim that
-// billed for 90 seconds and then lost its manager would be charged from whenever the next tick
-// happened to find it. Free, because it rides the status patch markPhase is already making.
+// The ONLY opener: accrue moves an anchor but never creates one, so a claim this misses bills
+// nothing for its whole life, not merely late. Safe to concentrate here because markPhase is the
+// only writer of status.phase and requeues on a failed patch, so every claim that reaches a
+// billing phase has had this run. Free, too — it rides the status patch markPhase is already
+// making, which is also what makes a crash before the first checkpoint lossless: the anchor is
+// what recovery measures the window from.
+//
+// Both stamps or neither, one patch: ProvisionedAt is what later refuses to bill a teardown that
+// was never billing (see billingRate), so a claim must never carry an anchor without it.
+//
+// With no anchor yet, billingRate admits Bound alone, which is the gate this needs and does not
+// restate. What that gives up is a claim whose Pod is deleted between two reconciles, only ever
+// observed Terminating, and then charged nothing rather than for its brief real life — bounded by
+// one reconcile gap, and absent spend is the honest direction.
 func stampAccrualStart(nc *nebulav1alpha1.NodeClaim) bool {
 	if nc.Status.LastAccruedAt != nil {
 		return false
@@ -264,7 +286,9 @@ func stampAccrualStart(nc *nebulav1alpha1.NodeClaim) bool {
 	if _, ok := billingRate(nc); !ok {
 		return false
 	}
-	nc.Status.LastAccruedAt = &metav1.Time{Time: time.Now().Truncate(time.Second)}
+	at := time.Now().Truncate(time.Second)
+	nc.Status.ProvisionedAt = &metav1.Time{Time: at}
+	nc.Status.LastAccruedAt = &metav1.Time{Time: at}
 	return true
 }
 
