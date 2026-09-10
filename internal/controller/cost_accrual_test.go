@@ -269,11 +269,8 @@ func TestCostAccrual_SkipsNonBilling(t *testing.T) {
 	}
 }
 
-// The loop opens an anchor for anything it considers billing, so Terminating has to be refused
-// unless status.provisionedAt says something was already being charged — otherwise the tick that
-// finds a never-billed claim on its way out opens its FIRST window there and every tick after that
-// charges a full interval, at the GPU rate, for an instance that never ran. Two ticks, because the
-// first only stamps: the charge this guards against appears on the second.
+// A Terminating claim with no previously opened window must remain unbillable, because it may
+// never have held an instance.
 func TestCostAccrual_TerminatingWithoutAWindowNeverStarts(t *testing.T) {
 	nc := billingClaim("terminating", "98.3200", nil)
 	nc.Status.Phase = nebulav1alpha1.NodeClaimTerminating

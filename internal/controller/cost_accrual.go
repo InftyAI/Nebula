@@ -263,22 +263,11 @@ func formatCost(usd float64) string {
 }
 
 // stampAccrualStart opens the billing window the moment a claim first becomes chargeable,
-// returning whether it mutated the claim.
+// returning whether it mutated the claim. The only opener — accrue moves an anchor but never
+// creates one — so a claim this misses bills nothing for its whole life, not merely late.
 //
-// The ONLY opener: accrue moves an anchor but never creates one, so a claim this misses bills
-// nothing for its whole life, not merely late. Safe to concentrate here because markPhase is the
-// only writer of status.phase and requeues on a failed patch, so every claim that reaches a
-// billing phase has had this run. Free, too — it rides the status patch markPhase is already
-// making, which is also what makes a crash before the first checkpoint lossless: the anchor is
-// what recovery measures the window from.
-//
-// Both stamps or neither, one patch: ProvisionedAt is what later refuses to bill a teardown that
-// was never billing (see billingRate), so a claim must never carry an anchor without it.
-//
-// With no anchor yet, billingRate admits Bound alone, which is the gate this needs and does not
-// restate. What that gives up is a claim whose Pod is deleted between two reconciles, only ever
-// observed Terminating, and then charged nothing rather than for its brief real life — bounded by
-// one reconcile gap, and absent spend is the honest direction.
+// Both stamps at one instant or neither: ProvisionedAt is what later refuses to bill a teardown
+// that was never billing (see billingRate), so an anchor must never exist without it.
 func stampAccrualStart(nc *nebulav1alpha1.NodeClaim) bool {
 	if nc.Status.LastAccruedAt != nil {
 		return false
