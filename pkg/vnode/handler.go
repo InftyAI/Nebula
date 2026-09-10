@@ -445,11 +445,8 @@ func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
-		// VK's Pod comes from the API server, so it may predate our own metadata patch. The
-		// status and endpoint are carried across or the tracked copy — what the poll loop
-		// re-emits, and so the only retry — loses them for good; the endpoint has no other
-		// in-memory home. The instance id deliberately has no line here: persistMetadata falls
-		// back to trackedPod.instance, which this never touches.
+		// Preserve status and the endpoint if this API-server copy predates our writes.
+		// persistMetadata recovers the instance ID from tp.instance instead.
 		status := tp.pod.Status
 		endpoint := tp.pod.Annotations[nebulav1alpha1.EndpointAnnotation]
 		tp.pod = pod.DeepCopy()
