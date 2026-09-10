@@ -661,13 +661,17 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	h.mu.Lock()
 	emit := make([]*corev1.Pod, 0, len(h.tracked))
 	tracked := len(h.tracked)
-	matched := 0
+	matched, frozen := 0, 0
 	for _, tp := range h.tracked {
 		inst, present := byClaim[tp.claimName]
 		before := statusSignature(tp.pod)
-		if !present {
+		switch {
+		// No reverse for a terminal or deleting pod.
+		case util.IsTerminalPodPhase(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
+			frozen++
+		case !present:
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
-		} else {
+		default:
 			matched++
 			applyState(tp.pod, inst.State, inst.Endpoint, h.nowFn())
 			// The observed address, for a provider that cannot know it before boot.
@@ -688,9 +692,10 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 
 	// V(1) so a healthy steady state stays quiet. tracked>0 with matched==0 means the
 	// claim names don't line up with what List returns — the classic "provisioned but
-	// never Running".
+	// never Running". frozen is what keeps that reading valid: a terminal or deleting pod is
+	// deliberately not matched, so without it those would look like the same failure.
 	log.V(1).Info("poll tick",
-		"listed", len(instances), "tracked", tracked, "matched", matched)
+		"listed", len(instances), "tracked", tracked, "matched", matched, "frozen", frozen)
 
 	// Re-emit EVERY tracked pod each tick, which makes status propagation
 	// level-triggered. VK dedups an emit against the last status IT received from us,

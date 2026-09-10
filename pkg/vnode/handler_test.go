@@ -759,6 +759,70 @@ func TestReconcileOnce_ReportsRunning(t *testing.T) {
 	}
 }
 
+func TestReconcileOnce_LeavesATerminalPodTerminal(t *testing.T) {
+	// A provision that failed AFTER the backend created something leaves an instance carrying the
+	// claim tag while the error dropped its id (Modal's mint runs after the sandbox exists). The
+	// poll loop matches by claim, so it would find that instance and walk the Pod back out of
+	// Failed — into Running with no instance id, which is a workload nothing can reach: logs and
+	// exec both refuse without one, and no connect token was ever persisted.
+	fp := &fakeProvider{provisionErr: errors.New("mint credential: context deadline exceeded")}
+	h := NewHandler(fp, nil, nil, openCluster())
+	pod := testPod("default", "p1")
+
+	if err := h.CreatePod(context.Background(), pod); err == nil {
+		t.Fatal("expected CreatePod to return the provision error")
+	}
+	// The orphan the failed call left behind, tagged with this pod's claim.
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: "5.6.7.8",
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodFailed {
+		t.Fatalf("phase = %q, want Failed to survive the poll tick", got.Status.Phase)
+	}
+	if got.Annotations[nebulav1alpha1.InstanceIDAnnotation] != "" {
+		t.Fatalf("instance id = %q, want none: the poll loop never records one",
+			got.Annotations[nebulav1alpha1.InstanceIDAnnotation])
+	}
+}
+
+func TestReconcileOnce_LeavesADeletingPodAlone(t *testing.T) {
+	// A pod whose deletion is in flight is on its way to terminal by our own hand, so the
+	// instance's live state is no longer news: reporting Ready=True again would re-promote a
+	// workload that is being torn down.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	pod := testPod("default", "p1")
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	// VK delivers the deletion through UpdatePod before it calls DeletePod.
+	deleting := pod.DeepCopy()
+	deleting.DeletionTimestamp = ptrNow(metav1.Now())
+	if err := h.UpdatePod(context.Background(), deleting); err != nil {
+		t.Fatalf("UpdatePod: %v", err)
+	}
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning, Endpoint: "5.6.7.8",
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase == corev1.PodRunning {
+		t.Fatal("a deleting pod was promoted to Running by the poll loop")
+	}
+}
+
 func TestReconcileOnce_DNSEndpointNotWrittenToPodIP(t *testing.T) {
 	// AWS reports a public DNS name as the endpoint. PodIP is validated by the API
 	// server as a literal IP, so a DNS name there fails the whole status write; it

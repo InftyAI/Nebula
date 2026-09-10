@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run linter
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.4.0
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Running Tests
+        run: |
+          go mod tidy
+          make test
+
+  # The matrix is DISCOVERED, so a new component is picked up by existing here rather than by
+  # someone remembering to add a line below. A component added without CI would never be built or
+  # tested by anything -- root `./...` stops at a nested go.mod. See components/README.md.
+  #
+  # Lint and test share this one job, which is why they live in one workflow: `needs` cannot reach a
+  # job in another file, so splitting them would mean two copies of the discovery rule -- and a rule
+  # changed in only one copy would lint a set of components and test a different set, silently.
+  discover:
+    name: Discover components
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.list.outputs.components }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      # Keyed on the Makefile, matching the root Makefile's own discovery.
+      - id: list
+        run: |
+          names=$(ls -d components/*/Makefile | xargs -n1 dirname | xargs -n1 basename | jq -R . | jq -sc .)
+          echo "components=$names" >> "$GITHUB_OUTPUT"
+
+  lint-components:
+    name: Lint components
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.discover.outputs.components) }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: components/${{ matrix.component }}/go.mod
+
+      - name: Run linter
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.4.0
+          working-directory: components/${{ matrix.component }}
+          args: --config ${{ github.workspace }}/.golangci.yml
+
+  test-components:
+    name: Test components
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.discover.outputs.components) }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: components/${{ matrix.component }}/go.mod
+
+      - name: Running Tests
+        working-directory: components/${{ matrix.component }}
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+          make test
