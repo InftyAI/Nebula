@@ -9,8 +9,7 @@
 #
 # --platform=${BUILDPLATFORM} pins the builder stage to the machine doing the building and leaves the
 # target to GOOS/GOARCH below. Without it, buildx runs an arm64 builder under emulation to produce the
-# arm64 image — minutes of QEMU per architecture for a cross-compile Go does for free. It is also why
-# this needs no Dockerfile.cross sed dance like the root's docker-buildx.
+# arm64 image — minutes of QEMU per architecture for a cross-compile Go does for free.
 FROM --platform=${BUILDPLATFORM} golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
@@ -26,13 +25,19 @@ COPY api/ api/
 WORKDIR /workspace/components/logship
 COPY components/logship/go.mod go.mod
 COPY components/logship/go.sum go.sum
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY components/logship/cmd/ cmd/
 COPY components/logship/internal/ internal/
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -a -o logship ./cmd
+# The mounts are BuildKit-managed volumes, so GOCACHE and the module cache survive between builds
+# instead of starting empty every time; GOCACHE is keyed by arch so two platforms building at once
+# do not thrash one directory. `-a` is deliberately absent, and re-adding it (kubebuilder scaffolds
+# it) undoes all of this: it means "ignore the build cache", for a byte-identical binary.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build,id=gobuild-${TARGETARCH} \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -o logship ./cmd
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /

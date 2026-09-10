@@ -1,5 +1,9 @@
-# Build the manager binary
-FROM golang:1.25 AS builder
+# Build the manager binary.
+#
+# --platform=${BUILDPLATFORM} pins the builder stage to the machine doing the building and leaves the
+# target to GOOS/GOARCH below. Without it, buildx runs a foreign-arch builder under emulation —
+# minutes of QEMU per architecture for a cross-compile Go does for free.
+FROM --platform=${BUILDPLATFORM} golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 # VERSION is stamped into the binary (pkg/version) and surfaces as the virtual
@@ -7,12 +11,10 @@ ARG TARGETARCH
 ARG VERSION=nebula-dev
 
 WORKDIR /workspace
-# Copy the Go Modules manifests
+# Split from the source COPY below so a source-only change does not re-resolve modules.
 COPY go.mod go.mod
 COPY go.sum go.sum
-# cache deps before building and copying source so that we don't need to re-download as much
-# and so that source changes don't invalidate our downloaded layer
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 # Copy the go source
 COPY cmd/main.go cmd/main.go
@@ -20,13 +22,17 @@ COPY api/ api/
 COPY internal/ internal/
 COPY pkg/ pkg/
 
-# Build
-# the GOARCH has not a default value to allow the binary be built according to the host where the command
-# was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
-# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
-# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -a -ldflags "-X github.com/InftyAI/Nebula/pkg/version.gitVersion=${VERSION}" \
+# TARGETOS/TARGETARCH come from buildx's --platform; a plain `docker build` leaves them at the host
+# platform, so `make docker-build` still yields a native image.
+#
+# The mounts are BuildKit-managed volumes, so GOCACHE and the module cache survive between builds
+# instead of starting empty every time; GOCACHE is keyed by arch so two platforms building at once
+# do not thrash one directory. `-a` is deliberately absent, and re-adding it (kubebuilder scaffolds
+# it) undoes all of this: it means "ignore the build cache", for a byte-identical binary.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build,id=gobuild-${TARGETARCH} \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -ldflags "-X github.com/InftyAI/Nebula/pkg/version.gitVersion=${VERSION}" \
     -o manager cmd/main.go
 
 # Use distroless as minimal base image to package the manager binary
