@@ -168,33 +168,39 @@ build: manifests generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run -ldflags "$(LDFLAGS)" ./cmd/main.go
 
-# If you wish to build the manager image targeting other platforms you can use the --platform flag.
-# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
-# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# What `docker-buildx` publishes: a manifest list covering both, so the same tag runs on Graviton and
+# x86 nodes. IMG must be a registry you can push to — a manifest list cannot live in the local image
+# store, so that target pushes rather than loading.
+PLATFORMS ?= linux/arm64,linux/amd64
+
+# Shared with components/logship on purpose. Every image target names this builder explicitly, because
+# the Dockerfile's Go build cache is a BuildKit cache mount and so lives INSIDE the builder: targets
+# that drift onto different builders each start from a cold cache, and `buildx use` state is not
+# something a Makefile should depend on. Deleting the builder therefore throws that cache away.
+# The docker-container driver is required: the built-in `docker` driver only builds more than one
+# platform when the daemon runs the containerd image store, which a stock Linux engine does not.
+BUILDX_BUILDER ?= nebula-builder
+
+.PHONY: buildx-builder
+buildx-builder:
+	@$(CONTAINER_TOOL) buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 \
+	  || $(CONTAINER_TOOL) buildx create --name $(BUILDX_BUILDER) --driver docker-container >/dev/null
+
+# Host platform, and --load so the image lands in the local store where `docker push` and
+# `kind load docker-image` can find it — a docker-container builder keeps it to itself otherwise.
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} .
+docker-build: buildx-builder ## Build docker image with the manager.
+	$(CONTAINER_TOOL) buildx build --builder $(BUILDX_BUILDER) --load \
+	  --build-arg VERSION=$(VERSION) --tag ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
-# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
-# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
-# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
-# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
-# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
-PLATFORMS ?= linux/arm64,linux/amd64
 .PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
-	- $(CONTAINER_TOOL) buildx create --name nebula-builder
-	$(CONTAINER_TOOL) buildx use nebula-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) --tag ${IMG} -f Dockerfile.cross .
-	- $(CONTAINER_TOOL) buildx rm nebula-builder
-	rm Dockerfile.cross
+docker-buildx: buildx-builder ## Build and push docker image for the manager for cross-platform support
+	$(CONTAINER_TOOL) buildx build --builder $(BUILDX_BUILDER) --push \
+	  --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) --tag ${IMG} .
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.

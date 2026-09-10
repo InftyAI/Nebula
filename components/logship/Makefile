@@ -8,7 +8,10 @@ CONTAINER_TOOL ?= docker
 # rejects it at pull time with "no match for platform in manifest", which reads like a missing tag.
 PLATFORMS ?= linux/amd64,linux/arm64
 
-# Shared with the root's docker-buildx on purpose, so both reuse one builder and its layer cache.
+# Shared with the root's image targets on purpose. Every image target names this builder explicitly,
+# because the Dockerfile's Go build cache is a BuildKit cache mount and so lives INSIDE the builder:
+# targets that drift onto different builders each start from a cold cache, and `buildx use` state is
+# not something a Makefile should depend on.
 BUILDX_BUILDER ?= nebula-builder
 
 # The repo root. The Docker build context and the shared linter config both live there; see the
@@ -65,23 +68,24 @@ build: fmt vet ## Build the logship binary.
 run: fmt vet ## Run logship against your current kubectl context. It takes no flags.
 	go run ./cmd
 
+.PHONY: buildx-builder
+buildx-builder:
+	@$(CONTAINER_TOOL) buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 \
+	  || $(CONTAINER_TOOL) buildx create --name $(BUILDX_BUILDER) --driver docker-container >/dev/null
+
 # Host platform, not PLATFORMS: --load takes a single image, and the one worth having locally is the
 # one this machine can run — a kind node on Apple silicon wants the arm64 build, an x86 CI box the amd64.
 .PHONY: docker-build
-docker-build: ## Build for this machine, into the local image store. Context is the repo root; see the Dockerfile.
-	$(CONTAINER_TOOL) buildx build --load -f Dockerfile -t ${IMG} $(ROOT)
+docker-build: buildx-builder ## Build for this machine, into the local image store. Context is the repo root; see the Dockerfile.
+	$(CONTAINER_TOOL) buildx build --builder $(BUILDX_BUILDER) --load \
+	  -f Dockerfile -t ${IMG} $(ROOT)
 
 # Builds again instead of pushing what docker-build made, and has to: a manifest list cannot live in
 # the local image store, so there is nothing there to push. Pushing the single-platform image that IS
 # there is what makes a node of the other architecture fail the pull with "no match for platform in
 # manifest" — at pull time, so it reads as a missing tag rather than as the wrong build.
-#
-# Passing --builder rather than `buildx use` leaves the shell's own builder selection alone. The
-# docker-container driver is required: the default driver cannot build two platforms at once.
 .PHONY: docker-push
-docker-push: ## Build every platform in PLATFORMS and push them as one tag.
-	$(CONTAINER_TOOL) buildx inspect $(BUILDX_BUILDER) >/dev/null 2>&1 \
-	  || $(CONTAINER_TOOL) buildx create --name $(BUILDX_BUILDER) --driver docker-container >/dev/null
+docker-push: buildx-builder ## Build every platform in PLATFORMS and push them as one tag.
 	$(CONTAINER_TOOL) buildx build --builder $(BUILDX_BUILDER) --push \
 	  --platform $(PLATFORMS) -f Dockerfile -t ${IMG} $(ROOT)
 

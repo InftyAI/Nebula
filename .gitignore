@@ -5,7 +5,6 @@
 *.so
 *.dylib
 bin/*
-Dockerfile.cross
 
 # A pattern containing a slash is anchored to this directory, so `bin/*` above does
 # not reach a component's build output (see components/README.md).
