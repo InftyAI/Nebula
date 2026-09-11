@@ -1559,7 +1559,7 @@ func TestReconcileOnce_ReadinessDeadlineSparesRunningInstance(t *testing.T) {
 	}
 }
 
-func TestreadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
+func TestReadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
 	// The provision call has its own timeout, so its duration must not eat the readiness
 	// budget: a Provision that took an hour still leaves the box a full budget to boot in.
 	fp := &fakeProvider{}
@@ -1580,7 +1580,7 @@ func TestreadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
 	}
 }
 
-func TestreadyExpired_RunningResetsTheClock(t *testing.T) {
+func TestReadyExpired_RunningResetsTheClock(t *testing.T) {
 	// The clock tracks the CURRENT Initializing spell. A pod that reported Running and is
 	// later demoted to Pending must get a fresh budget, not be failed on its first tick back.
 	fp := &fakeProvider{}
