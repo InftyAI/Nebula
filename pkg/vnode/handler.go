@@ -58,17 +58,7 @@ const defaultBlocklistTTL = 30 * time.Second
 const blocklistJitter = 30 * time.Second
 
 // defaultReadyDeadline bounds how long a pod may sit Initializing before the virtual node
-// gives up on it: past it the Pod is failed, so a controller-owned workload is reaped, torn
-// down and provisioned afresh (see readyExpired for who does what). It is the only escape
-// from a readiness signal we cannot read — Modal's probe never reporting pass leaves an
-// instance billing a GPU indefinitely while the Pod never goes Ready.
-//
-// It measures the Initializing spell only, not the provision call, which is bounded
-// separately (see readyExpired). Generous on purpose even so: the window legitimately covers
-// a provider's capacity queue, an image pull and a model download, and failing a healthy slow
-// boot costs both the GPU-minutes already spent and a fresh queue wait for the replacement.
-// There is deliberately no knob: one number that is clearly too long to hit by accident beats
-// a tunable one.
+// gives up on it.
 const defaultReadyDeadline = 10 * time.Minute
 
 // Blocklister records a failed placement so the placement controller fails over to
@@ -175,7 +165,7 @@ type trackedPod struct {
 	provisioningAt time.Time
 
 	// initializingAt is when the instance was first observed Initializing, and arms the
-	// readiness deadline (see readyExpired). Deliberately NOT provisioningAt: it measures
+	// readiness deadline (see waitingForReadyExpired). Deliberately NOT provisioningAt: it measures
 	// the boot alone, so a provision that took minutes does not eat the budget.
 	//
 	// Level-triggered, not one-shot like provisioningAt: it is cleared whenever the
@@ -701,9 +691,9 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
 		default:
 			matched++
-			if waited, over := h.readyExpired(tp, inst.State); over {
+			if waited, over := h.waitingForReadyExpired(tp, inst.State); over {
 				// Failing the Pod is the whole action: teardown follows from the
-				// terminal phase, via the reap (see readyExpired).
+				// terminal phase, via the reap (see waitingForReadyExpired).
 				log.Info("readiness deadline exceeded; failing the pod",
 					"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance,
 					"waited", waited.Round(time.Second).String(), "deadline", h.readyDeadline.String())
@@ -753,8 +743,8 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// readyExpired maintains the Initializing clock and reports whether it has run past the
-// deadline, with how long the pod has been there.
+// waitingForReadyExpired maintains the Initializing clock and reports whether it has run
+// past the deadline, with how long the pod has been there.
 //
 // It anchors on the FIRST observation of InstancePending, not on provisioningAt: the
 // provision call is bounded separately (see defaultProvisionTimeout), so measuring from
@@ -762,13 +752,18 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 // other state RESETS the clock rather than merely pausing it — a demoted pod gets a fresh
 // budget, and Failed/Terminated keep the more specific reason the provider gave.
 //
-// The caller only fails the pod; teardown follows from the terminal phase (docs/status.md
-// §The readiness deadline covers what that does and does not reclaim).
+// The caller only fails the pod; teardown follows from the terminal phase, via the reap.
+//
+// KNOWN GAP: a bare pod (no controlling owner) is deliberately retained by the reaper as a
+// record, and the claim's backstop only fires once the Pod object is gone — so its instance
+// keeps billing until a human deletes the Pod. Not a regression (an unreadable readiness
+// signal leaked the same instance before, by never going terminal at all), and not fixed:
+// closing it means terminating from here, by claim name when the id is unknown.
 //
 // Measured with time.Since rather than h.nowFn for the reason observeReady gives.
 //
 // Callers must hold h.mu.
-func (h *Handler) readyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
+func (h *Handler) waitingForReadyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
 	if state != provider.InstancePending {
 		tp.initializingAt = time.Time{}
 		return 0, false

@@ -186,9 +186,6 @@ const (
 	// neutral term rather than "Preempted".
 	PodReasonTerminated = "Terminated"
 	// PodReasonReadinessTimeout: the instance never reported ready inside the virtual
-	// node's deadline, so we gave up on it (see defaultReadyDeadline). Distinct from
-	// Failed because the provider never said anything was wrong — the instance may have
-	// been perfectly healthy and only our readiness signal unusable — and an operator
-	// seeing this should suspect the workload's probe, not the provider.
+	// node's deadline, so we gave up on it (see defaultReadyDeadline).
 	PodReasonReadinessTimeout = "ReadinessTimeout"
 )
