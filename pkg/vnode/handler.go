@@ -165,7 +165,7 @@ type trackedPod struct {
 	provisioningAt time.Time
 
 	// initializingAt is when the instance was first observed Initializing, and arms the
-	// readiness deadline (see waitingForReadyExpired). Deliberately NOT provisioningAt: it measures
+	// readiness deadline (see readyExpired). Deliberately NOT provisioningAt: it measures
 	// the boot alone, so a provision that took minutes does not eat the budget.
 	//
 	// Level-triggered, not one-shot like provisioningAt: it is cleared whenever the
@@ -691,9 +691,9 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
 		default:
 			matched++
-			if waited, over := h.waitingForReadyExpired(tp, inst.State); over {
+			if waited, over := h.readyExpired(tp, inst.State); over {
 				// Failing the Pod is the whole action: teardown follows from the
-				// terminal phase, via the reap (see waitingForReadyExpired).
+				// terminal phase, via the reap (see readyExpired).
 				log.Info("readiness deadline exceeded; failing the pod",
 					"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance,
 					"waited", waited.Round(time.Second).String(), "deadline", h.readyDeadline.String())
@@ -743,7 +743,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// waitingForReadyExpired maintains the Initializing clock and reports whether it has run
+// readyExpired maintains the Initializing clock and reports whether it has run
 // past the deadline, with how long the pod has been there.
 //
 // It anchors on the FIRST observation of InstancePending, not on provisioningAt: the
@@ -763,7 +763,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 // Measured with time.Since rather than h.nowFn for the reason observeReady gives.
 //
 // Callers must hold h.mu.
-func (h *Handler) waitingForReadyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
+func (h *Handler) readyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
 	if state != provider.InstancePending {
 		tp.initializingAt = time.Time{}
 		return 0, false

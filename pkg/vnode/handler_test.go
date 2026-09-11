@@ -1559,14 +1559,14 @@ func TestReconcileOnce_ReadinessDeadlineSparesRunningInstance(t *testing.T) {
 	}
 }
 
-func TestWaitingForReadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
+func TestreadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
 	// The provision call has its own timeout, so its duration must not eat the readiness
 	// budget: a Provision that took an hour still leaves the box a full budget to boot in.
 	fp := &fakeProvider{}
 	h := NewHandler(fp, nil, nil, openCluster())
 	tp := &trackedPod{pod: testPod("default", "p1"), provisioningAt: time.Now().Add(-time.Hour)}
 
-	if _, over := h.waitingForReadyExpired(tp, provider.InstancePending); over {
+	if _, over := h.readyExpired(tp, provider.InstancePending); over {
 		t.Fatal("a long provision must not expire the readiness deadline")
 	}
 	if tp.initializingAt.IsZero() {
@@ -1575,25 +1575,25 @@ func TestWaitingForReadyExpired_ClockStartsAtInitializingNotAtProvision(t *testi
 
 	// Now blow the Initializing clock alone: that IS the deadline.
 	tp.initializingAt = tp.initializingAt.Add(-11 * time.Minute)
-	if _, over := h.waitingForReadyExpired(tp, provider.InstancePending); !over {
+	if _, over := h.readyExpired(tp, provider.InstancePending); !over {
 		t.Fatal("a pod initializing past the deadline must expire")
 	}
 }
 
-func TestWaitingForReadyExpired_RunningResetsTheClock(t *testing.T) {
+func TestreadyExpired_RunningResetsTheClock(t *testing.T) {
 	// The clock tracks the CURRENT Initializing spell. A pod that reported Running and is
 	// later demoted to Pending must get a fresh budget, not be failed on its first tick back.
 	fp := &fakeProvider{}
 	h := NewHandler(fp, nil, nil, openCluster())
 	tp := &trackedPod{pod: testPod("default", "p1"), initializingAt: time.Now().Add(-11 * time.Minute)}
 
-	if _, over := h.waitingForReadyExpired(tp, provider.InstanceRunning); over {
+	if _, over := h.readyExpired(tp, provider.InstanceRunning); over {
 		t.Fatal("Running must never expire")
 	}
 	if !tp.initializingAt.IsZero() {
 		t.Fatal("Running must reset the clock")
 	}
-	if _, over := h.waitingForReadyExpired(tp, provider.InstancePending); over {
+	if _, over := h.readyExpired(tp, provider.InstancePending); over {
 		t.Fatal("the first tick back at Initializing must start a fresh budget")
 	}
 }
