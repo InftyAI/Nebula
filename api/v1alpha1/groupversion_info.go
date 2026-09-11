@@ -185,4 +185,7 @@ const (
 	// reclaimed, or exited). Disappearance alone does not say WHY, so this is the
 	// neutral term rather than "Preempted".
 	PodReasonTerminated = "Terminated"
+	// PodReasonReadinessTimeout: the instance never reported ready inside the virtual
+	// node's deadline, so we gave up on it (see defaultReadyDeadline).
+	PodReasonReadinessTimeout = "ReadinessTimeout"
 )

@@ -157,7 +157,7 @@ func TestCreatePod_UnreachableProviderNotCountedAsCapacity(t *testing.T) {
 }
 
 // The ready duration is observed on the FIRST tick that reports Running and never
-// again, because provisionStart is consumed. Without that, every subsequent tick would
+// again, because provisioningAt is consumed. Without that, every subsequent tick would
 // add a sample with an ever-growing value — measuring the pod's age, not its boot.
 func TestReconcileOnce_ObservesReadyDurationExactlyOnce(t *testing.T) {
 	ready := labelsFor("", "")

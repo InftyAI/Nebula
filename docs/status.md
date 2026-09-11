@@ -28,6 +28,7 @@ enters the system.
   - [fake](#fake)
 - [Logs and exec](#logs-and-exec)
 - [What is not observable](#what-is-not-observable)
+- [The readiness deadline](#the-readiness-deadline)
 
 ---
 
@@ -46,6 +47,7 @@ teardown.
 | `Running` | `Running` | `applyState` ← `InstanceRunning` | yes | `Bound` |
 | `Failed` | `ProvisionFailed` | `CreatePod` | no | `Terminated` (via `isTerminal`) |
 | `Failed` | `Failed` | `applyState` ← `InstanceFailed` | yes | `Terminated` |
+| `Failed` | `ReadinessTimeout` | `applyReadinessTimeout`, poll loop | yes, still running | `Terminated` |
 | `Failed` | `Terminated` | `applyState` ← `InstanceTerminated` | gone | `Terminated` |
 | `Succeeded` | `Terminated` | `DeletePod` | gone | `Terminated` |
 
@@ -289,3 +291,34 @@ condition, and container readiness into one atomic write, so in Nebula
 `PodRunning` implies `Ready=True` implies all containers ready. The readiness bar
 lives entirely in each adapter's `toState`; a Pod is never `Running` but
 not-ready.
+
+---
+
+## The readiness deadline
+
+A readiness signal that never arrives is the one failure nothing else bounds: the instance
+exists, the provider reports nothing wrong, and the Pod sits at `Initializing` billing a GPU
+forever. So ten minutes (`defaultReadyDeadline`) after an instance is first observed
+`InstancePending`, one still reporting it goes `Failed` / `ReadinessTimeout`.
+
+The clock starts at `Initializing`, not at `Provision` — that call has its own deadline and
+can legitimately run for minutes. Any other state resets it, so a demoted instance gets a
+fresh budget.
+
+Failing the Pod is the whole action; teardown and replacement are the ordinary terminal-Pod
+path (reap → `DeletePod` → `Terminate`, then the owner places a replacement).
+
+- **The reason is not `Failed`.** The provider never reported a failure, so it points at the
+  workload's probe rather than the instance.
+- **A bare, un-owned Pod is not reaped**, so nothing terminates its instance — the one
+  terminal reason where the Pod is dead and the instance alive. It leaked before too, by
+  never going terminal at all.
+- **Replacement is unbounded**, one provision per ten minutes: a replacement Pod carries no
+  lineage from the one it replaced, so there is nowhere to keep the count.
+- **A manager restart grants a fresh budget**, the clock being in memory. Persisting it would
+  fail a healthy Pod on every restart.
+
+There is no flag, and ten minutes is deliberately far longer than any legitimate boot,
+because the deadline cannot tell "never ready" from "still queued for a GPU" (both are
+`InstancePending` — see [queued vs. booting](#what-is-not-observable)): a Pod killed while
+queued only sends its replacement to the back of the same queue.
