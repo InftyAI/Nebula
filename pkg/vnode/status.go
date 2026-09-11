@@ -17,7 +17,9 @@ limitations under the License.
 package vnode
 
 import (
+	"fmt"
 	"net"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,13 +33,14 @@ import (
 // them, operators match on them), so they live in api/v1alpha1 — see that const block
 // for what each means.
 const (
-	reasonProvisioning    = nebulav1alpha1.PodReasonProvisioning
-	reasonInitializing    = nebulav1alpha1.PodReasonInitializing
-	reasonRunning         = nebulav1alpha1.PodReasonRunning
-	reasonProvisionFailed = nebulav1alpha1.PodReasonProvisionFailed
-	reasonConfigError     = nebulav1alpha1.PodReasonConfigError
-	reasonFailed          = nebulav1alpha1.PodReasonFailed
-	reasonTerminated      = nebulav1alpha1.PodReasonTerminated
+	reasonProvisioning     = nebulav1alpha1.PodReasonProvisioning
+	reasonInitializing     = nebulav1alpha1.PodReasonInitializing
+	reasonRunning          = nebulav1alpha1.PodReasonRunning
+	reasonProvisionFailed  = nebulav1alpha1.PodReasonProvisionFailed
+	reasonConfigError      = nebulav1alpha1.PodReasonConfigError
+	reasonFailed           = nebulav1alpha1.PodReasonFailed
+	reasonTerminated       = nebulav1alpha1.PodReasonTerminated
+	reasonReadinessTimeout = nebulav1alpha1.PodReasonReadinessTimeout
 )
 
 // applyState projects a provider Instance state onto the Pod status, since the Pod is
@@ -99,6 +102,25 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 			},
 		}, false)
 	}
+}
+
+// applyReadinessTimeout fails a Pod whose instance never became ready in time.
+//
+// Not a case in applyState because no provider state stands behind it: the instance was
+// last observed Pending and, as far as the provider is concerned, fine. This is OUR
+// verdict, so it must not read as a provider-reported failure — see
+// PodReasonReadinessTimeout.
+func applyReadinessTimeout(pod *corev1.Pod, waited time.Duration, now metav1.Time) {
+	msg := fmt.Sprintf("external instance did not become ready within %s", waited.Round(time.Second))
+	setPhase(pod, corev1.PodFailed, reasonReadinessTimeout, msg, now)
+	setReady(pod, corev1.ConditionFalse, now)
+	setContainerStatuses(pod, corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{
+			Reason:     reasonReadinessTimeout,
+			Message:    msg,
+			FinishedAt: now,
+		},
+	}, false)
 }
 
 // setContainerStatuses mirrors the one instance's state onto every container in the spec.

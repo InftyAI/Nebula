@@ -57,6 +57,20 @@ const defaultBlocklistTTL = 30 * time.Second
 // expires and they stampede the same just-freed candidate together.
 const blocklistJitter = 30 * time.Second
 
+// defaultReadyDeadline bounds how long a pod may sit Initializing before the virtual node
+// gives up on it: past it the Pod is failed, so a controller-owned workload is reaped, torn
+// down and provisioned afresh (see readyExpired for who does what). It is the only escape
+// from a readiness signal we cannot read — Modal's probe never reporting pass leaves an
+// instance billing a GPU indefinitely while the Pod never goes Ready.
+//
+// It measures the Initializing spell only, not the provision call, which is bounded
+// separately (see readyExpired). Generous on purpose even so: the window legitimately covers
+// a provider's capacity queue, an image pull and a model download, and failing a healthy slow
+// boot costs both the GPU-minutes already spent and a fresh queue wait for the replacement.
+// There is deliberately no knob: one number that is clearly too long to hit by accident beats
+// a tunable one.
+const defaultReadyDeadline = 10 * time.Minute
+
 // Blocklister records a failed placement so the placement controller fails over to
 // the next candidate instead of hot-looping on a provider that just said no. The
 // write half of pkg/failover.Blocklist; a nil blocklist is a no-op.
@@ -115,9 +129,11 @@ type Handler struct {
 
 	notify func(*corev1.Pod)
 
-	// nowFn and pollEvery are seams for tests.
-	nowFn     func() metav1.Time
-	pollEvery time.Duration
+	// nowFn, pollEvery and readyDeadline are seams for tests. readyDeadline is
+	// defaultReadyDeadline in production and <=0 disables the deadline entirely.
+	nowFn         func() metav1.Time
+	pollEvery     time.Duration
+	readyDeadline time.Duration
 
 	// jitterFn returns the delay added to a block's base TTL (see recordBlock). A seam
 	// so tests can pin it to 0 and assert an exact TTL.
@@ -142,7 +158,7 @@ type trackedPod struct {
 	// persistCredential.
 	patchedMeta podMeta
 
-	// provisionStart is when THIS process began provisioning. It arms the one
+	// provisioningAt is when THIS process began provisioning. It arms the one
 	// metrics.InstanceReadyDuration observation the poll loop makes on the first
 	// Running, and is consumed by it, so zero means "do not observe" for either reason:
 	//
@@ -156,11 +172,22 @@ type trackedPod struct {
 	// Known bias: a provision still in flight across a restart never contributes, so the
 	// histogram under-samples the slowest boots. Fixing it means persisting the start
 	// time, a write on the provisioning path we have not taken.
-	provisionStart time.Time
+	provisioningAt time.Time
+
+	// initializingAt is when the instance was first observed Initializing, and arms the
+	// readiness deadline (see readyExpired). Deliberately NOT provisioningAt: it measures
+	// the boot alone, so a provision that took minutes does not eat the budget.
+	//
+	// Level-triggered, not one-shot like provisioningAt: it is cleared whenever the
+	// instance is not Pending, so the clock tracks the CURRENT Initializing spell. A pod
+	// re-adopted after a restart therefore gets a full budget from its first observed tick,
+	// which is the safe direction — the alternative, exempting it forever, disables the
+	// deadline for exactly the pods a restart left stuck.
+	initializingAt time.Time
 
 	// placement is what this pod was provisioned against. Two readers: the poll loop files
 	// the ready duration under the same dimensions as the provision counters, and DeletePod
-	// takes the region the instance is reachable in. Set only where provisionStart is armed.
+	// takes the region the instance is reachable in. Set only where provisioningAt is armed.
 	placement
 }
 
@@ -171,7 +198,7 @@ type trackedPod struct {
 // stays the durable record; this is the historical one.
 //
 // The zero value means "unknown" and is what every path that never provisioned stores. Its
-// readers degrade rather than guess: no ready sample is filed (provisionStart is zero on
+// readers degrade rather than guess: no ready sample is filed (provisioningAt is zero on
 // those same paths), and teardown falls back to reading the claim.
 type placement struct {
 	region string
@@ -231,13 +258,14 @@ func NewHandler(
 		poll = defaultPollInterval
 	}
 	return &Handler{
-		prov:      prov,
-		client:    client,
-		blocklist: blocklist,
-		cluster:   cluster,
-		tracked:   make(map[string]*trackedPod),
-		nowFn:     metav1.Now,
-		pollEvery: poll,
+		prov:          prov,
+		client:        client,
+		blocklist:     blocklist,
+		cluster:       cluster,
+		tracked:       make(map[string]*trackedPod),
+		nowFn:         metav1.Now,
+		pollEvery:     poll,
+		readyDeadline: defaultReadyDeadline,
 		// rand/v2's top-level source is auto-seeded and safe for concurrent use, so
 		// every handler draws an independent jitter without shared seeding.
 		jitterFn: func() time.Duration { return time.Duration(rand.Int64N(int64(blocklistJitter))) },
@@ -344,12 +372,12 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		"capacityType", req.CapacityType, "region", req.Region,
 		"envVars", len(req.Env), "timeout", timeout.String())
 
-	// Two clocks for two different waits: provisionStart measures the end-to-end wait a
+	// Two clocks for two different waits: provisioningAt measures the end-to-end wait a
 	// user feels (until the instance reports Running; handed to store below), callStart
 	// only the Provision call. Not interchangeable — the emit between them is a
 	// synchronous notify that can issue an API write, which would otherwise be charged
 	// to the provider's latency.
-	provisionStart := time.Now()
+	provisioningAt := time.Now()
 	// Carried into store so the poll loop's ready observation is filed under the same region
 	// and tier as the counters below, whatever the NodeClaim says by then.
 	place := placement{region: req.Region, tier: req.CapacityType}
@@ -401,7 +429,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// tracked copy carries it, published by the emit below, re-offered every tick until a
 	// write lands. Its reader is the NodeClaim controller (see InstanceIDAnnotation).
 	setInstanceID(pod, res.InstanceID)
-	h.store(pod, claim, res.InstanceID, provisionStart, place)
+	h.store(pod, claim, res.InstanceID, provisioningAt, place)
 
 	// The TOKEN cannot ride the Pod (readable with `get pod`, unencrypted in etcd), so it
 	// gets its own write — the only place it exists, since the provider mints it once and
@@ -553,7 +581,7 @@ func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.P
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	applyState(pod, inst.State, inst.Endpoint, h.nowFn())
 	// Zero start: this process never provisioned it, so the real start time is gone and
-	// the ready-duration is not observable (see trackedPod.provisionStart) — hence no
+	// the ready-duration is not observable (see trackedPod.provisioningAt) — hence no
 	// placement either, since nothing here will be filed under it.
 	h.store(pod, claim, inst.ID, time.Time{}, placement{})
 	log.Info("re-adopted live instance after cold tracking map (VK restart)",
@@ -673,6 +701,15 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
 		default:
 			matched++
+			if waited, over := h.readyExpired(tp, inst.State); over {
+				// Failing the Pod is the whole action: teardown follows from the
+				// terminal phase, via the reap (see readyExpired).
+				log.Info("readiness deadline exceeded; failing the pod",
+					"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance,
+					"waited", waited.Round(time.Second).String(), "deadline", h.readyDeadline.String())
+				applyReadinessTimeout(tp.pod, waited, h.nowFn())
+				break
+			}
 			applyState(tp.pod, inst.State, inst.Endpoint, h.nowFn())
 			// The observed address, for a provider that cannot know it before boot.
 			// Empty for one that published at create, which must not clear it.
@@ -716,6 +753,38 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
+// readyExpired maintains the Initializing clock and reports whether it has run past the
+// deadline, with how long the pod has been there.
+//
+// It anchors on the FIRST observation of InstancePending, not on provisioningAt: the
+// provision call is bounded separately (see defaultProvisionTimeout), so measuring from
+// there would spend the readiness budget on a box that had barely started booting. Any
+// other state RESETS the clock rather than merely pausing it — a demoted pod gets a fresh
+// budget, and Failed/Terminated keep the more specific reason the provider gave.
+//
+// The caller only fails the pod; teardown follows from the terminal phase (docs/status.md
+// §The readiness deadline covers what that does and does not reclaim).
+//
+// Measured with time.Since rather than h.nowFn for the reason observeReady gives.
+//
+// Callers must hold h.mu.
+func (h *Handler) readyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
+	if state != provider.InstancePending {
+		tp.initializingAt = time.Time{}
+		return 0, false
+	}
+	if h.readyDeadline <= 0 {
+		return 0, false
+	}
+	// First tick at Initializing: start the clock, never expire on the same tick.
+	if tp.initializingAt.IsZero() {
+		tp.initializingAt = time.Now()
+		return 0, false
+	}
+	waited := time.Since(tp.initializingAt)
+	return waited, waited > h.readyDeadline
+}
+
 // observeReady records the end-to-end provisioning wait the first time an instance
 // reports Running. The poll loop is the only place that number exists, since a
 // provider's create returns long before the instance is usable.
@@ -724,17 +793,17 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 // pin to a fixed instant, and subtracting a real start time from a pinned now would give
 // a nonsense duration.
 //
-// ONE-SHOT — it consumes provisionStart, whose zero value covers both "never armed" and
-// "already recorded" (see trackedPod.provisionStart). That guard also keeps the poll loop
+// ONE-SHOT — it consumes provisioningAt, whose zero value covers both "never armed" and
+// "already recorded" (see trackedPod.provisioningAt). That guard also keeps the poll loop
 // cheap: labels are rendered behind it, so at most once per pod, never per tick.
 //
 // Callers must hold h.mu.
 func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
-	if state != provider.InstanceRunning || tp.provisionStart.IsZero() {
+	if state != provider.InstanceRunning || tp.provisioningAt.IsZero() {
 		return
 	}
-	metrics.ObserveReady(h.metricLabels(tp.pod, tp.region, tp.tier), time.Since(tp.provisionStart))
-	tp.provisionStart = time.Time{} // spent; never observe this pod again
+	metrics.ObserveReady(h.metricLabels(tp.pod, tp.region, tp.tier), time.Since(tp.provisioningAt))
+	tp.provisioningAt = time.Time{} // spent; never observe this pod again
 }
 
 // setEndpoint stamps a reachable address onto the Pod's annotation — the one assignment
@@ -802,12 +871,12 @@ func statusSignature(pod *corev1.Pod) string {
 	return string(pod.Status.Phase) + "|" + pod.Status.Reason + "|" + string(ready) + "|" + pod.Status.PodIP
 }
 
-// store records/updates the tracked pod under lock. provisionStart arms the
-// ready-duration observation (see trackedPod.provisionStart) and place is part of what that
+// store records/updates the tracked pod under lock. provisioningAt arms the
+// ready-duration observation (see trackedPod.provisioningAt) and place is part of what that
 // observation is filed under; pass the zero values from any path that cannot know them —
 // a re-adoption, or an already-terminal pod.
 func (h *Handler) store(
-	pod *corev1.Pod, claim, instance string, provisionStart time.Time, place placement,
+	pod *corev1.Pod, claim, instance string, provisioningAt time.Time, place placement,
 ) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -815,7 +884,7 @@ func (h *Handler) store(
 		pod:            pod.DeepCopy(),
 		claimName:      claim,
 		instance:       instance,
-		provisionStart: provisionStart,
+		provisioningAt: provisioningAt,
 		placement:      place,
 	}
 }

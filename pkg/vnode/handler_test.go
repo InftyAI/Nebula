@@ -1492,6 +1492,137 @@ func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	}
 }
 
+func TestReconcileOnce_ReadinessDeadlineFailsPod(t *testing.T) {
+	// An instance the provider keeps reporting Pending forever — Modal's probe never
+	// reporting pass. Past the deadline the Pod goes terminal, which is the whole action:
+	// teardown is the reap's job, exactly as for every other terminal reason.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstancePending,
+	}}
+	// The first Pending tick only starts the clock, so the pod must survive it.
+	h.reconcileOnce(context.Background())
+	if got, _ := h.GetPod(context.Background(), "default", "p1"); got.Status.Reason != reasonInitializing {
+		t.Fatalf("reason = %q on the first Initializing tick, want %q", got.Status.Reason, reasonInitializing)
+	}
+	rewindInitializing(t, h, "default", "p1", 11*time.Minute)
+	h.reconcileOnce(context.Background())
+
+	got, err := h.GetPod(context.Background(), "default", "p1")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodFailed {
+		t.Fatalf("phase = %q, want Failed past the readiness deadline", got.Status.Phase)
+	}
+	// Must NOT be the generic Failed reason: the provider never reported a failure, and the
+	// distinction is what tells an operator to look at the probe (see PodReasonReadinessTimeout).
+	if got.Status.Reason != reasonReadinessTimeout {
+		t.Fatalf("reason = %q, want %q", got.Status.Reason, reasonReadinessTimeout)
+	}
+	if isPodReadyStatus(got) {
+		t.Fatal("expected Ready=False on a pod that never became ready")
+	}
+
+	// The next tick must not revisit it: the pod is terminal now, so the poll loop freezes it
+	// and the deadline's verdict (not a later Terminated from the same still-listed instance)
+	// is what survives.
+	h.reconcileOnce(context.Background())
+	again, _ := h.GetPod(context.Background(), "default", "p1")
+	if again.Status.Reason != reasonReadinessTimeout {
+		t.Fatalf("reason = %q after a second tick, want %q to stick", again.Status.Reason, reasonReadinessTimeout)
+	}
+}
+
+func TestReconcileOnce_ReadinessDeadlineSparesRunningInstance(t *testing.T) {
+	// The deadline applies to Initializing only. A long-lived Running pod is past it by
+	// construction, and killing one would be the single worst failure this feature could have.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	_ = h.CreatePod(context.Background(), testPod("default", "p1"))
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning,
+	}}
+	h.reconcileOnce(context.Background())
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodRunning {
+		t.Fatalf("phase = %q, want Running", got.Status.Phase)
+	}
+	if got.Status.Reason != reasonRunning {
+		t.Fatalf("reason = %q, want %q — the deadline must not touch a ready pod", got.Status.Reason, reasonRunning)
+	}
+}
+
+func TestReadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
+	// The provision call has its own timeout, so its duration must not eat the readiness
+	// budget: a Provision that took an hour still leaves the box a full budget to boot in.
+	fp := &fakeProvider{}
+	h := NewHandler(fp, nil, nil, openCluster())
+	tp := &trackedPod{pod: testPod("default", "p1"), provisioningAt: time.Now().Add(-time.Hour)}
+
+	if _, over := h.readyExpired(tp, provider.InstancePending); over {
+		t.Fatal("a long provision must not expire the readiness deadline")
+	}
+	if tp.initializingAt.IsZero() {
+		t.Fatal("the first Initializing observation must start the clock")
+	}
+
+	// Now blow the Initializing clock alone: that IS the deadline.
+	tp.initializingAt = tp.initializingAt.Add(-11 * time.Minute)
+	if _, over := h.readyExpired(tp, provider.InstancePending); !over {
+		t.Fatal("a pod initializing past the deadline must expire")
+	}
+}
+
+func TestReadyExpired_RunningResetsTheClock(t *testing.T) {
+	// The clock tracks the CURRENT Initializing spell. A pod that reported Running and is
+	// later demoted to Pending must get a fresh budget, not be failed on its first tick back.
+	fp := &fakeProvider{}
+	h := NewHandler(fp, nil, nil, openCluster())
+	tp := &trackedPod{pod: testPod("default", "p1"), initializingAt: time.Now().Add(-11 * time.Minute)}
+
+	if _, over := h.readyExpired(tp, provider.InstanceRunning); over {
+		t.Fatal("Running must never expire")
+	}
+	if !tp.initializingAt.IsZero() {
+		t.Fatal("Running must reset the clock")
+	}
+	if _, over := h.readyExpired(tp, provider.InstancePending); over {
+		t.Fatal("the first tick back at Initializing must start a fresh budget")
+	}
+}
+
+// rewindInitializing backdates a tracked pod's Initializing clock so the deadline is already
+// blown, keeping the test deterministic rather than sleeping past a shortened one.
+func rewindInitializing(t *testing.T, h *Handler, namespace, name string, by time.Duration) {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	tp, ok := h.tracked[key(namespace, name)]
+	if !ok {
+		t.Fatalf("pod %s is not tracked", key(namespace, name))
+	}
+	if tp.initializingAt.IsZero() {
+		t.Fatal("precondition: an Initializing tick must have started the clock")
+	}
+	tp.initializingAt = tp.initializingAt.Add(-by)
+}
+
+func isPodReadyStatus(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
 func TestReconcileOnce_ListErrorLeavesStatusUntouched(t *testing.T) {
 	// A List error must not advance anything. It means the fleet is half-known, and
 	// the only unsafe reading is "absent" — which maps to Terminated, a terminal
