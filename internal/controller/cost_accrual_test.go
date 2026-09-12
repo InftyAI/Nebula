@@ -146,11 +146,21 @@ func TestCostAccrual_ChargesFromTheAnchor(t *testing.T) {
 func TestCostAccrual_ChargesEveryClaimOfAWideFleet(t *testing.T) {
 	const fleetSize = accrualWorkers * 4
 	halfHour := 30 * time.Minute
+	// One pinned instant for every anchor AND for the accrual clock. billingClaim reads
+	// time.Now() per claim, so a second boundary crossing anywhere in the fan-out charges the
+	// claims on one side of it a 1s-longer window — $0.027 at this rate, far outside the
+	// tolerances below.
+	pinned := time.Now().Truncate(time.Second)
+	start := metav1.Time{Time: pinned.Add(-halfHour)}
 	fleet := make([]*nebulav1alpha1.NodeClaim, 0, fleetSize)
 	for i := range fleetSize {
-		fleet = append(fleet, billingClaim(fmt.Sprintf("bound-%d", i), "98.3200", &halfHour))
+		nc := billingClaim(fmt.Sprintf("bound-%d", i), "98.3200", &halfHour)
+		nc.Status.ProvisionedAt = start.DeepCopy()
+		nc.Status.LastAccruedAt = start.DeepCopy()
+		fleet = append(fleet, nc)
 	}
 	a, c := newAccrual(t, fleet...)
+	a.now = func() time.Time { return pinned }
 
 	a.accrueAll(context.Background())
 
