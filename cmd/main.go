@@ -68,9 +68,14 @@ const defaultNamespace = "nebula-system"
 // process — each controller's, and the virtual kubelet's status pushes. controller-runtime's
 // default 20/30 is what binds first at fleet scale, and it binds invisibly: throttled calls
 // wait in our own process, so it reads as API-server or provider slowness.
+//
+// Sized for 1k workloads, where cost accrual alone is a floor: one write per billing claim per
+// accrualInterval is ~33/s sustained, which 50 could not carry alongside placement and
+// provisioning. The virtual kubelet's poll loop does NOT add to this — an unchanged status is
+// deduped before it reaches the client (see pkg/vnode.podQueueRate).
 const (
-	restConfigQPS   = 50
-	restConfigBurst = 100
+	restConfigQPS   = 150
+	restConfigBurst = 300
 )
 
 var (

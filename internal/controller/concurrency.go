@@ -26,11 +26,11 @@ package controller
 // trip, or a provider call — not by CPU. So the worker sits idle while the fleet backs up,
 // and the observed rate is 1/latency regardless of how much CPU the manager is given.
 //
-// 8 matches pkg/vnode's podSyncWorkers, deliberately: the two pipelines hand work to each
-// other (VK writes the Pod status the claim controller waits on, and the claim controller's
-// teardown follows VK's DeletePod), so sizing them alike keeps either from being the
-// other's ceiling. Raising it further trades API-server pressure for latency, and the
-// server, not this constant, is the next limit.
+// Deliberately NOT matched to pkg/vnode's podSyncWorkers, which is far higher: the two are
+// bounded by different things. A VK worker blocks on a provider call and holds no API token,
+// so width there is nearly free, while every reconcile here is API writes — this one is
+// bounded by the client's rate budget (see restConfigQPS in cmd/main.go), and the server, not
+// this constant, is the next limit.
 //
 // Safe because controller-runtime never reconciles the same key concurrently, so per-object
 // state needs no locking, and the only state shared ACROSS objects is read-only (the

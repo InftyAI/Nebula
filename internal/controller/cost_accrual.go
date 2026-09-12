@@ -20,6 +20,7 @@ import (
 	"context"
 	"math"
 	"strconv"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -41,8 +42,8 @@ import (
 // What it does bound is the gap a baseline has to survive — a scrape must land between a series'
 // zero sample and its first charge, one tick later, or those dollars reach no increase() query at
 // all (see seedClaimBaseline). Thirty seconds keeps that reachable for the usual 15s scrape, at
-// ~16.7 writes/s across a 500-claim fleet: a third of the client's rate budget (see the QPS in
-// cmd/main.go), which is where this stops being free and starts competing with the reconcilers.
+// ~33 writes/s across the 1k fleet this targets — a fifth of the client's rate budget (see
+// restConfigQPS), which is where this stops being free and competes with the reconcilers.
 const accrualInterval = 30 * time.Second
 
 // accrualTimeout bounds one whole tick, List plus every write. A tick that cannot finish loses
@@ -53,6 +54,18 @@ const accrualInterval = 30 * time.Second
 // time.Ticker drops the ticks a slow receiver missed instead of queueing them, so the worst case is
 // back-to-back ticks, and re-deriving a window from its anchor cannot double-charge it.
 const accrualTimeout = accrualInterval
+
+// accrualWorkers is how many claims one tick checkpoints at once.
+//
+// A tick is one Update per billing claim, so a 1k fleet is 1k round trips — more than
+// accrualTimeout allows serially. That failure is not random: List order is stable, so the claims
+// at its tail are the SAME ones whose EST_COST stalls every tick. Concurrency is what fits the
+// fleet inside the window; it does not change how many writes a tick makes.
+//
+// Bounded, because the writes still share one client rate budget (see restConfigQPS in
+// cmd/main.go) — past that ceiling extra goroutines queue inside this process instead of at the
+// API server, which is the harder stall to read.
+const accrualWorkers = 16
 
 // CostAccrual advances each claim's durable spend ledger on a ticker.
 //
@@ -113,18 +126,30 @@ func (a *CostAccrual) accrueAll(ctx context.Context) {
 		log.Error(err, "listing nodeclaims to accrue")
 		return
 	}
+	// Each claim is its own object and its own compare-and-swap, so width costs nothing in
+	// correctness — see accrualWorkers for what it does cost.
+	sem := make(chan struct{}, accrualWorkers)
+	var wg sync.WaitGroup
 	for i := range claims.Items {
 		nc := &claims.Items[i]
-		if err := a.accrue(ctx, nc); err != nil {
-			// A conflict is the ordinary case — the reconciler patched the same claim from its
-			// own copy. The anchor did not move, so this window is simply charged next tick.
-			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-				log.V(1).Info("skipping accrual this tick", "claim", nc.Name, "reason", err.Error())
-				continue
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := a.accrue(ctx, nc); err != nil {
+				// A conflict is the ordinary case — the reconciler patched the same claim from
+				// its own copy. The anchor did not move, so this window is simply charged next
+				// tick.
+				if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+					log.V(1).Info("skipping accrual this tick", "claim", nc.Name, "reason", err.Error())
+					return
+				}
+				log.Error(err, "accruing claim cost", "claim", nc.Name)
 			}
-			log.Error(err, "accruing claim cost", "claim", nc.Name)
-		}
+		}()
 	}
+	wg.Wait()
 }
 
 // accrue persists what the claim has cost as of now and re-anchors there, in one patch.
