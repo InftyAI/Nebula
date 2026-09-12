@@ -22,6 +22,14 @@ rules:
   - patch
 - apiGroups:
   - ""
+  resourceNames:
+  - system:nodes
+  resources:
+  - groups
+  verbs:
+  - impersonate
+- apiGroups:
+  - ""
   resources:
   - nodes
   - pods
@@ -53,6 +61,16 @@ rules:
   - update
   - watch
 - apiGroups:
+  - ""
+  resourceNames:
+  - system:node:nebula-aws
+  - system:node:nebula-fake
+  - system:node:nebula-modal
+  resources:
+  - users
+  verbs:
+  - impersonate
+- apiGroups:
   - admissionregistration.k8s.io
   resources:
   - mutatingwebhookconfigurations
@@ -61,6 +79,41 @@ rules:
   - list
   - update
   - watch
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - certificatesigningrequests
+  verbs:
+  - create
+- apiGroups:
+  - certificates.k8s.io
+  resourceNames:
+  - nebula-kubelet-serving-nebula-aws
+  - nebula-kubelet-serving-nebula-fake
+  - nebula-kubelet-serving-nebula-modal
+  resources:
+  - certificatesigningrequests
+  verbs:
+  - delete
+  - get
+- apiGroups:
+  - certificates.k8s.io
+  resourceNames:
+  - nebula-kubelet-serving-nebula-aws
+  - nebula-kubelet-serving-nebula-fake
+  - nebula-kubelet-serving-nebula-modal
+  resources:
+  - certificatesigningrequests/approval
+  verbs:
+  - update
+- apiGroups:
+  - certificates.k8s.io
+  resourceNames:
+  - kubernetes.io/kubelet-serving
+  resources:
+  - signers
+  verbs:
+  - approve
 - apiGroups:
   - coordination.k8s.io
   resources:

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -43,6 +44,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/internal/controller"
@@ -95,6 +97,7 @@ func main() {
 	var enableHTTP2 bool
 	var kubeletAddr, kubeletClientCA string
 	var costLabels string
+	var kubeletServingTLSBootstrap bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -129,6 +132,14 @@ func main() {
 			"by candidate shape only. Changing this changes the identity of every cost series. Values "+
 			"come from Pod labels and are NOT capped: the manager warns once if they push the cost "+
 			"metric past 5000 series, but pick keys an admission policy constrains.")
+	flag.BoolVar(&kubeletServingTLSBootstrap, "kubelet-serving-tls-bootstrap", false,
+		"Request a serving certificate for the manager Pod IP through the "+
+			"kubernetes.io/kubelet-serving CSR signer, and approve it. Required wherever the "+
+			"control plane verifies kubelet serving certificates (EKS sets "+
+			"--kubelet-certificate-authority), since the self-signed fallback fails there with "+
+			"x509: certificate signed by unknown authority. Off by default because it needs the "+
+			"RBAC to impersonate one virtual node identity — the signer signs for nobody else "+
+			"(see addServingCertificateBootstrap).")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -308,7 +319,7 @@ func main() {
 	// The kubelet endpoint for `kubectl logs` — one listener shared by every provider's
 	// node, hence built here rather than in setupVirtualNodes. Nil is supported: the
 	// nodes then advertise no address, and logs report NotFound.
-	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA)
+	kubeletSrv := setupKubeletServer(mgr, kubeletAddr, kubeletClientCA, kubeletServingTLSBootstrap)
 
 	// Controller and webhook registration is deferred until the cert exists, so it
 	// runs in a goroutine: the cert cannot be minted until the manager is STARTED
@@ -465,7 +476,8 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 // what the API server dials and nothing substitutes for it: a Service would balance to
 // a non-leader replica, which holds no tracked Pods. Either way only logs degrade, so
 // it is logged loudly and the manager carries on.
-func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletServer {
+
+func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBootstrap bool) *vnode.KubeletServer {
 	if addr == "" {
 		setupLog.Info("kubelet API disabled by configuration; `kubectl logs` will not work for Nebula pods")
 		return nil
@@ -487,8 +499,75 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string) *vnode.KubeletS
 		setupLog.Error(err, "unable to add the kubelet API to the manager")
 		return nil
 	}
-	setupLog.Info("kubelet API enabled", "addr", addr, "advertisedIP", podIP, "clientCertRequired", clientCA != "")
+	if servingTLSBootstrap {
+		if err := addServingCertificateBootstrap(mgr, srv, podIP); err != nil {
+			setupLog.Error(err, "kubelet serving certificate bootstrap is off; "+
+				"the endpoint keeps its self-signed certificate, which a control plane that sets "+
+				"--kubelet-certificate-authority (EKS) rejects")
+		}
+	}
+	setupLog.Info("kubelet API enabled",
+		"addr", addr,
+		"advertisedIP", podIP,
+		"clientCertRequired", clientCA != "",
+		"servingTLSBootstrap", servingTLSBootstrap)
 	return srv
+}
+
+// Detached from the doc comment below: controller-gen ignores an rbac marker inside a
+// declaration's doc. A resourceName containing a colon must be QUOTED, or the marker fails to
+// parse and takes every other rbac rule in the package with it.
+//
+// Keep the CSR names in step with vnode.ServingCSRName, and the users with the providers that
+// can register. Only `create` cannot be scoped by name.
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,verbs=create
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames={nebula-kubelet-serving-nebula-aws,nebula-kubelet-serving-nebula-modal,nebula-kubelet-serving-nebula-fake},verbs=delete;get
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames={nebula-kubelet-serving-nebula-aws,nebula-kubelet-serving-nebula-modal,nebula-kubelet-serving-nebula-fake},verbs=update
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=kubernetes.io/kubelet-serving,verbs=approve
+// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-fake"},verbs=impersonate
+// +kubebuilder:rbac:groups="",resources=groups,resourceNames="system:nodes",verbs=impersonate
+
+// addServingCertificateBootstrap requests a trusted serving certificate for the kubelet
+// endpoint, IMPERSONATING a virtual node to do it — see vnode.NodeIdentity for why the signer
+// requires that.
+//
+// WHICH node is arbitrary: they all advertise this one endpoint at this Pod's IP, and the API
+// server verifies against the address it dialed. First name, for determinism.
+func addServingCertificateBootstrap(mgr ctrl.Manager, srv *vnode.KubeletServer, podIP string) error {
+	names := provider.Names()
+	if len(names) == 0 {
+		return errors.New("no provider registered, so there is no virtual node to request a certificate as")
+	}
+	nodeName := vnode.NodeName(names[0])
+
+	// Impersonation is confined to this client; NewKubeletServingCertificateBootstrapper takes
+	// the unimpersonated one too, and says which call needs which.
+	cfg := rest.CopyConfig(mgr.GetConfig())
+	cfg.Impersonate = rest.ImpersonationConfig{
+		UserName: vnode.NodeIdentity(nodeName),
+		Groups:   []string{"system:nodes"},
+	}
+	nodeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
+	ownClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
+	bootstrapper, err := vnode.NewKubeletServingCertificateBootstrapper(
+		nodeClient,
+		ownClient,
+		srv,
+		podIP,
+		nodeName,
+		managerNamespace(),
+		os.Getenv("POD_NAME"),
+	)
+	if err != nil {
+		return err
+	}
+	return mgr.Add(bootstrapper)
 }
 
 // setupVirtualNodes adds a vnode.Runner to the manager for every registered
