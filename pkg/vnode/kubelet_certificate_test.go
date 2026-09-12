@@ -120,11 +120,6 @@ func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testi
 		t.Fatalf("IP SANs = %v, want [10.20.18.154]", request.IPAddresses)
 	}
 
-	csr.Status.Conditions = append(csr.Status.Conditions, certificatesv1.CertificateSigningRequestCondition{
-		Type:   certificatesv1.CertificateApproved,
-		Status: "True",
-		Reason: "TestApproved",
-	})
 	csr.Status.Certificate = issueTestServingCertificate(t, request)
 	if _, err := client.CertificatesV1().CertificateSigningRequests().UpdateStatus(
 		context.Background(), csr, metav1.UpdateOptions{},
