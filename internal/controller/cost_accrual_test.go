@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -139,6 +140,45 @@ func TestCostAccrual_ChargesFromTheAnchor(t *testing.T) {
 
 // The whole point of persisting a timestamp: a window that spans a restart is charged in full on
 // the first tick back, not clipped to one interval.
+// A fleet wider than accrualWorkers, which is the only shape that exercises the fan-out at all: a
+// single-claim tick runs one goroutine and proves nothing. Charged exactly once each is the whole
+// property — a lost claim and a doubly-charged one both read as a wrong counter.
+func TestCostAccrual_ChargesEveryClaimOfAWideFleet(t *testing.T) {
+	const fleetSize = accrualWorkers * 4
+	halfHour := 30 * time.Minute
+	// One pinned instant for every anchor AND for the accrual clock. billingClaim reads
+	// time.Now() per claim, so a second boundary crossing anywhere in the fan-out charges the
+	// claims on one side of it a 1s-longer window — $0.027 at this rate, far outside the
+	// tolerances below.
+	pinned := time.Now().Truncate(time.Second)
+	start := metav1.Time{Time: pinned.Add(-halfHour)}
+	fleet := make([]*nebulav1alpha1.NodeClaim, 0, fleetSize)
+	for i := range fleetSize {
+		nc := billingClaim(fmt.Sprintf("bound-%d", i), "98.3200", &halfHour)
+		nc.Status.ProvisionedAt = start.DeepCopy()
+		nc.Status.LastAccruedAt = start.DeepCopy()
+		fleet = append(fleet, nc)
+	}
+	a, c := newAccrual(t, fleet...)
+	a.now = func() time.Time { return pinned }
+
+	a.accrueAll(context.Background())
+
+	want := 98.32 * 0.5
+	for _, nc := range fleet {
+		total, anchor := ledger(t, c, nc.Name)
+		if math.Abs(total-want) > 1e-3 {
+			t.Fatalf("claim %q: status.estimatedCostUSD %v, want %v", nc.Name, total, want)
+		}
+		if anchor == nil || time.Since(anchor.Time) > time.Minute {
+			t.Fatalf("claim %q: anchor was not moved forward: %v", nc.Name, anchor)
+		}
+	}
+	if got, wantAll := booked(t), want*fleetSize; math.Abs(got-wantAll) > 1e-6 {
+		t.Fatalf("booked %v, want %v — a claim was charged twice or not at all", got, wantAll)
+	}
+}
+
 func TestCostAccrual_RecoversDowntime(t *testing.T) {
 	down := 3 * time.Hour
 	a, c := newAccrual(t, billingClaim("bound", "10.0000", &down))
