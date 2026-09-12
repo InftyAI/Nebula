@@ -278,9 +278,7 @@ func (s *KubeletServer) tlsConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.servingCert.Load() == nil {
-		s.SetServingCertificate(cert)
-	}
+	s.servingCert.CompareAndSwap(nil, &cert)
 	cfg := &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			cert := s.servingCert.Load()

@@ -5,6 +5,7 @@ Nebula Pod. It is worth spelling out how, because none of the usual kubelet mach
 present.
 
 - [The transport](#the-transport)
+- [The serving certificate](#the-serving-certificate)
 - [The provider seam](#the-provider-seam)
 - [What logs honour, and the one heuristic](#what-logs-honour-and-the-one-heuristic)
 - [Containers are not addressable](#containers-are-not-addressable)
@@ -23,12 +24,8 @@ Pod IP and that port. Consequences worth knowing:
 - The endpoint is **leader-scoped and dialed by Pod IP**, not through a Service. The
   tracked Pods live in one process's memory, so a Service balancing across replicas
   would send requests to a replica that answers `NotFound`.
-- It starts with a self-signed, in-memory certificate and, by default, creates a
-  `kubernetes.io/kubelet-serving` CSR whose IP SAN is the advertised Pod IP. This is
-  required by control planes such as EKS that verify kubelet serving certificates.
-  The built-in signer requires an external approval decision; once the certificate is
-  issued, new TLS handshakes use it immediately without restarting the manager. See
-  [deploy.md](deploy.md#configuration) for approval and inspection commands.
+- It serves TLS on a certificate signed by the cluster CA, falling back to a self-signed
+  one until that is issued — see [The serving certificate](#the-serving-certificate).
 - Client certificates are **not** verified by default, because which CA signs the API
   server's kubelet client cert is not portable across distributions. Serving-certificate
   bootstrap secures the opposite direction and does not change that. Anything that can
@@ -37,6 +34,38 @@ Pod IP and that port. Consequences worth knowing:
   `--kubelet-client-ca` to require mTLS.
 - No POD_IP (running the manager off-cluster) means no endpoint. Logs and exec degrade
   to unsupported; nothing else is affected.
+
+## The serving certificate
+
+A managed control plane sets `--kubelet-certificate-authority` (EKS does) and rejects a
+self-signed kubelet certificate, so `kubectl exec` fails with `x509: certificate signed by
+unknown authority`. `--kubelet-serving-tls-bootstrap` — off in the flag, **on in
+`config/manager/manager.yaml`** — requests a real one from the `kubernetes.io/kubelet-serving`
+signer, and swaps it in without a restart. Until it lands, the endpoint keeps the self-signed
+fallback, so nothing depends on the request succeeding.
+
+The mechanics that are easy to get wrong:
+
+- **The requester is a node, and it is checked.** The CSR is created while impersonating
+  `system:node:nebula-<provider>`, with that same name as its CN. The signer signs for the node
+  that asks and for nobody else, and it reports a mismatch **nowhere** — the CSR sits
+  `Approved` with no certificate. `Approved,Issued` is the only healthy state.
+- **Two identities, not one.** Only the create is impersonated. The manager's own
+  ServiceAccount does the delete, the polling and the approval, because a node identity may
+  create and get its own CSRs and nothing more. Requester and approver differing is ordinary:
+  the signer cares only who asked.
+- **One certificate covers every virtual node.** All of them advertise the same address — this
+  Pod's IP — and the API server verifies against the address it dialed, not the node name. So
+  one request, under the first registered provider's node name, serves the whole set.
+- **One CSR per node, named `nebula-kubelet-serving-<node>`.** Stable rather than generated, so
+  `config/rbac/role.yaml` can scope delete, get and approval to those names by `resourceNames`;
+  only `create` is cluster-wide.
+- **Renewal is unattended.** 30 days requested, re-requested 24h before expiry with a fresh
+  ECDSA key that never leaves memory. A failed attempt retains the current certificate and
+  retries in 30s; a failed *approval* is retried in place, so a transient API error costs a poll
+  interval rather than the day the CSR cleaner takes to clear an unapproved request.
+
+Inspection commands are in [deploy.md](deploy.md#configuration).
 
 ## The provider seam
 

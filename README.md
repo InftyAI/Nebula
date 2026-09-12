@@ -105,22 +105,9 @@ the standard `nvidia.com/gpu` resource limit, so scheduling and provisioning rea
 the same number. Do not set `nodeName` or a provider `nodeSelector` yourself — the
 placement controller owns those.
 
-> `kubectl logs` and `kubectl exec` both work on Modal, `-f`/`--tail` and `-it`
-> included: the manager serves the two kubelet routes the API server proxies.
-> `--timestamps`/`--previous`/`--since` and `-c` are ignored, and a terminal resize is
-> not forwarded. On providers that do not support them yet, both answer NotFound.
-
 ## Getting started
 
-- See [docs/deploy.md](docs/deploy.md) to install
-- See [config/samples](config/samples) for example NodePools and a runnable workload.
-- See [docs/add-a-provider.md](docs/add-a-provider.md) to add a provider backend.
-- See [docs/architecture.md](docs/architecture.md) for design details.
-- See [docs/status.md](docs/status.md) for how instance lifecycle becomes Pod and
-  NodeClaim status, per provider.
-- See [docs/kubelet-api.md](docs/kubelet-api.md) for how `kubectl logs` and `kubectl exec`
-  reach a Pod with no kubelet.
-- See [docs/metrics.md](docs/metrics.md) for what is instrumented and how to query it.
+See [docs](docs/README.md) for an overview of Nebula.
 
 ## License
 

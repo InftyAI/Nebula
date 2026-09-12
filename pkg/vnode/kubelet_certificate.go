@@ -21,11 +21,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -33,6 +31,7 @@ import (
 	"time"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -48,10 +47,29 @@ const (
 	kubeletServingPollInterval        = 2 * time.Second
 )
 
+// NodeIdentity is the username the kubernetes.io/kubelet-serving signer expects on a request
+// for a node's serving certificate.
+//
+// One function because two places must agree: the request's CN, and the identity the client
+// impersonates to submit it. The signer compares them and ignores a mismatch in silence — the
+// CSR stays Approved and unsigned, with no condition to notice.
+func NodeIdentity(nodeName string) string { return "system:node:" + nodeName }
+
+// ServingCSRName is the CSR one virtual node reuses for the life of the cluster.
+//
+// Derived from the node name and nothing per-process, so RBAC can scope delete, get and
+// approval to exactly these names (see the markers in cmd/main.go). Changing the format means
+// changing that list too, or the manager loses access to its own CSR.
+func ServingCSRName(nodeName string) string { return "nebula-kubelet-serving-" + nodeName }
+
 type KubeletServingCertificateBootstrapper struct {
-	client        certificatesclientv1.CertificateSigningRequestInterface
+	// nodeClient impersonates the virtual node and CREATES the request; ownClient is the
+	// manager's own identity and does the rest. See the constructor.
+	nodeClient    certificatesclientv1.CertificateSigningRequestInterface
+	ownClient     certificatesclientv1.CertificateSigningRequestInterface
 	server        *KubeletServer
 	nodeIP        string
+	nodeName      string
 	podName       string
 	podNamespace  string
 	csrName       string
@@ -61,13 +79,23 @@ type KubeletServingCertificateBootstrapper struct {
 
 var _ manager.Runnable = (*KubeletServingCertificateBootstrapper)(nil)
 
+// NewKubeletServingCertificateBootstrapper builds the CSR loop for one virtual node, over TWO
+// clients because no single identity can do the whole job:
+//
+//   - nodeClient impersonates NodeIdentity(nodeName) and creates the request; the signer
+//     refuses one submitted by anything else.
+//   - ownClient is the manager's ServiceAccount and does the rest. A node may create and get
+//     its own CSRs and nothing more — on EKS it `cannot delete resource
+//     "certificatesigningrequests"`, and approving is an approver's job anyway.
+//
+// Requester and approver differing is the ordinary arrangement: the signer checks who ASKED.
 func NewKubeletServingCertificateBootstrapper(
-	client kubernetes.Interface,
+	nodeClient, ownClient kubernetes.Interface,
 	server *KubeletServer,
-	nodeIP, podNamespace, podName, podUID string,
+	nodeIP, nodeName, podNamespace, podName string,
 ) (*KubeletServingCertificateBootstrapper, error) {
-	if client == nil {
-		return nil, errors.New("kubelet serving certificate: Kubernetes client is required")
+	if nodeClient == nil || ownClient == nil {
+		return nil, errors.New("kubelet serving certificate: both the node and manager clients are required")
 	}
 	if server == nil {
 		return nil, errors.New("kubelet serving certificate: kubelet server is required")
@@ -75,18 +103,22 @@ func NewKubeletServingCertificateBootstrapper(
 	if net.ParseIP(nodeIP) == nil {
 		return nil, fmt.Errorf("kubelet serving certificate: node IP %q is invalid", nodeIP)
 	}
-	if podName == "" || podNamespace == "" || podUID == "" {
-		return nil, errors.New("kubelet serving certificate: POD_NAME, POD_NAMESPACE and POD_UID are required")
+	if nodeName == "" {
+		return nil, errors.New("kubelet serving certificate: a virtual node name is required")
+	}
+	if podName == "" || podNamespace == "" {
+		return nil, errors.New("kubelet serving certificate: POD_NAME and POD_NAMESPACE are required")
 	}
 
-	sum := sha256.Sum256([]byte(podUID))
 	return &KubeletServingCertificateBootstrapper{
-		client:        client.CertificatesV1().CertificateSigningRequests(),
+		nodeClient:    nodeClient.CertificatesV1().CertificateSigningRequests(),
+		ownClient:     ownClient.CertificatesV1().CertificateSigningRequests(),
 		server:        server,
 		nodeIP:        nodeIP,
+		nodeName:      nodeName,
 		podName:       podName,
 		podNamespace:  podNamespace,
-		csrName:       "nebula-kubelet-serving-" + hex.EncodeToString(sum[:12]),
+		csrName:       ServingCSRName(nodeName),
 		pollInterval:  kubeletServingPollInterval,
 		retryInterval: kubeletServingRetryInterval,
 	}, nil
@@ -124,16 +156,19 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 	if err != nil {
 		return time.Time{}, fmt.Errorf("generate private key: %w", err)
 	}
-	requestPEM, keyPEM, err := servingCertificateRequest(b.nodeIP, b.podName, key)
+	requestPEM, keyPEM, err := servingCertificateRequest(b.nodeIP, NodeIdentity(b.nodeName), key)
 	if err != nil {
 		return time.Time{}, err
 	}
 
-	if err := b.client.Delete(ctx, b.csrName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	// A CSR left by an earlier attempt is unusable: its certificate would be for a key we no
+	// longer hold. Usually a no-op — the cleaner drops an issued CSR an hour after approval.
+	if err := b.ownClient.Delete(ctx, b.csrName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return time.Time{}, fmt.Errorf("delete stale CSR %s: %w", b.csrName, err)
 	}
 	expirationSeconds := int32(kubeletServingCertificateLifetime / time.Second)
-	csr, err := b.client.Create(ctx, &certificatesv1.CertificateSigningRequest{
+	// The one call whose IDENTITY matters (see the constructor).
+	csr, err := b.nodeClient.Create(ctx, &certificatesv1.CertificateSigningRequest{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: b.csrName,
 			Labels: map[string]string{
@@ -161,14 +196,12 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 
 	log := logf.FromContext(ctx).WithName("kubelet-serving-certificate")
 	log.Info("waiting for kubelet serving certificate approval",
-		"csr", csr.Name,
-		"approveCommand", "kubectl certificate approve "+csr.Name,
-		"podIP", b.nodeIP)
+		"csr", csr.Name, "identity", NodeIdentity(b.nodeName), "podIP", b.nodeIP)
 
 	ticker := time.NewTicker(b.pollInterval)
 	defer ticker.Stop()
 	for {
-		current, err := b.client.Get(ctx, b.csrName, metav1.GetOptions{})
+		current, err := b.ownClient.Get(ctx, b.csrName, metav1.GetOptions{})
 		if err != nil {
 			return time.Time{}, fmt.Errorf("get CSR %s: %w", b.csrName, err)
 		}
@@ -186,6 +219,17 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 			return notAfter, nil
 		}
 
+		// Retrying in here recovers a transient UpdateApproval in one tick, where recreating the
+		// CSR would cost the 24h the cleaner takes to remove it AND keep yanking it out from
+		// under a human approving by hand. `current` for a fresh resourceVersion.
+		if !isApproved(current) {
+			if err := b.approve(ctx, current); err != nil {
+				log.Error(err, "could not self-approve the serving certificate request; "+
+					"approve it by hand or the endpoint keeps its self-signed certificate",
+					"csr", b.csrName, "approveCommand", "kubectl certificate approve "+b.csrName)
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return time.Time{}, ctx.Err()
@@ -194,10 +238,39 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 	}
 }
 
-func servingCertificateRequest(nodeIP, podName string, key *ecdsa.PrivateKey) ([]byte, []byte, error) {
+func isApproved(csr *certificatesv1.CertificateSigningRequest) bool {
+	for _, condition := range csr.Status.Conditions {
+		if condition.Type == certificatesv1.CertificateApproved {
+			return true
+		}
+	}
+	return false
+}
+
+// approve approves our own request, as the MANAGER — a node cannot approve its own
+// certificate, and the built-in approver only handles real kubelets. Without this the endpoint
+// keeps its self-signed certificate until a human runs `kubectl certificate approve`, at every
+// renewal.
+//
+// Caller must check isApproved first: a second Approved condition is rejected by validation.
+func (b *KubeletServingCertificateBootstrapper) approve(
+	ctx context.Context, csr *certificatesv1.CertificateSigningRequest,
+) error {
+	csr.Status.Conditions = append(csr.Status.Conditions, certificatesv1.CertificateSigningRequestCondition{
+		Type:           certificatesv1.CertificateApproved,
+		Status:         corev1.ConditionTrue,
+		Reason:         "NebulaKubeletServing",
+		Message:        "approved by the Nebula manager for its own kubelet serving endpoint",
+		LastUpdateTime: metav1.Now(),
+	})
+	_, err := b.ownClient.UpdateApproval(ctx, b.csrName, csr, metav1.UpdateOptions{})
+	return err
+}
+
+func servingCertificateRequest(nodeIP, identity string, key *ecdsa.PrivateKey) ([]byte, []byte, error) {
 	template := &x509.CertificateRequest{
 		Subject: pkix.Name{
-			CommonName:   "system:node:" + podName,
+			CommonName:   identity,
 			Organization: []string{"system:nodes"},
 		},
 		IPAddresses: []net.IP{net.ParseIP(nodeIP)},

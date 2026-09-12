@@ -130,7 +130,7 @@ Manager flags worth knowing (edit `config/manager/manager.yaml` `args`):
 | Flag | Default | Meaning |
 |---|---|---|
 | `--kubelet-bind-address` | `:10250` | Where the kubelet log endpoint listens — the address the API server proxies `kubectl logs` to. Set it empty to disable the endpoint, which disables logs and nothing else. |
-| `--kubelet-serving-tls-bootstrap` | `true` | Request a certificate for the advertised Pod IP from the `kubernetes.io/kubelet-serving` signer. Until it is approved and issued, the endpoint retains its self-signed fallback. Disable this only when the API server does not verify kubelet serving certificates. |
+| `--kubelet-serving-tls-bootstrap` | `false`, but `manager.yaml` ships `true` | Request a certificate for the advertised Pod IP from the `kubernetes.io/kubelet-serving` signer, and approve it. **Required on EKS and any control plane that sets `--kubelet-certificate-authority`**, where the self-signed fallback makes `kubectl exec` fail with `x509: certificate signed by unknown authority`. The flag's own default is off because the feature needs the `impersonate` grant on `users`/`groups` in `config/rbac/role.yaml`; the shipped manifest turns it on. |
 | `--kubelet-client-ca` | *(empty)* | PEM bundle of CAs whose client certificates are accepted on that port. **Empty means client certificates are not verified**, so anything able to reach port 10250 can read the logs of any Pod on Nebula's virtual nodes. Set it to your API server's kubelet client CA to require mTLS, or keep the port closed with a NetworkPolicy. The default is open because which CA signs that client cert is not portable — kubeadm uses the cluster CA, EKS/GKE their own — so requiring it by default would break logs on managed control planes. |
 
 The endpoint needs `POD_IP` (projected via `fieldRef` in `config/manager/manager.yaml`)
@@ -138,28 +138,30 @@ because virtual nodes advertise the leader's Pod IP, not a Service. Running the 
 off-cluster leaves it unset, and logs degrade to unsupported. See
 [kubelet-api.md](kubelet-api.md).
 
-The Kubernetes signer does not approve kubelet-serving requests itself. On a cluster
-without a dedicated approver, inspect and approve Nebula's request after each manager
-Pod recreation and certificate renewal:
+With `--kubelet-serving-tls-bootstrap` enabled the manager submits and approves the request
+itself, once at startup and again at each renewal, so there is no manual step. To check it
+landed:
 
 ```bash
-CSR=$(kubectl get csr \
-  -l app.kubernetes.io/name=nebula,app.kubernetes.io/component=kubelet-serving-certificate \
-  --sort-by=.metadata.creationTimestamp -o name | tail -n1)
+# Approved,Issued is the healthy state. "Approved" alone means the signer refused the
+# request, which is what happens when the identity it was submitted under is not a node.
+kubectl get csr -l app.kubernetes.io/component=kubelet-serving-certificate
 
-# Confirm the requested IP SAN matches the manager Pod IP before approving it.
-kubectl get csr "$CSR" -o jsonpath='{.spec.request}' \
-  | openssl base64 -d -A | openssl req -text -noout
-kubectl -n nebula-system get pod -l control-plane=controller-manager -o wide
-
-kubectl certificate approve "$CSR"
 kubectl -n nebula-system logs deploy/nebula-controller-manager \
   | grep 'installed trusted kubelet serving certificate'
 ```
 
-An installation with an external CSR approver should restrict it to requests that
-match Nebula's ServiceAccount, `system:nodes` organization, manager Pod identity, and
-current Pod IP. Nebula intentionally receives no permission to approve certificates.
+Two identities are involved, and the split is not cosmetic. The CSR is **created** while
+impersonating `system:node:nebula-<provider>`, because the signer signs for nobody else;
+everything else — the stale delete, the polling, the approval — goes out as the manager's
+ServiceAccount, because a node identity may create and get its own CSRs and nothing more. A
+single-identity version fails on the delete and never creates a CSR at all.
+
+The request is named `nebula-kubelet-serving-<node>`, one per virtual node for the life of the
+cluster, which is what lets `config/rbac/role.yaml` scope delete, get and approval to those
+names by `resourceNames`. Only `create` is cluster-wide. An external approver, if you run one,
+should match on that node identity, the `system:nodes` organization, and the current manager
+Pod IP as the sole IP SAN.
 
 ---
 
@@ -230,7 +232,7 @@ kubectl -n nebula-system logs deploy/nebula-controller-manager | grep -i provide
 # Virtual nodes exist, one per registered provider.
 kubectl get nodes -l nebula.inftyai.com/provider
 
-# Kubelet serving CSR is signed (required by control planes that verify kubelet TLS).
+# Kubelet serving CSR reached Approved,Issued — only with --kubelet-serving-tls-bootstrap.
 kubectl get csr \
   -l app.kubernetes.io/name=nebula,app.kubernetes.io/component=kubelet-serving-certificate
 
