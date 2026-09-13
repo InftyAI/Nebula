@@ -64,13 +64,20 @@ import (
 // a fallback for managerNamespace when POD_NAMESPACE is unset.
 const defaultNamespace = "nebula-system"
 
-// restConfigQPS and restConfigBurst size the client-go bucket shared by every API call in the
-// process — each controller's, and the virtual kubelet's status pushes. controller-runtime's
-// default 20/30 is what binds first at fleet scale, and it binds invisibly: throttled calls
-// wait in our own process, so it reads as API-server or provider slowness.
+// restConfigQPS and restConfigBurst size the bucket client-go installs for EACH clientset built
+// from this config — the manager's, the virtual kubelet's, the cert bootstrapper's two — and NOT
+// one process-wide budget: NewForConfigAndClient only creates a limiter when RateLimiter is nil,
+// on its own shallow copy. Left unshared for the reason vnode.podQueueRateLimiter gives: one
+// budget lets status pushes starve the reconcilers into a stall nobody can read.
+//
+// 150 is sized for 1k workloads on the MANAGER's bucket, which is the one every controller and
+// the cost-accrual loop draw on. Accrual is its floor: one write per billing claim per
+// accrualInterval is ~33/s sustained, which 50 could not carry alongside placement and
+// provisioning. controller-runtime's default 20/30 binds even sooner, and invisibly — throttled
+// calls wait in our own process, so it reads as API-server or provider slowness.
 const (
-	restConfigQPS   = 50
-	restConfigBurst = 100
+	restConfigQPS   = 150
+	restConfigBurst = 300
 )
 
 var (

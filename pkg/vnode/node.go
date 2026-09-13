@@ -47,7 +47,7 @@ const informerResync = time.Minute
 // work per pod key, so distinct pods provision in parallel while one key never runs
 // twice — without this, a single slow provision blocks pods that would succeed
 // instantly.
-const podSyncWorkers = 32
+const podSyncWorkers = 64
 
 // podQueueRate and podQueueBurst size the token bucket that admits work into each of the
 // pod controller's queues.
