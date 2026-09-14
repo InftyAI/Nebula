@@ -88,9 +88,7 @@ rules:
 - apiGroups:
   - certificates.k8s.io
   resourceNames:
-  - nebula-kubelet-serving-nebula-aws
-  - nebula-kubelet-serving-nebula-fake
-  - nebula-kubelet-serving-nebula-modal
+  - nebula-kubelet-serving
   resources:
   - certificatesigningrequests
   verbs:
@@ -99,9 +97,7 @@ rules:
 - apiGroups:
   - certificates.k8s.io
   resourceNames:
-  - nebula-kubelet-serving-nebula-aws
-  - nebula-kubelet-serving-nebula-fake
-  - nebula-kubelet-serving-nebula-modal
+  - nebula-kubelet-serving
   resources:
   - certificatesigningrequests/approval
   verbs:

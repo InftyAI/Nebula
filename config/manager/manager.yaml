@@ -98,7 +98,8 @@ spec:
                 fieldPath: status.podIP
           # Recorded as annotations on the kubelet-serving CSR, so an operator looking
           # at a stuck request can tell which manager Pod asked for it. The CSR's name
-          # comes from the node, not from here (see vnode.ServingCSRName).
+          # is fixed and carries no Pod identity (see vnode.ServingCSRName), which is
+          # why these annotations are the only way to tell.
           - name: POD_NAME
             valueFrom:
               fieldRef:

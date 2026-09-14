@@ -43,6 +43,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/yaml"
+
+	"github.com/InftyAI/Nebula/pkg/provider"
+	fakeprovider "github.com/InftyAI/Nebula/pkg/provider/fake"
 )
 
 func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testing.T) {
@@ -99,7 +102,7 @@ func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testi
 	var csr *certificatesv1.CertificateSigningRequest
 	waitFor(t, func() bool {
 		csr, err = client.CertificatesV1().CertificateSigningRequests().Get(
-			context.Background(), bootstrapper.csrName, metav1.GetOptions{},
+			context.Background(), ServingCSRName, metav1.GetOptions{},
 		)
 		return err == nil && isApproved(csr)
 	}, "self-approved kubelet-serving CSR")
@@ -107,9 +110,16 @@ func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testi
 	if csr.Spec.SignerName != certificatesv1.KubeletServingSignerName {
 		t.Fatalf("signer = %q, want %q", csr.Spec.SignerName, certificatesv1.KubeletServingSignerName)
 	}
+	// Exact set equality, and the three-usage set is also accepted — so a stray keyEncipherment
+	// still signs, and only this assertion catches it.
+	if want := []certificatesv1.KeyUsage{
+		certificatesv1.UsageDigitalSignature,
+		certificatesv1.UsageServerAuth,
+	}; !slices.Equal(csr.Spec.Usages, want) {
+		t.Fatalf("usages = %v, want %v", csr.Spec.Usages, want)
+	}
 	request := parseCertificateRequest(t, csr.Spec.Request)
-	// Must be the node identity the client impersonates, not the Pod: the signer compares the
-	// two and ignores a mismatch without any condition to notice (see NodeIdentity).
+	// The node identity, not the Pod: it has to match the impersonated user (see NodeIdentity).
 	if request.Subject.CommonName != "system:node:nebula-modal" {
 		t.Fatalf("common name = %q", request.Subject.CommonName)
 	}
@@ -185,10 +195,86 @@ func TestKubeletServingCertificateBootstrapperRoutesVerbsByIdentity(t *testing.T
 	// create as the node.
 	waitFor(t, func() bool {
 		csr, getErr := nodeFake.CertificatesV1().CertificateSigningRequests().Get(
-			ctx, bootstrapper.csrName, metav1.GetOptions{},
+			ctx, ServingCSRName, metav1.GetOptions{},
 		)
 		return getErr == nil && isApproved(csr)
 	}, "CSR created as the node and approved as the manager")
+}
+
+// TestKubeletServingCertificateBootstrapperRejectsReplacedCSR covers the cluster-global name: an
+// object recreated under it belongs to someone else, and approving it would sign SANs we do not
+// control. The attempt must restart instead, and recover once the name is ours again.
+func TestKubeletServingCertificateBootstrapperRejectsReplacedCSR(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var mu sync.Mutex
+	replaced := true
+	var creates, approvals int
+	// The fake tracker assigns no UID, so ours is empty and only the imposter's differs.
+	client.PrependReactor("get", "certificatesigningrequests",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !replaced {
+				return false, nil, nil
+			}
+			return true, &certificatesv1.CertificateSigningRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: ServingCSRName, UID: "someone-else"},
+			}, nil
+		})
+	client.PrependReactor("create", "certificatesigningrequests",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			creates++
+			mu.Unlock()
+			return false, nil, nil
+		})
+	client.PrependReactor("update", "certificatesigningrequests",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			approvals++
+			mu.Unlock()
+			return false, nil, nil
+		})
+
+	server, err := NewKubeletServer("10.20.18.154", ":10250", "")
+	if err != nil {
+		t.Fatalf("NewKubeletServer: %v", err)
+	}
+	bootstrapper, err := NewKubeletServingCertificateBootstrapper(
+		client, client, server,
+		"10.20.18.154", "nebula-modal", "nebula-system",
+		"nebula-controller-manager-abc",
+	)
+	if err != nil {
+		t.Fatalf("NewKubeletServingCertificateBootstrapper: %v", err)
+	}
+	bootstrapper.pollInterval = 5 * time.Millisecond
+	bootstrapper.retryInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = bootstrapper.Start(ctx) }()
+
+	// A second create proves the guard ended the first attempt; an approval is the failure this
+	// test exists for, so stop on either and let the assertion below name which happened.
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return creates >= 2 || approvals > 0
+	}, "the attempt to restart on a replaced CSR")
+	mu.Lock()
+	if approvals != 0 {
+		t.Errorf("approved a CSR created by someone else (%d times)", approvals)
+	}
+	replaced = false
+	mu.Unlock()
+
+	waitFor(t, func() bool {
+		csr, getErr := client.CertificatesV1().CertificateSigningRequests().Get(
+			ctx, ServingCSRName, metav1.GetOptions{},
+		)
+		return getErr == nil && isApproved(csr)
+	}, "approval once the name is ours again")
 }
 
 // TestKubeletServingCertificateBootstrapperRetriesApproval covers a transient UpdateApproval.
@@ -230,7 +316,7 @@ func TestKubeletServingCertificateBootstrapperRetriesApproval(t *testing.T) {
 
 	waitFor(t, func() bool {
 		csr, getErr := client.CertificatesV1().CertificateSigningRequests().Get(
-			ctx, bootstrapper.csrName, metav1.GetOptions{},
+			ctx, ServingCSRName, metav1.GetOptions{},
 		)
 		return getErr == nil && isApproved(csr)
 	}, "approval retried after a transient failure")
@@ -246,10 +332,15 @@ func TestKubeletServingCertificateBootstrapperRetriesApproval(t *testing.T) {
 	}
 }
 
-// TestServingCSRNameIsScopedByRBAC guards the coupling the narrow grant rests on: the name is
-// computed in Go, the resourceNames list is written by hand, and drift between them is silent
-// in CI and surfaces only as a Forbidden on a real cluster.
-func TestServingCSRNameIsScopedByRBAC(t *testing.T) {
+// registrableProviders is every provider whose adapter can register, so every identity
+// addServingCertificateBootstrap might impersonate — it takes the first REGISTERED name, which
+// depends on what has credentials at startup. A new adapter has to be added here by hand.
+var registrableProviders = []string{provider.ProviderAWS, provider.ProviderModal, fakeprovider.ProviderName}
+
+// TestKubeletServingRBACGrants pins names computed in Go against the hand-written resourceNames
+// lists. Drift passes CI and surfaces only on a real cluster, as a Forbidden nowhere near the
+// symptom it eventually causes.
+func TestKubeletServingRBACGrants(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
 	if err != nil {
 		t.Fatalf("read role.yaml: %v", err)
@@ -259,35 +350,46 @@ func TestServingCSRNameIsScopedByRBAC(t *testing.T) {
 		t.Fatalf("parse role.yaml: %v", err)
 	}
 
+	// Keyed by group/resource, because "users" lives in the core group and the CSR rules do not.
 	scoped := map[string]map[string]bool{}
 	for _, rule := range role.Rules {
-		if !slices.Contains(rule.APIGroups, certificatesv1.GroupName) {
-			continue
-		}
-		for _, resource := range rule.Resources {
-			// An unscoped rule may only create: that verb cannot be scoped by name, while
-			// deleting or approving someone else's CSR is what the scoping exists to prevent.
-			if len(rule.ResourceNames) == 0 {
-				if !slices.Equal(rule.Verbs, []string{"create"}) {
-					t.Errorf("cluster-wide rule on %s grants %v, want [create] alone", resource, rule.Verbs)
+		for _, group := range rule.APIGroups {
+			for _, resource := range rule.Resources {
+				// An unscoped CSR rule may only create: that verb cannot be scoped by name, while
+				// deleting or approving someone else's request is what the scoping exists to prevent.
+				if len(rule.ResourceNames) == 0 {
+					if group == certificatesv1.GroupName && !slices.Equal(rule.Verbs, []string{"create"}) {
+						t.Errorf("cluster-wide rule on %s grants %v, want [create] alone", resource, rule.Verbs)
+					}
+					continue
 				}
-				continue
-			}
-			if scoped[resource] == nil {
-				scoped[resource] = map[string]bool{}
-			}
-			for _, name := range rule.ResourceNames {
-				scoped[resource][name] = true
+				key := group + "/" + resource
+				if scoped[key] == nil {
+					scoped[key] = map[string]bool{}
+				}
+				for _, name := range rule.ResourceNames {
+					scoped[key][name] = true
+				}
 			}
 		}
 	}
 
+	remediate := "run `make manifests` after changing the markers in cmd/main.go"
 	for _, resource := range []string{"certificatesigningrequests", "certificatesigningrequests/approval"} {
-		for _, provider := range []string{"aws", "modal", "fake"} {
-			if want := ServingCSRName(NodeName(provider)); !scoped[resource][want] {
-				t.Errorf("role.yaml does not scope %s to %q; run `make manifests` after changing "+
-					"ServingCSRName or the markers in cmd/main.go", resource, want)
-			}
+		key := certificatesv1.GroupName + "/" + resource
+		if !scoped[key][ServingCSRName] {
+			t.Errorf("role.yaml does not scope %s to %q; %s", resource, ServingCSRName, remediate)
+		}
+		// One certificate serves every node, so exactly one name: an extra is either a leftover
+		// per-node grant or a widening nobody asked for.
+		if got := len(scoped[key]); got != 1 {
+			t.Errorf("%s is scoped to %d names, want only %q", resource, got, ServingCSRName)
+		}
+	}
+	for _, name := range registrableProviders {
+		if want := NodeIdentity(NodeName(name)); !scoped["/users"][want] {
+			t.Errorf("role.yaml does not grant impersonate on user %q, so provider %q cannot request "+
+				"a serving certificate; %s", want, name, remediate)
 		}
 	}
 }

@@ -46,20 +46,32 @@ fallback, so nothing depends on the request succeeding.
 
 The mechanics that are easy to get wrong:
 
-- **The requester is a node, and it is checked.** The CSR is created while impersonating
-  `system:node:nebula-<provider>`, with that same name as its CN. The signer signs for the node
-  that asks and for nobody else, and it reports a mismatch **nowhere** — the CSR sits
-  `Approved` with no certificate. `Approved,Issued` is the only healthy state.
+- **EKS checks the requester; upstream does not.** The CSR is created while impersonating
+  `system:node:nebula-<provider>`, with that same name as its CN. Send the identical request as the
+  manager's own ServiceAccount and EKS approves it and then never signs it — no certificate, and
+  **no condition** to notice, so `Approved,Issued` is the only healthy state. Both ways were
+  measured on EKS 1.35 with identical CSR bytes, differing only in the creating identity; check that
+  again before believing any claim that the impersonation is removable. None of this is upstream
+  behavior:
+  `ValidateKubeletServingCSR` never sees the requester and checks only the CN prefix and a
+  `system:nodes` organization, and a validation failure there writes `CertificateFailed` rather
+  than going quiet.
 - **Two identities, not one.** Only the create is impersonated. The manager's own
   ServiceAccount does the delete, the polling and the approval, because a node identity may
   create and get its own CSRs and nothing more. Requester and approver differing is ordinary:
   the signer cares only who asked.
-- **One certificate covers every virtual node.** All of them advertise the same address — this
-  Pod's IP — and the API server verifies against the address it dialed, not the node name. So
-  one request, under the first registered provider's node name, serves the whole set.
-- **One CSR per node, named `nebula-kubelet-serving-<node>`.** Stable rather than generated, so
-  `config/rbac/role.yaml` can scope delete, get and approval to those names by `resourceNames`;
-  only `create` is cluster-wide.
+- **One certificate covers every virtual node, so there is one CSR.** All of them advertise the
+  same address — this Pod's IP — and the API server verifies against the address it dialed, not
+  the node name. So a single request, submitted under the first registered provider's node
+  identity, serves the whole set. Its name is the fixed `nebula-kubelet-serving`, which is what
+  lets `config/rbac/role.yaml` scope delete, get and approval to that one name by
+  `resourceNames`; only `create` is cluster-wide. The node identity still varies, and the
+  `users` impersonate grant has to list every provider that can register.
+- **That name is global, so the object under it is checked.** A fetch by name can return a CSR
+  someone else recreated, and approving it would sign a key and SANs the manager does not control —
+  the name is the only thing its approval grant is scoped by. So each poll compares the object's UID
+  with the one it created and restarts the attempt on a mismatch. Two Nebula installations in one
+  cluster will therefore log a replaced CSR at each other indefinitely rather than converge.
 - **Renewal is unattended.** 30 days requested, re-requested 24h before expiry with a fresh
   ECDSA key that never leaves memory. A failed attempt retains the current certificate and
   retries in 30s; a failed *approval* is retried in place, so a transient API error costs a poll
