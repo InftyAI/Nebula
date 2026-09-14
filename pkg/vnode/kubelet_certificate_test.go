@@ -201,6 +201,82 @@ func TestKubeletServingCertificateBootstrapperRoutesVerbsByIdentity(t *testing.T
 	}, "CSR created as the node and approved as the manager")
 }
 
+// TestKubeletServingCertificateBootstrapperRejectsReplacedCSR covers the cluster-global name: an
+// object recreated under it belongs to someone else, and approving it would sign SANs we do not
+// control. The attempt must restart instead, and recover once the name is ours again.
+func TestKubeletServingCertificateBootstrapperRejectsReplacedCSR(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var mu sync.Mutex
+	replaced := true
+	var creates, approvals int
+	// The fake tracker assigns no UID, so ours is empty and only the imposter's differs.
+	client.PrependReactor("get", "certificatesigningrequests",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !replaced {
+				return false, nil, nil
+			}
+			return true, &certificatesv1.CertificateSigningRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: ServingCSRName, UID: "someone-else"},
+			}, nil
+		})
+	client.PrependReactor("create", "certificatesigningrequests",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			creates++
+			mu.Unlock()
+			return false, nil, nil
+		})
+	client.PrependReactor("update", "certificatesigningrequests",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			approvals++
+			mu.Unlock()
+			return false, nil, nil
+		})
+
+	server, err := NewKubeletServer("10.20.18.154", ":10250", "")
+	if err != nil {
+		t.Fatalf("NewKubeletServer: %v", err)
+	}
+	bootstrapper, err := NewKubeletServingCertificateBootstrapper(
+		client, client, server,
+		"10.20.18.154", "nebula-modal", "nebula-system",
+		"nebula-controller-manager-abc",
+	)
+	if err != nil {
+		t.Fatalf("NewKubeletServingCertificateBootstrapper: %v", err)
+	}
+	bootstrapper.pollInterval = 5 * time.Millisecond
+	bootstrapper.retryInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = bootstrapper.Start(ctx) }()
+
+	// A second create proves the guard ended the first attempt; an approval is the failure this
+	// test exists for, so stop on either and let the assertion below name which happened.
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return creates >= 2 || approvals > 0
+	}, "the attempt to restart on a replaced CSR")
+	mu.Lock()
+	if approvals != 0 {
+		t.Errorf("approved a CSR created by someone else (%d times)", approvals)
+	}
+	replaced = false
+	mu.Unlock()
+
+	waitFor(t, func() bool {
+		csr, getErr := client.CertificatesV1().CertificateSigningRequests().Get(
+			ctx, ServingCSRName, metav1.GetOptions{},
+		)
+		return getErr == nil && isApproved(csr)
+	}, "approval once the name is ours again")
+}
+
 // TestKubeletServingCertificateBootstrapperRetriesApproval covers a transient UpdateApproval.
 // Approving from outside the poll left nothing to try again, so the loop watched a CSR that
 // could not be signed until the cleaner removed it a day later.

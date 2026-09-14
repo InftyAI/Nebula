@@ -211,6 +211,14 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 		if err != nil {
 			return time.Time{}, fmt.Errorf("get CSR %s: %w", ServingCSRName, err)
 		}
+		// The name is cluster-global, so a get can return an object we did not create. Approving
+		// that would sign a key and SANs we do not control, and our approval grant is scoped by
+		// this name alone.
+		if current.UID != csr.UID {
+			return time.Time{}, fmt.Errorf("CSR %s was replaced (uid %s, created %s); "+
+				"another Nebula installation sharing the cluster would do this",
+				ServingCSRName, current.UID, csr.UID)
+		}
 		for _, condition := range current.Status.Conditions {
 			if condition.Type == certificatesv1.CertificateDenied || condition.Type == certificatesv1.CertificateFailed {
 				return time.Time{}, fmt.Errorf("CSR %s ended with %s: %s", ServingCSRName, condition.Type, condition.Message)

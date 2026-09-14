@@ -67,6 +67,11 @@ The mechanics that are easy to get wrong:
   lets `config/rbac/role.yaml` scope delete, get and approval to that one name by
   `resourceNames`; only `create` is cluster-wide. The node identity still varies, and the
   `users` impersonate grant has to list every provider that can register.
+- **That name is global, so the object under it is checked.** A fetch by name can return a CSR
+  someone else recreated, and approving it would sign a key and SANs the manager does not control —
+  the name is the only thing its approval grant is scoped by. So each poll compares the object's UID
+  with the one it created and restarts the attempt on a mismatch. Two Nebula installations in one
+  cluster will therefore log a replaced CSR at each other indefinitely rather than converge.
 - **Renewal is unattended.** 30 days requested, re-requested 24h before expiry with a fresh
   ECDSA key that never leaves memory. A failed attempt retains the current certificate and
   retries in 30s; a failed *approval* is retried in place, so a transient API error costs a poll
