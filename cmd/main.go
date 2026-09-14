@@ -525,11 +525,12 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBoots
 // declaration's doc. A resourceName containing a colon must be QUOTED, or the marker fails to
 // parse and takes every other rbac rule in the package with it.
 //
-// Keep the CSR names in step with vnode.ServingCSRName, and the users with the providers that
-// can register. Only `create` cannot be scoped by name.
+// Keep the CSR name in step with vnode.ServingCSRName, and the users with the providers that
+// can register — that list is the one part still keyed to a runtime-chosen name. Only `create`
+// cannot be scoped by name.
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,verbs=create
-// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames={nebula-kubelet-serving-nebula-aws,nebula-kubelet-serving-nebula-modal,nebula-kubelet-serving-nebula-fake},verbs=delete;get
-// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames={nebula-kubelet-serving-nebula-aws,nebula-kubelet-serving-nebula-modal,nebula-kubelet-serving-nebula-fake},verbs=update
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames=nebula-kubelet-serving,verbs=delete;get
+// +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames=nebula-kubelet-serving,verbs=update
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=kubernetes.io/kubelet-serving,verbs=approve
 // +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-fake"},verbs=impersonate
 // +kubebuilder:rbac:groups="",resources=groups,resourceNames="system:nodes",verbs=impersonate

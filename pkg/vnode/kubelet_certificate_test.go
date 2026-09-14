@@ -43,6 +43,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/yaml"
+
+	"github.com/InftyAI/Nebula/pkg/provider"
+	fakeprovider "github.com/InftyAI/Nebula/pkg/provider/fake"
 )
 
 func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testing.T) {
@@ -99,7 +102,7 @@ func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testi
 	var csr *certificatesv1.CertificateSigningRequest
 	waitFor(t, func() bool {
 		csr, err = client.CertificatesV1().CertificateSigningRequests().Get(
-			context.Background(), bootstrapper.csrName, metav1.GetOptions{},
+			context.Background(), ServingCSRName, metav1.GetOptions{},
 		)
 		return err == nil && isApproved(csr)
 	}, "self-approved kubelet-serving CSR")
@@ -185,7 +188,7 @@ func TestKubeletServingCertificateBootstrapperRoutesVerbsByIdentity(t *testing.T
 	// create as the node.
 	waitFor(t, func() bool {
 		csr, getErr := nodeFake.CertificatesV1().CertificateSigningRequests().Get(
-			ctx, bootstrapper.csrName, metav1.GetOptions{},
+			ctx, ServingCSRName, metav1.GetOptions{},
 		)
 		return getErr == nil && isApproved(csr)
 	}, "CSR created as the node and approved as the manager")
@@ -230,7 +233,7 @@ func TestKubeletServingCertificateBootstrapperRetriesApproval(t *testing.T) {
 
 	waitFor(t, func() bool {
 		csr, getErr := client.CertificatesV1().CertificateSigningRequests().Get(
-			ctx, bootstrapper.csrName, metav1.GetOptions{},
+			ctx, ServingCSRName, metav1.GetOptions{},
 		)
 		return getErr == nil && isApproved(csr)
 	}, "approval retried after a transient failure")
@@ -246,10 +249,20 @@ func TestKubeletServingCertificateBootstrapperRetriesApproval(t *testing.T) {
 	}
 }
 
-// TestServingCSRNameIsScopedByRBAC guards the coupling the narrow grant rests on: the name is
-// computed in Go, the resourceNames list is written by hand, and drift between them is silent
-// in CI and surfaces only as a Forbidden on a real cluster.
-func TestServingCSRNameIsScopedByRBAC(t *testing.T) {
+// registrableProviders is every provider whose adapter can register, and so every node identity
+// addServingCertificateBootstrap might impersonate — it takes the first REGISTERED name, and
+// which one that is depends on what has credentials at startup. Constants rather than literals
+// so a rename breaks the build; a new adapter has to be added here by hand.
+var registrableProviders = []string{provider.ProviderAWS, provider.ProviderModal, fakeprovider.ProviderName}
+
+// TestKubeletServingRBACGrants guards the two couplings between names computed in Go and the
+// hand-written resourceNames lists. Drift is silent in CI and surfaces on a real cluster as a
+// Forbidden, three layers from the eventual symptom (a self-signed certificate, so `kubectl
+// exec` fails x509 on EKS).
+//
+// The impersonate list is the fragile one: it is keyed to a node name chosen at runtime, so
+// landing a provider adapter without touching RBAC breaks the endpoint.
+func TestKubeletServingRBACGrants(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
 	if err != nil {
 		t.Fatalf("read role.yaml: %v", err)
@@ -259,35 +272,46 @@ func TestServingCSRNameIsScopedByRBAC(t *testing.T) {
 		t.Fatalf("parse role.yaml: %v", err)
 	}
 
+	// Keyed by group/resource, because "users" lives in the core group and the CSR rules do not.
 	scoped := map[string]map[string]bool{}
 	for _, rule := range role.Rules {
-		if !slices.Contains(rule.APIGroups, certificatesv1.GroupName) {
-			continue
-		}
-		for _, resource := range rule.Resources {
-			// An unscoped rule may only create: that verb cannot be scoped by name, while
-			// deleting or approving someone else's CSR is what the scoping exists to prevent.
-			if len(rule.ResourceNames) == 0 {
-				if !slices.Equal(rule.Verbs, []string{"create"}) {
-					t.Errorf("cluster-wide rule on %s grants %v, want [create] alone", resource, rule.Verbs)
+		for _, group := range rule.APIGroups {
+			for _, resource := range rule.Resources {
+				// An unscoped CSR rule may only create: that verb cannot be scoped by name, while
+				// deleting or approving someone else's request is what the scoping exists to prevent.
+				if len(rule.ResourceNames) == 0 {
+					if group == certificatesv1.GroupName && !slices.Equal(rule.Verbs, []string{"create"}) {
+						t.Errorf("cluster-wide rule on %s grants %v, want [create] alone", resource, rule.Verbs)
+					}
+					continue
 				}
-				continue
-			}
-			if scoped[resource] == nil {
-				scoped[resource] = map[string]bool{}
-			}
-			for _, name := range rule.ResourceNames {
-				scoped[resource][name] = true
+				key := group + "/" + resource
+				if scoped[key] == nil {
+					scoped[key] = map[string]bool{}
+				}
+				for _, name := range rule.ResourceNames {
+					scoped[key][name] = true
+				}
 			}
 		}
 	}
 
+	remediate := "run `make manifests` after changing the markers in cmd/main.go"
 	for _, resource := range []string{"certificatesigningrequests", "certificatesigningrequests/approval"} {
-		for _, provider := range []string{"aws", "modal", "fake"} {
-			if want := ServingCSRName(NodeName(provider)); !scoped[resource][want] {
-				t.Errorf("role.yaml does not scope %s to %q; run `make manifests` after changing "+
-					"ServingCSRName or the markers in cmd/main.go", resource, want)
-			}
+		key := certificatesv1.GroupName + "/" + resource
+		if !scoped[key][ServingCSRName] {
+			t.Errorf("role.yaml does not scope %s to %q; %s", resource, ServingCSRName, remediate)
+		}
+		// One certificate serves every node, so exactly one name: an extra is either a leftover
+		// per-node grant or a widening nobody asked for.
+		if got := len(scoped[key]); got != 1 {
+			t.Errorf("%s is scoped to %d names, want only %q", resource, got, ServingCSRName)
+		}
+	}
+	for _, name := range registrableProviders {
+		if want := NodeIdentity(NodeName(name)); !scoped["/users"][want] {
+			t.Errorf("role.yaml does not grant impersonate on user %q, so provider %q cannot request "+
+				"a serving certificate; %s", want, name, remediate)
 		}
 	}
 }

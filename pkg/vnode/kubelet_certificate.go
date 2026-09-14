@@ -55,12 +55,16 @@ const (
 // CSR stays Approved and unsigned, with no condition to notice.
 func NodeIdentity(nodeName string) string { return "system:node:" + nodeName }
 
-// ServingCSRName is the CSR one virtual node reuses for the life of the cluster.
+// ServingCSRName is the single CSR the kubelet endpoint reuses for the life of the cluster.
 //
-// Derived from the node name and nothing per-process, so RBAC can scope delete, get and
-// approval to exactly these names (see the markers in cmd/main.go). Changing the format means
-// changing that list too, or the manager loses access to its own CSR.
-func ServingCSRName(nodeName string) string { return "nebula-kubelet-serving-" + nodeName }
+// A constant, not a per-node name, because one certificate serves every virtual node: they all
+// advertise this Pod's address and the API server verifies the address it dialed. A per-node
+// name would claim otherwise, and RBAC would have to enumerate names only known at runtime.
+//
+// If virtual nodes ever stop sharing one address — provider-sharded replicas, each with its own
+// Pod IP — each needs its own certificate and this must go back to a per-node name, or two
+// replicas will delete each other's request.
+const ServingCSRName = "nebula-kubelet-serving"
 
 type KubeletServingCertificateBootstrapper struct {
 	// nodeClient impersonates the virtual node and CREATES the request; ownClient is the
@@ -72,7 +76,6 @@ type KubeletServingCertificateBootstrapper struct {
 	nodeName      string
 	podName       string
 	podNamespace  string
-	csrName       string
 	pollInterval  time.Duration
 	retryInterval time.Duration
 }
@@ -118,7 +121,6 @@ func NewKubeletServingCertificateBootstrapper(
 		nodeName:      nodeName,
 		podName:       podName,
 		podNamespace:  podNamespace,
-		csrName:       ServingCSRName(nodeName),
 		pollInterval:  kubeletServingPollInterval,
 		retryInterval: kubeletServingRetryInterval,
 	}, nil
@@ -163,14 +165,14 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 
 	// A CSR left by an earlier attempt is unusable: its certificate would be for a key we no
 	// longer hold. Usually a no-op — the cleaner drops an issued CSR an hour after approval.
-	if err := b.ownClient.Delete(ctx, b.csrName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-		return time.Time{}, fmt.Errorf("delete stale CSR %s: %w", b.csrName, err)
+	if err := b.ownClient.Delete(ctx, ServingCSRName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return time.Time{}, fmt.Errorf("delete stale CSR %s: %w", ServingCSRName, err)
 	}
 	expirationSeconds := int32(kubeletServingCertificateLifetime / time.Second)
 	// The one call whose IDENTITY matters (see the constructor).
 	csr, err := b.nodeClient.Create(ctx, &certificatesv1.CertificateSigningRequest{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: b.csrName,
+			Name: ServingCSRName,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":      "nebula",
 				"app.kubernetes.io/component": "kubelet-serving-certificate",
@@ -191,7 +193,16 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return time.Time{}, fmt.Errorf("create CSR %s: %w", b.csrName, err)
+		// Forbidden here is almost always the impersonate grant, not the create: the identity is
+		// the node name, which a new provider changes, while the RBAC list naming it is static
+		// YAML. Saying so turns the eventual symptom — the endpoint keeps its self-signed
+		// certificate and `kubectl exec` fails x509 on EKS — into the fix.
+		if apierrors.IsForbidden(err) {
+			return time.Time{}, fmt.Errorf("create CSR %s as %s: %w; add that name to the users "+
+				"impersonate grant in cmd/main.go and run `make manifests`",
+				ServingCSRName, NodeIdentity(b.nodeName), err)
+		}
+		return time.Time{}, fmt.Errorf("create CSR %s: %w", ServingCSRName, err)
 	}
 
 	log := logf.FromContext(ctx).WithName("kubelet-serving-certificate")
@@ -201,19 +212,19 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 	ticker := time.NewTicker(b.pollInterval)
 	defer ticker.Stop()
 	for {
-		current, err := b.ownClient.Get(ctx, b.csrName, metav1.GetOptions{})
+		current, err := b.ownClient.Get(ctx, ServingCSRName, metav1.GetOptions{})
 		if err != nil {
-			return time.Time{}, fmt.Errorf("get CSR %s: %w", b.csrName, err)
+			return time.Time{}, fmt.Errorf("get CSR %s: %w", ServingCSRName, err)
 		}
 		for _, condition := range current.Status.Conditions {
 			if condition.Type == certificatesv1.CertificateDenied || condition.Type == certificatesv1.CertificateFailed {
-				return time.Time{}, fmt.Errorf("CSR %s ended with %s: %s", b.csrName, condition.Type, condition.Message)
+				return time.Time{}, fmt.Errorf("CSR %s ended with %s: %s", ServingCSRName, condition.Type, condition.Message)
 			}
 		}
 		if len(current.Status.Certificate) > 0 {
 			cert, notAfter, err := servingCertificate(current.Status.Certificate, keyPEM, b.nodeIP)
 			if err != nil {
-				return time.Time{}, fmt.Errorf("load certificate from CSR %s: %w", b.csrName, err)
+				return time.Time{}, fmt.Errorf("load certificate from CSR %s: %w", ServingCSRName, err)
 			}
 			b.server.SetServingCertificate(cert)
 			return notAfter, nil
@@ -226,7 +237,7 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 			if err := b.approve(ctx, current); err != nil {
 				log.Error(err, "could not self-approve the serving certificate request; "+
 					"approve it by hand or the endpoint keeps its self-signed certificate",
-					"csr", b.csrName, "approveCommand", "kubectl certificate approve "+b.csrName)
+					"csr", ServingCSRName, "approveCommand", "kubectl certificate approve "+ServingCSRName)
 			}
 		}
 
@@ -263,7 +274,7 @@ func (b *KubeletServingCertificateBootstrapper) approve(
 		Message:        "approved by the Nebula manager for its own kubelet serving endpoint",
 		LastUpdateTime: metav1.Now(),
 	})
-	_, err := b.ownClient.UpdateApproval(ctx, b.csrName, csr, metav1.UpdateOptions{})
+	_, err := b.ownClient.UpdateApproval(ctx, ServingCSRName, csr, metav1.UpdateOptions{})
 	return err
 }
 

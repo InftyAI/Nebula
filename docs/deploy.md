@@ -157,11 +157,11 @@ everything else — the stale delete, the polling, the approval — goes out as 
 ServiceAccount, because a node identity may create and get its own CSRs and nothing more. A
 single-identity version fails on the delete and never creates a CSR at all.
 
-The request is named `nebula-kubelet-serving-<node>`, one per virtual node for the life of the
-cluster, which is what lets `config/rbac/role.yaml` scope delete, get and approval to those
-names by `resourceNames`. Only `create` is cluster-wide. An external approver, if you run one,
-should match on that node identity, the `system:nodes` organization, and the current manager
-Pod IP as the sole IP SAN.
+The request is named `nebula-kubelet-serving` — one for the whole cluster, because every virtual
+node advertises this Pod's IP and the API server verifies the address it dialed. A fixed name is
+what lets `config/rbac/role.yaml` scope delete, get and approval to it by `resourceNames`. Only
+`create` is cluster-wide. An external approver, if you run one, should match on that node
+identity, the `system:nodes` organization, and the current manager Pod IP as the sole IP SAN.
 
 ---
 

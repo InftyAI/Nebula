@@ -54,12 +54,13 @@ The mechanics that are easy to get wrong:
   ServiceAccount does the delete, the polling and the approval, because a node identity may
   create and get its own CSRs and nothing more. Requester and approver differing is ordinary:
   the signer cares only who asked.
-- **One certificate covers every virtual node.** All of them advertise the same address — this
-  Pod's IP — and the API server verifies against the address it dialed, not the node name. So
-  one request, under the first registered provider's node name, serves the whole set.
-- **One CSR per node, named `nebula-kubelet-serving-<node>`.** Stable rather than generated, so
-  `config/rbac/role.yaml` can scope delete, get and approval to those names by `resourceNames`;
-  only `create` is cluster-wide.
+- **One certificate covers every virtual node, so there is one CSR.** All of them advertise the
+  same address — this Pod's IP — and the API server verifies against the address it dialed, not
+  the node name. So a single request, submitted under the first registered provider's node
+  identity, serves the whole set. Its name is the fixed `nebula-kubelet-serving`, which is what
+  lets `config/rbac/role.yaml` scope delete, get and approval to that one name by
+  `resourceNames`; only `create` is cluster-wide. The node identity still varies, and the
+  `users` impersonate grant has to list every provider that can register.
 - **Renewal is unattended.** 30 days requested, re-requested 24h before expiry with a fresh
   ECDSA key that never leaves memory. A failed attempt retains the current certificate and
   retries in 30s; a failed *approval* is retried in place, so a transient API error costs a poll
