@@ -110,9 +110,16 @@ func TestKubeletServingCertificateBootstrapperInstallsIssuedCertificate(t *testi
 	if csr.Spec.SignerName != certificatesv1.KubeletServingSignerName {
 		t.Fatalf("signer = %q, want %q", csr.Spec.SignerName, certificatesv1.KubeletServingSignerName)
 	}
+	// Exact set equality, and the three-usage set is also accepted — so a stray keyEncipherment
+	// still signs, and only this assertion catches it.
+	if want := []certificatesv1.KeyUsage{
+		certificatesv1.UsageDigitalSignature,
+		certificatesv1.UsageServerAuth,
+	}; !slices.Equal(csr.Spec.Usages, want) {
+		t.Fatalf("usages = %v, want %v", csr.Spec.Usages, want)
+	}
 	request := parseCertificateRequest(t, csr.Spec.Request)
-	// Must be the node identity the client impersonates, not the Pod: the signer compares the
-	// two and ignores a mismatch without any condition to notice (see NodeIdentity).
+	// The node identity, not the Pod: it has to match the impersonated user (see NodeIdentity).
 	if request.Subject.CommonName != "system:node:nebula-modal" {
 		t.Fatalf("common name = %q", request.Subject.CommonName)
 	}
@@ -249,19 +256,14 @@ func TestKubeletServingCertificateBootstrapperRetriesApproval(t *testing.T) {
 	}
 }
 
-// registrableProviders is every provider whose adapter can register, and so every node identity
-// addServingCertificateBootstrap might impersonate — it takes the first REGISTERED name, and
-// which one that is depends on what has credentials at startup. Constants rather than literals
-// so a rename breaks the build; a new adapter has to be added here by hand.
+// registrableProviders is every provider whose adapter can register, so every identity
+// addServingCertificateBootstrap might impersonate — it takes the first REGISTERED name, which
+// depends on what has credentials at startup. A new adapter has to be added here by hand.
 var registrableProviders = []string{provider.ProviderAWS, provider.ProviderModal, fakeprovider.ProviderName}
 
-// TestKubeletServingRBACGrants guards the two couplings between names computed in Go and the
-// hand-written resourceNames lists. Drift is silent in CI and surfaces on a real cluster as a
-// Forbidden, three layers from the eventual symptom (a self-signed certificate, so `kubectl
-// exec` fails x509 on EKS).
-//
-// The impersonate list is the fragile one: it is keyed to a node name chosen at runtime, so
-// landing a provider adapter without touching RBAC breaks the endpoint.
+// TestKubeletServingRBACGrants pins names computed in Go against the hand-written resourceNames
+// lists. Drift passes CI and surfaces only on a real cluster, as a Forbidden nowhere near the
+// symptom it eventually causes.
 func TestKubeletServingRBACGrants(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
 	if err != nil {

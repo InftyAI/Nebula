@@ -47,23 +47,19 @@ const (
 	kubeletServingPollInterval        = 2 * time.Second
 )
 
-// NodeIdentity is the username the kubernetes.io/kubelet-serving signer expects on a request
-// for a node's serving certificate.
+// NodeIdentity is the CN a serving certificate request must carry, and the username the client
+// impersonates to submit it — one function because the two must agree.
 //
-// One function because two places must agree: the request's CN, and the identity the client
-// impersonates to submit it. The signer compares them and ignores a mismatch in silence — the
-// CSR stays Approved and unsigned, with no condition to notice.
+// EKS signs only for a system:node: creator, and refuses in silence: the same request from the
+// manager's ServiceAccount is approved and then never signed, with no condition to notice. That
+// is EKS-specific, not upstream behavior.
 func NodeIdentity(nodeName string) string { return "system:node:" + nodeName }
 
 // ServingCSRName is the single CSR the kubelet endpoint reuses for the life of the cluster.
 //
-// A constant, not a per-node name, because one certificate serves every virtual node: they all
-// advertise this Pod's address and the API server verifies the address it dialed. A per-node
-// name would claim otherwise, and RBAC would have to enumerate names only known at runtime.
-//
-// If virtual nodes ever stop sharing one address — provider-sharded replicas, each with its own
-// Pod IP — each needs its own certificate and this must go back to a per-node name, or two
-// replicas will delete each other's request.
+// One name because one certificate serves every virtual node: they all advertise this Pod's
+// address, and the API server verifies the address it dialed. Provider-sharded replicas, each
+// with its own Pod IP, would need a name per node again.
 const ServingCSRName = "nebula-kubelet-serving"
 
 type KubeletServingCertificateBootstrapper struct {
@@ -85,13 +81,12 @@ var _ manager.Runnable = (*KubeletServingCertificateBootstrapper)(nil)
 // NewKubeletServingCertificateBootstrapper builds the CSR loop for one virtual node, over TWO
 // clients because no single identity can do the whole job:
 //
-//   - nodeClient impersonates NodeIdentity(nodeName) and creates the request; the signer
-//     refuses one submitted by anything else.
-//   - ownClient is the manager's ServiceAccount and does the rest. A node may create and get
-//     its own CSRs and nothing more — on EKS it `cannot delete resource
-//     "certificatesigningrequests"`, and approving is an approver's job anyway.
+//   - nodeClient impersonates NodeIdentity(nodeName) and creates the request; see there.
+//   - ownClient is the manager's ServiceAccount and does the rest. A node may create and get its
+//     own CSRs and nothing more — on EKS it `cannot delete resource
+//     "certificatesigningrequests"`.
 //
-// Requester and approver differing is the ordinary arrangement: the signer checks who ASKED.
+// Only the CREATE's identity matters, so approving as the manager is not a workaround.
 func NewKubeletServingCertificateBootstrapper(
 	nodeClient, ownClient kubernetes.Interface,
 	server *KubeletServer,
@@ -186,6 +181,8 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 			Request:           requestPEM,
 			SignerName:        certificatesv1.KubeletServingSignerName,
 			ExpirationSeconds: &expirationSeconds,
+			// Two, not three: keyEncipherment is for an RSA key and this one is ECDSA. The signer
+			// accepts either set, so adding it would still sign — and still be wrong.
 			Usages: []certificatesv1.KeyUsage{
 				certificatesv1.UsageDigitalSignature,
 				certificatesv1.UsageServerAuth,
@@ -193,10 +190,8 @@ func (b *KubeletServingCertificateBootstrapper) requestAndWait(ctx context.Conte
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		// Forbidden here is almost always the impersonate grant, not the create: the identity is
-		// the node name, which a new provider changes, while the RBAC list naming it is static
-		// YAML. Saying so turns the eventual symptom — the endpoint keeps its self-signed
-		// certificate and `kubectl exec` fails x509 on EKS — into the fix.
+		// Forbidden here is almost always the impersonate grant: the identity changes with the
+		// provider, the RBAC list naming it does not.
 		if apierrors.IsForbidden(err) {
 			return time.Time{}, fmt.Errorf("create CSR %s as %s: %w; add that name to the users "+
 				"impersonate grant in cmd/main.go and run `make manifests`",

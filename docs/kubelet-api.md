@@ -46,10 +46,16 @@ fallback, so nothing depends on the request succeeding.
 
 The mechanics that are easy to get wrong:
 
-- **The requester is a node, and it is checked.** The CSR is created while impersonating
-  `system:node:nebula-<provider>`, with that same name as its CN. The signer signs for the node
-  that asks and for nobody else, and it reports a mismatch **nowhere** — the CSR sits
-  `Approved` with no certificate. `Approved,Issued` is the only healthy state.
+- **EKS checks the requester; upstream does not.** The CSR is created while impersonating
+  `system:node:nebula-<provider>`, with that same name as its CN. Send the identical request as the
+  manager's own ServiceAccount and EKS approves it and then never signs it — no certificate, and
+  **no condition** to notice, so `Approved,Issued` is the only healthy state. Both ways were
+  measured on EKS 1.35 with identical CSR bytes, differing only in the creating identity; check that
+  again before believing any claim that the impersonation is removable. None of this is upstream
+  behavior:
+  `ValidateKubeletServingCSR` never sees the requester and checks only the CN prefix and a
+  `system:nodes` organization, and a validation failure there writes `CertificateFailed` rather
+  than going quiet.
 - **Two identities, not one.** Only the create is impersonated. The manager's own
   ServiceAccount does the delete, the polling and the approval, because a node identity may
   create and get its own CSRs and nothing more. Requester and approver differing is ordinary:

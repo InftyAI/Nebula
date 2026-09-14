@@ -152,10 +152,13 @@ kubectl -n nebula-system logs deploy/nebula-controller-manager \
 ```
 
 Two identities are involved, and the split is not cosmetic. The CSR is **created** while
-impersonating `system:node:nebula-<provider>`, because the signer signs for nobody else;
-everything else — the stale delete, the polling, the approval — goes out as the manager's
-ServiceAccount, because a node identity may create and get its own CSRs and nothing more. A
-single-identity version fails on the delete and never creates a CSR at all.
+impersonating `system:node:nebula-<provider>`, because EKS silently declines to sign a request from
+the manager's own ServiceAccount — upstream Kubernetes does not check the requester at all, so this
+is EKS-specific and measured rather than inferred (see
+[kubelet-api.md](kubelet-api.md#the-serving-certificate)); everything else — the stale delete, the polling,
+the approval — goes out as the manager's ServiceAccount, because a node identity may create and
+get its own CSRs and nothing more. A single-identity version fails on the delete and never
+creates a CSR at all.
 
 The request is named `nebula-kubelet-serving` — one for the whole cluster, because every virtual
 node advertises this Pod's IP and the API server verifies the address it dialed. A fixed name is
