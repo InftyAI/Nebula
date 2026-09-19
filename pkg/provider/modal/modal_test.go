@@ -160,11 +160,12 @@ func newTestProvider(f *fakeClient) *Provider {
 // so tests can also exercise non-canonical casing (e.g. "h100").
 func gpuPod(claim, accel string, count int64) *corev1.Pod {
 	c := corev1.Container{
-		Name:    "main",
-		Image:   "myimg:latest",
-		Command: []string{"run"},
-		Args:    []string{"--flag"},
-		Env:     []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
+		Name:       "main",
+		Image:      "myimg:latest",
+		Command:    []string{"run"},
+		Args:       []string{"--flag"},
+		WorkingDir: "/workspace",
+		Env:        []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
@@ -212,6 +213,10 @@ func TestProvision_GPUPod(t *testing.T) {
 	if !slices.Equal(f.lastSpec.Command, []string{"run"}) ||
 		!slices.Equal(f.lastSpec.Args, []string{"--flag"}) {
 		t.Fatalf("command = %v, args = %v", f.lastSpec.Command, f.lastSpec.Args)
+	}
+	// Dropping this silently ran the workload in the image's WORKDIR instead.
+	if f.lastSpec.WorkingDir != "/workspace" {
+		t.Fatalf("workingDir = %q, want /workspace", f.lastSpec.WorkingDir)
 	}
 }
 

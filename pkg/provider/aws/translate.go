@@ -63,10 +63,10 @@ func buildUserData(spec InstanceSpec) (string, error) {
 	//     which takes a single program; Command[0] is the entrypoint and Command[1:]
 	//     become leading arguments (Docker only lets --entrypoint carry the program).
 	//   - Args (Pod args) are appended after as CMD arguments.
-	// When Command is empty the image's own ENTRYPOINT runs; when Args is empty the
-	// image's own CMD runs — so an image with a baked-in entrypoint launches exactly
-	// as it would under a kubelet. Env keys are sorted so the rendered script is
-	// deterministic (stable across reconciles and easy to assert in tests).
+	// With both empty the image's own ENTRYPOINT and CMD run, as under a kubelet. Either
+	// field alone drops the image's CMD — Kubernetes falls back to it only when neither is
+	// set, and Docker's --entrypoint clears it to match. Env keys are sorted so the
+	// rendered script is deterministic (stable across reconciles and easy to assert in tests).
 	b.WriteString("docker run --rm --gpus all")
 	for _, k := range sortedKeys(spec.Env) {
 		fmt.Fprintf(&b, " -e %s", shellQuote(k+"="+spec.Env[k]))
