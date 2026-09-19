@@ -1,0 +1,90 @@
+name: Release
+
+# Tag-driven: the tag IS the version. Nothing in the repo pins a release version, so a release
+# needs no prior bump commit -- the tag is stamped into the images, the binary (VERSION ->
+# pkg/version) and dist/install.yaml below. workflow_dispatch exists to re-publish a tag whose
+# first run failed halfway, without moving the tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing tag to publish
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CONTROLLER_IMAGE: inftyai/nebula-controller
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  # Both images ship under the same tag. Their names are repeated here rather than taken from env
+  # because the matrix is evaluated before env exists.
+  images:
+    name: Push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: inftyai/nebula-controller
+            dir: .
+            target: docker-buildx
+          - image: inftyai/nebula-logship
+            dir: components/logship
+            target: docker-push
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      # PLATFORMS carries linux/arm64, which an amd64 runner can only build under emulation.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # VERSION is passed explicitly: its default is `git describe`, which needs the tag history
+      # that checkout does not fetch, and would silently stamp a bare commit instead.
+      - name: Build and push
+        working-directory: ${{ matrix.dir }}
+        run: make ${{ matrix.target }} IMG=${{ matrix.image }}:${{ env.VERSION }} VERSION=${{ env.VERSION }}
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: images
+    permissions:
+      contents: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v5
+
+      # build-installer runs controller-gen and kustomize through `go install`.
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Pins the released tag into the manifest, so applying it cannot drift onto a different
+      # image than the release it came from.
+      - name: Generate install manifest
+        run: make build-installer IMG=${{ env.CONTROLLER_IMAGE }}:${{ env.VERSION }}
+
+      # Runs after the images so a published release never points at a tag nobody can pull.
+      # A pre-release suffix (v0.2.0-rc.1) must not become the repo's "latest" release.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$VERSION" dist/install.yaml \
+            --title "$VERSION" --generate-notes $prerelease
