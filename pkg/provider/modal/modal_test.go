@@ -160,11 +160,12 @@ func newTestProvider(f *fakeClient) *Provider {
 // so tests can also exercise non-canonical casing (e.g. "h100").
 func gpuPod(claim, accel string, count int64) *corev1.Pod {
 	c := corev1.Container{
-		Name:    "main",
-		Image:   "myimg:latest",
-		Command: []string{"run"},
-		Args:    []string{"--flag"},
-		Env:     []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
+		Name:       "main",
+		Image:      "myimg:latest",
+		Command:    []string{"run"},
+		Args:       []string{"--flag"},
+		WorkingDir: "/workspace",
+		Env:        []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
@@ -208,8 +209,64 @@ func TestProvision_GPUPod(t *testing.T) {
 	if got := f.lastSpec.Tags[ClaimTagKey]; got != "claim-a" {
 		t.Fatalf("claim tag = %q, want claim-a", got)
 	}
-	if len(f.lastSpec.Command) != 2 || f.lastSpec.Command[0] != "run" {
-		t.Fatalf("command = %v", f.lastSpec.Command)
+	// Carried apart, not concatenated: the split is what decides the entrypoint reset.
+	if !slices.Equal(f.lastSpec.Command, []string{"run"}) ||
+		!slices.Equal(f.lastSpec.Args, []string{"--flag"}) {
+		t.Fatalf("command = %v, args = %v", f.lastSpec.Command, f.lastSpec.Args)
+	}
+	// Dropping this silently ran the workload in the image's WORKDIR instead.
+	if f.lastSpec.WorkingDir != "/workspace" {
+		t.Fatalf("workingDir = %q, want /workspace", f.lastSpec.WorkingDir)
+	}
+}
+
+// A Pod's `command` REPLACES the image entrypoint while Modal PREPENDS it, so the adapter
+// clears the entrypoint for exactly that case. `args` alone must keep it — Modal's prepend
+// IS the Kubernetes args semantics — and clearing it there would drop the workload's
+// entrypoint entirely. See imageFor.
+func TestClearsEntrypoint(t *testing.T) {
+	cases := []struct {
+		name    string
+		command []string
+		args    []string
+		want    bool
+	}{
+		{name: "command and args", command: []string{"sh", "-c"}, args: []string{"echo hi"}, want: true},
+		{name: "command only", command: []string{"/bin/serve"}, want: true},
+		{name: "args only", args: []string{"--flag"}, want: false},
+		{name: "neither", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := SandboxSpec{Command: tc.command, Args: tc.args}
+			if got := clearsEntrypoint(spec); got != tc.want {
+				t.Fatalf("clearsEntrypoint = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Modal accepts one argv, so command+args flatten in Pod order.
+func TestEntrypointArgs(t *testing.T) {
+	cases := []struct {
+		name    string
+		command []string
+		args    []string
+		want    []string
+	}{
+		{name: "command and args", command: []string{"sh", "-c"}, args: []string{"echo hi"},
+			want: []string{"sh", "-c", "echo hi"}},
+		{name: "command only", command: []string{"/bin/serve"}, want: []string{"/bin/serve"}},
+		{name: "args only", args: []string{"--flag"}, want: []string{"--flag"}},
+		{name: "neither", want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := SandboxSpec{Command: tc.command, Args: tc.args}
+			if got := entrypointArgs(spec); !slices.Equal(got, tc.want) {
+				t.Fatalf("entrypointArgs = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

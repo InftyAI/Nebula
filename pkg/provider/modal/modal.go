@@ -34,6 +34,9 @@ limitations under the License.
 //     opaque candidate and regionsOf splits it back at the API boundary. The cost is
 //     blocklist precision, which is free here since no Modal failure is
 //     region-attributable.
+//   - The image's ENTRYPOINT is PREPENDED to the sandbox argv, where Kubernetes has
+//     `command` replace it. The adapter clears the entrypoint to restore the Kubernetes
+//     contract; see imageFor.
 //   - Sandboxes carry native tags, so NativeTags=true and ClaimName is a tag rather
 //     than smuggled into the instance name.
 //   - There is no preemption push; detection is poll-based.
@@ -47,6 +50,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -129,8 +133,15 @@ type Client interface {
 type SandboxSpec struct {
 	// Image is the container image, from the Pod's first container.
 	Image string
-	// Command is the container command+args, from the Pod.
+	// Command and Args are the Pod's container command and args. Modal takes a single
+	// argv (entrypointArgs concatenates them), but they are carried apart because only
+	// `command` replaces the image's entrypoint under Kubernetes semantics, and that is
+	// what decides whether the image needs its entrypoint cleared — see imageFor.
 	Command []string
+	Args    []string
+	// WorkingDir is the Pod's container workingDir. Empty leaves the image's own WORKDIR
+	// standing, which is what a Pod that omits the field means.
+	WorkingDir string
 	// Env is the environment, taken whole from provider.ProvisionRequest.Env: literals plus
 	// everything envFrom/valueFrom referenced, already resolved by the caller.
 	//
@@ -216,10 +227,10 @@ type SandboxSpec struct {
 // (they are in the Pod spec already), values never do. The probe renders as set/unset — it is
 // a pointer, so %v would print an address, and only its presence matters.
 func (s SandboxSpec) String() string {
-	return fmt.Sprintf("SandboxSpec{Image:%s Command:%v Env:%s GPU:%s GPUCount:%d CPU:%g "+
+	return fmt.Sprintf("SandboxSpec{Image:%s Command:%v Args:%v WorkingDir:%s Env:%s GPU:%s GPUCount:%d CPU:%g "+
 		"CPULimit:%g MemoryMiB:%d MemoryLimitMiB:%d Ports:%v Regions:%v Egress:%s "+
 		"EgressTargets:%v Timeout:%s Tags:%v ReadinessProbe:%t RegistryAuth:%s}",
-		s.Image, s.Command, provider.RedactedEnv(s.Env), s.GPU, s.GPUCount, s.CPU,
+		s.Image, s.Command, s.Args, s.WorkingDir, provider.RedactedEnv(s.Env), s.GPU, s.GPUCount, s.CPU,
 		s.CPULimit, s.MemoryMiB, s.MemoryLimitMiB, s.Ports, s.Regions, s.EgressMode,
 		s.EgressTargets, s.Timeout, s.Tags, s.ReadinessProbe != nil, s.RegistryAuth)
 }
@@ -573,8 +584,10 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 	}
 
 	spec := SandboxSpec{
-		Image:   c.Image,
-		Command: append(append([]string{}, c.Command...), c.Args...),
+		Image:      c.Image,
+		Command:    slices.Clone(c.Command),
+		Args:       slices.Clone(c.Args),
+		WorkingDir: c.WorkingDir,
 		// The caller's resolved map is the whole environment — the Pod's literals plus
 		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
 		// here: it holds references this adapter has no cluster access to follow. See
