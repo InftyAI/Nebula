@@ -3,7 +3,7 @@
 This guide covers building and deploying the Nebula manager to a Kubernetes
 cluster, including wiring provider credentials.
 
-- [Quick start](#quick-start)
+- [From source](#from-source)
 - [How credentials are handled](#how-credentials-are-handled)
 - [Webhook TLS (no cert-manager)](#webhook-tls-no-cert-manager)
 - [What `deploy-all` does](#what-deploy-all-does)
@@ -15,7 +15,10 @@ cluster, including wiring provider credentials.
 
 ---
 
-## Quick start
+## From source
+
+To install a release instead of building, see the quick start in the
+[README](../README.md#quick-start).
 
 ```bash
 # 1. Put provider credentials in .env (secrets only — gitignored).

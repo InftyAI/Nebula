@@ -15,6 +15,9 @@ components/*/bin/
 # exactly the kind of thing that sneaks into a commit unnoticed.
 /manager
 
+# `make build-installer` output, the release artifact — generated, never reviewed.
+/dist
+
 # Test binary, build with `go test -c`
 *.test
 

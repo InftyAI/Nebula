@@ -72,6 +72,20 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 # the catalog pass LoadRestrictionsNone.
 KUSTOMIZE_BUILD_FLAGS ?= --load-restrictor=LoadRestrictionsNone
 
+# render-manifests builds an overlay with the manager image pinned to IMG.
+#
+# `kustomize build` has no image-override flag, so pinning it means EDITING
+# config/manager/kustomization.yaml, whose newTag is committed. The trap restores the file
+# however the shell exits, so a local deploy leaves no stray version diff to commit by
+# accident. One shell for the whole body, or the trap would fire on the first line.
+KUSTOMIZATION := $(CURDIR)/config/manager/kustomization.yaml
+define render-manifests
+	cp $(KUSTOMIZATION) $(KUSTOMIZATION).bak && \
+	trap 'mv $(KUSTOMIZATION).bak $(KUSTOMIZATION)' EXIT && \
+	(cd $(CURDIR)/config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)) && \
+	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) $(1)
+endef
+
 .PHONY: verify-catalog
 verify-catalog: kustomize ## Verify the price catalog CSVs parse and the catalog ConfigMap renders.
 	go test ./pkg/provider/catalog/...
@@ -205,8 +219,7 @@ docker-buildx: buildx-builder ## Build and push docker image for the manager for
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) config/default > dist/install.yaml
+	$(call render-manifests,config/default) > dist/install.yaml
 
 ##@ Deployment
 
@@ -224,13 +237,11 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) config/default | $(KUBECTL) apply -f -
+	$(call render-manifests,config/default) | $(KUBECTL) apply -f -
 
 .PHONY: deploy-e2e
 deploy-e2e: manifests kustomize ## Deploy for e2e: config/default plus the fake-provider env var (baked in at deploy time, not via a post-deploy rollout).
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build $(KUSTOMIZE_BUILD_FLAGS) config/e2e | $(KUBECTL) apply -f -
+	$(call render-manifests,config/e2e) | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
