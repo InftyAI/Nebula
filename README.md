@@ -105,9 +105,31 @@ the standard `nvidia.com/gpu` resource limit, so scheduling and provisioning rea
 the same number. Do not set `nodeName` or a provider `nodeSelector` yourself — the
 placement controller owns those.
 
-## Getting started
+## Quick start
 
-See [docs](docs/README.md) for an overview of Nebula.
+```bash
+# 1. Namespace and provider credentials. Create them first — the manager reads them as env
+#    on startup. MODAL_ENVIRONMENT is optional; see docs/deploy.md for the other providers.
+kubectl create namespace nebula-system
+kubectl create secret generic nebula-modal-credentials -n nebula-system \
+  --from-literal=MODAL_TOKEN_ID=ak-... \
+  --from-literal=MODAL_TOKEN_SECRET=as-...
+
+# 2. CRDs, manager and webhook. Server-side apply, because the CRDs are too large for the
+#    last-applied annotation. The manager provisions its own webhook cert — no cert-manager.
+kubectl apply --server-side -f https://github.com/InftyAI/Nebula/releases/download/v0.1.0/install.yaml
+```
+
+One virtual node appears per provider whose credentials are present:
+
+```bash
+kubectl get nodes -l nebula.inftyai.com/provider
+```
+
+Then define a [NodePool](#defining-a-nodepool) and [opt a workload in](#opting-a-workload-in).
+
+To build and deploy from source instead, see [docs/deploy.md](docs/deploy.md). The
+[docs](docs/README.md) cover the rest.
 
 ## License
 
