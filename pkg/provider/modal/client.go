@@ -169,7 +169,6 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	createStart := time.Now()
 	sb, err := c.mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
 		Command: entrypointArgs(spec),
-		// Empty leaves the image's WORKDIR alone, so this needs no conditional.
 		Workdir: spec.WorkingDir,
 		// Env is the whole environment, including values resolved from this cluster's
 		// Secrets (see provider.ProvisionRequest.Env). No Secrets field alongside it: the
