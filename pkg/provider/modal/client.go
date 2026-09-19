@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,7 +168,7 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 
 	createStart := time.Now()
 	sb, err := c.mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
-		Command: spec.Command,
+		Command: entrypointArgs(spec),
 		// Env is the whole environment, including values resolved from this cluster's
 		// Secrets (see provider.ProvisionRequest.Env). No Secrets field alongside it: the
 		// SDK hydrates this map into an ephemeral server-side Modal Secret before the
@@ -211,9 +212,47 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	return sb.SandboxID, cred, nil
 }
 
-// imageFor resolves the sandbox's image, attaching pull credentials when the spec carries
-// them. Modal takes them as a Secret, so this is where the spec's data becomes an SDK object.
+// imageFor resolves the sandbox's image and, when the Pod set a `command`, clears the
+// image's ENTRYPOINT so Kubernetes semantics hold.
 func (c *sdkClient) imageFor(ctx context.Context, spec SandboxSpec) (*modal.Image, error) {
+	image, err := c.registryImage(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	if !clearsEntrypoint(spec) {
+		return image, nil
+	}
+	// `ENTRYPOINT ["bash","-l"]` runs `bash -l sh -c <script>`, where bash reads `sh` as a
+	// script FILENAME, resolves it to the dash binary and dies parsing ELF —
+	// `/usr/bin/sh: cannot execute binary file`, exit 126, workload never started. A Pod
+	// that sets only `args` must keep the entrypoint, which is what Modal's prepend already
+	// means, so the reset is conditional.
+	return image.DockerfileCommands([]string{entrypointReset}, nil), nil
+}
+
+// clearsEntrypoint reports whether this spec needs the image's ENTRYPOINT cleared — see
+// imageFor for why, and why `args` alone must not. Split out so the rule is testable
+// without an SDK client.
+func clearsEntrypoint(spec SandboxSpec) bool { return len(spec.Command) > 0 }
+
+// entrypointReset is the Dockerfile line that clears an inherited ENTRYPOINT. Metadata
+// only — it builds no layer content, so the cost is one extra build step, not a re-pull.
+const entrypointReset = "ENTRYPOINT []"
+
+// entrypointArgs flattens the Pod's command+args into the single argv Modal accepts. The
+// two are kept apart in the spec only to decide the reset above; Modal cannot express the
+// entrypoint/cmd distinction at create time.
+func entrypointArgs(spec SandboxSpec) []string {
+	if len(spec.Command) == 0 {
+		return slices.Clone(spec.Args)
+	}
+	return append(slices.Clone(spec.Command), spec.Args...)
+}
+
+// registryImage resolves the image from its registry, attaching pull credentials when the
+// spec carries them. Modal takes them as a Secret, so this is where the spec's data becomes
+// an SDK object.
+func (c *sdkClient) registryImage(ctx context.Context, spec SandboxSpec) (*modal.Image, error) {
 	a := spec.RegistryAuth
 	switch {
 	case a == nil:
