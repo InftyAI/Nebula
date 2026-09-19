@@ -1,7 +1,10 @@
 name: E2E Tests
 
+# Tags excluded for the reason given in ci.yml -- the Kind suite is the expensive one to
+# re-run for nothing.
 on:
   push:
+    tags-ignore: ['**']
   pull_request:
 
 jobs:

@@ -1,7 +1,10 @@
 name: CI
 
+# An unfiltered `push` matches tags too, so a release tag would re-run this against a commit
+# already tested on main. `**` and not `*`, which does not match a branch name with a slash.
 on:
   push:
+    tags-ignore: ['**']
   pull_request:
 
 permissions:
