@@ -30,6 +30,12 @@ import (
 // UNREACHABLE (the Strategy enum admits only Ordered), kept so widening the enum
 // cannot ship without its weight validation.
 // +kubebuilder:validation:XValidation:rule="self.strategy != 'Weighted' || self.providers.all(p, has(p.weight))",message="strategy Weighted requires a weight on every provider"
+// The CEL rule below enforces that Modal is never paired with Spot capacity: Modal does
+// not support spot instances, so admitting such a pool would let it claim a policy it
+// cannot honour. The guard checks the user-supplied list only; the API default fills
+// capacityTypes with [OnDemand, Spot] when omitted, and that default already satisfies
+// this rule for any pool that does not list Spot explicitly.
+// +kubebuilder:validation:XValidation:rule="!(self.providers.exists(p, p.name == 'modal') && has(self.capacityTypes) && self.capacityTypes.exists(c, c == 'Spot'))",message="Modal does not support spot instances; remove Modal from providers or remove Spot from capacityTypes"
 // (AWS once required at least one region here, because an omitted list meant "the
 // client's default region" and its client has none. Omitted now means "every region
 // the provider serves", which is a valid — if broad — AWS policy, so the rule is gone.
@@ -272,7 +278,7 @@ type NodePool struct {
 
 // NodePoolList contains a list of NodePool.
 type NodePoolList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:", inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []NodePool `json:"items"`
 }
