@@ -147,27 +147,15 @@ type ProviderSpec struct {
 	// +optional
 	Weight *int32 `json:"weight,omitempty"`
 
-	// Regions CONSTRAINS where this provider may place, in the provider's own
-	// vocabulary. It lives here per provider because region names are
-	// provider-namespaced. Three levels:
+	// Regions CONSTRAINS where this provider may place. Three levels:
 	//   - omitted/empty => every region the provider serves. For a region-simple
 	//     provider (Modal) this sends no region at all, its widest and cheapest mode.
-	//   - a geography GROUP token ("us", "eu", "ap", ...) => that geography's regions.
-	//     The recommended way to ask for breadth with a residency boundary.
+	//   - a GEOGRAPHY ("us", "eu", "ap", ...) => that geography's regions here. The
+	//     recommended way to ask for breadth with a residency boundary, and the only
+	//     level a workload can also request per-Pod.
 	//   - a literal region name ("us-east-1" on AWS, "us-east" on Modal) => just that.
-	// Only the provider knows its own geography, so it resolves which level a value is
-	// (see provider.Provider's ExpandRegions). Group tokens are shared across
-	// providers; the regions behind them are not.
-	//
-	// A non-group value is passed through UNVALIDATED, because region names change
-	// faster than Nebula ships: a bad one fails at provision time with the provider's
-	// own error, which beats refusing a region that launched last week. It is also the
-	// escape hatch for AWS opt-in regions, which no group contains.
-	//
-	// Unconstrained is the widest and costliest setting: every region becomes a
-	// failover candidate and gets swept by the poll loop. Prefer a group unless the
-	// workload needs global reach. Entry count is uncapped (a group already expands to
-	// many); maxLength bounds each entry.
+	// Geographies are shared across providers; the regions behind them are not, so only
+	// the provider resolves which level a value is (provider.Provider's ExpandRegions).
 	// +optional
 	// +kubebuilder:validation:items:MaxLength=32
 	Regions []string `json:"regions,omitempty"`

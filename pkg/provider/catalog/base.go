@@ -53,8 +53,8 @@ type Lookup interface {
 // only while a provider's catalog price is all-in; one that meters CPU/memory separately
 // overrides it and adds those components.
 //
-// Lifecycle, Capabilities and ClassifyProvisionError are genuinely provider-specific and
-// are not provided here.
+// Lifecycle, Capabilities, ClassifyProvisionError and ExpandRegions are genuinely
+// provider-specific and are not provided here.
 type Base struct {
 	// ProviderName is this provider's stable identifier (e.g. "modal"), used both
 	// as Name() and as the key into the catalog.
@@ -73,18 +73,6 @@ func (b Base) Name() string { return b.ProviderName }
 func (b Base) Offerings(context.Context) ([]provider.Offering, error) {
 	return b.Catalog.Offerings(b.ProviderName), nil
 }
-
-// ExpandRegions passes the declared regions through unchanged: one candidate each, tokens
-// used verbatim as region names. Right for a provider whose own vocabulary already spans
-// both levels the pool speaks AND whose provision reports capacity failures synchronously,
-// so walking candidates actually buys a retry in the next region. nil stays nil, which
-// every adapter reads as "unconstrained".
-//
-// Both halves have real overriders, in opposite directions: AWS expands a group token into
-// many candidates ("us" is not a callable region), while Modal collapses everything into
-// ONE candidate because its create cannot fail over. Check which a new provider resembles
-// before inheriting this.
-func (b Base) ExpandRegions(declared []string) []string { return declared }
 
 // MapAccelerator translates a canonical accelerator request (type + count) into this
 // provider's own ids, using the catalog as the mapping table: matching rows contribute

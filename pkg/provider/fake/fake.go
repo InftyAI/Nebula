@@ -29,6 +29,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,15 @@ import (
 // NodePool referencing "fake" can only resolve when the fake is explicitly
 // enabled, so a real cluster never places onto it by accident.
 const ProviderName = "fake"
+
+// regionsByGeography is the fake's region table. Two geographies are enough to cover both
+// halves of narrowing — one that resolves to several regions, one to a single region — and
+// every geography absent here resolves to nothing, which is the elimination path. The names
+// are deliberately unlike any real provider's so they can never be mistaken for live ones.
+var regionsByGeography = map[string][]string{
+	"us": {"us-fake-1", "us-fake-2"},
+	"eu": {"eu-fake-1"},
+}
 
 // compile-time assertion that Provider satisfies the interface.
 var _ provider.Provider = (*Provider)(nil)
@@ -80,6 +90,72 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		PreemptionNotice:     0,
 		PollInterval:         0, // use the vnode default cadence
 	}
+}
+
+// ExpandRegions expands geography tokens through regionsByGeography and narrows the
+// result to the requested geographies, mirroring the AWS adapter. Only that shape gives
+// placement a NAMED region per candidate, which is what lets the e2e suite assert which
+// region a Pod landed in rather than just that it landed.
+//
+// The fake names regions without partitioning anything behind them: Provision, Get and
+// List ignore the region entirely, so no instance behaves differently per region.
+func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
+	expanded := expandRegions(declared)
+	if len(narrowTo) == 0 {
+		return expanded
+	}
+	want := make(map[string]bool)
+	for _, token := range narrowTo {
+		token = strings.ToLower(strings.TrimSpace(token))
+		// Only the shared vocabulary narrows; anything else is dropped, never
+		// forwarded, because every Provision error is terminal.
+		if !provider.IsGeography(token) {
+			continue
+		}
+		for _, r := range regionsByGeography[token] {
+			want[r] = true
+		}
+	}
+	var out []string
+	for _, r := range expanded {
+		if want[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// expandRegions resolves each declared token, forwarding a non-geography verbatim. An
+// empty declaration means unconstrained, which walks the whole vocabulary in order.
+func expandRegions(declared []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(r string) {
+		if r == "" || seen[r] {
+			return
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	if len(declared) == 0 {
+		for _, g := range provider.Geographies {
+			for _, r := range regionsByGeography[g] {
+				add(r)
+			}
+		}
+		return out
+	}
+	for _, d := range declared {
+		d = strings.TrimSpace(d)
+		if token := strings.ToLower(d); provider.IsGeography(token) {
+			for _, r := range regionsByGeography[token] {
+				add(r)
+			}
+			continue
+		}
+		add(d)
+	}
+	return out
 }
 
 // Provision records one instance for the claim and reports it Running at once.

@@ -940,7 +940,7 @@ func TestExpandRegions_CollapsesToOneCandidate(t *testing.T) {
 		want:     []string{"eu-west" + regionSeparator + "us-east"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := p.ExpandRegions(tc.declared)
+			got := p.ExpandRegions(tc.declared, nil)
 			if !slices.Equal(got, tc.want) {
 				t.Fatalf("ExpandRegions(%v) = %v, want %v", tc.declared, got, tc.want)
 			}
@@ -949,6 +949,133 @@ func TestExpandRegions_CollapsesToOneCandidate(t *testing.T) {
 					"over, so every extra candidate is a region silently never tried", tc.declared, len(got))
 			}
 		})
+	}
+}
+
+func TestExpandRegions_NarrowTo(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	for _, tc := range []struct {
+		name     string
+		declared []string
+		narrowTo []string
+		want     []string
+	}{{
+		name:     "an unconstrained pool takes the request as its constraint",
+		narrowTo: []string{"us"},
+		want:     []string{"us"},
+	}, {
+		name:     "a declaration matching the request survives whole",
+		declared: []string{"us"},
+		narrowTo: []string{"us"},
+		want:     []string{"us"},
+	}, {
+		// The pool is narrower than the request, which is the ordinary case now that only
+		// broad geographies can be requested: the declaration is what survives.
+		name:     "a declaration inside the request survives it",
+		declared: []string{"us-east"},
+		narrowTo: []string{"us"},
+		want:     []string{"us-east"},
+	}, {
+		// Modal files Japan under Asia-Pacific while naming it "jp", so no spelling rule
+		// could relate the two. regionsByGeography carries the membership as data.
+		name:     "jp survives a request for ap though its name does not say so",
+		declared: []string{"jp"},
+		narrowTo: []string{"ap"},
+		want:     []string{"jp"},
+	}, {
+		// The cost of broad-only requests: Modal's narrow names are real regions a pool
+		// may declare, but a workload cannot ASK for one. It asks for "ap" instead.
+		name:     "a Modal narrow region name is not requestable",
+		declared: []string{"ap"},
+		narrowTo: []string{"jp"},
+		want:     nil,
+	}, {
+		name:     "several survivors stay ONE candidate",
+		declared: []string{"us-east", "eu-west", "ap-south"},
+		narrowTo: []string{"us", "eu"},
+		want:     []string{"us-east" + regionSeparator + "eu-west"},
+	}, {
+		// A geography's own name is in its region list, so both halves of the declaration
+		// survive and Modal's scheduler gets to choose between them.
+		name:     "a broad region and a narrow one under it both survive",
+		declared: []string{"us", "us-east"},
+		narrowTo: []string{"us"},
+		want:     []string{"us" + regionSeparator + "us-east"},
+	}, {
+		name:     "case and whitespace are normalized",
+		narrowTo: []string{" US "},
+		want:     []string{"us"},
+	}, {
+		name:     "a disjoint request yields no candidate",
+		declared: []string{"us-east"},
+		narrowTo: []string{"eu"},
+		want:     nil,
+	}, {
+		// The reason regionsByGeography exists. "us-east-1" is an AWS region name; forwarded,
+		// it would reach Sandboxes.Create and either fail the Pod terminally -- before
+		// the walk ever reached the AWS ref that WOULD have served it -- or be ignored,
+		// placing the sandbox anywhere and breaking the residency that was asked for.
+		name:     "an AWS region name is dropped, never forwarded to Modal",
+		narrowTo: []string{"us-east-1"},
+		want:     nil,
+	}, {
+		name:     "an unknown token is dropped",
+		declared: []string{"us"},
+		narrowTo: []string{"usa"},
+		want:     nil,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.ExpandRegions(tc.declared, tc.narrowTo)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ExpandRegions(%v, %v) = %v, want %v",
+					tc.declared, tc.narrowTo, got, tc.want)
+			}
+			// An empty result with a narrowTo means NO CANDIDATE. Reading it as
+			// unconstrained -- which is what nil means without one -- would place a Pod
+			// that asked for one geography anywhere Modal runs.
+			if len(got) > 1 {
+				t.Fatalf("produced %d candidates; Modal cannot fail over", len(got))
+			}
+		})
+	}
+}
+
+// TestExpandRegions_NarrowToTakesVocabularyOnly covers the IsGeography gate itself, which no
+// other case can reach: a narrowing resolves only because the token is VOCABULARY, not merely
+// because this adapter has a table entry for it. Modal makes the stake concrete — "jp" IS a
+// region it serves, so without the gate an unconstrained pool would hand it straight to the
+// API as a candidate, honouring a token every sibling provider drops.
+func TestExpandRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
+	regionsByGeography["jp"] = []string{"jp"}
+	defer delete(regionsByGeography, "jp")
+
+	p := newTestProvider(&fakeClient{})
+	if got := p.ExpandRegions(nil, []string{"jp"}); got != nil {
+		t.Errorf("narrowTo [jp] resolved to %v; only provider.Geographies tokens may narrow", got)
+	}
+}
+
+// TestRegionsByGeography_IsResolvable is the seam between Modal's half of the region model
+// and the shared one. A key outside provider.Geographies is unreachable, and a geography
+// missing its OWN name is worse than unreachable: Modal's expansion is the identity, so a
+// pool declaring that geography would place fine while a Pod requesting it would be filtered
+// out — the same word meaning two things on one provider.
+func TestRegionsByGeography_IsResolvable(t *testing.T) {
+	for geography, regions := range regionsByGeography {
+		if !provider.IsGeography(geography) {
+			t.Errorf("%q is not a provider.Geographies token, so nothing can resolve to it", geography)
+		}
+		if !slices.Contains(regions, geography) {
+			t.Errorf("geography %q does not list itself; Modal serves all nine broad names, "+
+				"and the self-entry is what the identity expansion relies on", geography)
+		}
+	}
+	// Every geography must be resolvable here, or a NodePool declaring one places while the
+	// matching request drops -- the divergence above, in the other direction.
+	for _, g := range provider.Geographies {
+		if _, ok := regionsByGeography[g]; !ok {
+			t.Errorf("geography %q has no Modal entry", g)
+		}
 	}
 }
 
@@ -968,7 +1095,7 @@ func TestExpandRegions_RoundTripsThroughProvision(t *testing.T) {
 		f := &fakeClient{createID: "sb-1"}
 		p := newTestProvider(f)
 
-		candidates := p.ExpandRegions(declared)
+		candidates := p.ExpandRegions(declared, nil)
 		// Placement's own fallback when expansion is empty: one unconstrained candidate.
 		if len(candidates) == 0 {
 			candidates = []string{""}

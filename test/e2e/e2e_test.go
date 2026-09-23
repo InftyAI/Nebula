@@ -58,6 +58,14 @@ const (
 	// excludes nebula-system (see config/webhook/selector_patch.yaml), so a Pod
 	// there would never get the scheduling gate and placement would never run.
 	fakeWorkloadNS = "nebula-e2e-workload"
+
+	// Region-narrowing fixtures. They share fakeWorkloadNS but need their own pool,
+	// because that pool declares regions while fakePoolName deliberately declares
+	// none (its spec covers the unconstrained path).
+	fakeRegionPoolName   = "e2e-fake-region-pool"
+	regionServedPod      = "e2e-fake-region-served"
+	regionUnreachablePod = "e2e-fake-region-unreachable"
+	regionUnknownPod     = "e2e-fake-region-unknown"
 )
 
 var _ = Describe("Manager", Ordered, func() {
@@ -125,6 +133,9 @@ var _ = Describe("Manager", Ordered, func() {
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", fakeWorkloadPod,
 			"-n", fakeWorkloadNS, "--ignore-not-found=true"))
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakePoolName, "--ignore-not-found=true"))
+		// The region Pods go with the namespace; their pool is cluster-scoped.
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "nodepool", fakeRegionPoolName,
+			"--ignore-not-found=true"))
 		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", fakeWorkloadNS, "--ignore-not-found=true"))
 
 		By("cleaning up the sync-benchmark batch, pool, and namespace")
@@ -432,6 +443,116 @@ spec:
 			Eventually(verifyBound).Should(Succeed())
 
 			By("cleaning up the fake workload")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile, "--ignore-not-found=true"))
+		})
+
+		It("should honour the region annotation, and gate the Pod when it cannot", func() {
+			// The annotation narrows placement WITHIN the pool, so three Pods against one
+			// pool cover the whole contract: a request the pool can serve lands in that
+			// exact region, a request for a geography the pool cannot reach stays gated,
+			// and a token outside the geography vocabulary stays gated too. The last two
+			// are the ones worth having in e2e — a regression there does not error, it
+			// silently places the workload in the wrong jurisdiction.
+
+			By("creating the workload namespace (idempotent: the placement spec may have made it)")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", fakeWorkloadNS))
+			cmd := exec.Command("kubectl", "label", "--overwrite", "ns", fakeWorkloadNS,
+				"pod-security.kubernetes.io/enforce=restricted")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to label the workload namespace")
+
+			By("creating a pool spanning both of the fake provider's geographies, plus three Pods")
+			pod := func(name, regions string) string {
+				return fmt.Sprintf(`---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    nebula.inftyai.com/enabled: "true"
+    nebula.inftyai.com/nodepool: %s
+  annotations:
+    nebula.inftyai.com/regions: %s
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: main
+    image: registry.k8s.io/pause:3.10
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+`, name, fakeWorkloadNS, fakeRegionPoolName, regions)
+			}
+			manifest := fmt.Sprintf(`apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  name: %s
+spec:
+  providers:
+  - name: %s
+    regions:
+    - us
+    - eu
+  capacityTypes:
+  - OnDemand
+  strategy: Ordered
+`, fakeRegionPoolName, fakeProviderName) +
+				pod(regionServedPod, "eu") +
+				pod(regionUnreachablePod, "ap") +
+				pod(regionUnknownPod, "atlantis")
+			manifestFile := filepath.Join("/tmp", "nebula-fake-region-workload.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), 0o644)).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply the NodePool + Pods")
+
+			By("verifying the served request lands in the requested geography's region")
+			// The pool allows us AND eu, and us sorts first in the walk — so eu-fake-1 can
+			// only be the narrowing at work, not the pool's own ordering.
+			verifyRegion := func(g Gomega) {
+				claim := fmt.Sprintf("%s-%s", fakeWorkloadNS, regionServedPod)
+				out, err := utils.Run(exec.Command("kubectl", "get", "nodeclaim", claim,
+					"-o", "jsonpath={.spec.region}"))
+				g.Expect(err).NotTo(HaveOccurred(), "NodeClaim not created")
+				g.Expect(out).To(Equal("eu-fake-1"), "claim records the wrong region")
+			}
+			Eventually(verifyRegion).Should(Succeed())
+
+			By("verifying that Pod is ungated and bound")
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "pod", regionServedPod,
+					"-n", fakeWorkloadNS, "-o", "jsonpath={.spec.nodeName}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal(fakeVirtualNode), "Pod not bound to the fake virtual node")
+			}).Should(Succeed())
+
+			// Consistently, not Eventually: the assertion is that nothing happens. The
+			// served Pod above is already placed, so the controller has demonstrably run
+			// this pool — a still-gated Pod here is a decision, not a slow start.
+			for _, tc := range []struct{ pod, why string }{
+				{regionUnreachablePod, "the pool reaches no region in the requested geography"},
+				{regionUnknownPod, "the requested token is not a geography"},
+			} {
+				By("verifying the Pod stays gated because " + tc.why)
+				Consistently(func(g Gomega) {
+					out, err := utils.Run(exec.Command("kubectl", "get", "pod", tc.pod,
+						"-n", fakeWorkloadNS, "-o", "jsonpath={.spec.schedulingGates[*].name}"))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(ContainSubstring("nebula.inftyai.com/provider-selection"),
+						"Pod was placed despite an unservable region request")
+				}, 15*time.Second, 3*time.Second).Should(Succeed())
+
+				claim := fmt.Sprintf("%s-%s", fakeWorkloadNS, tc.pod)
+				_, err := utils.Run(exec.Command("kubectl", "get", "nodeclaim", claim))
+				Expect(err).To(HaveOccurred(), "a gated Pod must not own a NodeClaim")
+			}
+
+			By("cleaning up the region workloads")
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile, "--ignore-not-found=true"))
 		})
 
