@@ -317,37 +317,80 @@ func New(client Client, cat catalog.Lookup) *Provider {
 // where a comma reads like a list a consumer might re-split with different rules.
 const regionSeparator = "|"
 
-// ExpandRegions implements provider.Provider, overriding catalog.Base's
-// pass-through. It resolves the pool's whole declaration to at most ONE candidate,
-// carrying every declared region in it, rather than one candidate per region.
-//
-// The opposite of AWS, because Modal cannot fail over. An AWS CreateFleet reports a
-// shortage synchronously, so walking regions one at a time lets the next be tried.
-// Sandboxes.Create instead ACCEPTS immediately and returns a real id with the GPU maybe
-// still queued. No error means ClassifyProvisionError never runs, nothing is blocklisted,
-// and placement is never re-driven — so the first region walked would be the only one ever
-// tried, shrinking the pool to one region and discarding the rest.
-//
-// Handing Modal the full set moves the choice to the party that can act on it: its
-// scheduler takes several regions and picks with a live view of capacity.
-//
-// The cost is that the candidate's region is a joined token, so a blocklist entry covers
-// the whole set. That loses nothing today, since a queued sandbox never reports which
-// region ran dry.
-func (p *Provider) ExpandRegions(declared []string) []string {
-	seen := make(map[string]bool)
-	regions := make([]string, 0, len(declared))
-	for _, d := range declared {
-		d = strings.TrimSpace(d)
-		if d == "" || seen[d] {
+// regionsByGeography maps a geography token to the Modal regions it encompasses.
+var regionsByGeography = map[string][]string{
+	"us": {"us", "us-east", "us-central", "us-south", "us-west"},
+	"eu": {"eu", "eu-west", "eu-north", "eu-south"},
+	"ap": {"ap", "ap-northeast", "ap-southeast", "ap-south", "ap-melbourne", "jp", "au"},
+	"uk": {"uk"},
+	"ca": {"ca"},
+	"me": {"me"},
+	"sa": {"sa"},
+	"af": {"af"},
+	"mx": {"mx"},
+}
+
+// narrowRegions intersects a pool's declaration with the requested geographies, dropping any
+// Modal cannot resolve. An empty result means no candidate.
+func narrowRegions(declared, narrowTo []string) []string {
+	requested := make([]string, 0, len(narrowTo))
+	want := make(map[string]bool)
+	for _, t := range narrowTo {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if !provider.IsGeography(t) {
 			continue
 		}
-		seen[d] = true
-		regions = append(regions, d)
+		inside, ok := regionsByGeography[t]
+		if !ok {
+			continue
+		}
+		requested = append(requested, t)
+		for _, r := range inside {
+			want[r] = true
+		}
 	}
-	if len(regions) == 0 {
-		return nil // unconstrained: the widest and cheapest case
+	switch {
+	case len(requested) == 0:
+		return nil // nothing Modal can resolve
+	case len(declared) == 0:
+		return requested // unconstrained pool: the request becomes the constraint
 	}
+	var out []string
+	for _, d := range declared {
+		if want[strings.ToLower(strings.TrimSpace(d))] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// dedupeRegions trims and dedupes, preserving first-seen order so the joined token is
+// stable across reconciles.
+func dedupeRegions(regions []string) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(regions))
+	for _, r := range regions {
+		r = strings.TrimSpace(r)
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+// ExpandRegions implements provider.Provider. It resolves the pool's whole declaration to at
+// most ONE candidate, carrying every declared region in it, rather than one per region.
+func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
+	regions := dedupeRegions(declared)
+	if len(narrowTo) > 0 {
+		regions = dedupeRegions(narrowRegions(regions, narrowTo))
+		if len(regions) == 0 {
+			return nil
+		}
+	}
+	// With no declaration this joins to "": unpinned, Modal's widest and cheapest candidate.
 	return []string{strings.Join(regions, regionSeparator)}
 }
 

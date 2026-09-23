@@ -132,6 +132,70 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	}
 }
 
+// The fake backs the e2e suite, so its region behaviour has to be the real thing: a
+// geography expands, a literal passes through, and a narrowing request subsets the
+// expansion. If any of this drifted toward a pass-through, e2e would sign off on a
+// narrowing the real adapters never perform.
+func TestExpandRegions(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared []string
+		narrowTo []string
+		want     []string
+	}{{
+		name: "unconstrained walks the vocabulary in order",
+		want: []string{"eu-fake-1", "us-fake-1", "us-fake-2"},
+	}, {
+		name:     "a geography expands to its regions",
+		declared: []string{"us"},
+		want:     []string{"us-fake-1", "us-fake-2"},
+	}, {
+		name:     "a non-geography is forwarded verbatim",
+		declared: []string{"somewhere-else-1"},
+		want:     []string{"somewhere-else-1"},
+	}, {
+		name:     "narrowing subsets the expansion",
+		declared: []string{"us", "eu"},
+		narrowTo: []string{"eu"},
+		want:     []string{"eu-fake-1"},
+	}, {
+		// The pool is the ceiling: narrowing can never reach outside it.
+		name:     "narrowing cannot widen past the declaration",
+		declared: []string{"eu"},
+		narrowTo: []string{"us"},
+		want:     nil,
+	}, {
+		// Empty under a narrowing means "this provider cannot reach there", which
+		// placement skips rather than running unconstrained.
+		name:     "a geography the fake does not serve resolves to nothing",
+		narrowTo: []string{"ap"},
+		want:     nil,
+	}, {
+		name:     "a region name is not vocabulary, so it narrows to nothing",
+		narrowTo: []string{"us-fake-1"},
+		want:     nil,
+	}, {
+		name:     "narrowing tokens are trimmed and case-folded",
+		narrowTo: []string{" US "},
+		want:     []string{"us-fake-1", "us-fake-2"},
+	}}
+
+	p := New()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := p.ExpandRegions(tt.declared, tt.narrowTo)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ExpandRegions(%v, %v) = %v, want %v", tt.declared, tt.narrowTo, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("ExpandRegions(%v, %v) = %v, want %v", tt.declared, tt.narrowTo, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
 func TestMapAcceleratorFromCatalog(t *testing.T) {
 	p := New()
 	// A GPU in the fixed catalog resolves (case-insensitively); one that is not

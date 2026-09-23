@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"hash/fnv"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -104,6 +106,16 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 		return placement{}, false, 0
 	}
 
+	// The Pod's region ask, read ONCE: region expansion runs per provider ref, so parsing
+	// there would repeat this deferral log for every provider in the pool.
+	narrowTo, ok := requestedGeographies(pod)
+	if !ok {
+		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
+		log.Info("no requested region is a known geography; leaving Pod gated",
+			"regions", pod.Annotations[nebulav1alpha1.RegionsAnnotation])
+		return placement{}, false, 0
+	}
+
 	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
 	for _, tier := range capacityTiers(pool) { // outer: capacity
 		for _, ref := range pool.Spec.Providers { // provider (Ordered = listed order)
@@ -143,7 +155,17 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					continue
 				}
 			}
-			for _, region := range regionsFor(prov, ref) { // inner: region
+			// Empty means the pool's declaration, or the Pod's narrowing of it, reaches
+			// no region this provider can place in. The expansion must match
+			// awsRegionSource's (cmd/main.go); see its comment.
+			regions := prov.ExpandRegions(ref.Regions, narrowTo)
+			if len(regions) == 0 {
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipNoAvailableRegions)
+				log.V(1).Info("skipping candidate: no available region serves the requested geographies",
+					"provider", ref.Name, "capacityType", tier, "regions", narrowTo)
+				continue
+			}
+			for _, region := range regions { // inner: region
 				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
@@ -241,26 +263,22 @@ func servesEgress(prov provider.Provider, policy *nebulav1alpha1.EgressPolicy) b
 	return prov.Capabilities().SupportsEgressPolicy
 }
 
-// regionsFor is the inner axis for one provider ref: the concrete regions to try, in
-// expansion order. The pool's declaration is a CONSTRAINT, not a list of regions —
-// it may be omitted (unconstrained), name a geography group ("us"), or name regions
-// literally — so only the provider can resolve it, and ExpandRegions does (see
-// provider.Provider for the three levels).
-//
-// The empty-string fallback covers expansion yielding nothing: a region-simple provider
-// whose pool declared no regions still needs ONE candidate, or `range` runs zero times and
-// the provider is silently unplaceable. That candidate means "send no region, place freely" —
-// Modal's normal and cheapest mode.
-//
-// This and awsRegionSource (cmd/main.go) are the only readers of ProviderSpec.Regions and
-// MUST expand it identically: a region provisioned into but not swept is absent from List,
-// and absence is reported as Terminated on a live, billing instance.
-func regionsFor(prov provider.Provider, ref nebulav1alpha1.ProviderSpec) []string {
-	regions := prov.ExpandRegions(ref.Regions)
-	if len(regions) == 0 {
-		return []string{""} // unconstrained on a region-simple provider
+// requestedGeographies reads the Pod's RegionsAnnotation into the narrowing ExpandRegions
+// takes. Absent means no narrowing, the common case.
+func requestedGeographies(pod *corev1.Pod) (narrowTo []string, ok bool) {
+	raw := strings.TrimSpace(pod.Annotations[nebulav1alpha1.RegionsAnnotation])
+	if raw == "" {
+		return nil, true
 	}
-	return regions
+	tokens := strings.Split(raw, ",")
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if provider.IsGeography(t) && !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out, len(out) > 0
 }
 
 // blockedUntil reports whether the (provider, accelerator, tier, region)

@@ -40,7 +40,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -71,26 +70,27 @@ const spotPollInterval = 10 * time.Second
 // container became healthy" — that is the poll loop's job.
 const provisionTimeout = 2 * time.Minute
 
-// regionGroups maps a NodePool geography token to the EC2 regions it covers. A group token
-// is not an EC2 region name and cannot be derived from one ("us" is not an endpoint, London
-// is eu-west-2), so the mapping is data.
+// regionsByGeography maps a geography token to the AWS regions it encompasses.
 //
-// Only DEFAULT-enabled regions are listed. Opt-in ones (af-south-1, ap-east-1, ca-west-1,
-// eu-south-1, me-central-1, …) are excluded because clientFor resolves a GPU AMI and the
-// default VPC's subnets on first use and does not cache failures — a region the account has
-// not enabled would fail and retry every poll tick, forever, for a region nobody asked for.
-// An operator who HAS enabled one names it explicitly; literal names pass through untouched.
-//
-// GovCloud (us-gov-*) and China (cn-*) are absent for a stronger reason: separate IAM
-// partitions, so one credential set cannot reach them at all.
-//
-// Kept sorted so the failover walk order within a group is stable and reviewable.
-var regionGroups = map[string][]string{
+// The empty entries are the opt-in regions, disabled by default in AWS accounts.
+var regionsByGeography = map[string][]string{
 	"us": {"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
-	"eu": {"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3"},
-	"ap": {"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1", "ap-southeast-2"},
 	"ca": {"ca-central-1"},
 	"sa": {"sa-east-1"},
+	"eu": {"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3"},
+	"uk": {"eu-west-2"},
+	"ap": {
+		"ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+		"ap-south-1", "ap-southeast-1", "ap-southeast-2",
+	},
+	"af": {},
+	"me": {},
+	"mx": {},
+}
+
+// regionsIn returns the list of AWS regions within a given geography token.
+func regionsIn(geography string) []string {
+	return regionsByGeography[geography]
 }
 
 // ErrSpotCapacity is a marker the Client wraps onto a Spot-tier capacity failure
@@ -264,34 +264,46 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 	return p
 }
 
-// ExpandRegions implements provider.Provider, overriding catalog.Base's pass-through:
-// EC2 region names do not contain the pool's group tokens, so AWS needs the
-// regionGroups table. Three levels, in the order they are checked:
+// ExpandRegions implements provider.Provider. EC2 region names are not geographies, so AWS
+// resolves them through regionsByGeography. Three levels, in the order they are checked:
 //
-//	nil/[]          => every default-enabled region (the union of regionGroups)
-//	["us"]          => that group's regions
+//	nil/[]          => every default-enabled region
+//	["us"]          => the default-enabled regions in that geography
 //	["us-east-1"]   => itself, verbatim and unvalidated
 //
-// A non-group value is a literal region name, NOT validated against any list: EC2 gains
-// regions faster than this table is edited, so validating would reject a region that
-// exists, while an impossible name simply fails at clientFor with AWS's own error. That is
-// also the escape hatch for opt-in regions, which no group contains.
-//
-// The result is deduped (["us", "us-east-1"] is 4 regions, not 5) and order-stable, so the
-// failover walk is reproducible.
-//
-// Unconstrained is wide: ~17 regions per capacity tier, each walked as a candidate and
-// swept by List/Offerings every tick. Prefer a group unless the workload needs global reach.
-//
-// It delegates to the package-level ExpandRegions, which cmd/main.go's region source also
-// needs — it must expand each pool BEFORE unioning across pools (a pool declaring nothing
-// means "all", a meaning lost if raw lists were unioned first).
-func (p *Provider) ExpandRegions(declared []string) []string { return ExpandRegions(declared) }
+// narrowTo filters the expansion to only include regions within the requested geographies.
+func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
+	return narrowRegions(ExpandRegions(declared), narrowTo)
+}
 
-// ExpandRegions is Provider.ExpandRegions as a package-level function; see that
-// method for the semantics. It is exported because the NodePool-backed RegionSource
-// in cmd/main.go must apply the identical expansion, and it needs it per-pool at a
-// point where no Provider is in hand.
+// narrowRegions keeps the regions that fall inside at least one requested geography. An
+// empty narrowTo is the no-op.
+func narrowRegions(expanded, narrowTo []string) []string {
+	if len(narrowTo) == 0 {
+		return expanded
+	}
+	want := make(map[string]bool)
+	for _, token := range narrowTo {
+		token = strings.ToLower(strings.TrimSpace(token))
+		// The token must be a recognized geography; otherwise it is ignored.
+		if !provider.IsGeography(token) {
+			continue
+		}
+		for _, r := range regionsByGeography[token] {
+			want[r] = true
+		}
+	}
+	var out []string
+	for _, r := range expanded {
+		if want[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ExpandRegions is the package-level function that mirrors Provider.ExpandRegions, expanding
+// declared regions into the full set of EC2 regions, with geographies resolved.
 func ExpandRegions(declared []string) []string {
 	seen := make(map[string]bool)
 	var out []string
@@ -302,16 +314,10 @@ func ExpandRegions(declared []string) []string {
 		seen[r] = true
 		out = append(out, r)
 	}
-	// Unconstrained: every default-enabled region. Walk the group table in sorted key
-	// order so the union is deterministic (Go randomizes map iteration).
 	if len(declared) == 0 {
-		groups := make([]string, 0, len(regionGroups))
-		for g := range regionGroups {
-			groups = append(groups, g)
-		}
-		sort.Strings(groups)
-		for _, g := range groups {
-			for _, r := range regionGroups[g] {
+		// Unconstrained: every default-enabled region.
+		for _, g := range provider.Geographies {
+			for _, r := range regionsByGeography[g] {
 				add(r)
 			}
 		}
@@ -319,8 +325,8 @@ func ExpandRegions(declared []string) []string {
 	}
 	for _, d := range declared {
 		d = strings.TrimSpace(d)
-		if group, ok := regionGroups[strings.ToLower(d)]; ok {
-			for _, r := range group {
+		if token := strings.ToLower(d); provider.IsGeography(token) {
+			for _, r := range regionsIn(token) {
 				add(r)
 			}
 			continue

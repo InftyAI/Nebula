@@ -99,6 +99,11 @@ const (
 	// via util.AcceleratorRequest.
 	AcceleratorTypeLabel = "nebula.inftyai.com/accelerator-type"
 
+	// RegionsAnnotation narrows ONE workload to a comma-separated list of broad
+	// geographies ("eu", or "eu,uk"), which is how a Pod expresses data residency without
+	// an operator carving out a NodePool per jurisdiction. Case and spacing are free.
+	RegionsAnnotation = "nebula.inftyai.com/regions"
+
 	// EndpointAnnotation carries the reachable address of the external instance (a DNS
 	// name, an IP, or a URL, in the provider's own form). It is the only way to reach
 	// the workload, and PodIP cannot hold it — the API server validates PodIP as a

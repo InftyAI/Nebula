@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -85,11 +86,26 @@ func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool) {
 	return nil, false
 }
 
-// ExpandRegions passes the declaration through, matching catalog.Base's default (the
-// region-simple behaviour). Tests that need group expansion set expandRegions.
-func (f *fakeProvider) ExpandRegions(declared []string) []string {
+// ExpandRegions is region-simple like Modal: declared tokens are their own geographies, an
+// unconstrained pool takes the narrowing as its constraint, and no declaration at all is
+// one unpinned candidate. Tests that need group expansion set expandRegions.
+func (f *fakeProvider) ExpandRegions(declared, narrowTo []string) []string {
 	if f.expandRegions != nil {
-		return f.expandRegions(declared)
+		declared = f.expandRegions(declared)
+	}
+	switch {
+	case len(narrowTo) > 0 && len(declared) == 0:
+		return narrowTo
+	case len(narrowTo) > 0:
+		var out []string
+		for _, d := range declared {
+			if slices.Contains(narrowTo, d) {
+				out = append(out, d)
+			}
+		}
+		return out
+	case len(declared) == 0:
+		return []string{""}
 	}
 	return declared
 }
@@ -98,10 +114,12 @@ func (f *fakeProvider) ClassifyProvisionError(error, string, string) provider.Bl
 }
 
 // resolver returns a Providers func that resolves only the given provider.
-func resolver(provs ...*fakeProvider) func(string) (provider.Provider, bool) {
+// It takes the interface, not *fakeProvider, so a test can register a REAL adapter where the
+// thing under test is that adapter's own behaviour (see the region-narrowing tests).
+func resolver(provs ...provider.Provider) func(string) (provider.Provider, bool) {
 	return func(name string) (provider.Provider, bool) {
 		for _, p := range provs {
-			if p.name == name {
+			if p.Name() == name {
 				return p, true
 			}
 		}
@@ -125,7 +143,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 // newClaimReconciler wires a NodeClaimReconciler over a fake client seeded with
 // objs. Any fakeProviders passed are registered as the reconciler's resolver so
 // the teardown backstop can reach them.
-func newClaimReconciler(t *testing.T, objs []client.Object, provs ...*fakeProvider) (*NodeClaimReconciler, client.Client) {
+func newClaimReconciler(t *testing.T, objs []client.Object, provs ...provider.Provider) (*NodeClaimReconciler, client.Client) {
 	t.Helper()
 	s := testScheme(t)
 	c := fake.NewClientBuilder().

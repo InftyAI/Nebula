@@ -119,28 +119,14 @@ type Provider interface {
 	// only the provider knows its geography:
 	//
 	//   - nil/empty  => unconstrained: every region this provider serves.
-	//   - a GROUP token ("us", "eu", "ap") => that geography's regions.
+	//   - a GEOGRAPHY ("us", "eu", "ap" — see Geographies) => its regions here.
 	//   - anything else => a literal region name, passed through UNVALIDATED.
 	//
-	// That last case is deliberate: region names change faster than this code, so an
-	// unrecognized one is forwarded and a genuinely bad name fails at provision time with
-	// the provider's own error. Better than refusing a region that shipped last week.
+	// Narrowing with narrowTo restricts the result to regions within the specified geographies.
 	//
-	// Expanding HERE, at the pool boundary, keeps everything downstream single-valued —
-	// NodeClaimSpec.Region, ProvisionRequest.Region and the blocklist key — so a capacity
-	// failure blocks the one candidate that failed, not the group it came from.
-	//
-	// How many candidates a declaration becomes depends on whether the provider can FAIL
-	// OVER between regions. One that reports a shortage synchronously (AWS) returns one
-	// candidate per region, so the next is tried. One that just queues the request with no
-	// error (Modal) must not: nothing would re-drive placement, so only the first
-	// candidate would ever be tried. It returns ONE opaque candidate carrying the whole
-	// set and lets its own scheduler choose.
-	//
-	// Pure (no API calls, no ctx), because the result feeds both placement's candidate walk
-	// and the List/Offerings fan-out, and those MUST agree: a region provisioned into but
-	// not swept is absent from List, which reports a live instance as Terminated.
-	ExpandRegions(declared []string) []string
+	// An empty result means no candidate: placement skips this provider. A provider that
+	// can place without a region returns [""] for it — one candidate, unpinned.
+	ExpandRegions(declared, narrowTo []string) []string
 
 	// ClassifyProvisionError maps a Provision error to the granularity at which
 	// the failing placement should be blocklisted. This keeps failover precise:
@@ -232,9 +218,7 @@ type ProvisionRequest struct {
 	// capacity failure blocklist just that region; a provider that cannot fail over
 	// (Modal) may encode several for its own scheduler, and only that adapter parses it.
 	//
-	// Empty means "no region constraint" — common, not a fallback: a pool declaring no
-	// regions leaves it empty, which on Modal is the widest and cheapest option (pinning
-	// costs 1.5-1.75x). AWS cannot honour it, but its ExpandRegions never produces it.
+	// Empty means "no region constraint".
 	Region string
 	// Egress is the pool's outbound policy, or nil for Open. Placement has already checked
 	// that this provider can enforce it (Capabilities.SupportsEgressPolicy), so an adapter

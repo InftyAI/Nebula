@@ -613,21 +613,27 @@ func TestExpandRegions(t *testing.T) {
 	}{{
 		name:     "nil is unconstrained: every default-enabled region",
 		declared: nil,
+		// Grouped by geography, in provider.Geographies order — so London trails sa-east-1,
+		// under "uk", rather than sitting with the eu-* names it is spelled like.
 		want: []string{
 			"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1", "ap-southeast-2",
 			"ca-central-1",
-			"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3",
+			"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3",
 			"sa-east-1",
+			"eu-west-2",
 			"us-east-1", "us-east-2", "us-west-1", "us-west-2",
 		},
 	}, {
 		name:     "empty behaves as nil",
 		declared: []string{},
+		// Grouped by geography, in provider.Geographies order — so London trails sa-east-1,
+		// under "uk", rather than sitting with the eu-* names it is spelled like.
 		want: []string{
 			"ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-southeast-1", "ap-southeast-2",
 			"ca-central-1",
-			"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3",
+			"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3",
 			"sa-east-1",
+			"eu-west-2",
 			"us-east-1", "us-east-2", "us-west-1", "us-west-2",
 		},
 	}, {
@@ -635,9 +641,10 @@ func TestExpandRegions(t *testing.T) {
 		declared: []string{"us"},
 		want:     []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
 	}, {
+		// London is absent on purpose: it is under "uk" alone (see regionsByGeography).
 		name:     "group token is case-insensitive",
 		declared: []string{"EU"},
-		want:     []string{"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3"},
+		want:     []string{"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3"},
 	}, {
 		name:     "literal region passes through",
 		declared: []string{"us-east-1"},
@@ -680,18 +687,125 @@ func TestExpandRegions(t *testing.T) {
 			// source calls the function while placement calls the method, and the two
 			// diverging is exactly the bug that reports a live fleet as Terminated.
 			p := newTestProvider(&fakeClient{})
-			if m := p.ExpandRegions(tc.declared); !slices.Equal(m, got) {
+			if m := p.ExpandRegions(tc.declared, nil); !slices.Equal(m, got) {
 				t.Fatalf("method %v != function %v", m, got)
 			}
 		})
 	}
 }
 
+func TestExpandRegions_NarrowTo(t *testing.T) {
+	cases := []struct {
+		name     string
+		declared []string
+		narrowTo []string
+		want     []string
+	}{{
+		name:     "no narrowing is the no-op",
+		declared: []string{"us"},
+		want:     []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
+	}, {
+		name:     "group token narrows the unconstrained expansion",
+		narrowTo: []string{"us"},
+		want:     []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
+	}, {
+		// Only geographies reach here, so a Modal region name is not a narrowing this
+		// adapter could honour even by accident -- it is dropped, not forwarded.
+		name:     "a Modal region name is dropped",
+		declared: []string{"us"},
+		narrowTo: []string{"us-east"},
+		want:     nil,
+	}, {
+		name:     "uk selects London",
+		narrowTo: []string{"uk"},
+		want:     []string{"eu-west-2"},
+	}, {
+		// The partition is the point: "eu" is the EEA, so it must not reach London even
+		// though eu-west-2 is spelled like the rest of the group. Wanting both means
+		// asking for both.
+		name:     "eu excludes London",
+		narrowTo: []string{"eu"},
+		want:     []string{"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-3"},
+	}, {
+		// An EC2 region name is not a geography, so the per-workload path drops it. The
+		// declaration is the only place a literal region belongs.
+		name:     "an AWS region name is dropped, not matched literally",
+		narrowTo: []string{"us-east-1"},
+		want:     nil,
+	}, {
+		name:     "several tokens union",
+		narrowTo: []string{"ca", "sa"},
+		want:     []string{"ca-central-1", "sa-east-1"},
+	}, {
+		name:     "case and whitespace are normalized",
+		narrowTo: []string{" US "},
+		want:     []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
+	}, {
+		// Africa is opt-in only, so no default-enabled region falls under it. Empty
+		// means no candidate: placement skips the ref rather than widening.
+		name:     "a geography AWS serves only via opt-in narrows to nothing",
+		narrowTo: []string{"af"},
+		want:     nil,
+	}, {
+		name:     "an unresolvable token narrows to nothing",
+		narrowTo: []string{"usa"},
+		want:     nil,
+	}, {
+		name:     "a disjoint request narrows to nothing",
+		declared: []string{"eu"},
+		narrowTo: []string{"us"},
+		want:     nil,
+	}, {
+		// The accepted cost of a default-enabled-only table: eu-south-1 IS in Europe, but
+		// nothing here says so, so a request for "eu" cannot select it. The admin's literal
+		// declaration still places it -- it is only per-workload narrowing that loses it.
+		name:     "an opt-in region declared by the pool is not narrowable",
+		declared: []string{"eu-south-1", "eu-west-1"},
+		narrowTo: []string{"eu"},
+		want:     []string{"eu-west-1"},
+	}}
+	p := newTestProvider(&fakeClient{})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.ExpandRegions(tc.declared, tc.narrowTo)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("ExpandRegions(%v, %v)\n got %v\nwant %v",
+					tc.declared, tc.narrowTo, got, tc.want)
+			}
+			// The invariant that makes narrowing safe without any membership check:
+			// whatever comes out is a subset of what the SWEEP covers for the same
+			// declaration. A narrowing that escaped it would provision into a region
+			// List never polls, and absence from List reports a live instance as
+			// Terminated.
+			for _, r := range got {
+				if !slices.Contains(ExpandRegions(tc.declared), r) {
+					t.Fatalf("narrowed region %q is outside the swept expansion %v",
+						r, ExpandRegions(tc.declared))
+				}
+			}
+		})
+	}
+}
+
+// TestExpandRegions_NarrowToTakesVocabularyOnly covers the IsGeography gate itself, which no
+// other case can reach: a narrowing resolves only because the token is VOCABULARY, not merely
+// because this adapter happens to have a table entry for it. Without the gate, adding a key
+// here would silently give one provider a narrowing token its siblings drop.
+func TestExpandRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
+	regionsByGeography["jp"] = []string{"ap-northeast-1"}
+	defer delete(regionsByGeography, "jp")
+
+	if got := narrowRegions(ExpandRegions(nil), []string{"jp"}); len(got) != 0 {
+		t.Errorf("narrowTo [jp] resolved to %v; only provider.Geographies tokens may narrow", got)
+	}
+}
+
 func TestRegionGroups_ExcludeOptInRegions(t *testing.T) {
 	// Opt-in regions are disabled until an operator enables them. clientFor does not
-	// cache build failures, so one in a group would fail its AMI/subnet resolution and
-	// retry on EVERY poll tick, forever, for a region nobody asked for. Guard the
-	// table against a well-meant future addition.
+	// cache build failures, so one reached by an expansion would fail its AMI/subnet
+	// resolution and retry on EVERY poll tick, forever, for a region nobody asked for.
+	// So they are absent from regionsByGeography itself, which is the only thing an
+	// expansion or a narrowing consults; a pool names one literally instead.
 	optIn := []string{
 		"af-south-1", "ap-east-1", "ap-east-2", "ap-south-2",
 		"ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
@@ -701,13 +815,62 @@ func TestRegionGroups_ExcludeOptInRegions(t *testing.T) {
 	all := ExpandRegions(nil)
 	for _, r := range optIn {
 		if slices.Contains(all, r) {
-			t.Errorf("opt-in region %q must not be in any group (it is disabled by default)", r)
+			t.Errorf("opt-in region %q must not expand (it is disabled by default)", r)
+		}
+		for geography, regions := range regionsByGeography {
+			if slices.Contains(regions, r) {
+				t.Errorf("opt-in region %q is listed under %q; the table holds default-enabled "+
+					"regions only, or narrowing can select one clientFor will retry forever", r, geography)
+			}
 		}
 	}
-	// Separate IAM partitions: one credential set cannot reach them at all.
+	// Separate IAM partitions: one credential set cannot reach them at all, so they are
+	// absent from regionsByGeography entirely, not merely from the default-enabled set.
 	for _, r := range all {
 		if strings.HasPrefix(r, "us-gov-") || strings.HasPrefix(r, "cn-") {
-			t.Errorf("region %q is in another IAM partition and must not be in a group", r)
+			t.Errorf("region %q is in another IAM partition and must not expand", r)
+		}
+	}
+	for geography, regions := range regionsByGeography {
+		for _, r := range regions {
+			if strings.HasPrefix(r, "us-gov-") || strings.HasPrefix(r, "cn-") {
+				t.Errorf("region %q under %q is in another IAM partition", r, geography)
+			}
+		}
+	}
+}
+
+// TestRegionsByGeography_IsResolvable is the seam between AWS's half of the region model and
+// the shared one: a key outside provider.Geographies is unreachable, since no declaration or
+// narrowing resolves to it and its regions can never be placed into.
+func TestRegionsByGeography_IsResolvable(t *testing.T) {
+	for geography := range regionsByGeography {
+		if !provider.IsGeography(geography) {
+			t.Errorf("%q is not a provider.Geographies token, so nothing can resolve to it", geography)
+		}
+	}
+	// And every geography must appear, mapping to nothing when AWS reaches it only through
+	// opt-in regions. A MISSING key and an empty one behave identically, so this is about the
+	// table staying a complete record of what was checked.
+	for _, g := range provider.Geographies {
+		if _, ok := regionsByGeography[g]; !ok {
+			t.Errorf("geography %q has no entry; use an empty one if AWS serves it no "+
+				"default-enabled region", g)
+		}
+	}
+	// The lists ARE the walk order — nothing sorts them downstream — and they must partition:
+	// a region under two geographies would be walked twice by a declaration naming both.
+	home := map[string]string{}
+	for geography, regions := range regionsByGeography {
+		if !slices.IsSorted(regions) {
+			t.Errorf("%q is not sorted: %v", geography, regions)
+		}
+		for _, r := range regions {
+			if other, dup := home[r]; dup {
+				t.Errorf("%q is under both %q and %q; placement would attempt it twice",
+					r, other, geography)
+			}
+			home[r] = geography
 		}
 	}
 }

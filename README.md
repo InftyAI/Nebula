@@ -90,6 +90,8 @@ metadata:
     nebula.inftyai.com/enabled: "true"          # opt in
     nebula.inftyai.com/nodepool: gpu            # which NodePool to place against
     nebula.inftyai.com/accelerator-type: h100   # GPU type (case-insensitive)
+  annotations:
+    nebula.inftyai.com/regions: eu,uk           # optional: narrow within the pool
 spec:
   containers:
   - name: workload
@@ -98,12 +100,6 @@ spec:
       limits:
         nvidia.com/gpu: "8"                     # GPU count
 ```
-
-The accelerator **type** rides on the label and is matched case-insensitively
-against the provider catalog (`pkg/provider/catalog/data`); the **count** rides on
-the standard `nvidia.com/gpu` resource limit, so scheduling and provisioning read
-the same number. Do not set `nodeName` or a provider `nodeSelector` yourself — the
-placement controller owns those.
 
 ## Quick start
 
@@ -126,10 +122,7 @@ One virtual node appears per provider whose credentials are present:
 kubectl get nodes -l nebula.inftyai.com/provider
 ```
 
-Then define a [NodePool](#defining-a-nodepool) and [opt a workload in](#opting-a-workload-in).
-
-To build and deploy from source instead, see [docs/deploy.md](docs/deploy.md). The
-[docs](docs/README.md) cover the rest.
+See [docs](docs/README.md) for more detailed instructions.
 
 ## License
 

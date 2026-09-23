@@ -73,7 +73,7 @@ func (b *fakeBlocklist) BlockedUntil(c failover.Candidate) (time.Duration, bool)
 }
 
 // newPlacementReconciler wires a PodPlacementReconciler over a fake client.
-func newPlacementReconciler(t *testing.T, objs []client.Object, provs ...*fakeProvider) (*PodPlacementReconciler, client.Client) {
+func newPlacementReconciler(t *testing.T, objs []client.Object, provs ...provider.Provider) (*PodPlacementReconciler, client.Client) {
 	t.Helper()
 	s := testScheme(t)
 	_ = clientgoscheme.AddToScheme(s)
@@ -480,7 +480,7 @@ func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 }
 
 func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
-	// The pool declares a GROUP token, not a region. Placement must walk the concrete
+	// The pool declares a GEOGRAPHY, not a region. Placement must walk the concrete
 	// regions the provider expands it into — and must record a CONCRETE one on the claim,
 	// never the token: the claim's region feeds ProvisionRequest.Region, which the adapter
 	// turns into a regional API endpoint, and "us" is not one.
@@ -511,27 +511,144 @@ func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
 	}
 }
 
-func TestRegionsFor_UnconstrainedOnRegionSimpleProviderYieldsOneCandidate(t *testing.T) {
-	// A region-simple provider passes nil through (catalog.Base's default), so
-	// expansion yields nothing. regionsFor must still emit ONE candidate — the empty
-	// region, meaning "send no region" — or `range` would run zero times and the
-	// provider would be silently unplaceable with no error anywhere.
-	prov := &fakeProvider{name: provider.ProviderModal}
-	got := regionsFor(prov, nebulav1alpha1.ProviderSpec{Name: provider.ProviderModal})
-	if !slices.Equal(got, []string{""}) {
-		t.Fatalf("regionsFor(nil) = %v, want one empty candidate", got)
+func TestRequestedGeographies(t *testing.T) {
+	cases := []struct {
+		name  string
+		anno  string
+		want  []string
+		valid bool
+	}{{
+		name:  "absent is no narrowing",
+		anno:  "",
+		valid: true,
+	}, {
+		// Not the same as a typo: there is nothing here to honour or reject.
+		name:  "whitespace only reads as absent",
+		anno:  "   ",
+		valid: true,
+	}, {
+		name:  "one geography",
+		anno:  "eu",
+		want:  []string{"eu"},
+		valid: true,
+	}, {
+		name:  "case and spacing are free, and repeats collapse",
+		anno:  " EU , uk ,eu",
+		want:  []string{"eu", "uk"},
+		valid: true,
+	}, {
+		// Matches what an adapter does with a token it cannot resolve: drop it. The Pod
+		// still asked for somewhere real, so honour that rather than failing the lot.
+		name:  "an unknown token alongside a known one is dropped",
+		anno:  "eu,atlantis",
+		want:  []string{"eu"},
+		valid: true,
+	}, {
+		// The case that must NOT come back as "no narrowing": empty reads as
+		// unconstrained downstream, so a typo would place the Pod anywhere on earth.
+		name: "nothing resolvable is an invalid request",
+		anno: "atlantis",
+	}, {
+		// A provider region name is not vocabulary here, however real it is. It would
+		// resolve on one provider and not the next, making placement depend on the order
+		// the pool happens to list them.
+		name: "a provider region name is not vocabulary",
+		anno: "us-east-1",
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+			if tc.anno != "" {
+				pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: tc.anno}
+			}
+			got, ok := requestedGeographies(pod)
+			if ok != tc.valid {
+				t.Fatalf("ok = %v, want %v", ok, tc.valid)
+			}
+			if tc.valid && !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
-func TestRegionsFor_AgreesWithAWSSweepExpansion(t *testing.T) {
-	// The two readers of ProviderSpec.Regions — placement's regionsFor and the AWS
+func TestPlacement_PodAnnotationNarrowsToTheRequestedJurisdiction(t *testing.T) {
+	// The pool is unconstrained, so AWS offers all 17 default-enabled regions. The Pod asks
+	// for "uk", which AWS serves from London alone — so the claim must carry eu-west-2 and
+	// not the first region of the walk. This is the whole point of the annotation: data
+	// residency for ONE workload, without an operator carving out a per-jurisdiction pool.
+	//
+	// CPU-only on purpose: it keeps MapAccelerator (and so the catalog) out of the path, so
+	// the real adapter's region table can be exercised with no client and no CSV.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "uk"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderAWS)
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+
+	reconcilePod(t, r, "default", "p1")
+
+	if region := getClaim(t, c, "default-p1").Spec.Region; region != "eu-west-2" {
+		t.Fatalf("expected the narrowing to select London, got %q", region)
+	}
+}
+
+func TestPlacement_NarrowingThatEliminatesEveryRegionLeavesPodGated(t *testing.T) {
+	// AWS reaches Africa only through an opt-in region, so "af" resolves to nothing there
+	// (see regionsByGeography). The provider must be SKIPPED, not widened: an empty
+	// expansion under a narrowing means no candidate, and the alternative — falling back to
+	// the unconstrained set — would place an af-only workload in Ohio.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "af"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderAWS)
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+
+	reconcilePod(t, r, "default", "p1")
+
+	if got := getPod(t, c, "default", "p1"); !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when no region serves the request")
+	}
+}
+
+func TestPlacement_DeclarationReachingNoRegionLeavesPodGated(t *testing.T) {
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderAWS, "af")
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+
+	reconcilePod(t, r, "default", "p1")
+
+	if got := getPod(t, c, "default", "p1"); !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when the pool's declaration reaches no region")
+	}
+}
+
+func TestPlacement_UnresolvableRegionAnnotationLeavesPodGated(t *testing.T) {
+	// A typo is an invalid request, not an empty narrowing: the Pod stays gated until a
+	// human fixes it. Placing it would mean ignoring a residency constraint.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "europe"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal)
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	if got := getPod(t, c, "default", "p1"); !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated on an unresolvable region request")
+	}
+}
+
+func TestPlacementExpansion_AgreesWithAWSSweep(t *testing.T) {
+	// The two readers of ProviderSpec.Regions — selectPlacement and the AWS
 	// RegionSource in cmd/main.go — MUST expand a declaration identically. If the
 	// sweep covers less than placement provisions into, the missing region's instances
 	// are absent from List, and applyState maps absence to Terminated: a live, billing
 	// fleet reported as gone. Both go through ExpandRegions; this pins that they do.
 	for _, declared := range [][]string{nil, {"us"}, {"eu"}, {"us-east-1"}, {"us", "me-central-1"}} {
-		placementSide := regionsFor(awsprovider.New(nil, nil, nil),
-			nebulav1alpha1.ProviderSpec{Name: provider.ProviderAWS, Regions: declared})
+		placementSide := awsprovider.New(nil, nil, nil).ExpandRegions(declared, nil)
 		sweepSide := awsprovider.ExpandRegions(declared)
 		if !slices.Equal(placementSide, sweepSide) {
 			t.Errorf("declared %v: placement walks %v but the sweep covers %v",

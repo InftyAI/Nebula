@@ -67,21 +67,15 @@ which is the whole reason for splitting them:
 | `reason` | Means | Clears when |
 | --- | --- | --- |
 | `no_pool` | The Pod names a NodePool that does not exist, or carries no pool label. | A human fixes the Pod (or the workload generating it). |
-| `invalid_request` | The accelerator request is malformed — e.g. `nvidia.com/gpu` with no accelerator-type label. It is *not* treated as CPU-only. | A human fixes the Pod spec. |
+| `invalid_request` | The request is malformed — `nvidia.com/gpu` with no accelerator-type label (*not* treated as CPU-only), or a `nebula.inftyai.com/regions` annotation naming no known geography. | A human fixes the Pod spec. |
 | `all_blocked` | A servable candidate exists, but failover is holding every one of them off. | By itself — the Pod is already requeued for the block's expiry. |
 | `no_candidate` | No provider in the pool can serve this request at all. | An operator adds a provider, or a provider registers. |
 | `stale_claim` | A NodeClaim from a prior same-named Pod has not been reaped yet. | By itself, in seconds. A sustained rate means the NodeClaim backstop is stuck. |
 
 The skip `reason` is likewise closed: `provider_unregistered`,
-`capacity_type_unsupported`, `accelerator_unsupported`, `blocked`. Only `blocked` clears
-on its own. One reconcile can file several skips — the walk visits every candidate before
-giving up.
-
-`nebula_placement_deferrals_total` counts **deferrals, not Pods**. A gated Pod is
-reconciled again on every requeue and resync, so one Pod stuck for an hour contributes
-many increments. The rate is therefore a measure of placement pressure, not a population:
-for "how many Pods are stuck right now" read the SchedulingGated Pod count from
-kube-state-metrics, and use this series to explain *why*.
+`capacity_type_unsupported`, `accelerator_unsupported`, `egress_policy_unsupported`,
+`no_available_regions`, `blocked`. Only `blocked` clears on its own. One reconcile can file
+several skips — the walk visits every candidate before giving up.
 
 ## Provisioning
 

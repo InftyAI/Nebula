@@ -31,6 +31,8 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/metrics"
+	"github.com/InftyAI/Nebula/pkg/provider"
+	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -103,7 +105,7 @@ func TestPlacement_DeferralReasons(t *testing.T) {
 		pool string // the pool label expected on the metric
 		want string
 		// build returns the objects to seed and the providers to register.
-		build func() ([]client.Object, []*fakeProvider, Blocklister)
+		build func() ([]client.Object, []provider.Provider, Blocklister)
 	}{{
 		// The Pod names a pool that does not exist. The pool label is deliberately the
 		// placeholder, NOT the unresolved name — that string is a user-controlled Pod
@@ -111,22 +113,22 @@ func TestPlacement_DeferralReasons(t *testing.T) {
 		name: "missing pool",
 		pool: "none",
 		want: metrics.DeferNoPool,
-		build: func() ([]client.Object, []*fakeProvider, Blocklister) {
+		build: func() ([]client.Object, []provider.Provider, Blocklister) {
 			return []client.Object{gatedPod("d1", "default", "uid-d1", "ghost-pool", "H100")},
-				[]*fakeProvider{{name: "p1"}}, nil
+				[]provider.Provider{&fakeProvider{name: "p1"}}, nil
 		},
 	}, {
 		// nvidia.com/gpu with no accelerator-type label: malformed, not CPU-only.
 		name: "invalid accelerator request",
 		pool: "pool",
 		want: metrics.DeferInvalidRequest,
-		build: func() ([]client.Object, []*fakeProvider, Blocklister) {
+		build: func() ([]client.Object, []provider.Provider, Blocklister) {
 			pod := gatedPod("d1", "default", "uid-d1", "pool", "")
 			pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
 				util.NvidiaGPUResource: resource.MustParse("1"),
 			}
 			pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "p1")
-			return []client.Object{pod, pool}, []*fakeProvider{{name: "p1"}}, nil
+			return []client.Object{pod, pool}, []provider.Provider{&fakeProvider{name: "p1"}}, nil
 		},
 	}, {
 		// Servable, but every candidate is blocked: self-clearing, and the caller
@@ -134,10 +136,10 @@ func TestPlacement_DeferralReasons(t *testing.T) {
 		name: "all candidates blocked",
 		pool: "pool",
 		want: metrics.DeferAllBlocked,
-		build: func() ([]client.Object, []*fakeProvider, Blocklister) {
+		build: func() ([]client.Object, []provider.Provider, Blocklister) {
 			pod := gatedPod("d1", "default", "uid-d1", "pool", "H100")
 			pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "p1")
-			return []client.Object{pod, pool}, []*fakeProvider{{name: "p1"}},
+			return []client.Object{pod, pool}, []provider.Provider{&fakeProvider{name: "p1"}},
 				&fakeBlocklist{blocked: []failover.Candidate{{Provider: "p1"}}}
 		},
 	}, {
@@ -145,17 +147,17 @@ func TestPlacement_DeferralReasons(t *testing.T) {
 		name: "no servable candidate",
 		pool: "pool",
 		want: metrics.DeferNoCandidate,
-		build: func() ([]client.Object, []*fakeProvider, Blocklister) {
+		build: func() ([]client.Object, []provider.Provider, Blocklister) {
 			pod := gatedPod("d1", "default", "uid-d1", "pool", "H100")
 			pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "p1")
-			return []client.Object{pod, pool}, []*fakeProvider{{name: "p1", gpus: []string{"A100"}}}, nil
+			return []client.Object{pod, pool}, []provider.Provider{&fakeProvider{name: "p1", gpus: []string{"A100"}}}, nil
 		},
 	}, {
 		// A claim from a prior same-named Pod has not been reaped yet.
 		name: "stale claim",
 		pool: "pool",
 		want: metrics.DeferStaleClaim,
-		build: func() ([]client.Object, []*fakeProvider, Blocklister) {
+		build: func() ([]client.Object, []provider.Provider, Blocklister) {
 			pod := gatedPod("d1", "default", "uid-new", "pool", "H100")
 			pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, "p1")
 			stale := &nebulav1alpha1.NodeClaim{
@@ -164,7 +166,7 @@ func TestPlacement_DeferralReasons(t *testing.T) {
 					PodRef: nebulav1alpha1.PodReference{Namespace: "default", Name: "d1", UID: "uid-old"},
 				},
 			}
-			return []client.Object{pod, pool, stale}, []*fakeProvider{{name: "p1"}}, nil
+			return []client.Object{pod, pool, stale}, []provider.Provider{&fakeProvider{name: "p1"}}, nil
 		},
 	}}
 
@@ -235,6 +237,24 @@ func TestPlacement_CandidateSkipReasons(t *testing.T) {
 	}
 	if got := counterVal(t, metrics.CandidateSkips, accelUnsupported) - before["accel"]; got != 1 {
 		t.Fatalf("accelerator_unsupported skips delta = %v, want 1", got)
+	}
+}
+
+// Its own test, not a fourth provider above: the annotation would apply to every provider
+// there. The real AWS adapter pins the real cause — "af" is opt-in-only, so an
+// unconstrained pool still reaches no region.
+func TestPlacement_NarrowingToNoRegionFilesNoAvailableRegions(t *testing.T) {
+	noRegions := skipLabels(provider.ProviderAWS, nebulav1alpha1.CapacityOnDemand, "", metrics.SkipNoAvailableRegions)
+	before := counterVal(t, metrics.CandidateSkips, noRegions)
+
+	pod := gatedPod("r1", "default", "uid-r1", "pool", "")
+	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "af"}
+	pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderAWS)
+	r, _ := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+	reconcilePod(t, r, "default", "r1")
+
+	if got := counterVal(t, metrics.CandidateSkips, noRegions) - before; got != 1 {
+		t.Fatalf("no_available_regions skips delta = %v, want 1", got)
 	}
 }
 
