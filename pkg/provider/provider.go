@@ -218,9 +218,7 @@ type ProvisionRequest struct {
 	// capacity failure blocklist just that region; a provider that cannot fail over
 	// (Modal) may encode several for its own scheduler, and only that adapter parses it.
 	//
-	// Empty means "no region constraint", and arrives only if this provider's ExpandRegions
-	// returned [""] — so an adapter that cannot honour it never sees it. On Modal it is the
-	// widest and cheapest option (pinning costs 1.5-1.75x).
+	// Empty means "no region constraint".
 	Region string
 	// Egress is the pool's outbound policy, or nil for Open. Placement has already checked
 	// that this provider can enforce it (Capabilities.SupportsEgressPolicy), so an adapter

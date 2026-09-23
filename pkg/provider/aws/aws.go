@@ -72,11 +72,7 @@ const provisionTimeout = 2 * time.Minute
 
 // regionsByGeography maps a geography token to the AWS regions it encompasses.
 //
-// The empty entries are the opt-in regions, left out on purpose: EC2 answers
-// OptInRequired for an account that has not enabled one, which translate.go maps to
-// ErrAuth and so blocklists the WHOLE provider. A pool can still name such a region
-// literally, but narrowing intersects this table — so it cannot be reached through the
-// regions annotation.
+// The empty entries are the opt-in regions, disabled by default in AWS accounts.
 var regionsByGeography = map[string][]string{
 	"us": {"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
 	"ca": {"ca-central-1"},

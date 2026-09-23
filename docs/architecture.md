@@ -50,15 +50,10 @@ mapping), see [docs/status.md](status.md).
 
 **Non-goals in the current implementation**
 
-- Uniform geographic coverage. `provider.Geographies` is a flat, provider-neutral
-  vocabulary of broad tokens (`us`, `eu`, `ap`, `uk`, `ca`, `me`, `sa`, `af`, `mx`)
-  and that is the whole shared namespace — a provider's own region names are the
-  second level and are never vocabulary.
-- Regions a provider's geography table does not list. That table is the only authority
-  on which geography holds which region, so such a region is reachable only by naming
-  it literally in the NodePool, never through a Pod's `regions` annotation. AWS's
-  opt-in regions are left out on purpose: EC2 answers `OptInRequired`, which classifies
-  as an auth failure and would blocklist the whole provider.
+- Uniform geographic coverage. Regions come in two levels: broad geographies
+  (`provider.Geographies`: `us`, `eu`, `ap`, `uk`, `ca`, `me`, `sa`, `af`, `mx`) and a
+  provider's own region names (`us-east-1`). A NodePool may declare either; a Pod's
+  `regions` annotation takes geographies only.
 - Price-ranked region choice. Within a capacity tier the expanded regions are walked
   in order, not ranked: the catalog carries no per-region prices, so a wide
   declaration cannot yet prefer the cheapest region. Modal is the sharper case — a
