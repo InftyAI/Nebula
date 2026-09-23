@@ -32,6 +32,7 @@ import (
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -236,6 +237,24 @@ func TestPlacement_CandidateSkipReasons(t *testing.T) {
 	}
 	if got := counterVal(t, metrics.CandidateSkips, accelUnsupported) - before["accel"]; got != 1 {
 		t.Fatalf("accelerator_unsupported skips delta = %v, want 1", got)
+	}
+}
+
+// Its own test, not a fourth provider above: the annotation would apply to every provider
+// there. The real AWS adapter pins the real cause — "af" is opt-in-only, so an
+// unconstrained pool still reaches no region.
+func TestPlacement_NarrowingToNoRegionFilesNoAvailableRegions(t *testing.T) {
+	noRegions := skipLabels(provider.ProviderAWS, nebulav1alpha1.CapacityOnDemand, "", metrics.SkipNoAvailableRegions)
+	before := counterVal(t, metrics.CandidateSkips, noRegions)
+
+	pod := gatedPod("r1", "default", "uid-r1", "pool", "")
+	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "af"}
+	pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderAWS)
+	r, _ := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+	reconcilePod(t, r, "default", "r1")
+
+	if got := counterVal(t, metrics.CandidateSkips, noRegions) - before; got != 1 {
+		t.Fatalf("no_available_regions skips delta = %v, want 1", got)
 	}
 }
 

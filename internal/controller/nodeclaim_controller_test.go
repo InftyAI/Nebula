@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -85,15 +86,26 @@ func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool) {
 	return nil, false
 }
 
-// ExpandRegions passes the declaration through and fails closed on narrowing — the
-// region-simple behaviour, as pkg/provider/fake has. Tests that need group expansion set
-// expandRegions.
+// ExpandRegions is region-simple like Modal: declared tokens are their own geographies, an
+// unconstrained pool takes the narrowing as its constraint, and no declaration at all is
+// one unpinned candidate. Tests that need group expansion set expandRegions.
 func (f *fakeProvider) ExpandRegions(declared, narrowTo []string) []string {
-	if len(narrowTo) > 0 {
-		return nil
-	}
 	if f.expandRegions != nil {
-		return f.expandRegions(declared)
+		declared = f.expandRegions(declared)
+	}
+	switch {
+	case len(narrowTo) > 0 && len(declared) == 0:
+		return narrowTo
+	case len(narrowTo) > 0:
+		var out []string
+		for _, d := range declared {
+			if slices.Contains(narrowTo, d) {
+				out = append(out, d)
+			}
+		}
+		return out
+	case len(declared) == 0:
+		return []string{""}
 	}
 	return declared
 }

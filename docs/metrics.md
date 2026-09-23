@@ -77,6 +77,10 @@ The skip `reason` is likewise closed: `provider_unregistered`,
 `no_available_regions`, `blocked`. Only `blocked` clears on its own. One reconcile can file
 several skips — the walk visits every candidate before giving up.
 
+`nebula_placement_deferrals_total` counts **deferrals, not Pods**: a gated Pod adds one on
+every reconcile that fails to place it. Read the rate as placement pressure. For how many
+Pods are stuck right now, count SchedulingGated Pods in kube-state-metrics.
+
 ## Provisioning
 
 What the external call cost, and how it failed.

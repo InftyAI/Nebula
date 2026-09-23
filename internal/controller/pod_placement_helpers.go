@@ -106,8 +106,8 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 		return placement{}, false, 0
 	}
 
-	// The Pod's region ask, read ONCE: regionsFor runs per provider ref, so parsing inside it
-	// would repeat this deferral log for every provider in the pool.
+	// The Pod's region ask, read ONCE: region expansion runs per provider ref, so parsing
+	// there would repeat this deferral log for every provider in the pool.
 	narrowTo, ok := requestedGeographies(pod)
 	if !ok {
 		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
@@ -155,9 +155,10 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					continue
 				}
 			}
-			// Empty can only mean the Pod's narrowing eliminated every region this
-			// provider reaches: without one, regionsFor always yields a candidate.
-			regions := regionsFor(prov, ref, narrowTo)
+			// Empty means the pool's declaration, or the Pod's narrowing of it, reaches
+			// no region this provider can place in. The expansion must match
+			// awsRegionSource's (cmd/main.go); see its comment.
+			regions := prov.ExpandRegions(ref.Regions, narrowTo)
 			if len(regions) == 0 {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipNoAvailableRegions)
 				log.V(1).Info("skipping candidate: no available region serves the requested geographies",
@@ -260,35 +261,6 @@ func servesEgress(prov provider.Provider, policy *nebulav1alpha1.EgressPolicy) b
 		return true
 	}
 	return prov.Capabilities().SupportsEgressPolicy
-}
-
-// regionsFor is the inner axis for one provider ref: the concrete regions to try, in
-// expansion order. The pool's declaration is a CONSTRAINT, not a list of regions —
-// it may be omitted (unconstrained), name a geography group ("us"), or name regions
-// literally — so only the provider can resolve it, and ExpandRegions does (see
-// provider.Provider for the three levels).
-//
-// narrowTo is the Pod's own ask (RegionsAnnotation), which subsets that expansion.
-//
-// The empty-string fallback covers expansion yielding nothing: a region-simple provider
-// whose pool declared no regions still needs ONE candidate, or `range` runs zero times and
-// the provider is silently unplaceable. That candidate means "send no region, place freely" —
-// Modal's normal and cheapest mode.
-//
-// It is gated on there being NO narrowing, and that guard is load-bearing: under a narrowing
-// an empty expansion means the intersection eliminated every region, so falling back to ""
-// would place a Pod that asked for "us" anywhere on earth. Empty means no candidate there,
-// and the caller skips the provider.
-//
-// This and awsRegionSource (cmd/main.go) are the only readers of ProviderSpec.Regions and
-// MUST expand it identically: a region provisioned into but not swept is absent from List,
-// and absence is reported as Terminated on a live, billing instance.
-func regionsFor(prov provider.Provider, ref nebulav1alpha1.ProviderSpec, narrowTo []string) []string {
-	regions := prov.ExpandRegions(ref.Regions, narrowTo)
-	if len(regions) == 0 && len(narrowTo) == 0 {
-		return []string{""} // unconstrained on a region-simple provider
-	}
-	return regions
 }
 
 // requestedGeographies reads the Pod's RegionsAnnotation into the narrowing ExpandRegions

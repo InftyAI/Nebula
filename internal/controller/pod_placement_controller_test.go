@@ -511,18 +511,6 @@ func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
 	}
 }
 
-func TestRegionsFor_UnconstrainedOnRegionSimpleProviderYieldsOneCandidate(t *testing.T) {
-	// A region-simple provider passes nil through, so expansion yields nothing.
-	// regionsFor must still emit ONE candidate — the empty
-	// region, meaning "send no region" — or `range` would run zero times and the
-	// provider would be silently unplaceable with no error anywhere.
-	prov := &fakeProvider{name: provider.ProviderModal}
-	got := regionsFor(prov, nebulav1alpha1.ProviderSpec{Name: provider.ProviderModal}, nil)
-	if !slices.Equal(got, []string{""}) {
-		t.Fatalf("regionsFor(nil) = %v, want one empty candidate", got)
-	}
-}
-
 func TestRequestedGeographies(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -623,6 +611,19 @@ func TestPlacement_NarrowingThatEliminatesEveryRegionLeavesPodGated(t *testing.T
 	}
 }
 
+func TestPlacement_DeclarationReachingNoRegionLeavesPodGated(t *testing.T) {
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderAWS, "af")
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+
+	reconcilePod(t, r, "default", "p1")
+
+	if got := getPod(t, c, "default", "p1"); !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when the pool's declaration reaches no region")
+	}
+}
+
 func TestPlacement_UnresolvableRegionAnnotationLeavesPodGated(t *testing.T) {
 	// A typo is an invalid request, not an empty narrowing: the Pod stays gated until a
 	// human fixes it. Placing it would mean ignoring a residency constraint.
@@ -640,15 +641,14 @@ func TestPlacement_UnresolvableRegionAnnotationLeavesPodGated(t *testing.T) {
 	}
 }
 
-func TestRegionsFor_AgreesWithAWSSweepExpansion(t *testing.T) {
-	// The two readers of ProviderSpec.Regions — placement's regionsFor and the AWS
+func TestPlacementExpansion_AgreesWithAWSSweep(t *testing.T) {
+	// The two readers of ProviderSpec.Regions — selectPlacement and the AWS
 	// RegionSource in cmd/main.go — MUST expand a declaration identically. If the
 	// sweep covers less than placement provisions into, the missing region's instances
 	// are absent from List, and applyState maps absence to Terminated: a live, billing
 	// fleet reported as gone. Both go through ExpandRegions; this pins that they do.
 	for _, declared := range [][]string{nil, {"us"}, {"eu"}, {"us-east-1"}, {"us", "me-central-1"}} {
-		placementSide := regionsFor(awsprovider.New(nil, nil, nil),
-			nebulav1alpha1.ProviderSpec{Name: provider.ProviderAWS, Regions: declared}, nil)
+		placementSide := awsprovider.New(nil, nil, nil).ExpandRegions(declared, nil)
 		sweepSide := awsprovider.ExpandRegions(declared)
 		if !slices.Equal(placementSide, sweepSide) {
 			t.Errorf("declared %v: placement walks %v but the sweep covers %v",

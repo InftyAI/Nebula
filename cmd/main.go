@@ -678,8 +678,8 @@ func awsRegionSource(c client.Client) awsprovider.RegionSource {
 					// unioning the raw lists first would collapse that to "nothing" —
 					// the swept set would miss regions placement provisions into, and
 					// List's absence is reported as Terminated on live instances.
-					// This is the same expansion regionsFor applies on the placement
-					// side; both must agree, so both call this one function.
+					// This is the same expansion selectPlacement applies through the
+					// adapter's ExpandRegions; both must agree, so both call this one function.
 					regions = append(regions, awsprovider.ExpandRegions(ps.Regions)...)
 				}
 			}

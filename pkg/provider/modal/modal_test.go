@@ -917,15 +917,14 @@ func TestExpandRegions_CollapsesToOneCandidate(t *testing.T) {
 		declared []string
 		want     []string
 	}{{
-		name:     "no declaration stays unconstrained",
+		// [""], not nil: nil is no candidate, and placement would skip Modal entirely.
+		name:     "no declaration is one unpinned candidate",
 		declared: nil,
-		want:     nil,
+		want:     []string{""},
 	}, {
-		// Not []string{""}: an empty candidate and no candidate must not be confused,
-		// and regionsFor supplies the one candidate the walk needs.
-		name:     "a declaration of only blanks is unconstrained, not an empty region",
+		name:     "a declaration of only blanks is unconstrained, not a blank region",
 		declared: []string{"", "  "},
-		want:     nil,
+		want:     []string{""},
 	}, {
 		name:     "a single region is one candidate holding it",
 		declared: []string{"us"},
@@ -1050,7 +1049,7 @@ func TestExpandRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
 	defer delete(regionsByGeography, "jp")
 
 	p := newTestProvider(&fakeClient{})
-	if got := p.ExpandRegions(nil, []string{"jp"}); got != nil {
+	if got := p.ExpandRegions(nil, []string{"jp"}); len(got) != 0 {
 		t.Errorf("narrowTo [jp] resolved to %v; only provider.Geographies tokens may narrow", got)
 	}
 }

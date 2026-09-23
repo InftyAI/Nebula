@@ -795,7 +795,7 @@ func TestExpandRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
 	regionsByGeography["jp"] = []string{"ap-northeast-1"}
 	defer delete(regionsByGeography, "jp")
 
-	if got := narrowRegions(ExpandRegions(nil), []string{"jp"}); got != nil {
+	if got := narrowRegions(ExpandRegions(nil), []string{"jp"}); len(got) != 0 {
 		t.Errorf("narrowTo [jp] resolved to %v; only provider.Geographies tokens may narrow", got)
 	}
 }

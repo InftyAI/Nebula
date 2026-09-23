@@ -386,10 +386,11 @@ func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
 	regions := dedupeRegions(declared)
 	if len(narrowTo) > 0 {
 		regions = dedupeRegions(narrowRegions(regions, narrowTo))
+		if len(regions) == 0 {
+			return nil
+		}
 	}
-	if len(regions) == 0 {
-		return nil
-	}
+	// With no declaration this joins to "": unpinned, Modal's widest and cheapest candidate.
 	return []string{strings.Join(regions, regionSeparator)}
 }
 
