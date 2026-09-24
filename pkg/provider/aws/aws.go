@@ -191,16 +191,19 @@ type EC2Instance struct {
 // set serves every region and only the region endpoint differs.
 type ClientFactory func(ctx context.Context, region string) (Client, error)
 
-// RegionSource reports the regions the adapter should sweep in List and Offerings. The
-// NodePool is the source of truth: cmd/main.go backs this with a lister over
-// ProviderSpec.Regions across every "aws" pool, so the set is DYNAMIC (a pool added at
-// runtime widens the sweep) and needs no env var. Provisioning never needed it — the target
-// region rides on the request — only the fan-out does.
+// RegionSource reports the declarations the adapter should sweep in List and Offerings: one
+// entry per "aws" NodePool, its ProviderSpec.Regions verbatim. The NodePool is the source of
+// truth: cmd/main.go backs this with a lister, so the set is DYNAMIC (a pool added at runtime
+// widens the sweep) and needs no env var. Provisioning never needed it — the target region
+// rides on the request — only the fan-out does.
+//
+// Per pool, not flattened: a nil entry is a pool with no constraint (every region), which a
+// flat list would lose. See sweepRegions.
 //
 // It may return empty (no aws pool yet, or an unsynced cache); sweepRegions then falls back
 // to the lazy client cache's keys, so a fleet placed by a prior generation is still swept.
 // Must be safe to call concurrently.
-type RegionSource func() []string
+type RegionSource func() [][]string
 
 // Provider is the EC2 implementation of provider.Provider. It embeds catalog.Base
 // for the generic catalog methods (Name, Offerings, and MapAccelerator — which
@@ -220,7 +223,7 @@ type Provider struct {
 	// newClient lazily builds the Client for a region (AMI/subnet resolution). The
 	// factory seam keeps the adapter SDK-free and unit-testable.
 	newClient ClientFactory
-	// regionSource reports the NodePool-declared regions to sweep in List/Offerings.
+	// regionSource reports the NodePool declarations to sweep in List/Offerings.
 	// May be nil in tests, in which case sweepRegions uses only the cache keys.
 	regionSource RegionSource
 
@@ -229,12 +232,12 @@ type Provider struct {
 }
 
 // New returns an EC2 Provider backed by a client factory and price catalog.
-// regionSource supplies the NodePool-declared region set the List/Offerings fan-out
+// regionSource supplies the NodePool declarations the List/Offerings fan-out
 // sweeps (nil is tolerated — the sweep then uses only the regions already
 // provisioned into). cat is the catalog.Lookup seam so tests can inject a fake.
 //
 // There is deliberately NO default region: every request carries its own region
-// (ExpandRegions turns even an omitted pool declaration into concrete regions, and
+// (ResolveRegions turns even an omitted pool declaration into concrete regions, and
 // placement stamps one onto the ProvisionRequest), and observed instances report
 // their region from the region-pinned client — so nothing needs a fallback, and no
 // AWS_REGION env is read.
@@ -256,7 +259,7 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 	p := New(
 		func(context.Context, string) (Client, error) { return client, nil },
 		cat,
-		func() []string { return []string{region} },
+		func() [][]string { return [][]string{{region}} },
 	)
 	// Pre-seed the cache so even a stray region lookup returns the fake rather than
 	// invoking the (constant) factory.
@@ -264,7 +267,7 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 	return p
 }
 
-// ExpandRegions implements provider.Provider. EC2 region names are not geographies, so AWS
+// ResolveRegions implements provider.Provider. EC2 region names are not geographies, so AWS
 // resolves them through regionsByGeography. Three levels, in the order they are checked:
 //
 //	nil/[]          => every default-enabled region
@@ -272,8 +275,8 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 //	["us-east-1"]   => itself, verbatim and unvalidated
 //
 // narrowTo filters the expansion to only include regions within the requested geographies.
-func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
-	return narrowRegions(ExpandRegions(declared), narrowTo)
+func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
+	return narrowRegions(expandDeclared(declared), narrowTo)
 }
 
 // narrowRegions keeps the regions that fall inside at least one requested geography. An
@@ -302,9 +305,9 @@ func narrowRegions(expanded, narrowTo []string) []string {
 	return out
 }
 
-// ExpandRegions is the package-level function that mirrors Provider.ExpandRegions, expanding
-// declared regions into the full set of EC2 regions, with geographies resolved.
-func ExpandRegions(declared []string) []string {
+// expandDeclared turns a pool's declaration into concrete EC2 regions, with no narrowing.
+// Placement narrows it and sweepRegions reads it as is, so the two agree.
+func expandDeclared(declared []string) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(r string) {
@@ -337,11 +340,13 @@ func ExpandRegions(declared []string) []string {
 }
 
 // sweepRegions returns the regions List and Offerings fan out across: the union of
-// the NodePool-declared set (regionSource) and every region already in the lazy
-// client cache. The cache half is what makes teardown survive a NodePool edit — an
-// instance still running in a region just dropped from every pool is still swept and
-// so still observed/reclaimed, rather than being stranded because the region left
-// the declared set. Order is not significant (callers concatenate results).
+// each NodePool declaration (regionSource), resolved per pool as placement resolves it,
+// and every region already in the lazy client cache. A region placed into but not swept
+// is absent from List, which reports a live instance as Terminated. The cache half is
+// what makes teardown survive a NodePool edit — an instance still running in a region
+// just dropped from every pool is still swept and so still observed/reclaimed, rather than
+// being stranded because the region left the declared set. Order is not significant
+// (callers concatenate results).
 func (p *Provider) sweepRegions() []string {
 	seen := make(map[string]bool)
 	var out []string
@@ -353,8 +358,10 @@ func (p *Provider) sweepRegions() []string {
 		out = append(out, r)
 	}
 	if p.regionSource != nil {
-		for _, r := range p.regionSource() {
-			add(strings.TrimSpace(r))
+		for _, declared := range p.regionSource() {
+			for _, r := range expandDeclared(declared) {
+				add(r)
+			}
 		}
 	}
 	p.mu.Lock()

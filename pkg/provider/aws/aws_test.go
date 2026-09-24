@@ -339,7 +339,7 @@ func TestProvision_EmptyRegionIsError(t *testing.T) {
 
 	// There is NO default region: a request that omits one cannot build a client, so
 	// Provision errors rather than silently guessing. In production every request
-	// carries a region (ExpandRegions never yields an empty one; placement stamps it),
+	// carries a region (ResolveRegions never yields an empty one; placement stamps it),
 	// so this only guards a malformed request.
 	if _, err := p.Provision(context.Background(), gpuPod("H100", 8), provider.ProvisionRequest{
 		ClaimName: "claim-def",
@@ -511,7 +511,7 @@ func TestTerminate_RegionOutsideTheSweep(t *testing.T) {
 	p := New(
 		func(context.Context, string) (Client, error) { return f, nil },
 		fakeCatalog{},
-		func() []string { return nil }, // no pool declares a region
+		func() [][]string { return nil }, // no aws pool
 	)
 
 	if regions := p.sweepRegions(); len(regions) != 0 {
@@ -522,6 +522,24 @@ func TestTerminate_RegionOutsideTheSweep(t *testing.T) {
 	}
 	if len(f.terminated) != 1 || f.terminated[0] != "i-2" {
 		t.Fatalf("terminated = %v, want [i-2]", f.terminated)
+	}
+}
+
+// TestSweepRegions_CoversEveryPoolsPlacement pins that the sweep covers every region
+// placement can provision into, per pool. The unconstrained pool is the case that breaks if
+// declarations are flattened before resolving: appended to ["us"] it would vanish, leaving
+// eu-west-1 unswept and a live instance there reported as Terminated.
+func TestSweepRegions_CoversEveryPoolsPlacement(t *testing.T) {
+	pools := [][]string{nil, {"us"}, {"me-central-1"}}
+	p := New(nil, fakeCatalog{}, func() [][]string { return pools })
+
+	swept := p.sweepRegions()
+	for _, declared := range pools {
+		for _, r := range p.ResolveRegions(declared, nil) {
+			if !slices.Contains(swept, r) {
+				t.Errorf("pool %v places into %q, which the sweep %v misses", declared, r, swept)
+			}
+		}
 	}
 }
 
@@ -605,7 +623,7 @@ func TestCapabilities(t *testing.T) {
 	}
 }
 
-func TestExpandRegions(t *testing.T) {
+func TestExpandDeclared(t *testing.T) {
 	cases := []struct {
 		name     string
 		declared []string
@@ -679,22 +697,15 @@ func TestExpandRegions(t *testing.T) {
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ExpandRegions(tc.declared)
+			got := expandDeclared(tc.declared)
 			if !slices.Equal(got, tc.want) {
-				t.Fatalf("ExpandRegions(%v)\n got %v\nwant %v", tc.declared, got, tc.want)
-			}
-			// The method must agree with the package function: cmd/main.go's region
-			// source calls the function while placement calls the method, and the two
-			// diverging is exactly the bug that reports a live fleet as Terminated.
-			p := newTestProvider(&fakeClient{})
-			if m := p.ExpandRegions(tc.declared, nil); !slices.Equal(m, got) {
-				t.Fatalf("method %v != function %v", m, got)
+				t.Fatalf("expandDeclared(%v)\n got %v\nwant %v", tc.declared, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestExpandRegions_NarrowTo(t *testing.T) {
+func TestResolveRegions_NarrowTo(t *testing.T) {
 	cases := []struct {
 		name     string
 		declared []string
@@ -767,9 +778,9 @@ func TestExpandRegions_NarrowTo(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := p.ExpandRegions(tc.declared, tc.narrowTo)
+			got := p.ResolveRegions(tc.declared, tc.narrowTo)
 			if !slices.Equal(got, tc.want) {
-				t.Fatalf("ExpandRegions(%v, %v)\n got %v\nwant %v",
+				t.Fatalf("ResolveRegions(%v, %v)\n got %v\nwant %v",
 					tc.declared, tc.narrowTo, got, tc.want)
 			}
 			// The invariant that makes narrowing safe without any membership check:
@@ -778,24 +789,24 @@ func TestExpandRegions_NarrowTo(t *testing.T) {
 			// List never polls, and absence from List reports a live instance as
 			// Terminated.
 			for _, r := range got {
-				if !slices.Contains(ExpandRegions(tc.declared), r) {
+				if !slices.Contains(expandDeclared(tc.declared), r) {
 					t.Fatalf("narrowed region %q is outside the swept expansion %v",
-						r, ExpandRegions(tc.declared))
+						r, expandDeclared(tc.declared))
 				}
 			}
 		})
 	}
 }
 
-// TestExpandRegions_NarrowToTakesVocabularyOnly covers the IsGeography gate itself, which no
+// TestResolveRegions_NarrowToTakesVocabularyOnly covers the IsGeography gate itself, which no
 // other case can reach: a narrowing resolves only because the token is VOCABULARY, not merely
 // because this adapter happens to have a table entry for it. Without the gate, adding a key
 // here would silently give one provider a narrowing token its siblings drop.
-func TestExpandRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
+func TestResolveRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
 	regionsByGeography["jp"] = []string{"ap-northeast-1"}
 	defer delete(regionsByGeography, "jp")
 
-	if got := narrowRegions(ExpandRegions(nil), []string{"jp"}); len(got) != 0 {
+	if got := narrowRegions(expandDeclared(nil), []string{"jp"}); len(got) != 0 {
 		t.Errorf("narrowTo [jp] resolved to %v; only provider.Geographies tokens may narrow", got)
 	}
 }
@@ -812,7 +823,7 @@ func TestRegionGroups_ExcludeOptInRegions(t *testing.T) {
 		"ca-west-1", "eu-central-2", "eu-south-1", "eu-south-2",
 		"il-central-1", "me-central-1", "me-south-1", "mx-central-1",
 	}
-	all := ExpandRegions(nil)
+	all := expandDeclared(nil)
 	for _, r := range optIn {
 		if slices.Contains(all, r) {
 			t.Errorf("opt-in region %q must not expand (it is disabled by default)", r)

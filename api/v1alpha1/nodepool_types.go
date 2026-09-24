@@ -155,7 +155,7 @@ type ProviderSpec struct {
 	//     level a workload can also request per-Pod.
 	//   - a literal region name ("us-east-1" on AWS, "us-east" on Modal) => just that.
 	// Geographies are shared across providers; the regions behind them are not, so only
-	// the provider resolves which level a value is (provider.Provider's ExpandRegions).
+	// the provider resolves which level a value is (provider.Provider's ResolveRegions).
 	// +optional
 	// +kubebuilder:validation:items:MaxLength=32
 	Regions []string `json:"regions,omitempty"`

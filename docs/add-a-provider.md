@@ -26,7 +26,7 @@ Create `pkg/provider/<name>/` and implement `provider.Provider`
 | `Offerings(ctx)` | Price/availability rows for the optimizer (see the catalog below). |
 | `MapAccelerator(canonical, count)` | Translate a canonical accelerator (type + count) to the provider's own id; `ok=false` if unsupported. |
 | `ClassifyProvisionError(err, accel, region)` | Map a Provision failure to the `BlockScope` failover should blocklist. Only an **auth** error widens to the whole provider (`DenyAll`); capacity, quota, and unrecognized errors are all scoped to that {accel, tier, region} so failover can route around one candidate instead of fencing off the provider. Delegate to `provider.ClassifyError` for the shared part and decorate only what is provider-specific (e.g. the region axis). |
-| `ExpandRegions(declared, narrowTo)` | Turn a pool's `regions` into the region candidates placement will walk, optionally narrowed to the geographies one workload asked for. |
+| `ResolveRegions(declared, narrowTo)` | Turn a pool's `regions` into the region candidates placement will walk, optionally narrowed to the geographies one workload asked for. |
 
 The Pod is the single source of truth for the workload shape; `ProvisionRequest`
 carries only what the Pod cannot express (the optimizer's capacity tier and the

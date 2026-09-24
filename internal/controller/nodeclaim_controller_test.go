@@ -51,7 +51,7 @@ type fakeProvider struct {
 	gpus         []string            // accelerators MapAccelerator offers; nil = offer any
 	spot         bool                // Capabilities().SupportsSpot (placement skips Spot without it)
 	egress       bool                // Capabilities().SupportsEgressPolicy (placement skips restricted pools without it)
-	// expandRegions overrides ExpandRegions; nil = pass the declaration through.
+	// expandRegions overrides ResolveRegions; nil = pass the declaration through.
 	expandRegions func([]string) []string
 }
 
@@ -86,10 +86,10 @@ func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool) {
 	return nil, false
 }
 
-// ExpandRegions is region-simple like Modal: declared tokens are their own geographies, an
+// ResolveRegions is region-simple like Modal: declared tokens are their own geographies, an
 // unconstrained pool takes the narrowing as its constraint, and no declaration at all is
 // one unpinned candidate. Tests that need group expansion set expandRegions.
-func (f *fakeProvider) ExpandRegions(declared, narrowTo []string) []string {
+func (f *fakeProvider) ResolveRegions(declared, narrowTo []string) []string {
 	if f.expandRegions != nil {
 		declared = f.expandRegions(declared)
 	}

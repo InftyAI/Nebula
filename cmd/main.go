@@ -651,10 +651,11 @@ func registerProviders(ctx context.Context, c client.Client) {
 	}
 }
 
-// awsRegionSource returns the AWS adapter's RegionSource: the union of
-// ProviderSpec.Regions across every NodePool referencing the "aws" provider. No
-// env/flag needed — regions are the operator's per-pool declaration — and editing a
-// pool widens the swept set on the next List tick without a restart.
+// awsRegionSource returns the AWS adapter's RegionSource: ProviderSpec.Regions of every
+// NodePool referencing the "aws" provider, one entry per pool and unexpanded — the
+// adapter resolves them, as it does for placement. No env/flag needed — regions are the
+// operator's per-pool declaration — and editing a pool widens the swept set on the next
+// List tick without a restart.
 //
 // Evaluated per List/Offerings tick, served from the manager's informer cache (no API
 // call), so the O(pools) scan is cheap; sweepRegions dedupes. On a list error (cache
@@ -662,28 +663,23 @@ func registerProviders(ctx context.Context, c client.Client) {
 // the regions already provisioned into. Uses a background context, since it runs long
 // after registration returns.
 func awsRegionSource(c client.Client) awsprovider.RegionSource {
-	return func() []string {
+	return func() [][]string {
 		var pools nebulav1alpha1.NodePoolList
 		if err := c.List(context.Background(), &pools); err != nil {
 			setupLog.V(1).Info("aws region source: list NodePools failed; sweeping provisioned regions only",
 				"reason", err.Error())
 			return nil
 		}
-		var regions []string
+		var declared [][]string
 		for i := range pools.Items {
 			for _, ps := range pools.Items[i].Spec.Providers {
 				if ps.Name == provider.ProviderAWS {
-					// Expand PER POOL, before unioning. ProviderSpec.Regions is a
-					// constraint, not a list: an omitted one means "every region", and
-					// unioning the raw lists first would collapse that to "nothing" —
-					// the swept set would miss regions placement provisions into, and
-					// List's absence is reported as Terminated on live instances.
-					// This is the same expansion selectPlacement applies through the
-					// adapter's ExpandRegions; both must agree, so both call this one function.
-					regions = append(regions, awsprovider.ExpandRegions(ps.Regions)...)
+					// Never flatten: an omitted ProviderSpec.Regions means "every region",
+					// and appended to another pool's list it would vanish.
+					declared = append(declared, ps.Regions)
 				}
 			}
 		}
-		return regions
+		return declared
 	}
 }

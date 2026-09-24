@@ -7,7 +7,7 @@
 // (the cheapest one on Modal). Zone is not modeled — AWS's CreateFleet already spreads
 // across a region's AZs and no NeoCloud exposes zones. Region vocabularies differ per
 // provider, and the pool speaks group tokens ("us") on top, so translation lives behind
-// ExpandRegions rather than in the control plane.
+// ResolveRegions rather than in the control plane.
 //
 // Design rules:
 //   - The Pod is the source of truth for the workload shape. Provision reads
@@ -114,7 +114,7 @@ type Provider interface {
 	// blocklist — an alternate running dry does not disable the primary.
 	MapAccelerator(canonical string, count int32) (providerAcceleratorIDs []string, ok bool)
 
-	// ExpandRegions resolves a pool's declared region constraint (ProviderSpec.Regions)
+	// ResolveRegions resolves a pool's declared region constraint (ProviderSpec.Regions)
 	// into the concrete regions placement may walk, in this provider's own vocabulary —
 	// only the provider knows its geography:
 	//
@@ -126,7 +126,7 @@ type Provider interface {
 	//
 	// An empty result means no candidate: placement skips this provider. A provider that
 	// can place without a region returns [""] for it — one candidate, unpinned.
-	ExpandRegions(declared, narrowTo []string) []string
+	ResolveRegions(declared, narrowTo []string) []string
 
 	// ClassifyProvisionError maps a Provision error to the granularity at which
 	// the failing placement should be blocklisted. This keeps failover precise:
@@ -213,7 +213,7 @@ type ProvisionRequest struct {
 	// nowhere to live on the Pod.
 	CapacityType nebulav1alpha1.CapacityType
 	// Region is the ONE candidate placement chose, exactly as this provider's own
-	// ExpandRegions minted it — already resolved (never a group token) and opaque to the
+	// ResolveRegions minted it — already resolved (never a group token) and opaque to the
 	// control plane. Usually one concrete region (AWS "us-east-1"), which is what lets a
 	// capacity failure blocklist just that region; a provider that cannot fail over
 	// (Modal) may encode several for its own scheduler, and only that adapter parses it.

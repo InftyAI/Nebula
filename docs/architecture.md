@@ -164,7 +164,7 @@ Follow one GPU Pod from creation to teardown:
    ```text
    for each capacityType in pool.spec.capacityTypes:     # outer axis
      for each provider in pool.spec.providers:           # listed order today
-       for each region in ExpandRegions(provider.regions, podGeographies):
+       for each region in ResolveRegions(provider.regions, podGeographies):
          skip unregistered providers
          skip providers that do not offer the accelerator type/count
          skip providers that cannot serve the tier (Modal has no Spot)
@@ -173,7 +173,7 @@ Follow one GPU Pod from creation to teardown:
          choose the first remaining candidate
    ```
 
-   The inner axis is whatever the provider's `ExpandRegions` returns, which is not
+   The inner axis is whatever the provider's `ResolveRegions` returns, which is not
    one iteration per declared region: AWS expands a group token into many candidates,
    while Modal collapses every declared region into a single candidate carrying them
    all (so its inner loop always runs exactly once, and the chosen `region` may be a

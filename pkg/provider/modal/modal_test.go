@@ -903,13 +903,13 @@ func TestProvision_CarriesRegion(t *testing.T) {
 	}
 }
 
-// TestExpandRegions_CollapsesToOneCandidate pins the axis decision that matters most
+// TestResolveRegions_CollapsesToOneCandidate pins the axis decision that matters most
 // for Modal: a pool's whole region declaration becomes exactly ONE placement
 // candidate. Modal's create accepts a sandbox and queues it without a capacity error,
 // so nothing re-drives placement afterwards — one candidate per region would mean the
 // first region walked is the only one ever tried, silently discarding the rest of the
 // operator's declaration. Collapsing hands the full set to Modal's own scheduler.
-func TestExpandRegions_CollapsesToOneCandidate(t *testing.T) {
+func TestResolveRegions_CollapsesToOneCandidate(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 
 	for _, tc := range []struct {
@@ -939,19 +939,19 @@ func TestExpandRegions_CollapsesToOneCandidate(t *testing.T) {
 		want:     []string{"eu-west" + regionSeparator + "us-east"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := p.ExpandRegions(tc.declared, nil)
+			got := p.ResolveRegions(tc.declared, nil)
 			if !slices.Equal(got, tc.want) {
-				t.Fatalf("ExpandRegions(%v) = %v, want %v", tc.declared, got, tc.want)
+				t.Fatalf("ResolveRegions(%v) = %v, want %v", tc.declared, got, tc.want)
 			}
 			if len(got) > 1 {
-				t.Fatalf("ExpandRegions(%v) produced %d candidates; Modal cannot fail "+
+				t.Fatalf("ResolveRegions(%v) produced %d candidates; Modal cannot fail "+
 					"over, so every extra candidate is a region silently never tried", tc.declared, len(got))
 			}
 		})
 	}
 }
 
-func TestExpandRegions_NarrowTo(t *testing.T) {
+func TestResolveRegions_NarrowTo(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	for _, tc := range []struct {
 		name     string
@@ -1024,9 +1024,9 @@ func TestExpandRegions_NarrowTo(t *testing.T) {
 		want:     nil,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := p.ExpandRegions(tc.declared, tc.narrowTo)
+			got := p.ResolveRegions(tc.declared, tc.narrowTo)
 			if !slices.Equal(got, tc.want) {
-				t.Fatalf("ExpandRegions(%v, %v) = %v, want %v",
+				t.Fatalf("ResolveRegions(%v, %v) = %v, want %v",
 					tc.declared, tc.narrowTo, got, tc.want)
 			}
 			// An empty result with a narrowTo means NO CANDIDATE. Reading it as
@@ -1039,17 +1039,17 @@ func TestExpandRegions_NarrowTo(t *testing.T) {
 	}
 }
 
-// TestExpandRegions_NarrowToTakesVocabularyOnly covers the IsGeography gate itself, which no
+// TestResolveRegions_NarrowToTakesVocabularyOnly covers the IsGeography gate itself, which no
 // other case can reach: a narrowing resolves only because the token is VOCABULARY, not merely
 // because this adapter has a table entry for it. Modal makes the stake concrete — "jp" IS a
 // region it serves, so without the gate an unconstrained pool would hand it straight to the
 // API as a candidate, honouring a token every sibling provider drops.
-func TestExpandRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
+func TestResolveRegions_NarrowToTakesVocabularyOnly(t *testing.T) {
 	regionsByGeography["jp"] = []string{"jp"}
 	defer delete(regionsByGeography, "jp")
 
 	p := newTestProvider(&fakeClient{})
-	if got := p.ExpandRegions(nil, []string{"jp"}); len(got) != 0 {
+	if got := p.ResolveRegions(nil, []string{"jp"}); len(got) != 0 {
 		t.Errorf("narrowTo [jp] resolved to %v; only provider.Geographies tokens may narrow", got)
 	}
 }
@@ -1078,13 +1078,13 @@ func TestRegionsByGeography_IsResolvable(t *testing.T) {
 	}
 }
 
-// TestExpandRegions_RoundTripsThroughProvision is the invariant that makes the
-// collapse safe: whatever ExpandRegions joins, regionsOf must split back to the exact
+// TestResolveRegions_RoundTripsThroughProvision is the invariant that makes the
+// collapse safe: whatever ResolveRegions joins, regionsOf must split back to the exact
 // declared set by the time it reaches Modal's API. The two are inverses, and this
 // asserts it end to end through Provision rather than on the helpers alone — a
 // mismatch here would send Modal a region name it has never heard of (the joined
 // token), which is precisely the failure a unit test on either half would miss.
-func TestExpandRegions_RoundTripsThroughProvision(t *testing.T) {
+func TestResolveRegions_RoundTripsThroughProvision(t *testing.T) {
 	for _, declared := range [][]string{
 		nil,
 		{"us"},
@@ -1094,7 +1094,7 @@ func TestExpandRegions_RoundTripsThroughProvision(t *testing.T) {
 		f := &fakeClient{createID: "sb-1"}
 		p := newTestProvider(f)
 
-		candidates := p.ExpandRegions(declared, nil)
+		candidates := p.ResolveRegions(declared, nil)
 		// Placement's own fallback when expansion is empty: one unconstrained candidate.
 		if len(candidates) == 0 {
 			candidates = []string{""}
