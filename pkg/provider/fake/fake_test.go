@@ -136,7 +136,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 // geography expands, a literal passes through, and a narrowing request subsets the
 // expansion. If any of this drifted toward a pass-through, e2e would sign off on a
 // narrowing the real adapters never perform.
-func TestExpandRegions(t *testing.T) {
+func TestResolveRegions(t *testing.T) {
 	tests := []struct {
 		name     string
 		declared []string
@@ -183,13 +183,13 @@ func TestExpandRegions(t *testing.T) {
 	p := New()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := p.ExpandRegions(tt.declared, tt.narrowTo)
+			got := p.ResolveRegions(tt.declared, tt.narrowTo)
 			if len(got) != len(tt.want) {
-				t.Fatalf("ExpandRegions(%v, %v) = %v, want %v", tt.declared, tt.narrowTo, got, tt.want)
+				t.Fatalf("ResolveRegions(%v, %v) = %v, want %v", tt.declared, tt.narrowTo, got, tt.want)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Fatalf("ExpandRegions(%v, %v) = %v, want %v", tt.declared, tt.narrowTo, got, tt.want)
+					t.Fatalf("ResolveRegions(%v, %v) = %v, want %v", tt.declared, tt.narrowTo, got, tt.want)
 				}
 			}
 		})

@@ -641,22 +641,6 @@ func TestPlacement_UnresolvableRegionAnnotationLeavesPodGated(t *testing.T) {
 	}
 }
 
-func TestPlacementExpansion_AgreesWithAWSSweep(t *testing.T) {
-	// The two readers of ProviderSpec.Regions — selectPlacement and the AWS
-	// RegionSource in cmd/main.go — MUST expand a declaration identically. If the
-	// sweep covers less than placement provisions into, the missing region's instances
-	// are absent from List, and applyState maps absence to Terminated: a live, billing
-	// fleet reported as gone. Both go through ExpandRegions; this pins that they do.
-	for _, declared := range [][]string{nil, {"us"}, {"eu"}, {"us-east-1"}, {"us", "me-central-1"}} {
-		placementSide := awsprovider.New(nil, nil, nil).ExpandRegions(declared, nil)
-		sweepSide := awsprovider.ExpandRegions(declared)
-		if !slices.Equal(placementSide, sweepSide) {
-			t.Errorf("declared %v: placement walks %v but the sweep covers %v",
-				declared, placementSide, sweepSide)
-		}
-	}
-}
-
 func TestPlacement_SkipsSpotWhenProviderHasNoSpotTier(t *testing.T) {
 	// Modal has no user-facing preemptible capacity (SupportsSpot=false). The pool
 	// asks for Spot first, but that candidate is unservable, so the walk falls

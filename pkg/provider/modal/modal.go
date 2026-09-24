@@ -30,7 +30,7 @@ limitations under the License.
 //   - A pool's regions go out in ONE call rather than being walked. Create never fails
 //     on capacity (it queues), so nothing would re-drive placement to a second region
 //     and walking would strand the workload in whichever came first. Modal's scheduler
-//     has the live capacity view, so ExpandRegions collapses the declaration into one
+//     has the live capacity view, so ResolveRegions collapses the declaration into one
 //     opaque candidate and regionsOf splits it back at the API boundary. The cost is
 //     blocklist precision, which is free here since no Modal failure is
 //     region-attributable.
@@ -189,7 +189,7 @@ type SandboxSpec struct {
 	//
 	// It carries EVERY region the pool declared, not one per attempt, because a Modal
 	// create cannot fail over — it returns an accepted id with no capacity error, so
-	// nothing here could try a second region afterwards. See ExpandRegions and regionsOf.
+	// nothing here could try a second region afterwards. See ResolveRegions and regionsOf.
 	Regions []string
 	// Timeout is the sandbox's maximum lifetime. It MUST be non-zero: Modal treats
 	// a zero timeout as its 5-minute default, which would terminate a real
@@ -318,6 +318,7 @@ func New(client Client, cat catalog.Lookup) *Provider {
 const regionSeparator = "|"
 
 // regionsByGeography maps a geography token to the Modal regions it encompasses.
+// See: https://modal.com/docs/guide/region-selection#container-region-options.
 var regionsByGeography = map[string][]string{
 	"us": {"us", "us-east", "us-central", "us-south", "us-west"},
 	"eu": {"eu", "eu-west", "eu-north", "eu-south"},
@@ -380,9 +381,9 @@ func dedupeRegions(regions []string) []string {
 	return out
 }
 
-// ExpandRegions implements provider.Provider. It resolves the pool's whole declaration to at
+// ResolveRegions implements provider.Provider. It resolves the pool's whole declaration to at
 // most ONE candidate, carrying every declared region in it, rather than one per region.
-func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
+func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 	regions := dedupeRegions(declared)
 	if len(narrowTo) > 0 {
 		regions = dedupeRegions(narrowRegions(regions, narrowTo))
@@ -562,7 +563,7 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // sentinel; ClassifyError honours those first, then falls back to string heuristics.
 //
 // It confines the block to the failing CANDIDATE, which is not necessarily one region:
-// ExpandRegions sends every declared region at once, so the token may name the whole set
+// ResolveRegions sends every declared region at once, so the token may name the whole set
 // and the block then covers all of it. That is honest — a multi-region create never says
 // which region was short — and a pool wanting per-region blocking declares per-region
 // pools. An empty region leaves Region nil, which per BlockScope matches only candidates
@@ -684,7 +685,7 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 }
 
 // regionsOf turns placement's single region candidate back into the slice Modal's
-// API takes. It is the exact inverse of ExpandRegions' join: that collapses the
+// API takes. It is the exact inverse of ResolveRegions' join: that collapses the
 // pool's whole declaration into ONE candidate (see there for why Modal cannot fail
 // over region by region), and this expands it again at the call boundary, so the
 // set the operator declared is what Modal's scheduler gets to choose among.

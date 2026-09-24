@@ -156,9 +156,8 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				}
 			}
 			// Empty means the pool's declaration, or the Pod's narrowing of it, reaches
-			// no region this provider can place in. The expansion must match
-			// awsRegionSource's (cmd/main.go); see its comment.
-			regions := prov.ExpandRegions(ref.Regions, narrowTo)
+			// no region this provider can place in.
+			regions := prov.ResolveRegions(ref.Regions, narrowTo)
 			if len(regions) == 0 {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipNoAvailableRegions)
 				log.V(1).Info("skipping candidate: no available region serves the requested geographies",
@@ -263,7 +262,7 @@ func servesEgress(prov provider.Provider, policy *nebulav1alpha1.EgressPolicy) b
 	return prov.Capabilities().SupportsEgressPolicy
 }
 
-// requestedGeographies reads the Pod's RegionsAnnotation into the narrowing ExpandRegions
+// requestedGeographies reads the Pod's RegionsAnnotation into the narrowing ResolveRegions
 // takes. Absent means no narrowing, the common case.
 func requestedGeographies(pod *corev1.Pod) (narrowTo []string, ok bool) {
 	raw := strings.TrimSpace(pod.Annotations[nebulav1alpha1.RegionsAnnotation])

@@ -92,14 +92,14 @@ func (p *Provider) Capabilities() provider.Capabilities {
 	}
 }
 
-// ExpandRegions expands geography tokens through regionsByGeography and narrows the
+// ResolveRegions expands geography tokens through regionsByGeography and narrows the
 // result to the requested geographies, mirroring the AWS adapter. Only that shape gives
 // placement a NAMED region per candidate, which is what lets the e2e suite assert which
 // region a Pod landed in rather than just that it landed.
 //
 // The fake names regions without partitioning anything behind them: Provision, Get and
 // List ignore the region entirely, so no instance behaves differently per region.
-func (p *Provider) ExpandRegions(declared, narrowTo []string) []string {
+func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 	expanded := expandRegions(declared)
 	if len(narrowTo) == 0 {
 		return expanded

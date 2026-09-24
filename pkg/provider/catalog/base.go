@@ -53,7 +53,7 @@ type Lookup interface {
 // only while a provider's catalog price is all-in; one that meters CPU/memory separately
 // overrides it and adds those components.
 //
-// Lifecycle, Capabilities, ClassifyProvisionError and ExpandRegions are genuinely
+// Lifecycle, Capabilities, ClassifyProvisionError and ResolveRegions are genuinely
 // provider-specific and are not provided here.
 type Base struct {
 	// ProviderName is this provider's stable identifier (e.g. "modal"), used both
