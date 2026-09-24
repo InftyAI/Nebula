@@ -342,10 +342,11 @@ func expandDeclared(declared []string) []string {
 // sweepRegions returns the regions List and Offerings fan out across: the union of
 // each NodePool declaration (regionSource), resolved per pool as placement resolves it,
 // and every region already in the lazy client cache. A region placed into but not swept
-// is absent from List, which reports a live instance as Terminated. The cache half is what makes teardown survive a NodePool edit — an
-// instance still running in a region just dropped from every pool is still swept and
-// so still observed/reclaimed, rather than being stranded because the region left
-// the declared set. Order is not significant (callers concatenate results).
+// is absent from List, which reports a live instance as Terminated. The cache half is
+// what makes teardown survive a NodePool edit — an instance still running in a region
+// just dropped from every pool is still swept and so still observed/reclaimed, rather than
+// being stranded because the region left the declared set. Order is not significant
+// (callers concatenate results).
 func (p *Provider) sweepRegions() []string {
 	seen := make(map[string]bool)
 	var out []string
