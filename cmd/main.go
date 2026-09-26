@@ -462,11 +462,8 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 		}
 	}
 
-	// Cost accrual is a clock-driven loop, not a reconciler, so it is added directly. It opts into
-	// leader election by NOT implementing LeaderElectionRunnable, which buys two things: N replicas
-	// would mean N times the writes, and each would book windows into its OWN cost counter, leaving
-	// increase() to read a series that holds only the races that replica won. The ledger itself is
-	// safe either way (see CostAccrual.accrue).
+	// Cost accrual is a clock-driven loop, not a reconciler, so it is added directly. It runs on
+	// the leader only (see CostAccrual.NeedLeaderElection).
 	if err := mgr.Add(controller.NewCostAccrual(mgr.GetClient())); err != nil {
 		return fmt.Errorf("unable to add the cost accrual loop: %w", err)
 	}

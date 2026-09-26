@@ -1045,3 +1045,9 @@ func TestCostAccrual_StartAccrues(t *testing.T) {
 	}
 	t.Fatal("Start persisted nothing after 5s of 1ms ticks")
 }
+
+func TestCostAccrualNeedsLeaderElection(t *testing.T) {
+	if !NewCostAccrual(nil).NeedLeaderElection() {
+		t.Fatal("cost accrual must run on the leader only")
+	}
+}
