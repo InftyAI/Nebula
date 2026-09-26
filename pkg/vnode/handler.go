@@ -148,6 +148,36 @@ type trackedPod struct {
 	// persistCredential.
 	patchedMeta podMeta
 
+	// initializingAt is when the instance was first observed Initializing, and arms the
+	// readiness deadline (see readyExpired). Deliberately NOT placement.provisioningAt: it
+	// measures the boot alone, so a provision that took minutes does not eat the budget.
+	//
+	// Level-triggered, not one-shot like provisioningAt: it is cleared whenever the
+	// instance is not Pending, so the clock tracks the CURRENT Initializing spell. A pod
+	// re-adopted after a restart therefore gets a full budget from its first observed tick,
+	// which is the safe direction — the alternative, exempting it forever, disables the
+	// deadline for exactly the pods a restart left stuck.
+	initializingAt time.Time
+
+	// placement is what this pod was provisioned against. Two readers: the poll loop files
+	// the ready duration under the same dimensions as the provision counters, and DeletePod
+	// takes the region the instance is reachable in. Nil unless THIS process provisioned it.
+	placement *placement
+}
+
+// placement is the decision one provision was issued against: the two facts the Pod itself
+// cannot supply, read from the NodeClaim at create (see claimFor). Kept per attempt rather
+// than re-read where it is used, because the poll loop holds h.mu while it observes, and
+// because the claim can be deleted while its instance is still tracked. The NodeClaim
+// stays the durable record; this is the historical one.
+//
+// Nil means "unknown" and is what every path that never provisioned stores. Its readers
+// degrade rather than guess: no ready sample is filed, and teardown falls back to reading
+// the claim. Losing it on a restart is fine for the same reason.
+type placement struct {
+	region string
+	tier   nebulav1alpha1.CapacityType
+
 	// provisioningAt is when THIS process began provisioning. It arms the one
 	// metrics.InstanceReadyDuration observation the poll loop makes on the first
 	// Running, and is consumed by it, so zero means "do not observe" for either reason:
@@ -163,36 +193,6 @@ type trackedPod struct {
 	// histogram under-samples the slowest boots. Fixing it means persisting the start
 	// time, a write on the provisioning path we have not taken.
 	provisioningAt time.Time
-
-	// initializingAt is when the instance was first observed Initializing, and arms the
-	// readiness deadline (see readyExpired). Deliberately NOT provisioningAt: it measures
-	// the boot alone, so a provision that took minutes does not eat the budget.
-	//
-	// Level-triggered, not one-shot like provisioningAt: it is cleared whenever the
-	// instance is not Pending, so the clock tracks the CURRENT Initializing spell. A pod
-	// re-adopted after a restart therefore gets a full budget from its first observed tick,
-	// which is the safe direction — the alternative, exempting it forever, disables the
-	// deadline for exactly the pods a restart left stuck.
-	initializingAt time.Time
-
-	// placement is what this pod was provisioned against. Two readers: the poll loop files
-	// the ready duration under the same dimensions as the provision counters, and DeletePod
-	// takes the region the instance is reachable in. Set only where provisioningAt is armed.
-	placement
-}
-
-// placement is the decision one provision was issued against: the two facts the Pod itself
-// cannot supply, read from the NodeClaim at create (see claimFor). Kept per attempt rather
-// than re-read where it is used, because the poll loop holds h.mu while it observes, and
-// because the claim can be deleted while its instance is still tracked. The NodeClaim
-// stays the durable record; this is the historical one.
-//
-// The zero value means "unknown" and is what every path that never provisioned stores. Its
-// readers degrade rather than guess: no ready sample is filed (provisioningAt is zero on
-// those same paths), and teardown falls back to reading the claim.
-type placement struct {
-	region string
-	tier   nebulav1alpha1.CapacityType
 }
 
 // podMeta is the Pod metadata the virtual kubelet owns: the annotations it is the sole
@@ -367,10 +367,9 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// only the Provision call. Not interchangeable — the emit between them is a
 	// synchronous notify that can issue an API write, which would otherwise be charged
 	// to the provider's latency.
-	provisioningAt := time.Now()
 	// Carried into store so the poll loop's ready observation is filed under the same region
 	// and tier as the counters below, whatever the NodeClaim says by then.
-	place := placement{region: req.Region, tier: req.CapacityType}
+	place := &placement{region: req.Region, tier: req.CapacityType, provisioningAt: time.Now()}
 	labels := h.metricLabels(pod, place.region, place.tier)
 
 	// Report Provisioning BEFORE the call: it can run for minutes (AWS sweeps a region's
@@ -395,7 +394,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		// update branch instead of provisioning again.
 		//
 		// Safe only because Pod with empty instanceID will be terminated on the next poll tick.
-		h.store(pod, claim, "", time.Time{}, placement{})
+		h.store(pod, claim, "", nil)
 		h.emit(pod)
 		return err
 	}
@@ -419,7 +418,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// tracked copy carries it, published by the emit below, re-offered every tick until a
 	// write lands. Its reader is the NodeClaim controller (see InstanceIDAnnotation).
 	setInstanceID(pod, res.InstanceID)
-	h.store(pod, claim, res.InstanceID, provisioningAt, place)
+	h.store(pod, claim, res.InstanceID, place)
 
 	// The TOKEN cannot ride the Pod (readable with `get pod`, unencrypted in etcd), so it
 	// gets its own write — the only place it exists, since the provider mints it once and
@@ -483,7 +482,9 @@ func (h *Handler) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	instance, region := "", ""
 	if ok {
 		instance = tp.instance
-		region = tp.region
+		if tp.placement != nil {
+			region = tp.placement.region
+		}
 	}
 	h.mu.Unlock()
 
@@ -570,10 +571,9 @@ func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.P
 	}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	applyState(pod, inst.State, inst.Endpoint, h.nowFn())
-	// Zero start: this process never provisioned it, so the real start time is gone and
-	// the ready-duration is not observable (see trackedPod.provisioningAt) — hence no
-	// placement either, since nothing here will be filed under it.
-	h.store(pod, claim, inst.ID, time.Time{}, placement{})
+	// No placement: this process never provisioned it, so the real start time is gone and
+	// the ready-duration is not observable (see placement.provisioningAt).
+	h.store(pod, claim, inst.ID, nil)
 	log.Info("re-adopted live instance after cold tracking map (VK restart)",
 		"claim", claim, "instanceID", inst.ID, "state", inst.State)
 	return pod.DeepCopy(), nil
@@ -788,17 +788,18 @@ func (h *Handler) readyExpired(tp *trackedPod, state provider.InstanceState) (ti
 // pin to a fixed instant, and subtracting a real start time from a pinned now would give
 // a nonsense duration.
 //
-// ONE-SHOT — it consumes provisioningAt, whose zero value covers both "never armed" and
-// "already recorded" (see trackedPod.provisioningAt). That guard also keeps the poll loop
-// cheap: labels are rendered behind it, so at most once per pod, never per tick.
+// ONE-SHOT — it consumes placement.provisioningAt, whose zero value covers both "never
+// armed" and "already recorded". That guard also keeps the poll loop cheap: labels are
+// rendered behind it, so at most once per pod, never per tick.
 //
 // Callers must hold h.mu.
 func (h *Handler) observeReady(tp *trackedPod, state provider.InstanceState) {
-	if state != provider.InstanceRunning || tp.provisioningAt.IsZero() {
+	p := tp.placement
+	if state != provider.InstanceRunning || p == nil || p.provisioningAt.IsZero() {
 		return
 	}
-	metrics.ObserveReady(h.metricLabels(tp.pod, tp.region, tp.tier), time.Since(tp.provisioningAt))
-	tp.provisioningAt = time.Time{} // spent; never observe this pod again
+	metrics.ObserveReady(h.metricLabels(tp.pod, p.region, p.tier), time.Since(p.provisioningAt))
+	p.provisioningAt = time.Time{} // spent; never observe this pod again
 }
 
 // setEndpoint stamps a reachable address onto the Pod's annotation — the one assignment
@@ -866,21 +867,17 @@ func statusSignature(pod *corev1.Pod) string {
 	return string(pod.Status.Phase) + "|" + pod.Status.Reason + "|" + string(ready) + "|" + pod.Status.PodIP
 }
 
-// store records/updates the tracked pod under lock. provisioningAt arms the
-// ready-duration observation (see trackedPod.provisioningAt) and place is part of what that
-// observation is filed under; pass the zero values from any path that cannot know them —
+// store records/updates the tracked pod under lock. place arms the ready-duration
+// observation (see placement.provisioningAt); pass nil from any path that cannot know it —
 // a re-adoption, or an already-terminal pod.
-func (h *Handler) store(
-	pod *corev1.Pod, claim, instance string, provisioningAt time.Time, place placement,
-) {
+func (h *Handler) store(pod *corev1.Pod, claim, instance string, place *placement) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.tracked[key(pod.Namespace, pod.Name)] = &trackedPod{
-		pod:            pod.DeepCopy(),
-		claimName:      claim,
-		instance:       instance,
-		provisioningAt: provisioningAt,
-		placement:      place,
+		pod:       pod.DeepCopy(),
+		claimName: claim,
+		instance:  instance,
+		placement: place,
 	}
 }
 
