@@ -17,6 +17,7 @@ configMapGenerator:
   files:
   - modal.csv=../../pkg/provider/catalog/data/modal.csv
   - aws.csv=../../pkg/provider/catalog/data/aws.csv
+  - runpod.csv=../../pkg/provider/catalog/data/runpod.csv
 
 generatorOptions:
   # Stable name (no content-hash suffix) so `kubectl edit` and the volume
