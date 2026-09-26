@@ -28,18 +28,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
-// The RunPod REST API. There is no official Go SDK, so this is plain net/http — which is
-// also why the whole surface is one small file: the adapter needs five operations.
+// The RunPod REST API v2 (https://docs.runpod.io/api-reference-v2/overview; v1 retires
+// 2026-11-15). There is no official Go SDK, so this is plain net/http — which is also why the
+// whole surface is one small file: the adapter needs five operations.
 const (
-	// defaultBaseURL is RunPod's REST v1 root. Overridable only in tests (see newClient).
-	defaultBaseURL = "https://rest.runpod.io/v1"
+	// defaultBaseURL is RunPod's API host; every path carries its own /v2 prefix.
+	// Overridable only in tests (see newClient).
+	defaultBaseURL = "https://api.runpod.io"
 	// apiKeyEnv is where the credential comes from. It is delivered by the per-provider
 	// Secret the manager mounts via envFrom; absent means the provider is skipped at
 	// registration rather than failing the process.
@@ -57,6 +61,11 @@ const (
 	// cloudTypeSecure is the only cloud type Nebula requests; see the package doc for why
 	// COMMUNITY is out until the catalog can price it.
 	cloudTypeSecure = "SECURE"
+	// cpuFlavor is the CPU flavor a CPU-only Pod runs on; v2 requires one. A flavor fixes
+	// memory as a multiple of vCPUs, so the Pod's memory request has nowhere to go.
+	cpuFlavor = "cpu5c"
+	// listPageSize is the largest page GET /v2/pods serves.
+	listPageSize = 1000
 )
 
 // restClient is the real Client, backed by RunPod's REST API. Every RunPod-specific HTTP
@@ -147,9 +156,7 @@ func (c *restClient) do(ctx context.Context, method, path string, body, out any)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		// A transport failure, wrapped WITHOUT a sentinel on purpose: nobody knows whether
-		// RunPod acted on the request, and provider.IsRejection reads an unwrapped
-		// transport error as unattributable, which keeps the Pod retrying instead of being
-		// failed under an instance whose id we never saw.
+		// RunPod acted on the request, so it must stay unattributable and blocklist nothing.
 		return fmt.Errorf("runpod: %s %s: %w", method, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -175,20 +182,27 @@ func (c *restClient) do(ctx context.Context, method, path string, body, out any)
 	return nil
 }
 
-// errorMessage pulls the human-readable part out of an error response, trying RunPod's
-// JSON envelope first and falling back to the raw text — some gateway errors are HTML, and
-// an empty message would leave the classifier nothing to read.
+// errorMessage pulls the human-readable part out of an error response: v2's RFC 9457 body
+// ({title, status, detail, errors}), falling back to the raw text — some gateway errors are
+// HTML, and an empty message would leave the classifier nothing to read.
+//
+// The per-field errors are appended to the detail because a 422 puts the reason ONLY there.
 func errorMessage(raw []byte) string {
-	var envelope struct {
-		Error   string `json:"error"`
-		Message string `json:"message"`
+	var problem struct {
+		Title  string   `json:"title"`
+		Detail string   `json:"detail"`
+		Errors []string `json:"errors"`
 	}
-	if err := json.Unmarshal(raw, &envelope); err == nil {
-		if envelope.Error != "" {
-			return truncate(envelope.Error)
+	if err := json.Unmarshal(raw, &problem); err == nil {
+		msg := problem.Detail
+		if msg == "" {
+			msg = problem.Title
 		}
-		if envelope.Message != "" {
-			return truncate(envelope.Message)
+		if len(problem.Errors) > 0 {
+			msg = strings.TrimSpace(msg + ": " + strings.Join(problem.Errors, "; "))
+		}
+		if msg != "" {
+			return truncate(msg)
 		}
 	}
 	return truncate(strings.TrimSpace(string(raw)))
@@ -204,14 +218,13 @@ func truncate(s string) string {
 
 // classifyCreate wraps a create failure with the shared sentinel that matches it, which is
 // what lets the control plane act on the failure without knowing anything about RunPod (see
-// docs/add-a-provider.md, "Wrap the errors your Provision returns"). Unwrapped, every one of
-// these would land on nebula_provision_failures_total{reason="other"} and be retried
-// forever against a provider that has already given its answer.
+// docs/add-a-provider.md, "Wrap the errors your Provision returns").
 //
-// interruptible is the request's tier, which the error itself never carries; a capacity
-// failure on the spot tier also gets ErrSpotCapacity so ClassifyProvisionError can block
-// Spot alone and leave OnDemand purchasable.
-func classifyCreate(err error, interruptible bool) error {
+// The status table follows RunPod's own guidance for POST /v2/pods. Its gotcha is 400: it
+// means both "this GPU and data center could not be placed" and "the body breaks a
+// cross-field rule", with no machine-readable code to tell them apart, so only a detail
+// that reads as capacity is treated as one.
+func classifyCreate(err error) error {
 	var ae *apiError
 	if !errors.As(err, &ae) {
 		return err // a transport/encode failure: unattributable, and already wrapped
@@ -219,142 +232,132 @@ func classifyCreate(err error, interruptible bool) error {
 	msg := strings.ToLower(ae.message)
 
 	switch {
-	case ae.status == http.StatusUnauthorized, ae.status == http.StatusForbidden:
+	case ae.status >= http.StatusInternalServerError:
+		// Left UNWRAPPED, deliberately. A 5xx says RunPod failed to answer, not that it
+		// said no, and it may well have created the Pod before falling over.
+		return err
+
+	case ae.status == http.StatusUnauthorized:
 		// Whole-provider: nothing succeeds until the key is fixed.
 		return fmt.Errorf("%w: %w", err, provider.ErrAuth)
 
-	case ae.status >= http.StatusInternalServerError:
-		// Left UNWRAPPED, deliberately. A 5xx says RunPod failed to answer, not that it
-		// said no, and it may well have created the Pod before falling over. Wrapping a
-		// sentinel here would fail the Pod and blocklist a candidate on the strength of a
-		// server-side blip — and could reap a Pod out from under a paid instance.
-		return err
-
-	case ae.status == http.StatusTooManyRequests:
-		return fmt.Errorf("%w: %w", err, provider.ErrQuota)
+	case ae.status == http.StatusForbidden:
+		// NOT auth, on create: RunPod documents it as "your account cannot access the
+		// requested pool", to be skipped for the next candidate. DenyAll would fence off
+		// every other pool the account can use.
+		return fmt.Errorf("%w: %w", err, provider.ErrUnsupportedAccelerator)
 
 	// Money, not capacity, but scoped the same way: it is transient, it is not an
-	// authentication problem, and ErrQuota is the sentinel for "a limit stopped this". It
-	// does block more than the one candidate in practice, which the TTL bounds.
-	case ae.status == http.StatusPaymentRequired,
-		containsAny(msg, "insufficient funds", "insufficient balance", "not enough credit"):
+	// authentication problem, and ErrQuota is the sentinel for "a limit stopped this".
+	case ae.status == http.StatusPaymentRequired, ae.status == http.StatusTooManyRequests,
+		util.ContainsAny(msg, "insufficient funds", "insufficient balance", "not enough credit"):
 		return fmt.Errorf("%w: %w", err, provider.ErrQuota)
 
-	case containsAny(msg, "no longer any instances available", "no instances available",
+	case util.ContainsAny(msg, "no longer any instances available", "no instances available",
 		"no instance available", "out of capacity", "no capacity", "not available",
-		"unavailable", "sold out"):
-		if interruptible {
-			return fmt.Errorf("%w: %w: %w", err, provider.ErrNoCapacity, ErrSpotCapacity)
-		}
+		"unavailable", "sold out", "could not be placed"):
 		return fmt.Errorf("%w: %w", err, provider.ErrNoCapacity)
 
-	case containsAny(msg, "invalid gpu", "unknown gpu", "gpu type", "unsupported"):
+	case util.ContainsAny(msg, "invalid gpu", "unknown gpu", "gpu type", "unsupported"):
 		// A GPU id RunPod does not recognize: durable until runpod.csv is corrected, and
 		// accelerator-scoped so the rest of the provider stays usable.
 		return fmt.Errorf("%w: %w", err, provider.ErrUnsupportedAccelerator)
 
-	case containsAny(msg, "registry", "image", "pull", "manifest"):
-		// Belongs to the REQUEST, not the candidate, so ErrImagePull — which blocklists
-		// NOTHING. Blocking here would exclude an accelerator that is serving every other
-		// Pod fine, because one Pod named an image RunPod could not fetch.
-		return fmt.Errorf("%w: %w", err, provider.ErrImagePull)
+	case util.ContainsAny(msg, "registry", "image", "pull", "manifest"):
+		// Belongs to the REQUEST, not the candidate, so it must blocklist NOTHING. The phrase
+		// is what provider.ClassifyError keys on; left bare, a registry's "unauthorized" would
+		// read as OUR auth failing and fence the whole provider.
+		return fmt.Errorf("runpod: image pull credential or image rejected: %w", err)
 
 	default:
-		// An unrecognized 4xx. Left unwrapped rather than guessed at: none of the shared
-		// sentinels describes "RunPod rejected this and we do not know why", and every
-		// available guess is worse than retrying — ErrAuth would fence off the whole
-		// provider, a capacity wrap would evict a healthy candidate. A sustained
-		// reason="other" rate on this provider's metrics is the signal that a condition
-		// belongs in the table above.
+		// A 422 or an unrecognized 400. Left unwrapped rather than guessed at: every
+		// available sentinel is worse — ErrAuth would fence off the whole provider, a
+		// capacity wrap would evict a healthy candidate.
 		return err
 	}
 }
 
-// containsAny reports whether s contains any of subs. A local copy because the shared one
-// in package provider is unexported, and the alternative — exporting it — would widen that
-// package's surface for one adapter's convenience.
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
-// createPodRequest is RunPod's POST /pods body. Only the fields Nebula sets are present;
+// createPodRequest is RunPod's POST /v2/pods body. Only the fields Nebula sets are present;
 // everything omitted takes RunPod's own default, which is the point of the omitempty tags —
 // a zero we did not mean would override a sane default with 0.
+//
+// No mounts: a Nebula instance is cattle with nothing to persist, and v2 attaches no
+// persistent volume unless asked (v1 defaulted to a billable 20 GiB one).
 type createPodRequest struct {
-	Name        string `json:"name"`
-	ImageName   string `json:"imageName"`
-	CloudType   string `json:"cloudType"`
-	ComputeType string `json:"computeType"`
+	Name  string      `json:"name"`
+	Image string      `json:"image"`
+	Cloud string      `json:"cloud"`
+	GPU   *gpuRequest `json:"gpu,omitempty"`
+	CPU   *cpuRequest `json:"cpu,omitempty"`
 
-	GPUTypeIDs      []string `json:"gpuTypeIds,omitempty"`
-	GPUCount        int32    `json:"gpuCount,omitempty"`
-	GPUTypePriority string   `json:"gpuTypePriority,omitempty"`
-	MinVCPUPerGPU   int      `json:"minVCPUPerGPU,omitempty"`
-	MinRAMPerGPU    int      `json:"minRAMPerGPU,omitempty"`
-	VCPUCount       int      `json:"vcpuCount,omitempty"`
+	Disk       int               `json:"disk,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+	Entrypoint []string          `json:"entrypoint,omitempty"`
+	Cmd        []string          `json:"cmd,omitempty"`
+	Ports      []string          `json:"ports,omitempty"`
 
-	ContainerDiskInGb int `json:"containerDiskInGb,omitempty"`
-	// VolumeInGb has NO omitempty: 0 is exactly the value we mean, and it must be sent to
-	// override RunPod's default of a 20 GiB persistent volume. A Nebula instance is cattle
-	// with nothing to persist, so that volume would be pure cost.
-	VolumeInGb int `json:"volumeInGb"`
+	DataCenterIDs []string `json:"dataCenterIds,omitempty"`
+	Registry      string   `json:"registry,omitempty"`
+}
 
-	Env              map[string]string `json:"env,omitempty"`
-	DockerEntrypoint []string          `json:"dockerEntrypoint,omitempty"`
-	DockerStartCmd   []string          `json:"dockerStartCmd,omitempty"`
-	Ports            []string          `json:"ports,omitempty"`
+// gpuRequest is a GPU Pod's compute. The per-GPU minimums are placement filters, not
+// reservations: RunPod may hand out more, never less.
+type gpuRequest struct {
+	ID                 string `json:"id"`
+	Count              int32  `json:"count"`
+	MinVCPUCountPerGPU int    `json:"minVcpuCountPerGpu,omitempty"`
+	MinRAMPerGPU       int    `json:"minRamPerGpu,omitempty"`
+}
 
-	DataCenterIDs      []string `json:"dataCenterIds,omitempty"`
-	DataCenterPriority string   `json:"dataCenterPriority,omitempty"`
-	CountryCodes       []string `json:"countryCodes,omitempty"`
-
-	// Interruptible has no omitempty either: false is the OnDemand tier, and being explicit
-	// about the tier that costs money is worth four bytes.
-	Interruptible   bool   `json:"interruptible"`
-	SupportPublicIP bool   `json:"supportPublicIp,omitempty"`
-	RegistryAuthID  string `json:"containerRegistryAuthId,omitempty"`
+// cpuRequest is a CPU-only Pod's compute; v2 takes exactly one of it or gpuRequest.
+type cpuRequest struct {
+	ID        string `json:"id"`
+	VCPUCount int    `json:"vcpuCount"`
 }
 
 // podResponse is the subset of RunPod's Pod object this adapter reads. Fields it ignores
-// (savings plans, template, network volume, cost) are omitted rather than carried, so the
-// struct states exactly what the adapter's behaviour depends on.
+// (ssh, cost, template, mounts) are omitted rather than carried, so the struct states exactly
+// what the adapter's behaviour depends on.
 type podResponse struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	DesiredStatus string         `json:"desiredStatus"`
-	LastStartedAt string         `json:"lastStartedAt"`
-	Interruptible bool           `json:"interruptible"`
-	Ports         []string       `json:"ports"`
-	PortMappings  map[string]int `json:"portMappings"`
-	PublicIP      string         `json:"publicIp"`
-	// Machine carries the data center, and is only populated when the request asks for it
-	// (includeMachine=true) — hence the query on every read path. A pointer because RunPod
-	// sends null when it is not included, and Region must then stay empty rather than
-	// reporting a placement we did not observe.
-	Machine *struct {
-		DataCenterID string `json:"dataCenterId"`
-	} `json:"machine"`
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Status string   `json:"status"`
+	Ports  []string `json:"ports"`
+	// DataCenterID is null until the scheduler assigns one, which decodes to "" — Region
+	// then stays empty rather than reporting a placement we did not observe.
+	DataCenterID string `json:"dataCenterId"`
+	// Runtime is null unless the Pod is RUNNING.
+	Runtime *struct {
+		Ports []struct {
+			Private int     `json:"private"`
+			Public  *int    `json:"public"`
+			IP      *string `json:"ip"`
+		} `json:"ports"`
+	} `json:"runtime"`
 }
 
-// toPod converts the wire shape into the adapter's view.
+// toPod converts the wire shape into the adapter's view. Only a port RunPod has published on
+// a public IP becomes a mapping; the rest are reachable through the proxy alone.
 func (r podResponse) toPod() Pod {
 	pd := Pod{
-		ID:            r.ID,
-		Name:          r.Name,
-		DesiredStatus: r.DesiredStatus,
-		LastStartedAt: r.LastStartedAt,
-		Interruptible: r.Interruptible,
-		Ports:         r.Ports,
-		PublicIP:      r.PublicIP,
-		PortMappings:  r.PortMappings,
+		ID:           r.ID,
+		Name:         r.Name,
+		Status:       r.Status,
+		Ports:        r.Ports,
+		DataCenterID: r.DataCenterID,
 	}
-	if r.Machine != nil {
-		pd.DataCenterID = r.Machine.DataCenterID
+	if r.Runtime == nil {
+		return pd
+	}
+	for _, m := range r.Runtime.Ports {
+		if m.Public == nil || m.IP == nil || *m.IP == "" {
+			continue
+		}
+		if pd.PortMappings == nil {
+			pd.PortMappings = make(map[string]int)
+		}
+		pd.PortMappings[strconv.Itoa(m.Private)] = *m.Public
+		pd.PublicIP = *m.IP
 	}
 	return pd
 }
@@ -362,55 +365,31 @@ func (r podResponse) toPod() Pod {
 // CreatePod implements Client.
 func (c *restClient) CreatePod(ctx context.Context, spec PodSpec) (string, error) {
 	body := createPodRequest{
-		Name:        spec.Name,
-		ImageName:   spec.Image,
-		CloudType:   cloudTypeSecure,
-		ComputeType: "GPU",
-
-		GPUTypeIDs:    spec.GPUTypeIDs,
-		GPUCount:      spec.GPUCount,
-		MinVCPUPerGPU: spec.VCPUPerGPU,
-		MinRAMPerGPU:  spec.RAMPerGPUGiB,
-
-		ContainerDiskInGb: spec.ContainerDiskGiB,
-		VolumeInGb:        0,
-
-		Env:              spec.Env,
-		DockerEntrypoint: spec.Entrypoint,
-		DockerStartCmd:   spec.StartCmd,
-		Ports:            spec.Ports,
-
+		Name:          spec.Name,
+		Image:         spec.Image,
+		Cloud:         cloudTypeSecure,
+		Disk:          spec.ContainerDiskGiB,
+		Env:           spec.Env,
+		Entrypoint:    spec.Entrypoint,
+		Cmd:           spec.StartCmd,
+		Ports:         spec.Ports,
 		DataCenterIDs: spec.DataCenterIDs,
-		CountryCodes:  spec.CountryCodes,
-
-		Interruptible: spec.Interruptible,
-		// Ask for a public IP so a /tcp port can be reached directly. Harmless for the
-		// /http-only Pods this adapter creates today, and it is what would make a raw-TCP
-		// workload addressable without a second change here.
-		SupportPublicIP: true,
-		RegistryAuthID:  spec.RegistryAuthID,
+		Registry:      spec.RegistryAuthID,
 	}
-	if spec.GPUCount == 0 {
-		// A CPU-only Pod is a different product on RunPod: the GPU sizing fields are
-		// meaningless and vcpuCount replaces them.
-		body.ComputeType = "CPU"
-		body.VCPUCount = spec.VCPUCount
-	} else if len(spec.GPUTypeIDs) > 1 {
-		// Only meaningful with alternates: it tells RunPod to satisfy the list by whichever
-		// id has capacity rather than insisting on the first. With one id there is nothing
-		// to prioritize, and sending it would just be noise in the request.
-		body.GPUTypePriority = "availability"
-	}
-	if len(spec.DataCenterIDs) > 0 {
-		// custom, not availability: the pool NAMED these data centers, so honouring them is
-		// the point. availability would let RunPod place elsewhere, silently breaking a
-		// constraint an operator set for data residency.
-		body.DataCenterPriority = "custom"
+	if spec.GPUCount > 0 {
+		body.GPU = &gpuRequest{
+			ID:                 spec.GPUTypeID,
+			Count:              spec.GPUCount,
+			MinVCPUCountPerGPU: spec.VCPUPerGPU,
+			MinRAMPerGPU:       spec.RAMPerGPUGiB,
+		}
+	} else {
+		body.CPU = &cpuRequest{ID: cpuFlavor, VCPUCount: spec.VCPUCount}
 	}
 
 	var out podResponse
-	if err := c.do(ctx, http.MethodPost, "/pods", body, &out); err != nil {
-		return "", classifyCreate(err, spec.Interruptible)
+	if err := c.do(ctx, http.MethodPost, "/v2/pods", body, &out); err != nil {
+		return "", classifyCreate(err)
 	}
 	if out.ID == "" {
 		// A 2xx with no id is unusable and, worse, ambiguous: a Pod may exist that we can
@@ -425,7 +404,7 @@ func (c *restClient) CreatePod(ctx context.Context, spec PodSpec) (string, error
 // TerminatePod implements Client. Idempotent: a 404 means the Pod is already gone, which is
 // success for the caller (the NodeClaim finalizer retries against this).
 func (c *restClient) TerminatePod(ctx context.Context, id string) error {
-	err := c.do(ctx, http.MethodDelete, "/pods/"+url.PathEscape(id), nil, nil)
+	err := c.do(ctx, http.MethodDelete, "/v2/pods/"+url.PathEscape(id), nil, nil)
 	if err != nil && !notFound(err) {
 		return err
 	}
@@ -435,7 +414,7 @@ func (c *restClient) TerminatePod(ctx context.Context, id string) error {
 // GetPod implements Client, returning (nil, nil) for a Pod that no longer exists.
 func (c *restClient) GetPod(ctx context.Context, id string) (*Pod, error) {
 	var out podResponse
-	err := c.do(ctx, http.MethodGet, "/pods/"+url.PathEscape(id)+"?includeMachine=true", nil, &out)
+	err := c.do(ctx, http.MethodGet, "/v2/pods/"+url.PathEscape(id), nil, &out)
 	if notFound(err) {
 		return nil, nil
 	}
@@ -446,31 +425,51 @@ func (c *restClient) GetPod(ctx context.Context, id string) (*Pod, error) {
 	return &pd, nil
 }
 
-// ListPods implements Client: one call for the whole account. Filtering to Nebula's own Pods
-// is the adapter's job, since it owns the naming scheme (see Provider.List).
+// ListPods implements Client. Filtering to Nebula's own Pods is the adapter's job, since it
+// owns the naming scheme (see Provider.List).
+//
+// Every page is walked: a Pod missing from List reads as terminated, so stopping at the
+// first page would report every Pod past it dead. One call below listPageSize Pods.
 func (c *restClient) ListPods(ctx context.Context) ([]Pod, error) {
-	var out []podResponse
-	if err := c.do(ctx, http.MethodGet, "/pods?includeMachine=true", nil, &out); err != nil {
-		return nil, err
+	var pods []Pod
+	cursor := ""
+	for {
+		q := url.Values{"limit": {strconv.Itoa(listPageSize)}}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		var out struct {
+			Pods       []podResponse `json:"pods"`
+			Pagination struct {
+				NextCursor  *string `json:"nextCursor"`
+				HasNextPage bool    `json:"hasNextPage"`
+			} `json:"pagination"`
+		}
+		if err := c.do(ctx, http.MethodGet, "/v2/pods?"+q.Encode(), nil, &out); err != nil {
+			return nil, err
+		}
+		for _, r := range out.Pods {
+			pods = append(pods, r.toPod())
+		}
+		next := out.Pagination.NextCursor
+		if !out.Pagination.HasNextPage || next == nil || *next == "" || *next == cursor {
+			return pods, nil
+		}
+		cursor = *next
 	}
-	pods := make([]Pod, 0, len(out))
-	for _, r := range out {
-		pods = append(pods, r.toPod())
-	}
-	return pods, nil
 }
 
 // registryAuthPath is the collection RunPod stores image-pull credentials in.
-const registryAuthPath = "/containerregistryauth"
+const registryAuthPath = "/v2/registries"
 
-// registryAuthResponse is the subset of a containerRegistryAuth object this adapter reads.
+// registryAuthResponse is the subset of a registry credential this adapter reads.
 // Notably NOT the password: RunPod does not return it, and nothing here needs it back.
 type registryAuthResponse struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
-// EnsureRegistryAuth implements Client. RunPod's create takes a containerRegistryAuth ID,
+// EnsureRegistryAuth implements Client. RunPod's create takes a registry credential ID,
 // never an inline username/password, so a credential has to become an OBJECT in RunPod's
 // account before a Pod can use it.
 //
@@ -490,16 +489,17 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 		// The adapter vets the kind before calling (checkRegistryAuth), so this is a
 		// programming error rather than a user-facing one — but it must not become a silent
 		// anonymous pull.
-		return "", fmt.Errorf("runpod: registry auth %s cannot be expressed as a RunPod credential: %w",
-			auth, provider.ErrImagePull)
+		return "", auth.Unsupported("runpod")
 	}
 	name := registryAuthName(auth.Basic.Username, auth.Basic.Password)
 
-	var existing []registryAuthResponse
+	var existing struct {
+		Registries []registryAuthResponse `json:"registries"`
+	}
 	if err := c.do(ctx, http.MethodGet, registryAuthPath, nil, &existing); err != nil {
 		return "", err
 	}
-	for _, e := range existing {
+	for _, e := range existing.Registries {
 		if e.Name == name && e.ID != "" {
 			return e.ID, nil
 		}
@@ -513,14 +513,13 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 
 	var created registryAuthResponse
 	if err := c.do(ctx, http.MethodPost, registryAuthPath, body, &created); err != nil {
-		// Wrapped as an image-pull failure, which blocklists nothing: a credential RunPod
+		// Worded as an image-pull failure, which blocklists nothing: a credential RunPod
 		// would not store is a fact about this Pod's imagePullSecret, not about the
 		// accelerator or region the Pod was headed for.
-		return "", fmt.Errorf("%w: %w", err, provider.ErrImagePull)
+		return "", fmt.Errorf("runpod: store image pull credential %q: %w", name, err)
 	}
 	if created.ID == "" {
-		return "", fmt.Errorf("runpod: create registry auth %q: response carried no id: %w",
-			name, provider.ErrImagePull)
+		return "", fmt.Errorf("runpod: store image pull credential %q: response carried no id", name)
 	}
 	return created.ID, nil
 }

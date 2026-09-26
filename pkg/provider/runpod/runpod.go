@@ -24,15 +24,14 @@ limitations under the License.
 //   - Lifecycle is create/terminate only for our purposes, so SupportsStop=false. RunPod
 //     does expose stop/start, but a stopped Pod still bills for its disk and releases the
 //     GPU, so it is neither free nor resumable in the sense the capability promises.
-//   - Spot is REAL and is one boolean: `interruptible: true`, with no bid to name (the
-//     REST v1 API dropped bidPerGpu). So SupportsSpot=true and, unlike Modal, the
-//     capacity tier on the request is actually honoured.
-//   - There is NO preemption push and no notice window, so reclaims are noticed only by
-//     the poll loop — hence PreemptionNotice=0 and a faster-than-default PollInterval.
+//   - OnDemand only, so SupportsSpot=false: REST v2 has no interruptible tier (v1's
+//     `interruptible` flag has no successor).
 //   - Create FAILS SYNCHRONOUSLY when capacity is short ("no longer any instances
 //     available..."), the AWS behaviour rather than Modal's queue-and-accept. That is
-//     what makes region failover meaningful, so ExpandRegions is left as catalog.Base's
-//     pass-through: one candidate per declared region, each blocklistable on its own.
+//     what makes region failover meaningful, so ResolveRegions mints one candidate per
+//     declared region, each blocklistable on its own.
+//   - A create takes ONE GPU type, so interchangeable alternates cannot widen a launch the
+//     way AWS's fleet does; only the primary is sent.
 //   - Pods have NO tags. NativeTags=false, and Nebula's identity rides the Pod NAME
 //     (see podName/claimFromName), which is what List filters on.
 //   - There is no outbound-allowlist knob at all, so SupportsEgressPolicy=false and
@@ -42,9 +41,9 @@ limitations under the License.
 //     differently, and the catalog CSV has no cloud-type axis to express that, so
 //     offering both would make the price the optimizer reads a guess.
 //
-// kubectl logs and exec are NOT served: RunPod's REST v1 surface has no pod-log endpoint,
-// and its only way into a container is SSH, which needs key material this adapter has
-// nowhere to put. Both are optional halves of provider.Provider resolved by type
+// kubectl logs and exec are NOT served yet. v2 does stream logs (GET /v2/pods/{id}/logs, as
+// SSE), which a LogStreamer could wrap; its only way into a container is SSH, which needs key
+// material this adapter has nowhere to put. Both are optional halves of provider.Provider resolved by type
 // assertion, so leaving them out costs nothing but a NotFound.
 //
 // The concrete HTTP API lives behind the Client seam, so this file holds only
@@ -55,9 +54,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -77,17 +76,6 @@ const namePrefix = "nebula-"
 // whose name would exceed it rather than truncating — see podName.
 const maxNameLen = 191
 
-// spotPollInterval is how often to re-list. RunPod's interruptible tier reclaims
-// abruptly with no notice pushed to us, so a faster cadence than the vnode default is
-// what turns "the Pod vanished" into a NodeClaim update promptly. Matches AWS.
-const spotPollInterval = 10 * time.Second
-
-// ErrSpotCapacity is a marker the Client wraps onto an interruptible-tier capacity
-// failure (alongside provider.ErrNoCapacity) so ClassifyProvisionError — handed only the
-// error, never the request — can recover that the failing tier was Spot and block only
-// Spot, leaving OnDemand serviceable. The same device as aws.ErrSpotCapacity.
-var ErrSpotCapacity = errors.New("runpod: spot capacity")
-
 // compile-time assertion that Provider satisfies the interface. LogStreamer and Executor
 // are deliberately absent; see the package doc.
 var _ provider.Provider = (*Provider)(nil)
@@ -98,7 +86,7 @@ var _ provider.Provider = (*Provider)(nil)
 type Client interface {
 	// CreatePod launches one Pod from spec and returns its RunPod id. A capacity
 	// shortage is an ERROR here, not a queued Pod, and must be wrapped with
-	// provider.ErrNoCapacity (plus ErrSpotCapacity on the interruptible tier).
+	// provider.ErrNoCapacity.
 	CreatePod(ctx context.Context, spec PodSpec) (id string, err error)
 	// TerminatePod deletes a Pod by id. Must be idempotent: deleting an already-gone
 	// Pod returns nil, since the NodeClaim finalizer retries against it.
@@ -134,12 +122,9 @@ type PodSpec struct {
 	//
 	// SECRET-BEARING, hence the redacting String below.
 	Env map[string]string
-	// GPUTypeIDs are RunPod's own accelerator ids that can serve the request, PRIMARY
-	// first. All of them go out in one create: RunPod takes an array and picks by
-	// availability, so interchangeable ids broaden a SINGLE launch (as AWS's fleet spans
-	// instance types) without widening what a failure blocklists — the block keys on the
-	// canonical pool, not on whichever id RunPod landed. Empty for a CPU-only Pod.
-	GPUTypeIDs []string
+	// GPUTypeID is RunPod's own id for the accelerator — MapAccelerator's PRIMARY, since a
+	// v2 create takes exactly one. Empty for a CPU-only Pod.
+	GPUTypeID string
 	// GPUCount is how many accelerators to attach; 0 selects a CPU-only Pod.
 	GPUCount int32
 	// VCPUPerGPU and RAMPerGPUGiB are the Pod's cpu/memory requests expressed RunPod's
@@ -148,8 +133,9 @@ type PodSpec struct {
 	// RunPod's own defaults (2 vCPU, 8 GiB per GPU).
 	VCPUPerGPU   int
 	RAMPerGPUGiB int
-	// VCPUCount is the CPU-only equivalent, an absolute count rather than a per-GPU one.
-	// Only read when GPUCount is 0.
+	// VCPUCount is the CPU-only equivalent, an absolute count rather than a per-GPU one,
+	// rounded up to the power of two (at least 2) v2 requires. Only read when GPUCount is 0.
+	// Memory follows from it (see cpuFlavor); the Pod's memory request is not honoured.
 	VCPUCount int
 	// ContainerDiskGiB is the writable container disk, from the Pod's ephemeral-storage
 	// request. Zero leaves RunPod's default (50 GiB).
@@ -160,16 +146,11 @@ type PodSpec struct {
 	// Ports are the container ports to expose, in RunPod's "<port>/<proto>" form (see
 	// containerPorts). Empty leaves RunPod's default exposure.
 	Ports []string
-	// DataCenterIDs and CountryCodes are the placement constraint, split out of the ONE
-	// region candidate this request carries (see splitRegion). At most one is ever set,
-	// and both empty means unconstrained — the widest capacity pool, and the normal case
-	// for a pool that declares no regions.
+	// DataCenterIDs is the placement constraint, split out of the ONE region candidate this
+	// request carries (see ResolveRegions). Empty means unconstrained — the widest capacity
+	// pool, and the normal case for a pool that declares no regions.
 	DataCenterIDs []string
-	CountryCodes  []string
-	// Interruptible asks for the spot tier, from ProvisionRequest.CapacityType. RunPod's
-	// REST v1 takes no bid alongside it, so nothing else is needed to price it.
-	Interruptible bool
-	// RegistryAuthID is the RunPod containerRegistryAuth object authenticating the image
+	// RegistryAuthID is the RunPod registry credential authenticating the image
 	// pull, already resolved from the canonical credential by Client.EnsureRegistryAuth.
 	// Empty is an anonymous pull.
 	RegistryAuthID string
@@ -180,12 +161,12 @@ type PodSpec struct {
 // object id, not a credential, so it prints as-is.
 func (s PodSpec) String() string {
 	return fmt.Sprintf("PodSpec{Name:%s Image:%s Entrypoint:%v StartCmd:%v Env:%s "+
-		"GPUTypeIDs:%v GPUCount:%d VCPUPerGPU:%d RAMPerGPUGiB:%d VCPUCount:%d "+
-		"ContainerDiskGiB:%d Ports:%v DataCenterIDs:%v CountryCodes:%v Interruptible:%t "+
+		"GPUTypeID:%s GPUCount:%d VCPUPerGPU:%d RAMPerGPUGiB:%d VCPUCount:%d "+
+		"ContainerDiskGiB:%d Ports:%v DataCenterIDs:%v "+
 		"RegistryAuthID:%s}",
 		s.Name, s.Image, s.Entrypoint, s.StartCmd, provider.RedactedEnv(s.Env),
-		s.GPUTypeIDs, s.GPUCount, s.VCPUPerGPU, s.RAMPerGPUGiB, s.VCPUCount,
-		s.ContainerDiskGiB, s.Ports, s.DataCenterIDs, s.CountryCodes, s.Interruptible,
+		s.GPUTypeID, s.GPUCount, s.VCPUPerGPU, s.RAMPerGPUGiB, s.VCPUCount,
+		s.ContainerDiskGiB, s.Ports, s.DataCenterIDs,
 		s.RegistryAuthID)
 }
 
@@ -196,15 +177,8 @@ func (s PodSpec) GoString() string { return s.String() }
 type Pod struct {
 	ID   string
 	Name string
-	// DesiredStatus is RunPod's own status string (RUNNING/EXITED/TERMINATED). It is the
-	// DESIRED state, not the observed one, which is why toState also needs LastStartedAt.
-	DesiredStatus string
-	// LastStartedAt is when the container last started, empty until it has. Paired with
-	// DesiredStatus it is the closest thing RunPod offers to a readiness signal.
-	LastStartedAt string
-	// Interruptible is whether this Pod is on the spot tier, so an observed instance
-	// reports the tier it actually got.
-	Interruptible bool
+	// Status is RunPod's observed lifecycle status; see toState.
+	Status string
 	// DataCenterID is where RunPod placed it, in RunPod's own vocabulary.
 	DataCenterID string
 	// Ports are the exposed ports RunPod echoes back, in the same "<port>/<proto>" form
@@ -212,7 +186,7 @@ type Pod struct {
 	// they are present from creation, which is what makes an /http-only Pod addressable.
 	Ports []string
 	// PublicIP and PortMappings are the DIRECT address, keyed by container port, and only
-	// ever populated for a /tcp port RunPod has finished assigning. Both empty otherwise —
+	// ever populated for a port RunPod has published on a public IP. Both empty otherwise —
 	// including for every /http port, which is why they are a preference and not the
 	// endpoint's only source.
 	PublicIP     string
@@ -220,7 +194,7 @@ type Pod struct {
 }
 
 // Provider is the RunPod implementation of provider.Provider. It embeds catalog.Base for
-// the generic catalog methods — Name, Offerings, ExpandRegions and the catalog-driven
+// the generic catalog methods — Name, Offerings and the catalog-driven
 // MapAccelerator, which does real work here: RunPod's accelerator ids are marketing
 // strings ("NVIDIA H100 80GB HBM3") that share nothing with Nebula's canonical names, so
 // every row in runpod.csv carries an accelerator_id.
@@ -243,12 +217,12 @@ func New(client Client, cat catalog.Lookup) *Provider {
 // set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:         false,            // a stopped Pod still bills and loses its GPU
-		SupportsSpot:         true,             // `interruptible`, no bid to name
-		SupportsEgressPolicy: false,            // no outbound allowlist in the API at all
-		NativeTags:           false,            // identity rides the Pod name
-		PreemptionNotice:     0,                // abrupt; detected only by polling
-		PollInterval:         spotPollInterval, // Spot reclaims are abrupt; poll faster than default
+		SupportsStop:         false, // a stopped Pod still bills and loses its GPU
+		SupportsSpot:         false, // v2 has no interruptible tier
+		SupportsEgressPolicy: false, // no outbound allowlist in the API at all
+		NativeTags:           false, // identity rides the Pod name
+		PreemptionNotice:     0,     // OnDemand-only: nothing is reclaimed
+		PollInterval:         0,     // OnDemand-only → the default cadence is fine
 		// No ProvisionTimeout: one create call, no internal sweep across capacity pools
 		// to bound (contrast AWS, which walks a region's AZs itself).
 	}
@@ -369,24 +343,102 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	return out, nil
 }
 
+// regionSeparator joins a geography's data centers into ONE candidate; see ResolveRegions.
+// Not a comma, for the reason given at modal's regionSeparator.
+const regionSeparator = "|"
+
+// regionsByGeography maps a geography token to the RunPod data centers it encompasses, from
+// the dataCenterIds enum of RunPod's REST API. Empty entries are geographies RunPod has no
+// data center in.
+var regionsByGeography = map[string][]string{
+	"us": {
+		"US-CA-2", "US-DE-1", "US-GA-1", "US-GA-2", "US-IL-1", "US-KS-2",
+		"US-KS-3", "US-NC-1", "US-TX-1", "US-TX-3", "US-TX-4", "US-WA-1",
+	},
+	"ca": {"CA-MTL-1", "CA-MTL-2", "CA-MTL-3"},
+	// Iceland and Norway are EEA members, which is what "eu" means (see provider.Geographies).
+	"eu": {
+		"EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-RO-1", "EU-SE-1",
+		"EUR-IS-1", "EUR-IS-2", "EUR-IS-3", "EUR-NO-1",
+	},
+	"ap": {"AP-JP-1", "OC-AU-1"},
+	"uk": {},
+	"sa": {},
+	"af": {},
+	"me": {},
+	"mx": {},
+}
+
+// ResolveRegions implements provider.Provider. Each declared token is ONE candidate, and a
+// geography's candidate carries all its data centers: RunPod places by availability within
+// the dataCenterIds it is given, so a geography costs one create, while failover still walks
+// the declared tokens one by one.
+//
+//	nil/[]       => [""], unpinned: RunPod's widest pool
+//	["us"]       => ["US-CA-2|US-DE-1|..."]
+//	["EU-RO-1"]  => itself, verbatim and unvalidated
+//
+// narrowTo keeps the candidates inside those geographies; an unconstrained pool becomes one
+// candidate per requested geography.
+func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
+	var within map[string]bool // nil => no narrowing
+	if len(narrowTo) > 0 {
+		within = make(map[string]bool)
+		for _, t := range narrowTo {
+			if t = strings.ToLower(strings.TrimSpace(t)); provider.IsGeography(t) {
+				within[t] = true
+			}
+		}
+	}
+	tokens := declared
+	if len(declared) == 0 {
+		if within == nil {
+			return []string{""}
+		}
+		tokens = narrowTo
+	}
+
+	seen := make(map[string]bool)
+	var out []string
+	for _, d := range tokens {
+		d = strings.TrimSpace(d)
+		var dcs []string
+		if g := strings.ToLower(d); provider.IsGeography(g) {
+			if within != nil && !within[g] {
+				continue
+			}
+			dcs = regionsByGeography[g]
+		} else if d != "" && (within == nil || geographyOf(d, within)) {
+			dcs = []string{d}
+		}
+		if c := strings.Join(dcs, regionSeparator); c != "" && !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// geographyOf reports whether data center dc is listed under any of geographies.
+func geographyOf(dc string, geographies map[string]bool) bool {
+	for g := range geographies {
+		if slices.Contains(regionsByGeography[g], dc) {
+			return true
+		}
+	}
+	return false
+}
+
 // ClassifyProvisionError implements provider.Provider. The categories and the
 // scope-derivation rule are shared (provider.ClassifyError and the sentinels the Client
-// wraps), so this supplies only the two RunPod-specific facts: which tier failed, and the
-// region axis.
+// wraps), so this supplies only the RunPod-specific fact: the region axis.
 func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
 	// No failure, no block. ClassifyError already returns the zero scope, but the region
 	// decoration below would repopulate it into a scope recordBlock would install.
 	if err == nil {
 		return provider.BlockScope{}
 	}
-	// The failing tier is not on the error's face, so the Client marks an interruptible
-	// shortage. Getting this wrong in the safe direction matters: a Spot failure blocked
-	// as OnDemand would disable capacity that is still purchasable.
-	tier := nebulav1alpha1.CapacityOnDemand
-	if errors.Is(err, ErrSpotCapacity) {
-		tier = nebulav1alpha1.CapacitySpot
-	}
-	scope := provider.ClassifyError(err, tier, accelerator)
+	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, accelerator)
 	// The zero scope means BLOCK NOTHING — a rejection of this request that says nothing
 	// about the candidate, such as an image credential RunPod cannot use. Stamping a region
 	// onto it would make it non-empty, and recordBlock would install a region-wide block
@@ -463,7 +515,6 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 		return PodSpec{}, err
 	}
 
-	dcs, countries := splitRegion(req.Region)
 	spec := PodSpec{
 		Name:  name,
 		Image: c.Image,
@@ -478,9 +529,7 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 		Env:              req.Env,
 		ContainerDiskGiB: ephemeralGiB(&c),
 		Ports:            containerPorts(&c),
-		DataCenterIDs:    dcs,
-		CountryCodes:     countries,
-		Interruptible:    req.CapacityType == nebulav1alpha1.CapacitySpot,
+		DataCenterIDs:    dataCentersOf(req.Region),
 	}
 
 	// Accelerator type comes from the AcceleratorTypeLabel; count from the container's
@@ -490,15 +539,12 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 		return PodSpec{}, fmt.Errorf("runpod: %w", err)
 	}
 	if canonical != "" {
-		// Every id, not just the primary: RunPod's gpuTypeIds is an array it selects from
-		// by availability, so alternates widen this one launch. ids[0] stays the pool
-		// identity failover blocks on, which is the caller's business, not RunPod's.
 		ids, ok := p.MapAccelerator(canonical, count)
 		if !ok {
 			return PodSpec{}, fmt.Errorf("runpod: unsupported accelerator %q: %w",
 				canonical, provider.ErrUnsupportedAccelerator)
 		}
-		spec.GPUTypeIDs = ids
+		spec.GPUTypeID = ids[0]
 		spec.GPUCount = count
 		// RunPod sizes a GPU Pod's cpu/memory PER GPU, so the Pod's totals are divided by
 		// the count. Zero (nothing requested) leaves RunPod's own per-GPU defaults.
@@ -508,7 +554,7 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 	}
 	// No accelerator label => a CPU-only Pod, which RunPod sizes with an absolute vCPU
 	// count instead of a per-GPU one.
-	spec.VCPUCount = cores(resourceQty(&c, corev1.ResourceCPU))
+	spec.VCPUCount = powerOfTwoVCPUs(cores(resourceQty(&c, corev1.ResourceCPU)))
 	return spec, nil
 }
 
@@ -534,30 +580,13 @@ func checkRegistryAuth(a *provider.RegistryAuth) error {
 	}
 }
 
-// splitRegion turns the ONE region candidate placement chose into RunPod's two placement
-// fields. Empty means unconstrained (no pool regions declared) and yields neither, which is
-// the widest capacity pool.
-//
-// The split is by SHAPE, not by a lookup table: RunPod's data-center ids are compound
-// ("EU-RO-1", "US-KS-2"), while a bare two-letter token is an ISO country code its
-// countryCodes field takes ("us", "se"). So a pool declaring a geography gets one, a pool
-// naming a data center gets the other, and no static list of data centers has to be
-// maintained here — which matters because such a list rots silently: a stale entry only
-// surfaces as a rejected create for a region that exists.
-//
-// This is also why ExpandRegions is left as catalog.Base's pass-through. AWS has to expand
-// its group tokens because "us" is not a callable region name; for RunPod it IS callable,
-// as a country code, so there is nothing to expand and one declared token stays one
-// blocklistable candidate.
-func splitRegion(region string) (dataCenterIDs, countryCodes []string) {
-	region = strings.TrimSpace(region)
+// dataCentersOf splits a candidate ResolveRegions minted back into RunPod data centers.
+// Empty is unconstrained and yields none.
+func dataCentersOf(region string) []string {
 	if region == "" {
-		return nil, nil
+		return nil
 	}
-	if len(region) == 2 {
-		return nil, []string{strings.ToUpper(region)}
-	}
-	return []string{region}, nil
+	return strings.Split(region, regionSeparator)
 }
 
 // containerPorts renders the container's declared ports in RunPod's "<port>/<proto>" form.
@@ -650,6 +679,16 @@ func perGPU(total int, count int32) int {
 	return ceilDiv(total, int(count))
 }
 
+// powerOfTwoVCPUs rounds a vCPU count up to the power of two v2 requires of a CPU-only
+// Pod, with 2 as its floor — so an unset request also gets the smallest legal size.
+func powerOfTwoVCPUs(n int) int {
+	v := 2
+	for v < n {
+		v *= 2
+	}
+	return v
+}
+
 // ceilDiv divides rounding away from zero for positive inputs. Its own function because
 // every conversion above rounds the same way, and an inlined `(a+b-1)/b` is easy to get
 // subtly wrong once.
@@ -660,38 +699,28 @@ func ceilDiv(a, b int) int {
 	return (a + b - 1) / b
 }
 
-// RunPod's desiredStatus values, the only three the API documents.
+// RunPod's observed Pod statuses, as v2 documents them. PROVISIONING and STARTING are the
+// other two, both Pending.
 const (
-	// statusRunning: RunPod WANTS this Pod running. It says nothing about whether the
-	// container is up yet, which is why toState pairs it with LastStartedAt.
-	statusRunning = "RUNNING"
-	// statusExited: the container exited. RunPod does not distinguish a clean exit from a
-	// crash here, so it maps to Terminated — "gone", with no claim about why.
-	statusExited = "EXITED"
-	// statusTerminated: the Pod was destroyed (our own Terminate, or a spot reclaim).
+	statusRunning = "RUNNING" // container healthy
+	// statusExited is RunPod's stopped state, clean exit and crash alike, so it maps to
+	// Terminated — "gone", with no claim about why.
+	statusExited     = "EXITED"
+	statusError      = "ERROR" // unrecoverable
 	statusTerminated = "TERMINATED"
 )
 
-// toState maps an observed Pod to the provider-agnostic lifecycle state.
-//
-// The subtlety is that desiredStatus is DESIRED, not observed: RunPod reports RUNNING from
-// the moment it accepts the Pod, while the image may still be pulling. Reporting Running
-// then would advance the Pod — and its Deployment's ready replicas — before anything is
-// listening. LastStartedAt is the one field that only appears once the container has
-// actually started, so it is the gate. Same shape as AWS holding an instance at Pending
-// until its status checks clear.
-//
-// Everything unrecognized falls to Pending, so a status this adapter has not seen keeps the
-// poll loop watching rather than going terminal on a live, billing Pod.
+// toState maps an observed Pod to the provider-agnostic lifecycle state. Everything
+// unrecognized falls to Pending, so a status this adapter has not seen keeps the poll loop
+// watching rather than going terminal on a live, billing Pod.
 func toState(pd Pod) provider.InstanceState {
-	switch strings.ToUpper(pd.DesiredStatus) {
+	switch strings.ToUpper(pd.Status) {
 	case statusRunning:
-		if pd.LastStartedAt == "" {
-			return provider.InstancePending
-		}
 		return provider.InstanceRunning
 	case statusExited, statusTerminated:
 		return provider.InstanceTerminated
+	case statusError:
+		return provider.InstanceFailed
 	default:
 		return provider.InstancePending
 	}
@@ -704,15 +733,11 @@ func toState(pd Pod) provider.InstanceState {
 // and the only address a /http-only Pod ever has. Either way it is re-reported on every
 // tick, and an empty value never clears what is already on the Pod (the write paths skip "").
 func toInstance(pd Pod) provider.Instance {
-	tier := nebulav1alpha1.CapacityOnDemand
-	if pd.Interruptible {
-		tier = nebulav1alpha1.CapacitySpot
-	}
 	return provider.Instance{
 		ID:           pd.ID,
 		ClaimName:    claimFromName(pd.Name),
 		State:        toState(pd),
-		CapacityType: tier,
+		CapacityType: nebulav1alpha1.CapacityOnDemand,
 		Region:       pd.DataCenterID,
 		Endpoint:     endpointOf(pd),
 	}
