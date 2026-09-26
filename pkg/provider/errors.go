@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 // Provision failure categories, shared by every adapter. The CATEGORIES are
@@ -169,7 +170,7 @@ func categorize(err error) failureCategory {
 	// — a manager shutdown, a leader handoff — and the provider may well have accepted the
 	// request. Nothing about the candidate was learned, so blocklisting would punish it for
 	// our own exit. Only the block scope; the caller still fails the Pod.
-	if errors.Is(err, context.Canceled) || containsAny(msg, "context canceled") {
+	if errors.Is(err, context.Canceled) || util.ContainsAny(msg, "context canceled") {
 		return catUnattributable
 	}
 
@@ -189,7 +190,7 @@ func categorize(err error) failureCategory {
 	//   - "image build for": the Modal SDK's remote build verdict, the only thing it says when
 	//     the build itself reached a decision. An API error from the same call does NOT carry
 	//     it, which is what keeps an expired workspace token classifiable as auth below.
-	if containsAny(msg, "image pull credential", "image build for") {
+	if util.ContainsAny(msg, "image pull credential", "image build for") {
 		return catRequest
 	}
 
@@ -198,14 +199,14 @@ func categorize(err error) failureCategory {
 	// while every replacement Pod retried the same broken provider.
 	if strings.Contains(msg, "rpc error") {
 		switch {
-		case containsAny(msg, "code = unauthenticated", "code = permissiondenied"):
+		case util.ContainsAny(msg, "code = unauthenticated", "code = permissiondenied"):
 			return catAuth
 		case strings.Contains(msg, "code = resourceexhausted"):
 			return catCapacity
 		}
 	}
 
-	if containsAny(msg,
+	if util.ContainsAny(msg,
 		"rpc error", "connection refused", "connection reset", "broken pipe",
 		"no such host", "i/o timeout", "eof", "tls handshake",
 		"service unavailable", "bad gateway", "gateway timeout", "internal server error") {
@@ -213,24 +214,14 @@ func categorize(err error) failureCategory {
 	}
 
 	switch {
-	case containsAny(msg, "unauthorized", "forbidden", "authentication",
+	case util.ContainsAny(msg, "unauthorized", "forbidden", "authentication",
 		"unauthenticated", "invalid token", "api key"):
 		return catAuth
-	case containsAny(msg, "quota", "limit exceeded", "rate limit"):
+	case util.ContainsAny(msg, "quota", "limit exceeded", "rate limit"):
 		return catCapacity
-	case containsAny(msg, "no capacity", "capacity", "unavailable", "out of", "no gpu"):
+	case util.ContainsAny(msg, "no capacity", "capacity", "unavailable", "out of", "no gpu"):
 		return catCapacity
 	default:
 		return catUnattributable
 	}
-}
-
-// containsAny reports whether s contains any of subs.
-func containsAny(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
 }

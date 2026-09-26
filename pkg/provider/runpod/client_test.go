@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -71,36 +72,39 @@ func jsonReply(status int, body string) http.HandlerFunc {
 	}
 }
 
+// problem is a v2 error body (RFC 9457) carrying msg as its detail.
+func problem(status int, msg string) string {
+	return fmt.Sprintf(`{"title":%q,"status":%d,"detail":%q}`, http.StatusText(status), status, msg)
+}
+
 func TestClassifyCreate(t *testing.T) {
 	// Every one of these must carry a sentinel or deliberately carry none: unwrapped, a
-	// rejection lands on nebula_provision_failures_total{reason="other"} and is retried
-	// forever against a provider that has already given its answer.
+	// rejection lands on nebula_provision_failures_total{reason="other"}.
 	cases := []struct {
-		name string
-		// status and message are what RunPod answered; spot is the request's tier, which the
-		// error itself never carries.
+		name    string
 		status  int
 		message string
-		spot    bool
 
-		want     error // the sentinel the error must wrap, nil for "none"
-		wantSpot bool  // must also carry the spot-tier marker
+		want error // the sentinel the error must wrap, nil for "none"
+		// blocksNothing: the zero BlockScope, the contract for a REQUEST-scoped failure.
+		blocksNothing bool
 	}{{
-		name: "401 is auth", status: 401, message: "Unauthorized", want: provider.ErrAuth,
+		name: "401 is auth", status: 401, message: "invalid token", want: provider.ErrAuth,
 	}, {
-		name: "403 is auth", status: 403, message: "Forbidden", want: provider.ErrAuth,
+		// RunPod: "your account cannot access the requested pool — skip this candidate".
+		// DenyAll would fence off every pool the account CAN use.
+		name: "403 is scoped to the candidate", status: 403, message: "Forbidden",
+		want: provider.ErrUnsupportedAccelerator,
 	}, {
 		// A 5xx says RunPod failed to ANSWER, not that it said no — and it may have created
-		// the Pod before falling over. A sentinel here would fail the Pod and blocklist a
-		// candidate on a server-side blip, possibly reaping a paid instance.
+		// the Pod before falling over.
 		name: "500 stays unwrapped", status: 500, message: "internal error", want: nil,
 	}, {
 		name: "502 stays unwrapped", status: 502, message: "<html>bad gateway</html>", want: nil,
 	}, {
 		name: "429 is quota", status: 429, message: "Too Many Requests", want: provider.ErrQuota,
 	}, {
-		// Money, not capacity, but scoped the same way: transient, and not an auth problem.
-		name: "402 is quota", status: 402, message: "Payment Required", want: provider.ErrQuota,
+		name: "402 is quota", status: 402, message: "Insufficient balance", want: provider.ErrQuota,
 	}, {
 		name:    "insufficient funds is quota",
 		status:  400,
@@ -112,41 +116,32 @@ func TestClassifyCreate(t *testing.T) {
 		message: "There are no longer any instances available with the requested specifications",
 		want:    provider.ErrNoCapacity,
 	}, {
-		// The tier marker is what keeps a Spot shortage from disabling OnDemand capacity
-		// that is still purchasable at the higher price.
-		name:     "a spot shortage also marks the tier",
-		status:   400,
-		message:  "no instances available",
-		spot:     true,
-		want:     provider.ErrNoCapacity,
-		wantSpot: true,
-	}, {
 		name:    "an unknown gpu type is an accelerator problem",
 		status:  400,
 		message: "invalid gpu type id",
 		want:    provider.ErrUnsupportedAccelerator,
 	}, {
-		// Belongs to the REQUEST, not the candidate: ErrImagePull blocklists nothing, so one
-		// Pod's bad credential cannot exclude an accelerator serving every other Pod.
-		name:    "a registry failure is an image-pull problem",
-		status:  400,
-		message: "could not authenticate with registry",
-		want:    provider.ErrImagePull,
+		// Belongs to the REQUEST, not the candidate: one Pod's bad credential must not exclude
+		// an accelerator serving every other Pod — and a registry's "unauthorized" must not
+		// read as OUR auth failing.
+		name:          "a registry failure blocks nothing",
+		status:        400,
+		message:       "registry unauthorized: could not pull image",
+		blocksNothing: true,
 	}, {
-		// None of the shared sentinels describes "rejected, reason unknown", and every guess
-		// is worse than retrying: ErrAuth would fence off the provider, a capacity wrap would
-		// evict a healthy candidate. A sustained reason="other" rate is the signal to add a
-		// row to the table.
-		name: "an unrecognized 4xx stays unwrapped", status: 400, message: "something new", want: nil,
+		// v2's 400 also covers cross-field rule violations, with no code to tell them from
+		// capacity; guessing either way is worse than leaving it unattributable.
+		name: "an unrecognized 400 stays unwrapped", status: 400, message: "something new", want: nil,
+	}, {
+		name: "a 422 stays unwrapped", status: 422, message: "gpu.count: must be >= 1", want: nil,
 	}}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, _ := testServer(t, jsonReply(tc.status, fmt.Sprintf(`{"error":%q}`, tc.message)))
+			c, _ := testServer(t, jsonReply(tc.status, problem(tc.status, tc.message)))
 
 			_, err := c.CreatePod(context.Background(), PodSpec{
-				Name: "nebula-claim-a", Image: "img", GPUCount: 1,
-				GPUTypeIDs: []string{"NVIDIA H100 80GB HBM3"}, Interruptible: tc.spot,
+				Name: "nebula-claim-a", Image: "img", GPUCount: 1, GPUTypeID: "NVIDIA H100 80GB HBM3",
 			})
 			if err == nil {
 				t.Fatal("CreatePod succeeded against an error response")
@@ -155,22 +150,20 @@ func TestClassifyCreate(t *testing.T) {
 				t.Errorf("error %v does not wrap %v", err, tc.want)
 			}
 			if tc.want == nil {
-				// Assert it wraps NONE of them: the point of leaving it unwrapped is that
-				// provider.IsRejection reads it as unattributable.
 				for _, s := range []error{
 					provider.ErrAuth, provider.ErrQuota, provider.ErrNoCapacity,
-					provider.ErrUnsupportedAccelerator, provider.ErrImagePull,
+					provider.ErrUnsupportedAccelerator,
 				} {
 					if errors.Is(err, s) {
 						t.Errorf("error %v wraps %v; it must stay unattributable", err, s)
 					}
 				}
 			}
-			if got := errors.Is(err, ErrSpotCapacity); got != tc.wantSpot {
-				t.Errorf("errors.Is(err, ErrSpotCapacity) = %t, want %t", got, tc.wantSpot)
+			scope := provider.ClassifyError(err, "", "H100:1")
+			if tc.blocksNothing && scope != (provider.BlockScope{}) {
+				t.Errorf("scope = %+v, want the zero scope", scope)
 			}
-			// The status and RunPod's own words survive into the message, which is what an
-			// operator reads off a Pod condition.
+			// RunPod's own words survive into the message an operator reads off a Pod condition.
 			if !strings.Contains(err.Error(), tc.message) {
 				t.Errorf("error %q dropped RunPod's message %q", err, tc.message)
 			}
@@ -178,18 +171,32 @@ func TestClassifyCreate(t *testing.T) {
 	}
 }
 
+func TestErrorMessage_KeepsValidationErrors(t *testing.T) {
+	// A 422 carries its reason ONLY in errors[]; dropping it leaves "Unprocessable Entity".
+	got := errorMessage([]byte(`{"title":"Unprocessable Entity","status":422,
+		"detail":"validation failed","errors":["cpu.vcpuCount: must be a power of two"]}`))
+	if want := "validation failed: cpu.vcpuCount: must be a power of two"; got != want {
+		t.Errorf("errorMessage = %q, want %q", got, want)
+	}
+	if got := errorMessage([]byte("<html>bad gateway</html>")); got != "<html>bad gateway</html>" {
+		t.Errorf("non-JSON body = %q, want it verbatim", got)
+	}
+}
+
 func TestCreatePod_WireForm(t *testing.T) {
-	c, seen := testServer(t, jsonReply(200, `{"id":"pod-1"}`))
+	c, seen := testServer(t, jsonReply(201, `{"id":"pod-1"}`))
 
 	id, err := c.CreatePod(context.Background(), PodSpec{
 		Name:          "nebula-claim-a",
 		Image:         "myimg:latest",
-		GPUTypeIDs:    []string{"NVIDIA H100 80GB HBM3", "NVIDIA H100 NVL"},
+		Entrypoint:    []string{"python"},
+		StartCmd:      []string{"serve.py"},
+		Env:           map[string]string{"K": "v"},
+		GPUTypeID:     "NVIDIA H100 80GB HBM3",
 		GPUCount:      2,
 		VCPUPerGPU:    5,
 		RAMPerGPUGiB:  50,
-		DataCenterIDs: []string{"US-KS-2"},
-		Interruptible: true,
+		DataCenterIDs: []string{"US-KS-2", "US-TX-3"},
 	})
 	if err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -198,88 +205,53 @@ func TestCreatePod_WireForm(t *testing.T) {
 		t.Fatalf("id = %q, want pod-1", id)
 	}
 	req := (*seen)[0]
-	if req.method != http.MethodPost || req.path != "/pods" {
-		t.Errorf("%s %s, want POST /pods", req.method, req.path)
+	if req.method != http.MethodPost || req.path != "/v2/pods" {
+		t.Errorf("%s %s, want POST /v2/pods", req.method, req.path)
 	}
 	if req.auth != "Bearer test-key" {
 		t.Errorf("Authorization = %q", req.auth)
 	}
-	// volumeInGb must be PRESENT and 0: RunPod's default is a billable 20 GiB persistent
-	// volume, and a Nebula instance is cattle with nothing to persist. omitempty here would
-	// silently restore that default — which is why the field carries no omitempty tag.
-	v, ok := req.body["volumeInGb"]
-	if !ok {
-		t.Error("volumeInGb absent; RunPod would then attach its default 20 GiB billable volume")
-	} else if v != float64(0) {
-		t.Errorf("volumeInGb = %v, want 0", v)
+	want := map[string]any{
+		"name":  "nebula-claim-a",
+		"image": "myimg:latest",
+		// SECURE only: COMMUNITY prices the same GPU differently and the catalog has no
+		// cloud-type axis to express that.
+		"cloud":      cloudTypeSecure,
+		"entrypoint": []any{"python"},
+		"cmd":        []any{"serve.py"},
+		"env":        map[string]any{"K": "v"},
+		"gpu": map[string]any{
+			"id": "NVIDIA H100 80GB HBM3", "count": float64(2),
+			"minVcpuCountPerGpu": float64(5), "minRamPerGpu": float64(50),
+		},
+		"dataCenterIds": []any{"US-KS-2", "US-TX-3"},
 	}
-	// Likewise interruptible: false is the tier that costs money, so it is stated rather
-	// than left to a default.
-	if got, ok := req.body["interruptible"]; !ok || got != true {
-		t.Errorf("interruptible = %v (present=%t), want true", got, ok)
-	}
-	// SECURE only: COMMUNITY prices the same GPU differently and the catalog has no
-	// cloud-type axis to express that, so offering it would make the price a guess.
-	if req.body["cloudType"] != cloudTypeSecure {
-		t.Errorf("cloudType = %v, want %q", req.body["cloudType"], cloudTypeSecure)
-	}
-	if req.body["computeType"] != "GPU" {
-		t.Errorf("computeType = %v, want GPU", req.body["computeType"])
-	}
-	// Only meaningful WITH alternates: it tells RunPod to satisfy the list by whichever id
-	// has capacity rather than insisting on the first.
-	if req.body["gpuTypePriority"] != "availability" {
-		t.Errorf("gpuTypePriority = %v, want availability for a multi-id request", req.body["gpuTypePriority"])
-	}
-	// custom, not availability: the pool NAMED this data center, so letting RunPod place
-	// elsewhere would silently break a constraint an operator set for data residency.
-	if req.body["dataCenterPriority"] != "custom" {
-		t.Errorf("dataCenterPriority = %v, want custom", req.body["dataCenterPriority"])
-	}
-	if req.body["minVCPUPerGPU"] != float64(5) || req.body["minRAMPerGPU"] != float64(50) {
-		t.Errorf("per-GPU sizing = %v/%v, want 5/50",
-			req.body["minVCPUPerGPU"], req.body["minRAMPerGPU"])
+	if !reflect.DeepEqual(req.body, want) {
+		t.Errorf("body =\n%v\nwant\n%v", req.body, want)
 	}
 }
 
-func TestCreatePod_SingleGPUIDAndCPUOnly(t *testing.T) {
-	t.Run("one id sends no priority", func(t *testing.T) {
-		// With a single id there is nothing to prioritize, so the field would be noise.
-		c, seen := testServer(t, jsonReply(200, `{"id":"pod-1"}`))
-		if _, err := c.CreatePod(context.Background(), PodSpec{
-			Name: "nebula-a", Image: "img", GPUCount: 1, GPUTypeIDs: []string{"NVIDIA L4"},
-		}); err != nil {
-			t.Fatalf("CreatePod: %v", err)
-		}
-		if _, ok := (*seen)[0].body["gpuTypePriority"]; ok {
-			t.Error("gpuTypePriority sent for a single-id request")
-		}
-	})
-
-	t.Run("no GPU is a different product", func(t *testing.T) {
-		// A CPU-only Pod's per-GPU sizing fields are meaningless; vcpuCount replaces them.
-		c, seen := testServer(t, jsonReply(200, `{"id":"pod-cpu"}`))
-		if _, err := c.CreatePod(context.Background(), PodSpec{
-			Name: "nebula-c", Image: "img", VCPUCount: 3,
-		}); err != nil {
-			t.Fatalf("CreatePod: %v", err)
-		}
-		body := (*seen)[0].body
-		if body["computeType"] != "CPU" {
-			t.Errorf("computeType = %v, want CPU", body["computeType"])
-		}
-		if body["vcpuCount"] != float64(3) {
-			t.Errorf("vcpuCount = %v, want 3", body["vcpuCount"])
-		}
-		if _, ok := body["gpuCount"]; ok {
-			t.Error("gpuCount sent on a CPU-only Pod")
-		}
-	})
+func TestCreatePod_CPUOnly(t *testing.T) {
+	// v2 takes exactly one of gpu or cpu, and a CPU Pod names a flavor.
+	c, seen := testServer(t, jsonReply(201, `{"id":"pod-cpu"}`))
+	if _, err := c.CreatePod(context.Background(), PodSpec{
+		Name: "nebula-c", Image: "img", VCPUCount: 4,
+	}); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	body := (*seen)[0].body
+	if _, ok := body["gpu"]; ok {
+		t.Error("gpu sent on a CPU-only Pod")
+	}
+	want := map[string]any{"id": cpuFlavor, "vcpuCount": float64(4)}
+	if !reflect.DeepEqual(body["cpu"], want) {
+		t.Errorf("cpu = %v, want %v", body["cpu"], want)
+	}
 }
 
 func TestCreatePod_SuccessWithNoID(t *testing.T) {
 	// A 2xx with no id is worse than an error: a Pod may exist that we can never name to
-	// terminate. It must fail WITHOUT a sentinel so the Pod retries — Provision is
+	// terminate. It must fail WITHOUT a sentinel so nothing is blocklisted — Provision is
 	// idempotent on the claim name, and the name lookup will find whatever this call created.
 	c, _ := testServer(t, jsonReply(201, `{}`))
 
@@ -287,25 +259,25 @@ func TestCreatePod_SuccessWithNoID(t *testing.T) {
 	if err == nil {
 		t.Fatal("CreatePod accepted a response with no id")
 	}
-	if provider.IsRejection(err) {
-		t.Errorf("error %v reads as a rejection; it must stay retryable", err)
+	if scope := provider.ClassifyError(err, "", "H100:1"); scope != (provider.BlockScope{}) {
+		t.Errorf("scope = %+v; a missing id says nothing about the candidate", scope)
 	}
 }
 
 func TestTerminatePod_404IsSuccess(t *testing.T) {
 	// The NodeClaim finalizer retries Terminate, so an already-gone Pod has to be success —
 	// otherwise the finalizer never clears and the Pod is stuck deleting forever.
-	c, seen := testServer(t, jsonReply(404, `{"error":"pod not found"}`))
+	c, seen := testServer(t, jsonReply(404, problem(404, "pod not found")))
 	if err := c.TerminatePod(context.Background(), "pod-gone"); err != nil {
 		t.Fatalf("TerminatePod on a missing Pod = %v, want nil", err)
 	}
-	if req := (*seen)[0]; req.method != http.MethodDelete || req.path != "/pods/pod-gone" {
-		t.Errorf("%s %s, want DELETE /pods/pod-gone", req.method, req.path)
+	if req := (*seen)[0]; req.method != http.MethodDelete || req.path != "/v2/pods/pod-gone" {
+		t.Errorf("%s %s, want DELETE /v2/pods/pod-gone", req.method, req.path)
 	}
 
 	// Any OTHER failure must still surface: swallowing a 500 would drop the teardown
 	// obligation and leak a billing instance.
-	c2, _ := testServer(t, jsonReply(500, `{"error":"boom"}`))
+	c2, _ := testServer(t, jsonReply(500, problem(500, "boom")))
 	if err := c2.TerminatePod(context.Background(), "pod-1"); err == nil {
 		t.Error("TerminatePod swallowed a 500; the instance would leak")
 	}
@@ -313,48 +285,68 @@ func TestTerminatePod_404IsSuccess(t *testing.T) {
 
 func TestGetPod_404IsGone(t *testing.T) {
 	// Absent means terminated, per the interface contract.
-	c, seen := testServer(t, jsonReply(404, `{"error":"not found"}`))
+	c, seen := testServer(t, jsonReply(404, problem(404, "not found")))
 	pd, err := c.GetPod(context.Background(), "pod-gone")
 	if err != nil || pd != nil {
 		t.Fatalf("GetPod(missing) = %v, %v; want nil, nil", pd, err)
 	}
-	// includeMachine is what populates the data center, so every read path must ask for it —
-	// without it Region would silently stay empty on every instance.
-	if req := (*seen)[0]; !strings.Contains(req.query, "includeMachine=true") {
-		t.Errorf("GetPod query = %q, want includeMachine=true", req.query)
+	if req := (*seen)[0]; req.path != "/v2/pods/pod-gone" {
+		t.Errorf("GET %s, want /v2/pods/pod-gone", req.path)
 	}
 }
 
-func TestListPods_DecodesMachineAndPorts(t *testing.T) {
-	c, seen := testServer(t, jsonReply(200, `[
-		{"id":"pod-1","name":"nebula-claim-a","desiredStatus":"RUNNING",
-		 "lastStartedAt":"2026-08-29T00:00:00Z","interruptible":true,
-		 "ports":["8000/http"],"machine":{"dataCenterId":"EU-RO-1"}},
-		{"id":"pod-2","name":"nebula-claim-b","desiredStatus":"EXITED","machine":null}
-	]`))
+func TestListPods_DecodesPlacementAndPorts(t *testing.T) {
+	c, _ := testServer(t, jsonReply(200, `{"pods":[
+		{"id":"pod-1","name":"nebula-claim-a","status":"RUNNING","dataCenterId":"EU-RO-1",
+		 "ports":["8000/http","22/tcp"],
+		 "runtime":{"ports":[{"private":22,"public":34446,"type":"tcp","ip":"195.26.233.3"},
+		                     {"private":8000,"public":null,"type":"http","ip":null}]}},
+		{"id":"pod-2","name":"nebula-claim-b","status":"PROVISIONING","dataCenterId":null,"runtime":null}
+	],"pagination":{"nextCursor":null,"hasNextPage":false}}`))
 
 	pods, err := c.ListPods(context.Background())
 	if err != nil {
 		t.Fatalf("ListPods: %v", err)
 	}
-	// The list path needs includeMachine for the same reason Get does; it is the poll loop's
-	// only source of an instance's region.
-	if req := (*seen)[0]; !strings.Contains(req.query, "includeMachine=true") {
-		t.Errorf("ListPods query = %q, want includeMachine=true", req.query)
-	}
 	if len(pods) != 2 {
 		t.Fatalf("got %d pods, want 2", len(pods))
 	}
-	if pods[0].DataCenterID != "EU-RO-1" || !pods[0].Interruptible {
+	if pods[0].DataCenterID != "EU-RO-1" || pods[0].Status != "RUNNING" {
 		t.Errorf("pod-1 = %+v", pods[0])
 	}
-	if len(pods[0].Ports) != 1 || pods[0].Ports[0] != "8000/http" {
-		t.Errorf("pod-1 ports = %v; they are what makes an /http-only Pod addressable", pods[0].Ports)
+	// Only a port published on a public IP is a direct address; the /http one is proxy-only.
+	if pods[0].PublicIP != "195.26.233.3" || !reflect.DeepEqual(pods[0].PortMappings, map[string]int{"22": 34446}) {
+		t.Errorf("pod-1 direct address = %q %v", pods[0].PublicIP, pods[0].PortMappings)
 	}
-	// A null machine must leave the region EMPTY rather than reporting a placement that was
-	// never observed.
-	if pods[1].DataCenterID != "" {
-		t.Errorf("pod-2 region = %q, want empty for a null machine", pods[1].DataCenterID)
+	// A null data center must leave the region EMPTY rather than reporting a placement that
+	// was never observed.
+	if pods[1].DataCenterID != "" || pods[1].PortMappings != nil {
+		t.Errorf("pod-2 = %+v, want no region and no mappings", pods[1])
+	}
+}
+
+func TestListPods_WalksEveryPage(t *testing.T) {
+	// A Pod missing from List reads as terminated, so stopping at page one would report every
+	// Pod past it dead.
+	c, seen := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("cursor") == "" {
+			jsonReply(200, `{"pods":[{"id":"pod-1","name":"nebula-a"}],
+				"pagination":{"nextCursor":"c2","hasNextPage":true}}`)(w, r)
+			return
+		}
+		jsonReply(200, `{"pods":[{"id":"pod-2","name":"nebula-b"}],
+			"pagination":{"nextCursor":null,"hasNextPage":false}}`)(w, r)
+	})
+
+	pods, err := c.ListPods(context.Background())
+	if err != nil {
+		t.Fatalf("ListPods: %v", err)
+	}
+	if len(pods) != 2 || pods[1].ID != "pod-2" {
+		t.Fatalf("pods = %+v, want both pages", pods)
+	}
+	if q := (*seen)[1].query; !strings.Contains(q, "cursor=c2") {
+		t.Errorf("second page query = %q, want the cursor passed through", q)
 	}
 }
 
@@ -374,8 +366,8 @@ func TestEnsureRegistryAuth(t *testing.T) {
 			if r.Method == http.MethodPost {
 				t.Error("POST issued although a matching object already exists")
 			}
-			jsonReply(200, fmt.Sprintf(`[{"id":"cra-existing","name":%q},
-				{"id":"cra-other","name":"nebula-deadbeefdeadbeef"}]`, name))(w, r)
+			jsonReply(200, fmt.Sprintf(`{"registries":[{"id":"cra-existing","name":%q},
+				{"id":"cra-other","name":"nebula-deadbeefdeadbeef"}]}`, name))(w, r)
 		})
 
 		id, err := c.EnsureRegistryAuth(context.Background(), auth)
@@ -393,7 +385,7 @@ func TestEnsureRegistryAuth(t *testing.T) {
 	t.Run("creates when absent, and never sends the password back on the list", func(t *testing.T) {
 		c, seen := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
-				jsonReply(200, `[]`)(w, r)
+				jsonReply(200, `{"registries":[]}`)(w, r)
 				return
 			}
 			jsonReply(201, `{"id":"cra-new","name":"whatever"}`)(w, r)
@@ -442,19 +434,21 @@ func TestEnsureRegistryAuth(t *testing.T) {
 
 	t.Run("a create failure blocklists nothing", func(t *testing.T) {
 		// A credential RunPod will not store is a fact about this Pod's imagePullSecret, not
-		// about the accelerator or region it was headed for — so ErrImagePull, which the
-		// classifier maps to the zero BlockScope.
+		// about the accelerator or region it was headed for — so the zero BlockScope.
 		c, _ := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
-				jsonReply(200, `[]`)(w, r)
+				jsonReply(200, `{"registries":[]}`)(w, r)
 				return
 			}
-			jsonReply(400, `{"error":"invalid credential"}`)(w, r)
+			jsonReply(400, problem(400, "invalid credential"))(w, r)
 		})
 
 		_, err := c.EnsureRegistryAuth(context.Background(), auth)
-		if !errors.Is(err, provider.ErrImagePull) {
-			t.Errorf("error = %v, want it to wrap ErrImagePull", err)
+		if err == nil {
+			t.Fatal("EnsureRegistryAuth succeeded against an error response")
+		}
+		if scope := provider.ClassifyError(err, "", "H100:1"); scope != (provider.BlockScope{}) {
+			t.Errorf("scope = %+v, want the zero scope", scope)
 		}
 	})
 
@@ -462,13 +456,13 @@ func TestEnsureRegistryAuth(t *testing.T) {
 		// The adapter vets the kind first, so this is a programming error — but it must never
 		// become a silent ANONYMOUS pull, which either 401s opaquely or succeeds against a
 		// PUBLIC image of the same name.
-		c, seen := testServer(t, jsonReply(200, `[]`))
+		c, seen := testServer(t, jsonReply(200, `{"registries":[]}`))
 		_, err := c.EnsureRegistryAuth(context.Background(), &provider.RegistryAuth{
 			Registry: "1234.dkr.ecr.us-east-1.amazonaws.com",
 			AWSRole:  &provider.AWSRoleAuth{RoleARN: "arn:aws:iam::1234:role/pull", Region: "us-east-1"},
 		})
-		if !errors.Is(err, provider.ErrImagePull) {
-			t.Errorf("error = %v, want it to wrap ErrImagePull", err)
+		if scope := provider.ClassifyError(err, "", "H100:1"); err == nil || scope != (provider.BlockScope{}) {
+			t.Errorf("error = %v, scope = %+v; want a refusal that blocks nothing", err, scope)
 		}
 		if len(*seen) != 0 {
 			t.Errorf("made %d API calls for a credential it cannot express", len(*seen))

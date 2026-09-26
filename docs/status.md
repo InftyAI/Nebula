@@ -238,34 +238,28 @@ only two signals and has to record a third fact itself.
 
 ### RunPod
 
-One RunPod Pod per NodeClaim. The single signal is `desiredStatus`, and the name says
-what the trap is: it is the state RunPod *intends*, not the one it has reached.
+One RunPod Pod per NodeClaim, read through REST v2's `status`, which (unlike v1's
+`desiredStatus`) is the state the Pod has *reached*.
 
-| `desiredStatus` | `lastStartedAt` | `InstanceState` | Pod |
-|---|---|---|---|
-| `RUNNING` | set | `Running` | `Running` / `Ready=True` |
-| `RUNNING` | empty | `Pending` | `Pending` / `Initializing` |
-| `EXITED`, `TERMINATED` | — | `Terminated` | `Failed` / `Terminated` |
-| anything else | — | `Pending` | `Pending` / `Initializing` |
-| absent from `List` | — | `Terminated` | `Failed` / `Terminated` |
+| `status` | `InstanceState` | Pod |
+|---|---|---|
+| `RUNNING` | `Running` | `Running` / `Ready=True` |
+| `PROVISIONING`, `STARTING` | `Pending` | `Pending` / `Initializing` |
+| `EXITED`, `TERMINATED` | `Terminated` | `Failed` / `Terminated` |
+| `ERROR` | `Failed` | `Failed` |
+| anything else | `Pending` | `Pending` / `Initializing` |
+| absent from `List` | `Terminated` | `Failed` / `Terminated` |
 
-- **`RUNNING` alone is not running.** RunPod reports it from the moment it accepts the
-  Pod, while the image may still be pulling. `lastStartedAt` is the one field that
-  appears only once the container has actually started, so it is the gate — the same
-  role AWS's 2/2 reachability checks play. Without it a Deployment's replica would read
-  ready before anything was listening.
-- **There is no readiness concept beyond that.** RunPod has no probe, so "started" is
-  the strongest signal available; a container that is up but not yet serving reads
+- **There is no readiness concept beyond `RUNNING`.** RunPod has no probe, so "started"
+  is the strongest signal available; a container that is up but not yet serving reads
   `Running`. Contrast Modal, which has a real probe and latches it.
-- **There is no queueing**, as with AWS: `POST /pods` allocates a host machine before
-  it answers, and a capacity shortfall is a synchronous error
-  (`ErrNoCapacity`, plus `ErrSpotCapacity` on the interruptible tier) that drives
-  region/tier failover. So `Provision` always returns `reserved` and the Pod goes
-  straight to `Initializing`.
-- **No `Failed` case.** `EXITED` covers a clean exit and a crash alike — RunPod does
-  not distinguish them here and exposes no exit code — so a workload that died reads
-  as `Terminated`, indistinguishable from teardown. A spot reclaim arrives the same
-  way (`TERMINATED`, no notice), which is why the poll interval is 10s.
+- **There is no queueing**, as with AWS: `POST /v2/pods` allocates a host before it
+  answers, and a shortfall is a synchronous error (`ErrNoCapacity`) that drives region
+  failover. So `Provision` always returns `reserved`.
+- **`EXITED` hides crashes.** It covers a clean exit and a crash alike, with no exit
+  code, so a workload that died reads as `Terminated`, indistinguishable from teardown.
+- **OnDemand only.** v2 has no interruptible tier, so nothing is reclaimed and the
+  default poll cadence applies.
 - **Identity rides the Pod name**, not tags: RunPod Pods have none, so `List` filters
   on the `nebula-` prefix and the claim name is recovered by stripping it. A Pod whose
   name would exceed RunPod's 191-character cap is refused at `Provision` rather than
@@ -274,9 +268,9 @@ what the trap is: it is the state RunPod *intends*, not the one it has reached.
   is known at create time, so it is published from `CreatePod` like Modal's, but with
   no token — that proxy is unauthenticated. A Pod with a public IP and an assigned
   `/tcp` port mapping reports that direct address instead, once the poll loop sees it.
-- **Neither `kubectl logs` nor `kubectl exec` works.** RunPod's REST v1 surface has no
-  pod-log endpoint and its only way into a container is SSH, so the adapter implements
-  neither optional half and both routes answer NotFound.
+- **Neither `kubectl logs` nor `kubectl exec` works yet.** v2 streams logs over SSE
+  (`/v2/pods/{id}/logs`), which a `LogStreamer` could wrap; the only way into a
+  container is SSH, so exec answers NotFound.
 
 ### fake
 

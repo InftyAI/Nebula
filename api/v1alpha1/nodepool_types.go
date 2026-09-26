@@ -181,7 +181,7 @@ const (
 )
 
 // CapacityType is the purchase model (the outer axis). Each provider maps it to
-// its own concept — e.g. RunPod Spot -> interruptible/podRentInterruptable.
+// its own concept — e.g. AWS Spot -> a spot-market CreateFleet request.
 // +kubebuilder:validation:Enum=Spot;OnDemand
 type CapacityType string
 

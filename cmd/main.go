@@ -667,7 +667,7 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 	// environment (RUNPOD_API_KEY, delivered by the per-provider Secret) — there is no
 	// role/instance-identity path to fall back on, so an absent key is exactly the
 	// logged-and-skipped case. Also like Modal, there is no region config here: a pool's
-	// regions become RunPod data centers or country codes at provision time, so editing a
+	// regions become RunPod data centers at provision time, so editing a
 	// NodePool changes placement without a restart.
 	if p, err := runpod.NewSDKClient(ctx); err != nil {
 		setupLog.Info("skipping RunPod provider registration", "reason", err.Error())

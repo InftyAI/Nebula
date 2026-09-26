@@ -25,16 +25,15 @@
 #                     SEVERAL rows may share one accelerator_type, and the order
 #                     matters: MapAccelerator returns them in file order, so the
 #                     FIRST is the primary and the rest are interchangeable
-#                     alternates. RunPod's create takes the whole list and picks by
-#                     availability, so alternates widen a single launch — they never
-#                     widen what a failure blocklists, which keys on the canonical
-#                     pool. Put the variant with the best interconnect first (SXM
-#                     before NVL before PCIe); RunPod falls back only if it must.
+#                     alternates. A REST v2 create takes ONE gpu id, so only the
+#                     primary is launched; an alternate matters only once the rows
+#                     above it are flipped to available=false. Put the variant with
+#                     the best interconnect first (SXM before NVL before PCIe).
 #   gpu_count         BLANK. RunPod takes the GPU count as a request parameter, so it
 #                     is not a lookup dimension (contrast aws.csv, where the count is
 #                     baked into the instance type). A blank row matches any count.
-#   capacity_type     OnDemand | Spot. Spot is RunPod's `interruptible` tier: real,
-#                     abruptly reclaimed, and with no bid to name in the REST v1 API.
+#   capacity_type     OnDemand only. REST v2 has no interruptible tier, so a Spot row
+#                     would place Pods the adapter cannot launch.
 #   price_per_hour    approximate USD per GPU-hour on SECURE cloud
 #   available         whether Nebula may schedule onto it. Flipping a row to false
 #                     removes it from placement everywhere without touching Go — the
@@ -46,24 +45,13 @@
 #   updated           documentation only, ignored by the parser
 accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
 L4,NVIDIA L4,,OnDemand,0.43,true,,2026-08-29
-L4,NVIDIA L4,,Spot,0.25,true,,2026-08-29
 A40,NVIDIA A40,,OnDemand,0.40,true,,2026-08-29
-A40,NVIDIA A40,,Spot,0.23,true,,2026-08-29
 RTX4090,NVIDIA GeForce RTX 4090,,OnDemand,0.69,true,,2026-08-29
-RTX4090,NVIDIA GeForce RTX 4090,,Spot,0.35,true,,2026-08-29
 L40S,NVIDIA L40S,,OnDemand,0.86,true,,2026-08-29
-L40S,NVIDIA L40S,,Spot,0.49,true,,2026-08-29
 A100-40GB,NVIDIA A100-PCIE-40GB,,OnDemand,1.19,true,,2026-08-29
-A100-40GB,NVIDIA A100-PCIE-40GB,,Spot,0.69,true,,2026-08-29
 A100-80GB,NVIDIA A100-SXM4-80GB,,OnDemand,1.74,true,,2026-08-29
-A100-80GB,NVIDIA A100-SXM4-80GB,,Spot,0.99,true,,2026-08-29
 A100-80GB,NVIDIA A100 80GB PCIe,,OnDemand,1.64,true,,2026-08-29
-A100-80GB,NVIDIA A100 80GB PCIe,,Spot,0.94,true,,2026-08-29
 H100,NVIDIA H100 80GB HBM3,,OnDemand,2.99,true,,2026-08-29
-H100,NVIDIA H100 80GB HBM3,,Spot,1.65,true,,2026-08-29
 H100,NVIDIA H100 NVL,,OnDemand,2.79,true,,2026-08-29
-H100,NVIDIA H100 NVL,,Spot,1.55,true,,2026-08-29
 H100,NVIDIA H100 PCIe,,OnDemand,2.39,true,,2026-08-29
-H100,NVIDIA H100 PCIe,,Spot,1.35,true,,2026-08-29
 H200,NVIDIA H200,,OnDemand,3.99,true,,2026-08-29
-H200,NVIDIA H200,,Spot,2.19,true,,2026-08-29

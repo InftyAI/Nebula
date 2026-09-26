@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -62,7 +63,7 @@ func (f *fakeClient) CreatePod(_ context.Context, spec PodSpec) (string, error) 
 	if id == "" {
 		id = "pod-new"
 	}
-	f.pods = append(f.pods, Pod{ID: id, Name: spec.Name, DesiredStatus: statusRunning})
+	f.pods = append(f.pods, Pod{ID: id, Name: spec.Name, Status: statusRunning})
 	return id, nil
 }
 
@@ -99,9 +100,9 @@ func (c fakeCatalog) Offerings(_ string) []provider.Offering { return c.rows }
 
 // newTestProvider builds a Provider over a fake client and a catalog shaped like
 // runpod.csv: H100 carries THREE interchangeable RunPod ids (so MapAccelerator's
-// primary-then-alternates order is observable), A100-80GB one, and L4 a Spot row.
+// primary is observable), A100-80GB one, and L4 one.
 func newTestProvider(f *fakeClient) *Provider {
-	od, spot := nebulav1alpha1.CapacityOnDemand, nebulav1alpha1.CapacitySpot
+	od := nebulav1alpha1.CapacityOnDemand
 	row := func(typ, id string, tier nebulav1alpha1.CapacityType, price float64) provider.Offering {
 		return provider.Offering{
 			AcceleratorType: typ, AcceleratorID: id, CapacityType: tier,
@@ -113,7 +114,7 @@ func newTestProvider(f *fakeClient) *Provider {
 		row("H100", "NVIDIA H100 NVL", od, 2.79),
 		row("H100", "NVIDIA H100 PCIe", od, 2.39),
 		row("A100-80GB", "NVIDIA A100-SXM4-80GB", od, 1.74),
-		row("L4", "NVIDIA L4", spot, 0.22),
+		row("L4", "NVIDIA L4", od, 0.39),
 	}})
 }
 
@@ -209,10 +210,9 @@ func TestProvision_GPUPod(t *testing.T) {
 	if s.Env["HF_TOKEN"] != "hf_secret" {
 		t.Errorf("Env = %v; the caller's resolved env must go out whole", provider.RedactedEnv(s.Env))
 	}
-	// All three H100 ids ride one create, primary first: RunPod picks from the array by
-	// availability, so alternates broaden a SINGLE launch.
-	if len(s.GPUTypeIDs) != 3 || s.GPUTypeIDs[0] != "NVIDIA H100 80GB HBM3" {
-		t.Errorf("GPUTypeIDs = %v, want all three H100 ids with the primary first", s.GPUTypeIDs)
+	// v2 takes ONE gpu id per create, so only the primary goes out.
+	if s.GPUTypeID != "NVIDIA H100 80GB HBM3" {
+		t.Errorf("GPUTypeID = %q, want the primary H100 id", s.GPUTypeID)
 	}
 	if s.GPUCount != 2 {
 		t.Errorf("GPUCount = %d, want 2", s.GPUCount)
@@ -232,38 +232,32 @@ func TestProvision_GPUPod(t *testing.T) {
 	if strings.Join(s.Ports, ",") != "8000/http,9090/http" {
 		t.Errorf("Ports = %v, want both as /http", s.Ports)
 	}
-	// A compound token is a data center; the country-code field stays empty.
-	if len(s.DataCenterIDs) != 1 || s.DataCenterIDs[0] != "US-KS-2" || len(s.CountryCodes) != 0 {
-		t.Errorf("DataCenterIDs = %v, CountryCodes = %v", s.DataCenterIDs, s.CountryCodes)
-	}
-	if s.Interruptible {
-		t.Error("Interruptible = true on the OnDemand tier")
+	if strings.Join(s.DataCenterIDs, ",") != "US-KS-2" {
+		t.Errorf("DataCenterIDs = %v, want [US-KS-2]", s.DataCenterIDs)
 	}
 }
 
-func TestProvision_SpotAndCountryRegion(t *testing.T) {
-	f := &fakeClient{createID: "pod-spot"}
+func TestProvision_GeographyRegion(t *testing.T) {
+	f := &fakeClient{createID: "pod-ca"}
 	p := newTestProvider(f)
 
+	// A geography reaches Provision already joined by ResolveRegions; it must split back into
+	// the exact data centers, or RunPod is sent an id it has never heard of.
+	region := p.ResolveRegions([]string{"ca"}, nil)[0]
 	if _, err := p.Provision(context.Background(), gpuPod("l4", 1), provider.ProvisionRequest{
-		ClaimName:    "claim-s",
-		CapacityType: nebulav1alpha1.CapacitySpot,
-		Region:       "us",
+		ClaimName:    "claim-g",
+		CapacityType: nebulav1alpha1.CapacityOnDemand,
+		Region:       region,
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	s := f.lastSpec
-	if !s.Interruptible {
-		t.Error("Interruptible = false on the Spot tier; RunPod's spot tier is this one boolean")
-	}
-	// A bare two-letter token is an ISO country code RunPod takes natively, upper-cased —
-	// so nothing has to expand it and one declared token stays one blocklistable candidate.
-	if len(s.CountryCodes) != 1 || s.CountryCodes[0] != "US" || len(s.DataCenterIDs) != 0 {
-		t.Errorf("CountryCodes = %v, DataCenterIDs = %v, want [US]/[]", s.CountryCodes, s.DataCenterIDs)
+	if !reflect.DeepEqual(s.DataCenterIDs, regionsByGeography["ca"]) {
+		t.Errorf("DataCenterIDs = %v, want %v", s.DataCenterIDs, regionsByGeography["ca"])
 	}
 	// The label's casing is the user's; the catalog id that goes out is not.
-	if len(s.GPUTypeIDs) != 1 || s.GPUTypeIDs[0] != "NVIDIA L4" {
-		t.Errorf("GPUTypeIDs = %v, want [NVIDIA L4] from a lowercase label", s.GPUTypeIDs)
+	if s.GPUTypeID != "NVIDIA L4" {
+		t.Errorf("GPUTypeID = %q, want NVIDIA L4 from a lowercase label", s.GPUTypeID)
 	}
 }
 
@@ -279,16 +273,15 @@ func TestProvision_CPUOnlyPod(t *testing.T) {
 		t.Fatalf("Provision: %v", err)
 	}
 	s := f.lastSpec
-	// No accelerator: RunPod sizes the Pod with an ABSOLUTE vCPU count (rounded up from
-	// 2500m), not the per-GPU pair, and no GPU fields are set at all.
-	if s.VCPUCount != 3 || s.VCPUPerGPU != 0 || s.GPUCount != 0 || len(s.GPUTypeIDs) != 0 {
-		t.Errorf("VCPUCount = %d, VCPUPerGPU = %d, GPUCount = %d, GPUTypeIDs = %v",
-			s.VCPUCount, s.VCPUPerGPU, s.GPUCount, s.GPUTypeIDs)
+	// No accelerator: an ABSOLUTE vCPU count, 2500m rounded up to 3 and then to the power of
+	// two v2 accepts. Rounding down would under-provision the request.
+	if s.VCPUCount != 4 || s.VCPUPerGPU != 0 || s.GPUCount != 0 || s.GPUTypeID != "" {
+		t.Errorf("VCPUCount = %d, VCPUPerGPU = %d, GPUCount = %d, GPUTypeID = %q",
+			s.VCPUCount, s.VCPUPerGPU, s.GPUCount, s.GPUTypeID)
 	}
-	// No region declared leaves both placement fields empty — the widest capacity pool.
-	if len(s.DataCenterIDs) != 0 || len(s.CountryCodes) != 0 {
-		t.Errorf("region fields = %v/%v, want both empty when unconstrained",
-			s.DataCenterIDs, s.CountryCodes)
+	// No region declared leaves placement empty — the widest capacity pool.
+	if len(s.DataCenterIDs) != 0 {
+		t.Errorf("DataCenterIDs = %v, want empty when unconstrained", s.DataCenterIDs)
 	}
 }
 
@@ -296,8 +289,7 @@ func TestProvision_Idempotent(t *testing.T) {
 	// A Pod already carrying this claim's name is the ONLY record of ownership RunPod
 	// offers, so a repeat after a partial create must find it rather than pay twice.
 	f := &fakeClient{pods: []Pod{{
-		ID: "pod-existing", Name: "nebula-claim-a", DesiredStatus: statusRunning,
-		LastStartedAt: "2026-08-29T00:00:00Z",
+		ID: "pod-existing", Name: "nebula-claim-a", Status: statusRunning,
 	}}}
 	p := newTestProvider(f)
 
@@ -417,8 +409,8 @@ func TestProvision_RegistryAuth(t *testing.T) {
 		}
 		// A rejection of the REQUEST, not of the candidate: the Pod fails with the reason
 		// instead of retrying, and nothing gets blocklisted.
-		if !errors.Is(err, provider.ErrImagePull) {
-			t.Errorf("error = %v, want it to wrap ErrImagePull", err)
+		if scope := p.ClassifyProvisionError(err, "H100:1", ""); scope != (provider.BlockScope{}) {
+			t.Errorf("scope = %+v, want the zero scope", scope)
 		}
 		if f.authCnt != 0 || f.createCnt != 0 {
 			t.Errorf("authCnt = %d, createCnt = %d; a refused credential must cost no API calls",
@@ -470,9 +462,9 @@ func TestList_FiltersToNebulaPods(t *testing.T) {
 	// to someone else in the same account: reporting it would have the poll loop adopt it
 	// and the NodeClaim controller eventually TERMINATE it.
 	f := &fakeClient{pods: []Pod{
-		{ID: "pod-1", Name: "nebula-claim-a", DesiredStatus: statusRunning, LastStartedAt: "t"},
-		{ID: "pod-2", Name: "my-own-dev-box", DesiredStatus: statusRunning, LastStartedAt: "t"},
-		{ID: "pod-3", Name: "nebula-claim-b", DesiredStatus: statusExited},
+		{ID: "pod-1", Name: "nebula-claim-a", Status: statusRunning},
+		{ID: "pod-2", Name: "my-own-dev-box", Status: statusRunning},
+		{ID: "pod-3", Name: "nebula-claim-b", Status: statusExited},
 	}}
 	p := newTestProvider(f)
 
@@ -495,8 +487,7 @@ func TestList_FiltersToNebulaPods(t *testing.T) {
 
 func TestGetAndTerminate(t *testing.T) {
 	f := &fakeClient{pods: []Pod{{
-		ID: "pod-1", Name: "nebula-claim-a", DesiredStatus: statusRunning,
-		LastStartedAt: "t", Interruptible: true, DataCenterID: "EU-RO-1",
+		ID: "pod-1", Name: "nebula-claim-a", Status: statusRunning, DataCenterID: "EU-RO-1",
 		Ports: []string{"8000/http"},
 	}}}
 	p := newTestProvider(f)
@@ -508,9 +499,8 @@ func TestGetAndTerminate(t *testing.T) {
 	if inst == nil {
 		t.Fatal("Get returned nil for a live Pod")
 	}
-	// The observed instance reports the tier it actually GOT and where RunPod actually put
-	// it, both of which can differ from what was asked for.
-	if inst.CapacityType != nebulav1alpha1.CapacitySpot || inst.Region != "EU-RO-1" {
+	// Region is where RunPod actually put it, which a multi-DC candidate does not predict.
+	if inst.CapacityType != nebulav1alpha1.CapacityOnDemand || inst.Region != "EU-RO-1" {
 		t.Errorf("CapacityType = %q, Region = %q", inst.CapacityType, inst.Region)
 	}
 	// An /http-only Pod has no public IP or port mapping ever, so the derived proxy URL is
@@ -542,52 +532,27 @@ func TestGetAndTerminate(t *testing.T) {
 
 func TestToState(t *testing.T) {
 	cases := []struct {
-		name string
-		pod  Pod
-		want provider.InstanceState
-	}{{
-		// The subtlety of the whole adapter: desiredStatus is DESIRED. RunPod says RUNNING
-		// from the moment it accepts the Pod, while the image may still be pulling —
-		// reporting Running then would mark a Deployment's replica ready before anything is
-		// listening. LastStartedAt is the one field that only appears once the container has
-		// actually started.
-		name: "RUNNING without LastStartedAt is still Pending",
-		pod:  Pod{DesiredStatus: "RUNNING"},
-		want: provider.InstancePending,
-	}, {
-		name: "RUNNING with LastStartedAt is Running",
-		pod:  Pod{DesiredStatus: "RUNNING", LastStartedAt: "2026-08-29T00:00:00Z"},
-		want: provider.InstanceRunning,
-	}, {
-		name: "EXITED is Terminated",
-		pod:  Pod{DesiredStatus: "EXITED", LastStartedAt: "t"},
-		want: provider.InstanceTerminated,
-	}, {
-		// Our own Terminate, or a spot reclaim — indistinguishable here, and both mean gone.
-		name: "TERMINATED is Terminated",
-		pod:  Pod{DesiredStatus: "TERMINATED"},
-		want: provider.InstanceTerminated,
-	}, {
-		name: "casing is not load-bearing",
-		pod:  Pod{DesiredStatus: "running", LastStartedAt: "t"},
-		want: provider.InstanceRunning,
-	}, {
-		// A status this adapter has never seen keeps the poll loop WATCHING rather than
-		// going terminal on a live, billing Pod.
-		name: "an unknown status is Pending, not Terminated",
-		pod:  Pod{DesiredStatus: "SOMETHING_NEW"},
-		want: provider.InstancePending,
-	}, {
-		name: "an empty status is Pending",
-		pod:  Pod{},
-		want: provider.InstancePending,
-	}}
+		status string
+		want   provider.InstanceState
+	}{
+		// v2's status is OBSERVED, unlike v1's desiredStatus: RUNNING means the container
+		// started, so no started-at check is needed to keep an image pull from reading ready.
+		{"RUNNING", provider.InstanceRunning},
+		{"running", provider.InstanceRunning}, // casing is not load-bearing
+		{"PROVISIONING", provider.InstancePending},
+		{"STARTING", provider.InstancePending},
+		{"EXITED", provider.InstanceTerminated},
+		{"TERMINATED", provider.InstanceTerminated},
+		{"ERROR", provider.InstanceFailed},
+		// A status this adapter has never seen keeps the poll loop WATCHING rather than going
+		// terminal on a live, billing Pod.
+		{"SOMETHING_NEW", provider.InstancePending},
+		{"", provider.InstancePending},
+	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := toState(tc.pod); got != tc.want {
-				t.Errorf("toState = %v, want %v", got, tc.want)
-			}
-		})
+		if got := toState(Pod{Status: tc.status}); got != tc.want {
+			t.Errorf("toState(%q) = %v, want %v", tc.status, got, tc.want)
+		}
 	}
 }
 
@@ -644,17 +609,6 @@ func TestClassifyProvisionError(t *testing.T) {
 		}
 	})
 
-	t.Run("a spot shortage does not block OnDemand", func(t *testing.T) {
-		// The failing tier is not on the error's face, so the Client marks an interruptible
-		// shortage with ErrSpotCapacity. Blocking it as OnDemand would disable capacity that
-		// is still purchasable at the higher price.
-		err := fmt.Errorf("spot gone: %w: %w", provider.ErrNoCapacity, ErrSpotCapacity)
-		got := p.ClassifyProvisionError(err, accel, region)
-		if got.CapacityType != nebulav1alpha1.CapacitySpot {
-			t.Errorf("CapacityType = %q, want Spot", got.CapacityType)
-		}
-	})
-
 	t.Run("auth denies the whole provider and is not narrowed", func(t *testing.T) {
 		// A bad API key fails in every region, so narrowing DenyAll to one would contradict
 		// the category and keep trying the other candidates against the same dead key.
@@ -673,7 +627,7 @@ func TestClassifyProvisionError(t *testing.T) {
 		// onto the zero scope would make it non-empty, and recordBlock would then install a
 		// region-wide block across every accelerator — excluding that DC for every other Pod
 		// until the TTL lapsed.
-		err := fmt.Errorf("bad credential: %w", provider.ErrImagePull)
+		err := fmt.Errorf("runpod: image pull credential or image rejected: %w", errors.New("401"))
 		if got := p.ClassifyProvisionError(err, accel, region); got != (provider.BlockScope{}) {
 			t.Errorf("scope = %+v, want the zero scope so nothing is blocklisted", got)
 		}
@@ -691,10 +645,9 @@ func TestClassifyProvisionError(t *testing.T) {
 
 func TestCapabilities(t *testing.T) {
 	c := newTestProvider(&fakeClient{}).Capabilities()
-	// Spot is real here (`interruptible`), which is what makes the catalog's Spot rows and
-	// the ErrSpotCapacity marker meaningful — RunPod is the first adapter where both matter.
-	if !c.SupportsSpot {
-		t.Error("SupportsSpot = false")
+	// REST v2 has no interruptible tier, so advertising Spot would place Pods it cannot launch.
+	if c.SupportsSpot {
+		t.Error("SupportsSpot = true")
 	}
 	// A stopped RunPod Pod still bills for its disk and releases its GPU, so it is neither
 	// free nor resumable in the sense the capability promises.
@@ -710,41 +663,62 @@ func TestCapabilities(t *testing.T) {
 	if c.NativeTags {
 		t.Error("NativeTags = true; RunPod Pods have no tags")
 	}
-	// Reclaims arrive with no notice pushed to us, so polling is the only detector — hence
-	// a zero notice window and a faster-than-default cadence.
-	if c.PreemptionNotice != 0 {
-		t.Errorf("PreemptionNotice = %v, want 0 (abrupt)", c.PreemptionNotice)
-	}
-	if c.PollInterval != spotPollInterval {
-		t.Errorf("PollInterval = %v, want %v", c.PollInterval, spotPollInterval)
+	if c.PollInterval != 0 {
+		t.Errorf("PollInterval = %v, want 0 (the default cadence; nothing is reclaimed)", c.PollInterval)
 	}
 }
 
-func TestSplitRegion(t *testing.T) {
-	// The split is by SHAPE, not by a lookup table: RunPod's data-center ids are compound
-	// ("EU-RO-1") while a bare two-letter token is an ISO country code its countryCodes
-	// field takes. That is what keeps a static data-center list — which rots silently — out
-	// of this package, and why ExpandRegions stays catalog.Base's pass-through.
+func TestRegionsByGeography_IsResolvable(t *testing.T) {
+	for geography := range regionsByGeography {
+		if !provider.IsGeography(geography) {
+			t.Errorf("%q is not a provider.Geographies token, so nothing can resolve to it", geography)
+		}
+	}
+	// Every geography needs an entry, even an empty one, or a NodePool declaring it would be
+	// passed through as a literal data center RunPod has never heard of.
+	for _, g := range provider.Geographies {
+		if _, ok := regionsByGeography[g]; !ok {
+			t.Errorf("geography %q has no RunPod entry", g)
+		}
+	}
+}
+
+func TestResolveRegions(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	us := strings.Join(regionsByGeography["us"], regionSeparator)
+	eu := strings.Join(regionsByGeography["eu"], regionSeparator)
 	cases := []struct {
-		region    string
-		wantDCs   []string
-		wantCodes []string
+		name               string
+		declared, narrowTo []string
+		want               []string
 	}{
-		{region: "", wantDCs: nil, wantCodes: nil},
-		{region: "  ", wantDCs: nil, wantCodes: nil},
-		{region: "us", wantDCs: nil, wantCodes: []string{"US"}},
-		{region: "SE", wantDCs: nil, wantCodes: []string{"SE"}},
-		{region: "US-KS-2", wantDCs: []string{"US-KS-2"}, wantCodes: nil},
-		{region: "EU-RO-1", wantDCs: []string{"EU-RO-1"}, wantCodes: nil},
+		{name: "unconstrained is unpinned", want: []string{""}},
+		{name: "a geography is one joined candidate", declared: []string{"us"}, want: []string{us}},
+		{name: "a data center passes through", declared: []string{"EU-RO-1"}, want: []string{"EU-RO-1"}},
+		// No RunPod data center is in the UK, so the token resolves to no candidate at all
+		// rather than to the literal "uk".
+		{name: "an empty geography yields nothing", declared: []string{"uk"}, want: nil},
+		{name: "duplicates collapse", declared: []string{"us", "US", "EU-RO-1", "EU-RO-1"},
+			want: []string{us, "EU-RO-1"}},
+		{name: "narrowing an unpinned pool", narrowTo: []string{"eu"}, want: []string{eu}},
+		{name: "narrowing drops other geographies", declared: []string{"us", "eu"},
+			narrowTo: []string{"eu"}, want: []string{eu}},
+		{name: "narrowing keeps a data center inside it", declared: []string{"EU-RO-1", "US-KS-2"},
+			narrowTo: []string{"eu"}, want: []string{"EU-RO-1"}},
 	}
 	for _, tc := range cases {
-		t.Run(fmt.Sprintf("%q", tc.region), func(t *testing.T) {
-			dcs, codes := splitRegion(tc.region)
-			if strings.Join(dcs, ",") != strings.Join(tc.wantDCs, ",") ||
-				strings.Join(codes, ",") != strings.Join(tc.wantCodes, ",") {
-				t.Errorf("splitRegion(%q) = %v, %v; want %v, %v",
-					tc.region, dcs, codes, tc.wantDCs, tc.wantCodes)
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.ResolveRegions(tc.declared, tc.narrowTo); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ResolveRegions(%v, %v) = %q, want %q", tc.declared, tc.narrowTo, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPowerOfTwoVCPUs(t *testing.T) {
+	for n, want := range map[int]int{0: 2, 1: 2, 2: 2, 3: 4, 8: 8, 9: 16} {
+		if got := powerOfTwoVCPUs(n); got != want {
+			t.Errorf("powerOfTwoVCPUs(%d) = %d, want %d", n, got, want)
+		}
 	}
 }
