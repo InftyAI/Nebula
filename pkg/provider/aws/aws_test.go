@@ -45,6 +45,7 @@ type fakeClient struct {
 	instances  []EC2Instance
 	lastSpec   InstanceSpec
 	runCnt     int
+	listCnt    int
 	runErr     error
 	runID      string
 	terminated []string
@@ -91,7 +92,18 @@ func (f *fakeClient) DescribeInstance(_ context.Context, id string) (*EC2Instanc
 }
 
 func (f *fakeClient) ListInstances(_ context.Context) ([]EC2Instance, error) {
+	f.listCnt++
 	return f.instances, nil
+}
+
+func (f *fakeClient) FindInstance(_ context.Context, claimName string) (*EC2Instance, error) {
+	for i := range f.instances {
+		if f.instances[i].Tags[ClaimTagKey] == claimName {
+			inst := f.instances[i]
+			return &inst, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakeClient) AvailableInstanceTypes(_ context.Context) (map[string]bool, error) {
@@ -389,6 +401,10 @@ func TestProvision_Idempotent(t *testing.T) {
 	}
 	if f.runCnt != 0 {
 		t.Fatalf("RunInstance called %d times, want 0 (idempotent)", f.runCnt)
+	}
+	// A full list returns every Nebula instance in the region plus their status checks.
+	if f.listCnt != 0 {
+		t.Errorf("ListInstances called %d times on Provision, want 0", f.listCnt)
 	}
 }
 
