@@ -70,9 +70,8 @@ const accrualWorkers = 16
 // CostAccrual advances each claim's durable spend ledger on a ticker.
 //
 // A Runnable rather than a hook on the reconcile path: spend accrues with the CLOCK, not with
-// events, and a Bound claim can sit for hours without a reconcile. Leader election is the
-// manager's default for a plain Runnable and is load-bearing here — two replicas accruing the
-// same fleet would double every dollar.
+// events, and a Bound claim can sit for hours without a reconcile. Leader election is
+// load-bearing here (see NeedLeaderElection).
 //
 // It lives beside the reconciler rather than in pkg/metrics because it WRITES: the ledger is a
 // status field, and instrumentation that patches API objects is no longer instrumentation.
@@ -83,7 +82,18 @@ type CostAccrual struct {
 	now func() time.Time
 }
 
-var _ manager.Runnable = (*CostAccrual)(nil)
+var (
+	_ manager.Runnable               = (*CostAccrual)(nil)
+	_ manager.LeaderElectionRunnable = (*CostAccrual)(nil)
+)
+
+// NeedLeaderElection pins the loop to the leader. It matches the manager's default for a plain
+// Runnable, but is stated explicitly so a change to that default cannot silently let N replicas
+// accrue the same fleet: N times the writes, and each replica's cost counter would hold only the
+// windows it won the race for. The ledger itself is safe either way (see CostAccrual.accrue).
+func (a *CostAccrual) NeedLeaderElection() bool {
+	return true
+}
 
 // NewCostAccrual builds the accrual loop over the manager's client: cached reads, direct writes.
 func NewCostAccrual(c client.Client) *CostAccrual {
