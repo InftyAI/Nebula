@@ -123,6 +123,9 @@ type Client interface {
 	// ListInstances returns every Nebula-owned instance (filtered by the
 	// ClaimTagKey tag) across the region, in as few calls as possible.
 	ListInstances(ctx context.Context) ([]EC2Instance, error)
+	// FindInstance returns the live instance tagged with claimName, or (nil, nil) if none.
+	// Filtered server-side and without status checks, since only the id is read.
+	FindInstance(ctx context.Context, claimName string) (*EC2Instance, error)
 	// AvailableInstanceTypes returns the set of EC2 instance types the client's
 	// region actually offers, as a set keyed by instance type. It backs the
 	// per-region availability filter in Offerings: a static catalog row whose
@@ -719,16 +722,7 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 // or nil if none. It scans one region's client (the launch target), since a claim
 // is placed in exactly one region per provision attempt.
 func findByClaim(ctx context.Context, client Client, claimName string) (*EC2Instance, error) {
-	instances, err := client.ListInstances(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for i := range instances {
-		if instances[i].Tags[ClaimTagKey] == claimName {
-			return &instances[i], nil
-		}
-	}
-	return nil, nil
+	return client.FindInstance(ctx, claimName)
 }
 
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
