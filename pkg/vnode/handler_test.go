@@ -1559,12 +1559,34 @@ func TestReconcileOnce_ReadinessDeadlineSparesRunningInstance(t *testing.T) {
 	}
 }
 
+// Spending the ready observation must not drop the placement: DeletePod still needs its
+// region. A pod with no placement (re-adopted) must be skipped, not dereferenced.
+func TestObserveReady_SpendsStartButKeepsPlacement(t *testing.T) {
+	h := NewHandler(&fakeProvider{}, nil, nil, openCluster())
+	tp := &trackedPod{
+		pod:       testPod("default", "p1"),
+		placement: &placement{region: "us-east", provisioningAt: time.Now()},
+	}
+	h.observeReady(tp, provider.InstanceRunning)
+	if !tp.placement.provisioningAt.IsZero() {
+		t.Error("provisioningAt still armed after the first Running")
+	}
+	if tp.placement.region != "us-east" {
+		t.Errorf("region = %q, want us-east kept for teardown", tp.placement.region)
+	}
+
+	h.observeReady(&trackedPod{pod: testPod("default", "p2")}, provider.InstanceRunning)
+}
+
 func TestReadyExpired_ClockStartsAtInitializingNotAtProvision(t *testing.T) {
 	// The provision call has its own timeout, so its duration must not eat the readiness
 	// budget: a Provision that took an hour still leaves the box a full budget to boot in.
 	fp := &fakeProvider{}
 	h := NewHandler(fp, nil, nil, openCluster())
-	tp := &trackedPod{pod: testPod("default", "p1"), provisioningAt: time.Now().Add(-time.Hour)}
+	tp := &trackedPod{
+		pod:       testPod("default", "p1"),
+		placement: &placement{provisioningAt: time.Now().Add(-time.Hour)},
+	}
 
 	if _, over := h.readyExpired(tp, provider.InstancePending); over {
 		t.Fatal("a long provision must not expire the readiness deadline")
