@@ -541,6 +541,32 @@ func TestTerminate_RegionOutsideTheSweep(t *testing.T) {
 	}
 }
 
+func TestFindByClaim(t *testing.T) {
+	f := &fakeClient{
+		instances: []EC2Instance{{
+			ID: "i-1", Tags: map[string]string{ClaimTagKey: "claim-a"}, State: stateRunning, Region: testRegion,
+		}},
+	}
+	p := newTestProvider(f)
+
+	got, err := p.FindByClaim(context.Background(), "claim-a", testRegion)
+	if err != nil || got == nil || got.ID != "i-1" {
+		t.Fatalf("FindByClaim = %+v, %v; want i-1", got, err)
+	}
+	if got, err := p.FindByClaim(context.Background(), "claim-b", testRegion); err != nil || got != nil {
+		t.Fatalf("FindByClaim(unknown claim) = %+v, %v; want nil, nil", got, err)
+	}
+	// No region means Provision never launched, so nothing to find — and no error, which
+	// would wedge the NodeClaim finalizer on a claim that owns nothing.
+	if got, err := p.FindByClaim(context.Background(), "claim-a", ""); err != nil || got != nil {
+		t.Fatalf("FindByClaim(no region) = %+v, %v; want nil, nil", got, err)
+	}
+	// A lookup, not a List: every instance in the region comes back with status checks.
+	if f.listCnt != 0 {
+		t.Errorf("ListInstances called %d times, want 0", f.listCnt)
+	}
+}
+
 // TestSweepRegions_CoversEveryPoolsPlacement pins that the sweep covers every region
 // placement can provision into, per pool. The unconstrained pool is the case that breaks if
 // declarations are flattened before resolving: appended to ["us"] it would vanish, leaving

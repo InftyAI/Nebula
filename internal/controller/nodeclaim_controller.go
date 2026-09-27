@@ -76,7 +76,7 @@ const podReasonInitializing = nebulav1alpha1.PodReasonInitializing
 // sees no Pod and no delete event, so it never calls Terminate. The claim is cluster-scoped,
 // so it outlives the namespaced Pod and is reconciled level-triggered on every restart. When
 // the served Pod is gone it self-deletes, and its finalizer reclaims the instance (resolve
-// provider → find by claim name via List → Terminate) independent of VK liveness.
+// provider → find by claim name → Terminate) independent of VK liveness.
 //
 // Self-delete is guarded by placementGracePeriod, but only for a claim that has never
 // observed its Pod, so cache lag never tears down a live workload.
@@ -161,7 +161,7 @@ func (r *NodeClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Grace elapsed and the Pod never appeared: nothing was ever provisioned for
-	// this claim. Delete it; the backstop List finds no instance and the finalizer
+	// this claim. Delete it; the backstop finds no instance and the finalizer
 	// releases cleanly.
 	log.Info("served Pod never appeared within grace period; deleting orphaned claim",
 		"pod", nc.Spec.PodRef.Name)
@@ -199,18 +199,18 @@ func (r *NodeClaimReconciler) reconcileDelete(ctx context.Context, nc *nebulav1a
 		return r.releaseFinalizer(ctx, nc)
 	}
 
-	// Find the instance by its Pod-derived claim name. We cannot rely on
-	// status.InstanceID: VK tracks the id in memory, so if VK died (the very case
-	// this backstop exists for) that id was never persisted anywhere we can read.
-	// Re-deriving the claim name from PodRef and matching it against List is the
-	// only way to reclaim an instance VK has forgotten about. If DeletePod already
-	// ran, List simply won't contain it and findInstanceID returns "" (a no-op
-	// Terminate).
-	claim := util.ClaimName(nc.Spec.PodRef.Namespace, nc.Spec.PodRef.Name)
-	id, err := r.findInstanceID(ctx, prov, claim, nc.Status.InstanceID)
-	if err != nil {
-		log.Error(err, "listing provider instances for teardown; will retry")
-		return ctrl.Result{}, err
+	// status.InstanceID can be empty: VK died before the id reached the Pod (the very
+	// case this backstop exists for), or a failed Provision created an instance without
+	// ever returning its id. The Pod-derived claim name is then the only way to reclaim
+	// it. If DeletePod already ran, nothing matches and id stays "" (a no-op Terminate).
+	id := nc.Status.InstanceID
+	if id == "" {
+		claim := util.ClaimName(nc.Spec.PodRef.Namespace, nc.Spec.PodRef.Name)
+		var err error
+		if id, err = r.findInstanceID(ctx, prov, claim, nc.Spec.Region); err != nil {
+			log.Error(err, "looking up the claim's instance for teardown; will retry")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Terminate is idempotent (terminating an already-gone or empty instance
@@ -231,24 +231,14 @@ func (r *NodeClaimReconciler) reconcileDelete(ctx context.Context, nc *nebulav1a
 	return r.releaseFinalizer(ctx, nc)
 }
 
-// findInstanceID resolves the provider instance id to terminate. It prefers a
-// recorded status.InstanceID, then falls back to matching the Pod-derived claim
-// name against provider.List(). Returns "" when no instance exists (already gone
-// or never provisioned), which Terminate treats as a no-op.
-func (r *NodeClaimReconciler) findInstanceID(ctx context.Context, prov provider.Provider, claim, recordedID string) (string, error) {
-	if recordedID != "" {
-		return recordedID, nil
-	}
-	instances, err := prov.List(ctx)
-	if err != nil {
+// findInstanceID returns the id of claim's live instance, or "" when none exists
+// (already gone or never provisioned), which Terminate treats as a no-op.
+func (r *NodeClaimReconciler) findInstanceID(ctx context.Context, prov provider.Provider, claim, region string) (string, error) {
+	inst, err := prov.FindByClaim(ctx, claim, region)
+	if err != nil || inst == nil {
 		return "", err
 	}
-	for _, inst := range instances {
-		if inst.ClaimName == claim {
-			return inst.ID, nil
-		}
-	}
-	return "", nil // no live instance for this claim
+	return inst.ID, nil
 }
 
 // releaseFinalizer removes the terminate finalizer, allowing the API server to

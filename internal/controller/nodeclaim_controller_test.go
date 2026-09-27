@@ -39,12 +39,13 @@ import (
 
 // fakeProvider is a minimal provider.Provider. On the happy path the NodeClaim
 // controller never touches a provider (VK owns provisioning), but the teardown
-// backstop calls List/Terminate on the deletion path, so this records those.
+// backstop calls FindByClaim/Terminate on the deletion path, so this records those.
 type fakeProvider struct {
 	name string
 
-	list         []provider.Instance // what List returns
-	listErr      error               // if set, List fails
+	list         []provider.Instance // what List returns, and what FindByClaim searches
+	listErr      error               // if set, List and FindByClaim fail
+	findRegions  []string            // regions passed to FindByClaim, one per call
 	terminated   []string            // instance ids passed to Terminate, in order
 	regions      []string            // regions passed to Terminate, positionally paired with terminated
 	terminateErr error               // if set, Terminate fails
@@ -72,6 +73,18 @@ func (f *fakeProvider) Get(context.Context, string, string) (*provider.Instance,
 }
 func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
+}
+func (f *fakeProvider) FindByClaim(_ context.Context, claim, region string) (*provider.Instance, error) {
+	f.findRegions = append(f.findRegions, region)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	for _, inst := range f.list {
+		if inst.ClaimName == claim {
+			return &inst, nil
+		}
+	}
+	return nil, nil
 }
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool) {
@@ -465,8 +478,10 @@ func TestReconcile_NeverObservedPodDeletedAfterGrace(t *testing.T) {
 
 func TestReconcileDelete_TerminatesInstanceByClaimName(t *testing.T) {
 	// The backstop: on the deletion path, the instance is found by its
-	// Pod-derived claim name via List and terminated before the finalizer drops.
+	// Pod-derived claim name and terminated before the finalizer drops. The lookup
+	// gets spec.Region for the same reason Terminate does (see the test below).
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Spec.Region = "eu-west-1"
 	deleteClaim(t, claim) // set deletionTimestamp; finalizer keeps it alive
 	prov := &fakeProvider{
 		name: "fake",
@@ -479,6 +494,9 @@ func TestReconcileDelete_TerminatesInstanceByClaimName(t *testing.T) {
 	if len(prov.terminated) != 1 || prov.terminated[0] != "inst-1" {
 		t.Fatalf("expected Terminate(inst-1), got %v", prov.terminated)
 	}
+	if len(prov.findRegions) != 1 || prov.findRegions[0] != "eu-west-1" {
+		t.Fatalf("regions passed to FindByClaim = %v, want [eu-west-1]", prov.findRegions)
+	}
 	if claimExists(t, c, "c1") {
 		t.Fatal("expected finalizer released and claim gone after teardown")
 	}
@@ -486,7 +504,7 @@ func TestReconcileDelete_TerminatesInstanceByClaimName(t *testing.T) {
 
 func TestReconcileDelete_UsesRecordedInstanceID(t *testing.T) {
 	// When status.InstanceID is set (VK wrote it), the backstop terminates it
-	// directly without needing a List lookup.
+	// directly without a provider lookup.
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
 	claim.Status.InstanceID = "inst-recorded"
 	deleteClaim(t, claim)
@@ -497,6 +515,9 @@ func TestReconcileDelete_UsesRecordedInstanceID(t *testing.T) {
 
 	if len(prov.terminated) != 1 || prov.terminated[0] != "inst-recorded" {
 		t.Fatalf("expected Terminate(inst-recorded) from recorded id, got %v", prov.terminated)
+	}
+	if len(prov.findRegions) != 0 {
+		t.Fatalf("FindByClaim called %d times with a recorded id, want 0", len(prov.findRegions))
 	}
 }
 

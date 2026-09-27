@@ -472,7 +472,7 @@ func (p *Provider) Provision(
 	// No credential comes back, per the Provider contract: minting is one-shot with no
 	// read-back, and a fresh token revokes nothing, so re-minting for a sandbox whose token is
 	// already published strands the consumer holding it.
-	if existing, err := p.findByClaim(ctx, req.ClaimName); err != nil {
+	if existing, err := p.FindByClaim(ctx, req.ClaimName, ""); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {
 		return provider.ProvisionResult{
@@ -594,8 +594,8 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
-// findByClaim returns the sandbox tagged with claimName, or nil if none.
-func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider.Instance, error) {
+// FindByClaim implements provider.Provider. The region is ignored, as in Terminate.
+func (p *Provider) FindByClaim(ctx context.Context, claimName, _ string) (*provider.Instance, error) {
 	sb, err := p.client.FindSandbox(ctx, claimName)
 	if err != nil || sb == nil {
 		return nil, err

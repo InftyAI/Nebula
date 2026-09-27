@@ -498,7 +498,7 @@ func (p *Provider) Provision(
 	// create). A claim is placed in exactly one region per attempt, so scanning the
 	// target region's client is sufficient. It is reserved for the same reason a
 	// fresh launch is: it only exists because some earlier instant fleet succeeded.
-	if existing, err := findByClaim(ctx, client, req.ClaimName); err != nil {
+	if existing, err := client.FindInstance(ctx, req.ClaimName); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {
 		return provider.ProvisionResult{InstanceID: existing.ID, Reserved: true}, nil
@@ -606,6 +606,27 @@ func (p *Provider) Get(ctx context.Context, instanceID, region string) (*provide
 	// Absent from every reachable region => terminated (nil,nil), unless a region
 	// errored and might have held it, in which case surface the error for retry.
 	return nil, lastErr
+}
+
+// FindByClaim implements provider.Provider. An empty region finds nothing rather than
+// sweeping: Provision cannot launch without one (see clientFor), so no instance exists.
+//
+// Only pending/running instances match (see sdkClient.FindInstance), so a STOPPED instance
+// whose id was never recorded is not found — acceptable, as it bills EBS only, not compute.
+func (p *Provider) FindByClaim(ctx context.Context, claimName, region string) (*provider.Instance, error) {
+	if region == "" {
+		return nil, nil
+	}
+	client, err := p.clientFor(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+	ec2, err := client.FindInstance(ctx, claimName)
+	if err != nil || ec2 == nil {
+		return nil, err
+	}
+	inst := p.toInstance(*ec2)
+	return &inst, nil
 }
 
 // List implements provider.Provider. It FANS OUT across every region sweepRegions
@@ -716,13 +737,6 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 		scope.Region = &r
 	}
 	return scope
-}
-
-// findByClaim returns the instance in this client's region tagged with claimName,
-// or nil if none. It scans one region's client (the launch target), since a claim
-// is placed in exactly one region per provision attempt.
-func findByClaim(ctx context.Context, client Client, claimName string) (*EC2Instance, error) {
-	return client.FindInstance(ctx, claimName)
 }
 
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the

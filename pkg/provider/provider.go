@@ -89,6 +89,13 @@ type Provider interface {
 	// changing state here.
 	List(ctx context.Context) ([]Instance, error)
 
+	// FindByClaim returns the live instance for claimName, or (nil, nil) if none. It is the
+	// lookup for an instance whose id was never recorded, so it should cost one filtered
+	// call where the provider has one, not a List.
+	//
+	// region is the claim's (NodeClaim.Spec.Region), the one Provision launched into.
+	FindByClaim(ctx context.Context, claimName, region string) (*Instance, error)
+
 	// --- Catalog ---------------------------------------------------------
 
 	// Offerings returns the price/availability rows this provider can serve, feeding the

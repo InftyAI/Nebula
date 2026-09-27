@@ -232,6 +232,19 @@ func (p *Provider) List(_ context.Context) ([]provider.Instance, error) {
 	return out, nil
 }
 
+// FindByClaim returns the instance recorded for claimName, or (nil, nil) if none.
+func (p *Provider) FindByClaim(_ context.Context, claimName, _ string) (*provider.Instance, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, inst := range p.instances {
+		if inst.ClaimName == claimName {
+			out := *inst
+			return &out, nil
+		}
+	}
+	return nil, nil
+}
+
 // ClassifyProvisionError never really fails to provision, so any error it is
 // asked to classify is treated as a whole-provider block on OnDemand — the same
 // shared derivation the real adapters use.
