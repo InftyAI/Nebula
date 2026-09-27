@@ -119,6 +119,9 @@ type Client interface {
 	// ListSandboxes returns every Nebula-owned sandbox, filtered by the tag the
 	// adapter sets at create time, in as few calls as possible.
 	ListSandboxes(ctx context.Context) ([]Sandbox, error)
+	// FindSandbox returns the live sandbox tagged with claimName, or (nil, nil) if none.
+	// Filtered server-side, so it costs one list call and one observe, not one per sandbox.
+	FindSandbox(ctx context.Context, claimName string) (*Sandbox, error)
 	// SandboxLogs returns merged stdout+stderr, from the first byte, following until
 	// the sandbox exits (see provider.LogStreamer). The caller owns Close.
 	SandboxLogs(ctx context.Context, id string) (io.ReadCloser, error)
@@ -593,18 +596,12 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 
 // findByClaim returns the sandbox tagged with claimName, or nil if none.
 func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider.Instance, error) {
-	// TODO: do we have performance issue here?
-	sandboxes, err := p.client.ListSandboxes(ctx)
-	if err != nil {
+	sb, err := p.client.FindSandbox(ctx, claimName)
+	if err != nil || sb == nil {
 		return nil, err
 	}
-	for _, sb := range sandboxes {
-		if sb.Tags[ClaimTagKey] == claimName {
-			inst := p.toInstance(sb)
-			return &inst, nil
-		}
-	}
-	return nil, nil
+	inst := p.toInstance(*sb)
+	return &inst, nil
 }
 
 // sandboxSpecFromPod reads the workload off the Pod (source of truth) and the

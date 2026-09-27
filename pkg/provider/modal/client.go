@@ -716,6 +716,33 @@ func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 	return out, nil
 }
 
+// FindSandbox implements Client. Modal's Tags filter matches exact key=value pairs, which is
+// useless for ListSandboxes (every claim value differs) but exactly one claim's lookup.
+func (c *sdkClient) FindSandbox(ctx context.Context, claimName string) (*Sandbox, error) {
+	app, err := c.app(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("modal: resolve app: %w", err)
+	}
+	seq, err := c.mc.Sandboxes.List(ctx, &modal.SandboxListParams{
+		AppID: app.AppID,
+		Tags:  map[string]string{ClaimTagKey: claimName},
+	})
+	if err != nil {
+		return nil, err
+	}
+	for sb, err := range seq {
+		if err != nil {
+			return nil, err
+		}
+		observed, err := c.observe(ctx, sb)
+		if err != nil {
+			return nil, err
+		}
+		return &observed, nil
+	}
+	return nil, nil
+}
+
 // observe normalizes a live SDK *Sandbox into the adapter-level Sandbox view: tags
 // (from GetTags) and status (from Poll). A Poll error is tolerated so a single flaky
 // sandbox doesn't fail the whole read — the poll loop will re-observe next tick. A TAG

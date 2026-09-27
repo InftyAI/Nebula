@@ -727,6 +727,40 @@ func (c *sdkClient) DescribeInstance(ctx context.Context, id string) (*EC2Instan
 	return nil, nil
 }
 
+// FindInstance implements Client. The state filter matters as much as the tag: claim names
+// are reused across Pod restarts, and a terminated instance stays visible for ~1h. Unlike
+// ListInstances it drops stopped instances too: toState reads them as Terminated, so
+// adopting one would fail the Pod instead of launching a replacement.
+func (c *sdkClient) FindInstance(ctx context.Context, claimName string) (*EC2Instance, error) {
+	out, err := c.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   awssdk.String("tag:" + ClaimTagKey),
+				Values: []string{claimName},
+			},
+			stateFilter(statePending, stateRunning),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range out.Reservations {
+		if len(r.Instances) > 0 {
+			inst := c.observe(r.Instances[0])
+			return &inst, nil
+		}
+	}
+	return nil, nil
+}
+
+// stateFilter restricts DescribeInstances to the given instance states.
+func stateFilter(states ...string) ec2types.Filter {
+	return ec2types.Filter{
+		Name:   awssdk.String("instance-state-name"),
+		Values: states,
+	}
+}
+
 // ListInstances implements Client. It scopes the list server-side to instances
 // carrying the ClaimTagKey tag — the tag every Nebula instance is launched with —
 // so instances Nebula does not own are never returned, and pages through all
@@ -745,10 +779,7 @@ func (c *sdkClient) ListInstances(ctx context.Context) ([]EC2Instance, error) {
 				Name:   awssdk.String("tag-key"),
 				Values: []string{ClaimTagKey},
 			},
-			{
-				Name:   awssdk.String("instance-state-name"),
-				Values: []string{"pending", "running", "stopping", "stopped"},
-			},
+			stateFilter(statePending, stateRunning, stateStopping, stateStopped),
 		},
 	}
 	var out []EC2Instance

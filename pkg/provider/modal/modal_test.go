@@ -45,6 +45,7 @@ type fakeClient struct {
 	sandboxes  []Sandbox
 	lastSpec   SandboxSpec
 	createCnt  int
+	listCnt    int
 	createErr  error
 	createID   string
 	cred       Credential // credential CreateSandbox returns alongside its id
@@ -111,7 +112,18 @@ func (f *fakeClient) GetSandbox(_ context.Context, id string) (*Sandbox, error) 
 }
 
 func (f *fakeClient) ListSandboxes(_ context.Context) ([]Sandbox, error) {
+	f.listCnt++
 	return f.sandboxes, nil
+}
+
+func (f *fakeClient) FindSandbox(_ context.Context, claimName string) (*Sandbox, error) {
+	for i := range f.sandboxes {
+		if f.sandboxes[i].Tags[ClaimTagKey] == claimName {
+			s := f.sandboxes[i]
+			return &s, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakeClient) SandboxLogs(_ context.Context, id string) (io.ReadCloser, error) {
@@ -457,6 +469,11 @@ func TestProvision_Idempotent(t *testing.T) {
 	}
 	if f.createCnt != 0 {
 		t.Fatalf("CreateSandbox called %d times, want 0 (idempotent)", f.createCnt)
+	}
+	// A full list observes every sandbox in the App (two calls each), so the lookup must
+	// go through the claim-filtered FindSandbox instead.
+	if f.listCnt != 0 {
+		t.Errorf("ListSandboxes called %d times on Provision, want 0", f.listCnt)
 	}
 	// An adopted sandbox has been OBSERVED, unlike a fresh create, so its state is
 	// known: this one is running, which means capacity was necessarily allocated.

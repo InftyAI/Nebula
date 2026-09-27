@@ -1089,6 +1089,45 @@ func TestSDKAvailableInstanceTypes_ErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestSDKFindInstance_FiltersByClaimValue(t *testing.T) {
+	f := &fakeEC2{describePages: []*ec2.DescribeInstancesOutput{{
+		Reservations: []ec2types.Reservation{{Instances: []ec2types.Instance{{
+			InstanceId: awssdk.String("i-1"),
+			State:      &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning},
+		}}}},
+	}}}
+	c := newSDKClient(f)
+
+	inst, err := c.FindInstance(context.Background(), "claim-a")
+	if err != nil {
+		t.Fatalf("FindInstance: %v", err)
+	}
+	if inst == nil || inst.ID != "i-1" {
+		t.Fatalf("inst = %+v, want i-1", inst)
+	}
+	filters := map[string][]string{}
+	for _, fl := range f.lastDescribe.Filters {
+		filters[awssdk.ToString(fl.Name)] = fl.Values
+	}
+	if got := filters["tag:"+ClaimTagKey]; len(got) != 1 || got[0] != "claim-a" {
+		t.Errorf("claim filter = %v, want [claim-a]", got)
+	}
+	// Claim names are reused across Pod restarts, so anything else lets a retry adopt a
+	// terminated instance EC2 still shows, or a stopped one toState reads as Terminated.
+	if got := filters["instance-state-name"]; !reflect.DeepEqual(got, []string{statePending, stateRunning}) {
+		t.Errorf("instance-state-name filter = %v, want [pending running]", got)
+	}
+	// Provision reads only the id, so the status probe would be a wasted call.
+	if f.lastStatusIn != nil {
+		t.Error("DescribeInstanceStatus called; FindInstance must not probe status checks")
+	}
+
+	none, err := newSDKClient(&fakeEC2{}).FindInstance(context.Background(), "claim-b")
+	if err != nil || none != nil {
+		t.Errorf("FindInstance(no match) = %v, %v; want nil, nil", none, err)
+	}
+}
+
 func TestSDKList_PagesAndFiltersByClaimTag(t *testing.T) {
 	f := &fakeEC2{describePages: []*ec2.DescribeInstancesOutput{
 		{
