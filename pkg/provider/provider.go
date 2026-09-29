@@ -89,6 +89,13 @@ type Provider interface {
 	// changing state here.
 	List(ctx context.Context) ([]Instance, error)
 
+	// FindByClaim returns the instance for claimName that still holds resources (a stopped
+	// one included), or (nil, nil) if none. It is teardown's lookup for an instance whose id
+	// was never recorded, so it should cost one filtered call where the provider has one.
+	//
+	// region is the claim's (NodeClaim.Spec.Region), the one Provision launched into.
+	FindByClaim(ctx context.Context, claimName, region string) (*Instance, error)
+
 	// --- Catalog ---------------------------------------------------------
 
 	// Offerings returns the price/availability rows this provider can serve, feeding the

@@ -125,6 +125,17 @@ func (f *fakeProvider) Get(context.Context, string, string) (*provider.Instance,
 func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
 	return f.list, f.listErr
 }
+func (f *fakeProvider) FindByClaim(_ context.Context, claim, _ string) (*provider.Instance, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	for _, inst := range f.list {
+		if inst.ClaimName == claim {
+			return &inst, nil
+		}
+	}
+	return nil, nil
+}
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool)      { return []string{c}, true }
 func (f *fakeProvider) ResolveRegions(declared, _ []string) []string           { return declared }

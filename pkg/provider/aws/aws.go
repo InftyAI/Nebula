@@ -123,9 +123,9 @@ type Client interface {
 	// ListInstances returns every Nebula-owned instance (filtered by the
 	// ClaimTagKey tag) across the region, in as few calls as possible.
 	ListInstances(ctx context.Context) ([]EC2Instance, error)
-	// FindInstance returns the live instance tagged with claimName, or (nil, nil) if none.
-	// Filtered server-side and without status checks, since only the id is read.
-	FindInstance(ctx context.Context, claimName string) (*EC2Instance, error)
+	// FindInstance returns the instance tagged with claimName in one of states, or
+	// (nil, nil) if none. Filtered server-side and without status checks.
+	FindInstance(ctx context.Context, claimName string, states []string) (*EC2Instance, error)
 	// AvailableInstanceTypes returns the set of EC2 instance types the client's
 	// region actually offers, as a set keyed by instance type. It backs the
 	// per-region availability filter in Offerings: a static catalog row whose
@@ -498,7 +498,7 @@ func (p *Provider) Provision(
 	// create). A claim is placed in exactly one region per attempt, so scanning the
 	// target region's client is sufficient. It is reserved for the same reason a
 	// fresh launch is: it only exists because some earlier instant fleet succeeded.
-	if existing, err := findByClaim(ctx, client, req.ClaimName); err != nil {
+	if existing, err := client.FindInstance(ctx, req.ClaimName, adoptableStates); err != nil {
 		return provider.ProvisionResult{}, err
 	} else if existing != nil {
 		return provider.ProvisionResult{InstanceID: existing.ID, Reserved: true}, nil
@@ -606,6 +606,27 @@ func (p *Provider) Get(ctx context.Context, instanceID, region string) (*provide
 	// Absent from every reachable region => terminated (nil,nil), unless a region
 	// errored and might have held it, in which case surface the error for retry.
 	return nil, lastErr
+}
+
+// FindByClaim implements provider.Provider. An empty region finds nothing rather than
+// sweeping: Provision cannot launch without one (see clientFor), so no instance exists.
+//
+// Unlike Provision it matches stopped instances too: teardown is the caller, and a stopped
+// instance still holds its EBS volumes and public IP.
+func (p *Provider) FindByClaim(ctx context.Context, claimName, region string) (*provider.Instance, error) {
+	if region == "" {
+		return nil, nil
+	}
+	client, err := p.clientFor(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+	ec2, err := client.FindInstance(ctx, claimName, heldStates)
+	if err != nil || ec2 == nil {
+		return nil, err
+	}
+	inst := p.toInstance(*ec2)
+	return &inst, nil
 }
 
 // List implements provider.Provider. It FANS OUT across every region sweepRegions
@@ -718,13 +739,6 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
-// findByClaim returns the instance in this client's region tagged with claimName,
-// or nil if none. It scans one region's client (the launch target), since a claim
-// is placed in exactly one region per provision attempt.
-func findByClaim(ctx context.Context, client Client, claimName string) (*EC2Instance, error) {
-	return client.FindInstance(ctx, claimName)
-}
-
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
 // accelerator type (from the AcceleratorTypeLabel), maps it to an EC2 instance
 // type via the catalog, and stamps the claim tag, capacity tier, and region.
@@ -822,6 +836,14 @@ const (
 	stateStopped      = "stopped"
 	stateShuttingDown = "shutting-down"
 	stateTerminated   = "terminated"
+)
+
+// adoptableStates are what Provision may reuse: a stopped instance reads as Terminated
+// (see toState), so adopting one would fail the Pod instead of launching a replacement.
+// heldStates are every state that still holds resources — what List and teardown must see.
+var (
+	adoptableStates = []string{statePending, stateRunning}
+	heldStates      = []string{statePending, stateRunning, stateStopping, stateStopped}
 )
 
 // toState maps EC2's instance-state name to the provider-agnostic lifecycle

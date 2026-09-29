@@ -1098,7 +1098,7 @@ func TestSDKFindInstance_FiltersByClaimValue(t *testing.T) {
 	}}}
 	c := newSDKClient(f)
 
-	inst, err := c.FindInstance(context.Background(), "claim-a")
+	inst, err := c.FindInstance(context.Background(), "claim-a", adoptableStates)
 	if err != nil {
 		t.Fatalf("FindInstance: %v", err)
 	}
@@ -1112,17 +1112,17 @@ func TestSDKFindInstance_FiltersByClaimValue(t *testing.T) {
 	if got := filters["tag:"+ClaimTagKey]; len(got) != 1 || got[0] != "claim-a" {
 		t.Errorf("claim filter = %v, want [claim-a]", got)
 	}
-	// Claim names are reused across Pod restarts, so anything else lets a retry adopt a
-	// terminated instance EC2 still shows, or a stopped one toState reads as Terminated.
-	if got := filters["instance-state-name"]; !reflect.DeepEqual(got, []string{statePending, stateRunning}) {
-		t.Errorf("instance-state-name filter = %v, want [pending running]", got)
+	// The caller's states reach the wire: without them EC2 returns the terminated
+	// instances it keeps visible for ~1h, which a reused claim name would match.
+	if got := filters["instance-state-name"]; !reflect.DeepEqual(got, adoptableStates) {
+		t.Errorf("instance-state-name filter = %v, want %v", got, adoptableStates)
 	}
 	// Provision reads only the id, so the status probe would be a wasted call.
 	if f.lastStatusIn != nil {
 		t.Error("DescribeInstanceStatus called; FindInstance must not probe status checks")
 	}
 
-	none, err := newSDKClient(&fakeEC2{}).FindInstance(context.Background(), "claim-b")
+	none, err := newSDKClient(&fakeEC2{}).FindInstance(context.Background(), "claim-b", adoptableStates)
 	if err != nil || none != nil {
 		t.Errorf("FindInstance(no match) = %v, %v; want nil, nil", none, err)
 	}

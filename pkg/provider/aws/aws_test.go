@@ -96,9 +96,9 @@ func (f *fakeClient) ListInstances(_ context.Context) ([]EC2Instance, error) {
 	return f.instances, nil
 }
 
-func (f *fakeClient) FindInstance(_ context.Context, claimName string) (*EC2Instance, error) {
+func (f *fakeClient) FindInstance(_ context.Context, claimName string, states []string) (*EC2Instance, error) {
 	for i := range f.instances {
-		if f.instances[i].Tags[ClaimTagKey] == claimName {
+		if f.instances[i].Tags[ClaimTagKey] == claimName && slices.Contains(states, f.instances[i].State) {
 			inst := f.instances[i]
 			return &inst, nil
 		}
@@ -538,6 +538,58 @@ func TestTerminate_RegionOutsideTheSweep(t *testing.T) {
 	}
 	if len(f.terminated) != 1 || f.terminated[0] != "i-2" {
 		t.Fatalf("terminated = %v, want [i-2]", f.terminated)
+	}
+}
+
+func TestFindByClaim(t *testing.T) {
+	f := &fakeClient{
+		instances: []EC2Instance{{
+			ID: "i-1", Tags: map[string]string{ClaimTagKey: "claim-a"}, State: stateRunning, Region: testRegion,
+		}},
+	}
+	p := newTestProvider(f)
+
+	got, err := p.FindByClaim(context.Background(), "claim-a", testRegion)
+	if err != nil || got == nil || got.ID != "i-1" {
+		t.Fatalf("FindByClaim = %+v, %v; want i-1", got, err)
+	}
+	if got, err := p.FindByClaim(context.Background(), "claim-b", testRegion); err != nil || got != nil {
+		t.Fatalf("FindByClaim(unknown claim) = %+v, %v; want nil, nil", got, err)
+	}
+	// No region means Provision never launched, so nothing to find — and no error, which
+	// would wedge the NodeClaim finalizer on a claim that owns nothing.
+	if got, err := p.FindByClaim(context.Background(), "claim-a", ""); err != nil || got != nil {
+		t.Fatalf("FindByClaim(no region) = %+v, %v; want nil, nil", got, err)
+	}
+	// A lookup, not a List: every instance in the region comes back with status checks.
+	if f.listCnt != 0 {
+		t.Errorf("ListInstances called %d times, want 0", f.listCnt)
+	}
+}
+
+// A stopped instance whose id was never recorded still holds EBS and a public IP, so
+// teardown must find it — while Provision must NOT adopt it, since toState reads it as
+// Terminated and the Pod would fail instead of getting a replacement.
+func TestFindByClaim_StoppedFoundForTeardownNotAdopted(t *testing.T) {
+	f := &fakeClient{
+		instances: []EC2Instance{{
+			ID: "i-stopped", Tags: map[string]string{ClaimTagKey: "claim-a"}, State: stateStopped, Region: testRegion,
+		}},
+	}
+	p := newTestProvider(f)
+
+	got, err := p.FindByClaim(context.Background(), "claim-a", testRegion)
+	if err != nil || got == nil || got.ID != "i-stopped" {
+		t.Fatalf("FindByClaim = %+v, %v; want i-stopped", got, err)
+	}
+
+	res, err := p.Provision(context.Background(), gpuPod("H100", 8),
+		provider.ProvisionRequest{ClaimName: "claim-a", Region: testRegion})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if res.InstanceID == "i-stopped" || f.runCnt != 1 {
+		t.Fatalf("Provision adopted the stopped instance (id %q, launches %d)", res.InstanceID, f.runCnt)
 	}
 }
 
