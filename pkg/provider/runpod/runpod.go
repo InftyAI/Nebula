@@ -264,7 +264,14 @@ func (p *Provider) Provision(
 	// was allocated. That is the capacity question; readiness is separate and observed
 	// through List. No credential comes back — the interface forbids it on a re-Provision,
 	// and here there is nothing to re-mint anyway, since the proxy URL is derivable.
-	existing, err := p.findByClaim(ctx, req.ClaimName)
+	//
+	// Only a Pod that is still coming up or running is adopted: claim names are reused across
+	// Pod restarts, and an EXITED one reads as Terminated, which would fail the new Pod
+	// instead of creating its replacement.
+	existing, err := p.findByClaim(ctx, req.ClaimName, func(pd Pod) bool {
+		st := toState(pd)
+		return st == provider.InstancePending || st == provider.InstanceRunning
+	})
 	if err != nil {
 		return provider.ProvisionResult{}, err
 	}
@@ -347,21 +354,22 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 // Not a comma, for the reason given at modal's regionSeparator.
 const regionSeparator = "|"
 
-// regionsByGeography maps a geography token to the RunPod data centers it encompasses, from
-// the dataCenterIds enum of RunPod's REST API. Empty entries are geographies RunPod has no
-// data center in.
+// regionsByGeography maps a geography token to the RunPod data centers it encompasses. The
+// ids are GET /v2/catalog/datacenters as of 2026-09-29; the grouping is ours, by each id's
+// country, since the catalog's continent is coarser (it puts Canada with the US). Empty
+// entries are geographies RunPod has no data center in.
 var regionsByGeography = map[string][]string{
 	"us": {
-		"US-CA-2", "US-DE-1", "US-GA-1", "US-GA-2", "US-IL-1", "US-KS-2",
-		"US-KS-3", "US-NC-1", "US-TX-1", "US-TX-3", "US-TX-4", "US-WA-1",
+		"US-CA-2", "US-CO-1", "US-GA-2", "US-IL-1", "US-KS-2", "US-MD-1", "US-MO-1", "US-MO-2",
+		"US-NC-1", "US-NC-2", "US-NE-1", "US-PA-1", "US-TX-3", "US-TX-4", "US-WA-1", "US-WA-2",
 	},
-	"ca": {"CA-MTL-1", "CA-MTL-2", "CA-MTL-3"},
+	"ca": {"CA-MTL-1", "CA-MTL-3", "CA-MTL-4"},
 	// Iceland and Norway are EEA members, which is what "eu" means (see provider.Geographies).
 	"eu": {
 		"EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-RO-1", "EU-SE-1",
-		"EUR-IS-1", "EUR-IS-2", "EUR-IS-3", "EUR-NO-1",
+		"EUR-IS-1", "EUR-IS-2", "EUR-IS-3", "EUR-IS-4", "EUR-IS-5", "EUR-NO-1", "EUR-NO-2",
 	},
-	"ap": {"AP-JP-1", "OC-AU-1"},
+	"ap": {"AP-IN-1", "AP-JP-1", "OC-AU-1"},
 	"uk": {},
 	"sa": {},
 	"af": {},
@@ -375,7 +383,7 @@ var regionsByGeography = map[string][]string{
 // the declared tokens one by one.
 //
 //	nil/[]       => [""], unpinned: RunPod's widest pool
-//	["us"]       => ["US-CA-2|US-DE-1|..."]
+//	["us"]       => ["US-CA-2|US-CO-1|..."]
 //	["EU-RO-1"]  => itself, verbatim and unvalidated
 //
 // narrowTo keeps the candidates inside those geographies; an unconstrained pool becomes one
@@ -456,9 +464,22 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
-// findByClaim returns the Nebula-owned Pod for claimName, or nil if none. RunPod has no
-// server-side tag filter, so this is List plus a name comparison.
-func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider.Instance, error) {
+// FindByClaim implements provider.Provider. The region is ignored, as in Terminate.
+// EXITED and ERROR Pods match: they still bill their disk, so teardown must reach them.
+func (p *Provider) FindByClaim(ctx context.Context, claimName, _ string) (*provider.Instance, error) {
+	if _, err := podName(claimName); err != nil {
+		return nil, nil // Provision refuses such a name, so no Pod was ever created for it
+	}
+	return p.findByClaim(ctx, claimName, func(pd Pod) bool {
+		return strings.ToUpper(pd.Status) != statusTerminated
+	})
+}
+
+// findByClaim returns the first Nebula-owned Pod for claimName that match accepts, or nil
+// if none. RunPod has no server-side tag filter, so this is List plus a name comparison.
+func (p *Provider) findByClaim(
+	ctx context.Context, claimName string, match func(Pod) bool,
+) (*provider.Instance, error) {
 	name, err := podName(claimName)
 	if err != nil {
 		return nil, err
@@ -468,7 +489,7 @@ func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider
 		return nil, err
 	}
 	for _, pd := range pods {
-		if pd.Name == name {
+		if pd.Name == name && match(pd) {
 			inst := toInstance(pd)
 			return &inst, nil
 		}
@@ -477,7 +498,7 @@ func (p *Provider) findByClaim(ctx context.Context, claimName string) (*provider
 }
 
 // podName is the RunPod Pod name for a NodeClaim: the prefix that marks ownership plus
-// the claim name, which is what makes List/findByClaim work on a backend with no tags.
+// the claim name, which is what makes List/FindByClaim work on a backend with no tags.
 //
 // A name that would exceed RunPod's cap is an ERROR, never a truncation. Truncating would
 // map two long claim names onto one Pod name, and every consequence of that collision is

@@ -316,6 +316,47 @@ func TestProvision_Idempotent(t *testing.T) {
 	}
 }
 
+func TestProvision_DoesNotAdoptExitedPod(t *testing.T) {
+	// Claim names are reused across Pod restarts. Adopting a leftover EXITED Pod would hand
+	// the new Pod an instance toState reads as Terminated, failing it instead of replacing.
+	f := &fakeClient{pods: []Pod{{ID: "pod-exited", Name: "nebula-claim-a", Status: statusExited}}}
+	p := newTestProvider(f)
+
+	res, err := p.Provision(context.Background(), gpuPod("H100", 1), provider.ProvisionRequest{
+		ClaimName:    "claim-a",
+		CapacityType: nebulav1alpha1.CapacityOnDemand,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if res.InstanceID == "pod-exited" || f.createCnt != 1 {
+		t.Fatalf("adopted the EXITED Pod (id %q, creates %d), want a fresh create", res.InstanceID, f.createCnt)
+	}
+}
+
+func TestFindByClaim(t *testing.T) {
+	f := &fakeClient{pods: []Pod{
+		{ID: "pod-exited", Name: "nebula-claim-a", Status: statusExited},
+		{ID: "pod-gone", Name: "nebula-claim-b", Status: statusTerminated},
+	}}
+	p := newTestProvider(f)
+	ctx := context.Background()
+
+	// An EXITED Pod still bills its disk, so teardown must find it.
+	if got, err := p.FindByClaim(ctx, "claim-a", ""); err != nil || got == nil || got.ID != "pod-exited" {
+		t.Fatalf("FindByClaim(EXITED) = %+v, %v; want pod-exited", got, err)
+	}
+	if got, err := p.FindByClaim(ctx, "claim-b", ""); err != nil || got != nil {
+		t.Fatalf("FindByClaim(TERMINATED) = %+v, %v; want nil, nil", got, err)
+	}
+	// Provision refuses an overlong name, so nothing exists for it. An error here would
+	// wedge the NodeClaim finalizer on every retry.
+	long := strings.Repeat("x", maxNameLen)
+	if got, err := p.FindByClaim(ctx, long, ""); err != nil || got != nil {
+		t.Fatalf("FindByClaim(overlong) = %+v, %v; want nil, nil", got, err)
+	}
+}
+
 func TestProvision_RefusesOverlongClaimName(t *testing.T) {
 	// RunPod caps a pod name at 191 chars and the name is Nebula's ONLY carrier of
 	// identity, so a name that does not fit is refused rather than truncated: two
