@@ -728,17 +728,16 @@ func (c *sdkClient) DescribeInstance(ctx context.Context, id string) (*EC2Instan
 }
 
 // FindInstance implements Client. The state filter matters as much as the tag: claim names
-// are reused across Pod restarts, and a terminated instance stays visible for ~1h. Unlike
-// ListInstances it drops stopped instances too: toState reads them as Terminated, so
-// adopting one would fail the Pod instead of launching a replacement.
-func (c *sdkClient) FindInstance(ctx context.Context, claimName string) (*EC2Instance, error) {
+// are reused across Pod restarts, and a terminated instance stays visible for ~1h. Which
+// live states count is the caller's call (see adoptableStates).
+func (c *sdkClient) FindInstance(ctx context.Context, claimName string, states []string) (*EC2Instance, error) {
 	out, err := c.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []ec2types.Filter{
 			{
 				Name:   awssdk.String("tag:" + ClaimTagKey),
 				Values: []string{claimName},
 			},
-			stateFilter(statePending, stateRunning),
+			stateFilter(states...),
 		},
 	})
 	if err != nil {
@@ -779,7 +778,7 @@ func (c *sdkClient) ListInstances(ctx context.Context) ([]EC2Instance, error) {
 				Name:   awssdk.String("tag-key"),
 				Values: []string{ClaimTagKey},
 			},
-			stateFilter(statePending, stateRunning, stateStopping, stateStopped),
+			stateFilter(heldStates...),
 		},
 	}
 	var out []EC2Instance
