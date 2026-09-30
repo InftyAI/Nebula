@@ -24,31 +24,52 @@ import (
 // mibBytes is one MiB, the unit provider.PriceRequest quotes memory in.
 const mibBytes = 1024 * 1024
 
-// PodReservation returns the workload's CPU (vCPUs) and memory (MiB): limits, else
-// requests, else 0 (the provider's default). The limit wins because Modal bills the greater
-// of reservation and usage; it provisions this value as both request and limit, so the
-// price is exact. Memory rounds UP to whole MiB: rounding down would turn a sub-MiB size
-// into 0, i.e. unset, which Modal fills with its own unpriced default.
-func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
-	if pod == nil || len(pod.Spec.Containers) == 0 {
-		return 0, 0
-	}
-	c := &pod.Spec.Containers[0]
-	cpu := reservedQty(c, corev1.ResourceCPU)
-	mem := reservedQty(c, corev1.ResourceMemory)
-	// MilliValue is cores*1000; Value is bytes.
-	return float64(cpu.MilliValue()) / 1000.0, int((mem.Value() + mibBytes - 1) / mibBytes)
+// Resources is a container's CPU (vCPUs) and memory (MiB). Zero means undeclared.
+type Resources struct {
+	CPU       float64
+	MemoryMiB int
 }
 
-// reservedQty returns the container's limit for name, falling back to its request, and a
-// zero quantity when it declares neither. By value, so the caller never holds a pointer
-// into the Pod it was read from.
-func reservedQty(c *corev1.Container, name corev1.ResourceName) resource.Quantity {
-	if q, ok := c.Resources.Limits[name]; ok {
-		return q
+// PodResources returns the first container's requests and limits. A missing request falls
+// back to the limit, as Kubernetes defaults it; a missing limit stays 0 (no cap). Memory
+// rounds UP to whole MiB, so a sub-MiB size never becomes 0, i.e. unset.
+//
+// The FIRST container only, matching the single-workload-container shape the whole
+// provisioning path assumes (see modal.sandboxSpecFromPod).
+func PodResources(pod *corev1.Pod) (requests, limits Resources) {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return Resources{}, Resources{}
 	}
-	if q, ok := c.Resources.Requests[name]; ok {
-		return q
+	c := &pod.Spec.Containers[0]
+	limits = Resources{
+		CPU:       vCPUs(c.Resources.Limits[corev1.ResourceCPU]),
+		MemoryMiB: ceilMiB(c.Resources.Limits[corev1.ResourceMemory]),
 	}
-	return resource.Quantity{}
+	requests = limits
+	if q, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+		requests.CPU = vCPUs(q)
+	}
+	if q, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+		requests.MemoryMiB = ceilMiB(q)
+	}
+	return requests, limits
 }
+
+// PodReservation is the size a Pod is priced at: its limit, else its request. Modal bills
+// the greater of reservation and usage, so a limit bounds the bill and the price is an
+// upper bound. A request-only Pod has no bound and may bill above its price.
+func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
+	requests, limits := PodResources(pod)
+	cpuCores, memoryMiB = limits.CPU, limits.MemoryMiB
+	if cpuCores == 0 {
+		cpuCores = requests.CPU
+	}
+	if memoryMiB == 0 {
+		memoryMiB = requests.MemoryMiB
+	}
+	return cpuCores, memoryMiB
+}
+
+func vCPUs(q resource.Quantity) float64 { return float64(q.MilliValue()) / 1000.0 }
+
+func ceilMiB(q resource.Quantity) int { return int((q.Value() + mibBytes - 1) / mibBytes) }

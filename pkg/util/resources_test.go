@@ -43,7 +43,7 @@ func TestPodReservation(t *testing.T) {
 				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("16Gi")},
 			),
 			wantCPU: 8, wantMiB: 16384,
-			whatFor: "a burstable Pod priced at its request is undercharged when it bursts",
+			whatFor: "the limit bounds what Modal can bill, so pricing it is an upper bound",
 		},
 		"falls back to requests": {
 			pod: podWith(
@@ -98,6 +98,34 @@ func TestPodReservation(t *testing.T) {
 			if cpu != tc.wantCPU || mib != tc.wantMiB {
 				t.Fatalf("PodReservation = (%v cores, %v MiB), want (%v, %v): %s",
 					cpu, mib, tc.wantCPU, tc.wantMiB, tc.whatFor)
+			}
+		})
+	}
+}
+
+// Provisioning reads requests and limits apart: a request falls back to the limit, but a
+// limit never falls back to the request, or a request-only Pod would be capped.
+func TestPodResources(t *testing.T) {
+	burstable := podWith(
+		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("16Gi")},
+	)
+	limitsOnly := podWith(nil, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")})
+	requestsOnly := podWith(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}, nil)
+
+	for name, tc := range map[string]struct {
+		pod              *corev1.Pod
+		wantReq, wantLim Resources
+	}{
+		"burstable":     {burstable, Resources{0.5, 1024}, Resources{4, 16384}},
+		"limits only":   {limitsOnly, Resources{4, 0}, Resources{4, 0}},
+		"requests only": {requestsOnly, Resources{4, 0}, Resources{}},
+		"nil pod":       {nil, Resources{}, Resources{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, lim := PodResources(tc.pod)
+			if req != tc.wantReq || lim != tc.wantLim {
+				t.Fatalf("PodResources = (%+v, %+v), want (%+v, %+v)", req, lim, tc.wantReq, tc.wantLim)
 			}
 		})
 	}

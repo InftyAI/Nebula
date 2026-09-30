@@ -352,22 +352,22 @@ func TestPhysicalCores(t *testing.T) {
 
 func TestProvision_MapsResourceLimits(t *testing.T) {
 	cases := []struct {
-		name             string
-		requests, limits corev1.ResourceList
-		wantCPU          float64
-		wantMemMiB       int
+		name                      string
+		requests, limits          corev1.ResourceList
+		wantCPU, wantCPULimit     float64
+		wantMemMiB, wantMemLimMiB int
 	}{
 		{
-			name: "limits only",
+			name: "limits only: the request falls back to the limit",
 			limits: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("2"),
 				corev1.ResourceMemory: resource.MustParse("8Gi"),
 			},
-			wantCPU:    1,
-			wantMemMiB: 8192,
+			wantCPU: 1, wantCPULimit: 1,
+			wantMemMiB: 8192, wantMemLimMiB: 8192,
 		},
 		{
-			name: "burstable: request raised to the limit",
+			name: "burstable: request below the ceiling",
 			requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("500m"),
 				corev1.ResourceMemory: resource.MustParse("1Gi"),
@@ -376,27 +376,28 @@ func TestProvision_MapsResourceLimits(t *testing.T) {
 				corev1.ResourceCPU:    resource.MustParse("4"),
 				corev1.ResourceMemory: resource.MustParse("16Gi"),
 			},
-			wantCPU:    2,
-			wantMemMiB: 16384,
+			wantCPU: 0.25, wantCPULimit: 2,
+			wantMemMiB: 1024, wantMemLimMiB: 16384,
 		},
 		{
-			name: "requests only: capped at the request",
+			name: "requests only: uncapped, as in Kubernetes",
 			requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("500m"),
 				corev1.ResourceMemory: resource.MustParse("1Gi"),
 			},
-			wantCPU:    0.25,
-			wantMemMiB: 1024,
+			wantCPU: 0.25, wantCPULimit: 0,
+			wantMemMiB: 1024, wantMemLimMiB: 0,
 		},
 		{
-			name:       "neither: Modal applies its own defaults, uncapped",
-			wantCPU:    0,
-			wantMemMiB: 0,
+			name:    "neither: Modal applies its own defaults, uncapped",
+			wantCPU: 0, wantCPULimit: 0,
+			wantMemMiB: 0, wantMemLimMiB: 0,
 		},
 		{
-			name:    "cpu below Modal's minimum floors",
+			// The limit floors with the request, or the SDK rejects limit < request.
+			name:    "cpu below Modal's minimum floors on both sides",
 			limits:  corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1m")},
-			wantCPU: minModalCores,
+			wantCPU: minModalCores, wantCPULimit: minModalCores,
 		},
 	}
 
@@ -421,9 +422,13 @@ func TestProvision_MapsResourceLimits(t *testing.T) {
 			if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-lim"}); err != nil {
 				t.Fatalf("Provision: %v", err)
 			}
-			if f.lastSpec.CPU != tc.wantCPU || f.lastSpec.MemoryMiB != tc.wantMemMiB {
-				t.Fatalf("CPU/MemoryMiB = (%v, %d), want (%v, %d)",
-					f.lastSpec.CPU, f.lastSpec.MemoryMiB, tc.wantCPU, tc.wantMemMiB)
+			if f.lastSpec.CPU != tc.wantCPU || f.lastSpec.CPULimit != tc.wantCPULimit {
+				t.Fatalf("CPU/CPULimit = (%v, %v), want (%v, %v)",
+					f.lastSpec.CPU, f.lastSpec.CPULimit, tc.wantCPU, tc.wantCPULimit)
+			}
+			if f.lastSpec.MemoryMiB != tc.wantMemMiB || f.lastSpec.MemoryLimitMiB != tc.wantMemLimMiB {
+				t.Fatalf("MemoryMiB/MemoryLimitMiB = (%d, %d), want (%d, %d)",
+					f.lastSpec.MemoryMiB, f.lastSpec.MemoryLimitMiB, tc.wantMemMiB, tc.wantMemLimMiB)
 			}
 		})
 	}

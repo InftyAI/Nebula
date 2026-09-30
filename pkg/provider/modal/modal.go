@@ -155,10 +155,13 @@ type SandboxSpec struct {
 	GPU string
 	// GPUCount is how many accelerators to attach (0 for CPU-only).
 	GPUCount int32
-	// CPU (physical cores) and MemoryMiB come from util.PodReservation; zero is Modal's
-	// default. Each is sent as both request and limit (see sdkClient.CreateSandbox).
-	CPU       float64
-	MemoryMiB int
+	// CPU (physical cores) and MemoryMiB are the reservation, CPULimit and MemoryLimitMiB the
+	// hard cap, all from util.PodResources. Zero is Modal's default on a request and no cap on
+	// a limit. The claim is priced at the limit when one is set (see util.PodReservation).
+	CPU            float64
+	MemoryMiB      int
+	CPULimit       float64
+	MemoryLimitMiB int
 	// Ports are the container ports to expose, from the Pod's containerPorts. They
 	// declare to Modal which ports may receive traffic at all, and the connect URL
 	// routes to the first of them (see firstPort) — one token routes to one port.
@@ -217,10 +220,10 @@ type SandboxSpec struct {
 // a pointer, so %v would print an address, and only its presence matters.
 func (s SandboxSpec) String() string {
 	return fmt.Sprintf("SandboxSpec{Image:%s Command:%v Args:%v WorkingDir:%s Env:%s GPU:%s GPUCount:%d CPU:%g "+
-		"MemoryMiB:%d Ports:%v Regions:%v Egress:%s "+
+		"CPULimit:%g MemoryMiB:%d MemoryLimitMiB:%d Ports:%v Regions:%v Egress:%s "+
 		"EgressTargets:%v Timeout:%s Tags:%v ReadinessProbe:%t RegistryAuth:%s}",
 		s.Image, s.Command, s.Args, s.WorkingDir, provider.RedactedEnv(s.Env), s.GPU, s.GPUCount, s.CPU,
-		s.MemoryMiB, s.Ports, s.Regions, s.EgressMode,
+		s.CPULimit, s.MemoryMiB, s.MemoryLimitMiB, s.Ports, s.Regions, s.EgressMode,
 		s.EgressTargets, s.Timeout, s.Tags, s.ReadinessProbe != nil, s.RegistryAuth)
 }
 
@@ -611,7 +614,7 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		tags[ProbeTagKey] = probeTagValue
 	}
 
-	vCPUs, memMiB := util.PodReservation(pod)
+	requests, limits := util.PodResources(pod)
 	spec := SandboxSpec{
 		Image:      c.Image,
 		Command:    slices.Clone(c.Command),
@@ -621,10 +624,12 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
 		// here: it holds references this adapter has no cluster access to follow. See
 		// provider.ProvisionRequest.Env.
-		Env:       req.Env,
-		CPU:       physicalCores(vCPUs),
-		MemoryMiB: memMiB,
-		Ports:     containerPorts(&c),
+		Env:            req.Env,
+		CPU:            physicalCores(requests.CPU),
+		MemoryMiB:      requests.MemoryMiB,
+		CPULimit:       physicalCores(limits.CPU),
+		MemoryLimitMiB: limits.MemoryMiB,
+		Ports:          containerPorts(&c),
 		// An empty request region stays an empty slice, not a one-element [""]: that
 		// is the unconstrained case (no region declared on the pool), and it must
 		// reach Modal as "no placement constraint" — its widest pool and its
