@@ -403,8 +403,8 @@ func TestBasePricePerHour_EmbeddedCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("aws H100 x8: %v", err)
 	}
-	if got != 98.320 {
-		t.Fatalf("aws H100 x8 = %v, want 98.320 (whole-instance rate, unscaled)", got)
+	if got != 55.040 {
+		t.Fatalf("aws H100 x8 = %v, want 55.040 (whole-instance rate, unscaled)", got)
 	}
 }
 

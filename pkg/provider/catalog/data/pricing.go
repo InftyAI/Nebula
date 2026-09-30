@@ -21,7 +21,7 @@ package data
 
 // Modal meters CPU and memory SEPARATELY from the accelerator, so a sandbox's hourly
 // cost is the GPU price PLUS these. Not universal: AWS bundles both into the instance
-// price (p5.48xlarge's $98.320/hr already covers its vCPU and RAM), so a provider with
+// price (p5.48xlarge's $55.040/hr already covers its vCPU and RAM), so a provider with
 // no rates here is one whose CSV price is already all-in.
 //
 // Modal publishes these PER SECOND, so the literal stays exactly as printed on the price

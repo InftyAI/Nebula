@@ -132,8 +132,8 @@ func (b Base) MapAccelerator(canonical string, count int32) (providerAccelerator
 // adds them.
 //
 // Rows match as MapAccelerator matches them, plus capacity type: the one dimension
-// MapAccelerator can ignore and pricing cannot (AWS p5.48xlarge is $34.412 Spot against
-// $98.320 OnDemand). Among interchangeable alternates the FIRST row wins, so the price
+// MapAccelerator can ignore and pricing cannot (AWS p5.48xlarge is $20.839 Spot against
+// $55.040 OnDemand). Among interchangeable alternates the FIRST row wins, so the price
 // describes the id a launch actually tries first.
 func (b Base) PricePerHour(req provider.PriceRequest) (float64, error) {
 	// A CPU-only request. No row can match an empty type, so this is the same ErrNoPrice the
