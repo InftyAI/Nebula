@@ -43,7 +43,7 @@ func TestPodReservation(t *testing.T) {
 				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("16Gi")},
 			),
 			wantCPU: 2, wantMiB: 4096,
-			whatFor: "a burstable Pod is billed for what it reserved, not its ceiling",
+			whatFor: "an idle burstable Pod must not be charged for its whole ceiling",
 		},
 		"falls back to limits": {
 			pod: podWith(nil,
@@ -51,6 +51,16 @@ func TestPodReservation(t *testing.T) {
 			),
 			wantCPU: 8, wantMiB: 16384,
 			whatFor: "Kubernetes defaults the request to the limit",
+		},
+		"sub-MiB memory rounds up to 1 MiB": {
+			pod:     podWith(nil, corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("500Ki")}),
+			wantCPU: 0, wantMiB: 1,
+			whatFor: "0 would leave memory unset: Modal's unpriced default",
+		},
+		"fractional MiB rounds up": {
+			pod:     podWith(nil, corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Ki")}),
+			wantCPU: 0, wantMiB: 2,
+			whatFor: "rounding down would cap the Pod below what it declared",
 		},
 		"fractional cores": {
 			pod: podWith(corev1.ResourceList{
@@ -62,7 +72,7 @@ func TestPodReservation(t *testing.T) {
 		},
 		"decimal memory units convert to MiB": {
 			pod:     podWith(corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1G")}, nil),
-			wantCPU: 0, wantMiB: 953, // 1e9 / 1048576, truncated
+			wantCPU: 0, wantMiB: 954, // 1e9 / 1048576, rounded up
 			whatFor: "1G is not 1Gi, and the price is quoted per GiB",
 		},
 		"nothing declared": {
@@ -87,6 +97,34 @@ func TestPodReservation(t *testing.T) {
 			if cpu != tc.wantCPU || mib != tc.wantMiB {
 				t.Fatalf("PodReservation = (%v cores, %v MiB), want (%v, %v): %s",
 					cpu, mib, tc.wantCPU, tc.wantMiB, tc.whatFor)
+			}
+		})
+	}
+}
+
+// Provisioning reads requests and limits apart: a request falls back to the limit, but a
+// limit never falls back to the request, or a request-only Pod would be capped.
+func TestPodResources(t *testing.T) {
+	burstable := podWith(
+		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+		corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("16Gi")},
+	)
+	limitsOnly := podWith(nil, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")})
+	requestsOnly := podWith(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}, nil)
+
+	for name, tc := range map[string]struct {
+		pod              *corev1.Pod
+		wantReq, wantLim Resources
+	}{
+		"burstable":     {burstable, Resources{0.5, 1024}, Resources{4, 16384}},
+		"limits only":   {limitsOnly, Resources{4, 0}, Resources{4, 0}},
+		"requests only": {requestsOnly, Resources{4, 0}, Resources{}},
+		"nil pod":       {nil, Resources{}, Resources{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, lim := PodResources(tc.pod)
+			if req != tc.wantReq || lim != tc.wantLim {
+				t.Fatalf("PodResources = (%+v, %+v), want (%+v, %+v)", req, lim, tc.wantReq, tc.wantLim)
 			}
 		})
 	}

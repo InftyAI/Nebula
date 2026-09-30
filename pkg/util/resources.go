@@ -24,38 +24,46 @@ import (
 // mibBytes is one MiB, the unit provider.PriceRequest quotes memory in.
 const mibBytes = 1024 * 1024
 
-// PodReservation reads the workload's CPU and memory RESERVATION in the units
-// provider.PriceRequest quotes: fractional physical cores and MiB. Requests, falling
-// back to limits, and 0 for either when neither is set — which a provider reads as
-// "your default", so a priced 0 is a floor, not a claim that nothing was reserved.
-//
-// Reservation and not the limit, because a provider metering CPU/memory apart from the
-// accelerator (Modal) bills what was held for the workload; a burstable Pod's ceiling is
-// not what shows up on the invoice.
-//
-// The FIRST container only, matching the single-workload-container shape the whole
-// provisioning path assumes (see modal.sandboxSpecFromPod). Returns (0, 0) for a Pod with
-// no containers.
-func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
-	if pod == nil || len(pod.Spec.Containers) == 0 {
-		return 0, 0
-	}
-	c := &pod.Spec.Containers[0]
-	cpu := reservedQty(c, corev1.ResourceCPU)
-	mem := reservedQty(c, corev1.ResourceMemory)
-	// MilliValue is cores*1000; Value is bytes.
-	return float64(cpu.MilliValue()) / 1000.0, int(mem.Value() / mibBytes)
+// Resources is a container's CPU (vCPUs) and memory (MiB). Zero means undeclared.
+type Resources struct {
+	CPU       float64
+	MemoryMiB int
 }
 
-// reservedQty returns the container's request for name, falling back to its limit, and a
-// zero quantity when it declares neither. By value, so the caller never holds a pointer
-// into the Pod it was read from.
-func reservedQty(c *corev1.Container, name corev1.ResourceName) resource.Quantity {
-	if q, ok := c.Resources.Requests[name]; ok {
-		return q
+// PodResources returns the first container's requests and limits. A missing request falls
+// back to the limit, as Kubernetes defaults it; a missing limit stays 0 (no cap). Memory
+// rounds UP to whole MiB, so a sub-MiB size never becomes 0, i.e. unset.
+//
+// The FIRST container only, matching the single-workload-container shape the whole
+// provisioning path assumes (see modal.sandboxSpecFromPod).
+func PodResources(pod *corev1.Pod) (requests, limits Resources) {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return Resources{}, Resources{}
 	}
-	if q, ok := c.Resources.Limits[name]; ok {
-		return q
+	c := &pod.Spec.Containers[0]
+	limits = Resources{
+		CPU:       vCPUs(c.Resources.Limits[corev1.ResourceCPU]),
+		MemoryMiB: ceilMiB(c.Resources.Limits[corev1.ResourceMemory]),
 	}
-	return resource.Quantity{}
+	requests = limits
+	if q, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+		requests.CPU = vCPUs(q)
+	}
+	if q, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+		requests.MemoryMiB = ceilMiB(q)
+	}
+	return requests, limits
 }
+
+// PodReservation is the size a Pod is priced at: its requests (see PodResources). Modal
+// bills the greater of reservation and usage, so this is a floor: a Pod bursting above its
+// request is billed more than its price. Never the limit, which would charge an idle Pod
+// for its whole ceiling.
+func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
+	requests, _ := PodResources(pod)
+	return requests.CPU, requests.MemoryMiB
+}
+
+func vCPUs(q resource.Quantity) float64 { return float64(q.MilliValue()) / 1000.0 }
+
+func ceilMiB(q resource.Quantity) int { return int((q.Value() + mibBytes - 1) / mibBytes) }

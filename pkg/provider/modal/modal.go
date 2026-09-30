@@ -55,7 +55,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -156,21 +155,11 @@ type SandboxSpec struct {
 	GPU string
 	// GPUCount is how many accelerators to attach (0 for CPU-only).
 	GPUCount int32
-	// CPU is the requested cores (fractional, physical), from the Pod's first
-	// container resource request. Zero lets Modal apply its own default.
-	CPU float64
-	// MemoryMiB is the requested memory in MiB, from the Pod's request. Zero lets
-	// Modal apply its own default.
-	MemoryMiB int
-	// CPULimit and MemoryLimitMiB are the HARD caps, from the Pod's limits only —
-	// never from its requests, unlike CPU/MemoryMiB above, which fall back to limits
-	// when no request is given.
-	//
-	// Zero means no cap, which is also what a Pod that declares no limit means, so the
-	// two vocabularies line up on everything but one case: a positive limit smaller than
-	// Modal's unit must not truncate into that sentinel (see limitMiB). Without these a Pod's limits
-	// reached Modal as nothing at all: a limits-only Pod became a RESERVATION of that
-	// size with an unbounded ceiling — the inverse of what it asked for, and billable.
+	// CPU (physical cores) and MemoryMiB are the reservation, CPULimit and MemoryLimitMiB the
+	// hard cap, all from util.PodResources. Zero is Modal's default on a request and no cap on
+	// a limit. The claim is priced at the request (see util.PodReservation).
+	CPU            float64
+	MemoryMiB      int
 	CPULimit       float64
 	MemoryLimitMiB int
 	// Ports are the container ports to expose, from the Pod's containerPorts. They
@@ -412,7 +401,8 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 // would be read as free. A GPU sandbox in that state still prices, understating by those
 // same defaults, which is immaterial beside the accelerator.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
-	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
+	metered := data.ModalCPUCostPerHour(physicalCores(req.CPUCores)) +
+		data.ModalMemoryCostPerHour(req.MemoryMiB)
 
 	if req.AcceleratorType == "" {
 		if req.CPUCores <= 0 || req.MemoryMiB <= 0 {
@@ -624,6 +614,7 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		tags[ProbeTagKey] = probeTagValue
 	}
 
+	requests, limits := util.PodResources(pod)
 	spec := SandboxSpec{
 		Image:      c.Image,
 		Command:    slices.Clone(c.Command),
@@ -634,10 +625,10 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		// here: it holds references this adapter has no cluster access to follow. See
 		// provider.ProvisionRequest.Env.
 		Env:            req.Env,
-		CPU:            cpuCores(&c),
-		MemoryMiB:      memoryMiB(&c),
-		CPULimit:       cpuLimitCores(&c),
-		MemoryLimitMiB: memoryLimitMiB(&c),
+		CPU:            physicalCores(requests.CPU),
+		MemoryMiB:      requests.MemoryMiB,
+		CPULimit:       physicalCores(limits.CPU),
+		MemoryLimitMiB: limits.MemoryMiB,
 		Ports:          containerPorts(&c),
 		// An empty request region stays an empty slice, not a one-element [""]: that
 		// is the unconstrained case (no region declared on the pool), and it must
@@ -724,71 +715,21 @@ func checkRegistryAuth(a *provider.RegistryAuth) error {
 	}
 }
 
-// cpuCores reads the container's CPU request as fractional physical cores (Modal's
-// unit). It prefers requests, falling back to limits, and returns 0 (→ Modal
-// default) when neither is set.
-func cpuCores(c *corev1.Container) float64 { return cores(resourceQty(c, corev1.ResourceCPU)) }
+const (
+	// vCPUsPerModalCore: a Kubernetes CPU is a vCPU, but Modal requests and bills physical
+	// cores of 2 vCPU each (modal.com/pricing).
+	vCPUsPerModalCore = 2
+	// minModalCores is Modal's per-container minimum.
+	minModalCores = 0.125
+)
 
-// memoryMiB reads the container's memory request in MiB (Modal's unit), preferring
-// requests over limits. Returns 0 (→ Modal default) when neither is set.
-func memoryMiB(c *corev1.Container) int { return mib(resourceQty(c, corev1.ResourceMemory)) }
-
-// cpuLimitCores and memoryLimitMiB read the LIMITS, with no fallback to the request: a
-// request is a floor, and reusing it as a ceiling would cap a burstable Pod that never
-// asked to be capped. Zero (no limit declared) reaches Modal as "no limit", matching
-// Kubernetes. The request/limit asymmetry is entirely in which lookup they use.
-func cpuLimitCores(c *corev1.Container) float64 { return cores(limitQty(c, corev1.ResourceCPU)) }
-func memoryLimitMiB(c *corev1.Container) int    { return limitMiB(limitQty(c, corev1.ResourceMemory)) }
-
-// cores converts a CPU quantity to Modal's unit, fractional physical cores. MilliValue
-// is cores*1000. A nil quantity (unset) is 0, which lets Modal apply its own default.
-func cores(q *resource.Quantity) float64 {
-	if q == nil {
+// physicalCores converts vCPUs to Modal physical cores, floored at minModalCores; zero
+// stays zero (Modal's default). Shared with PricePerHour so price matches provisioning.
+func physicalCores(vCPUs float64) float64 {
+	if vCPUs <= 0 {
 		return 0
 	}
-	return float64(q.MilliValue()) / 1000.0
-}
-
-// mib converts a memory quantity to Modal's unit, MiB. Nil is 0, as in cores.
-func mib(q *resource.Quantity) int {
-	if q == nil {
-		return 0
-	}
-	const miB = 1024 * 1024
-	return int(q.Value() / miB)
-}
-
-// limitMiB is mib for a LIMIT, where 0 does not mean "unset" but "no cap". A positive
-// quantity below 1 MiB truncates to 0 there, so the plain conversion would hand an
-// UNBOUNDED sandbox to the one Pod that asked for the tightest ceiling — the inverse
-// of its declaration. Any positive limit therefore floors at 1 MiB, the smallest cap
-// Modal's unit can express. Modal may then refuse it as below its own minimum, which is
-// the honest answer for a limit it cannot honour, and is not silently unlimited.
-func limitMiB(q *resource.Quantity) int {
-	if m := mib(q); m != 0 || q == nil || q.Sign() <= 0 {
-		return m
-	}
-	return 1
-}
-
-// resourceQty returns the container's request for name, falling back to its limit,
-// or nil when neither is present.
-func resourceQty(c *corev1.Container, name corev1.ResourceName) *resource.Quantity {
-	if q, ok := c.Resources.Requests[name]; ok {
-		return &q
-	}
-	if q, ok := c.Resources.Limits[name]; ok {
-		return &q
-	}
-	return nil
-}
-
-// limitQty returns the container's limit for name, or nil when it has none.
-func limitQty(c *corev1.Container, name corev1.ResourceName) *resource.Quantity {
-	if q, ok := c.Resources.Limits[name]; ok {
-		return &q
-	}
-	return nil
+	return max(vCPUs/vCPUsPerModalCore, minModalCores)
 }
 
 // containerPorts collects the container's declared ports, which is what tells Modal

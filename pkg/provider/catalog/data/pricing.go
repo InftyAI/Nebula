@@ -21,7 +21,7 @@ package data
 
 // Modal meters CPU and memory SEPARATELY from the accelerator, so a sandbox's hourly
 // cost is the GPU price PLUS these. Not universal: AWS bundles both into the instance
-// price (p5.48xlarge's $98.320/hr already covers its vCPU and RAM), so a provider with
+// price (p5.48xlarge's $55.040/hr already covers its vCPU and RAM), so a provider with
 // no rates here is one whose CSV price is already all-in.
 //
 // Modal publishes these PER SECOND, so the literal stays exactly as printed on the price
@@ -53,8 +53,7 @@ const mibPerGiB = 1024
 // (see modal.SandboxSpec) — so no conversion happens at the call site, which is where a
 // factor-of-1024 slip would hide.
 //
-// Reservation, not usage: a sandbox bursting above its request toward CPULimit may bill
-// above these.
+// A floor, since Modal bills usage above the reservation (see util.PodReservation).
 func ModalCPUCostPerHour(cpuCores float64) float64 {
 	return cpuCores * ModalCPUPricePerCoreHour
 }
