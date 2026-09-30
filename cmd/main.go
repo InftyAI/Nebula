@@ -460,6 +460,9 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 		if err := webhookv1.SetupPodWebhookWithManager(mgr); err != nil {
 			return fmt.Errorf("unable to create Pod webhook: %w", err)
 		}
+		if err := webhookv1.SetupNodePoolWebhookWithManager(mgr); err != nil {
+			return fmt.Errorf("unable to create NodePool webhook: %w", err)
+		}
 	}
 
 	// Cost accrual is a clock-driven loop, not a reconciler, so it is added directly. It runs on
