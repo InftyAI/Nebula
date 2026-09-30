@@ -24,14 +24,13 @@ import (
 // mibBytes is one MiB, the unit provider.PriceRequest quotes memory in.
 const mibBytes = 1024 * 1024
 
-// PodReservation reads the workload's CPU and memory RESERVATION in the units
-// provider.PriceRequest quotes: fractional physical cores and MiB. Requests, falling
-// back to limits, and 0 for either when neither is set — which a provider reads as
-// "your default", so a priced 0 is a floor, not a claim that nothing was reserved.
+// PodReservation returns the workload's CPU (vCPUs) and memory (MiB): limits, else
+// requests, else 0 (the provider's default). The limit wins because Modal bills the greater
+// of reservation and usage; it provisions this value as both request and limit, so the
+// price is exact.
 //
-// Reservation and not the limit, because a provider metering CPU/memory apart from the
-// accelerator (Modal) bills what was held for the workload; a burstable Pod's ceiling is
-// not what shows up on the invoice.
+// Memory below 1 MiB truncates to 0 (Modal's default, uncapped), so its cost cannot be
+// tracked correctly. Accepted: no working Pod declares one.
 //
 // The FIRST container only, matching the single-workload-container shape the whole
 // provisioning path assumes (see modal.sandboxSpecFromPod). Returns (0, 0) for a Pod with
@@ -47,14 +46,14 @@ func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
 	return float64(cpu.MilliValue()) / 1000.0, int(mem.Value() / mibBytes)
 }
 
-// reservedQty returns the container's request for name, falling back to its limit, and a
+// reservedQty returns the container's limit for name, falling back to its request, and a
 // zero quantity when it declares neither. By value, so the caller never holds a pointer
 // into the Pod it was read from.
 func reservedQty(c *corev1.Container, name corev1.ResourceName) resource.Quantity {
-	if q, ok := c.Resources.Requests[name]; ok {
+	if q, ok := c.Resources.Limits[name]; ok {
 		return q
 	}
-	if q, ok := c.Resources.Limits[name]; ok {
+	if q, ok := c.Resources.Requests[name]; ok {
 		return q
 	}
 	return resource.Quantity{}

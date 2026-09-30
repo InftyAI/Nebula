@@ -51,9 +51,8 @@ type PriceRequest struct {
 	// CapacityType selects between a row's Spot and OnDemand prices, which differ
 	// sharply (AWS p5.48xlarge: $20.839 Spot vs $55.040 OnDemand).
 	CapacityType nebulav1alpha1.CapacityType
-	// CPUCores and MemoryMiB are the workload's RESERVATION, priced only by providers
-	// that meter them separately from the accelerator. Ignored by a provider whose
-	// instance price is all-in.
+	// CPUCores (vCPUs) and MemoryMiB are the workload's size (see util.PodReservation),
+	// priced only by providers that meter them apart from the accelerator.
 	CPUCores  float64
 	MemoryMiB int
 }

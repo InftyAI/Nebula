@@ -37,20 +37,21 @@ func TestPodReservation(t *testing.T) {
 		wantMiB int
 		whatFor string
 	}{
-		"requests win over limits": {
+		"limits win over requests": {
 			pod: podWith(
 				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("16Gi")},
 			),
-			wantCPU: 2, wantMiB: 4096,
-			whatFor: "a burstable Pod is billed for what it reserved, not its ceiling",
-		},
-		"falls back to limits": {
-			pod: podWith(nil,
-				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("16Gi")},
-			),
 			wantCPU: 8, wantMiB: 16384,
-			whatFor: "Kubernetes defaults the request to the limit",
+			whatFor: "a burstable Pod priced at its request is undercharged when it bursts",
+		},
+		"falls back to requests": {
+			pod: podWith(
+				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+				nil,
+			),
+			wantCPU: 2, wantMiB: 4096,
+			whatFor: "a request-only Pod is sized by its request",
 		},
 		"fractional cores": {
 			pod: podWith(corev1.ResourceList{

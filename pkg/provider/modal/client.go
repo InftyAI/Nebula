@@ -174,12 +174,13 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		// Secrets (see provider.ProvisionRequest.Env). No Secrets field alongside it: the
 		// SDK hydrates this map into an ephemeral server-side Modal Secret before the
 		// create (mergeEnvIntoSecrets), so nothing named is left in the workspace.
-		Env:            spec.Env,
-		GPU:            gpuReservation(spec.GPU, spec.GPUCount),
+		Env: spec.Env,
+		GPU: gpuReservation(spec.GPU, spec.GPUCount),
+		// Limit = request, so usage can never bill above the recorded price.
 		CPU:            spec.CPU,
 		MemoryMiB:      spec.MemoryMiB,
-		CPULimit:       spec.CPULimit,
-		MemoryLimitMiB: spec.MemoryLimitMiB,
+		CPULimit:       spec.CPU,
+		MemoryLimitMiB: spec.MemoryMiB,
 		EncryptedPorts: spec.Ports,
 		// Nil leaves Modal's SchedulerPlacement unset entirely (the SDK only builds one
 		// when Regions is non-empty), which is the unconstrained, un-multiplied case.

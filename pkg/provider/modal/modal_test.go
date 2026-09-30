@@ -320,8 +320,8 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-res"}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if f.lastSpec.CPU != 2.5 {
-		t.Fatalf("CPU = %v, want 2.5", f.lastSpec.CPU)
+	if f.lastSpec.CPU != 1.25 {
+		t.Fatalf("CPU = %v, want 1.25 physical cores for 2500m (2.5 vCPU)", f.lastSpec.CPU)
 	}
 	if f.lastSpec.MemoryMiB != 4096 {
 		t.Fatalf("MemoryMiB = %d, want 4096", f.lastSpec.MemoryMiB)
@@ -334,24 +334,40 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 	}
 }
 
+// Getting this wrong doubles both what the Pod gets and what it is billed.
+func TestPhysicalCores(t *testing.T) {
+	for vCPUs, want := range map[float64]float64{
+		20:  10,
+		4:   2,
+		0.5: 0.25,
+		0.1: minModalCores,
+		0:   0, // Modal's default, never floored
+		-1:  0,
+	} {
+		if got := physicalCores(vCPUs); got != want {
+			t.Errorf("physicalCores(%v) = %v, want %v", vCPUs, got, want)
+		}
+	}
+}
+
 func TestProvision_MapsResourceLimits(t *testing.T) {
 	cases := []struct {
-		name                      string
-		requests, limits          corev1.ResourceList
-		wantCPU, wantCPULimit     float64
-		wantMemMiB, wantMemLimMiB int
+		name             string
+		requests, limits corev1.ResourceList
+		wantCPU          float64
+		wantMemMiB       int
 	}{
 		{
-			name: "limits only: limit is the ceiling AND the request falls back to it",
+			name: "limits only",
 			limits: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("2"),
 				corev1.ResourceMemory: resource.MustParse("8Gi"),
 			},
-			wantCPU: 2, wantCPULimit: 2,
-			wantMemMiB: 8192, wantMemLimMiB: 8192,
+			wantCPU:    1,
+			wantMemMiB: 8192,
 		},
 		{
-			name: "both: burstable, request below the ceiling",
+			name: "burstable: request raised to the limit",
 			requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("500m"),
 				corev1.ResourceMemory: resource.MustParse("1Gi"),
@@ -360,27 +376,27 @@ func TestProvision_MapsResourceLimits(t *testing.T) {
 				corev1.ResourceCPU:    resource.MustParse("4"),
 				corev1.ResourceMemory: resource.MustParse("16Gi"),
 			},
-			wantCPU: 0.5, wantCPULimit: 4,
-			wantMemMiB: 1024, wantMemLimMiB: 16384,
+			wantCPU:    2,
+			wantMemMiB: 16384,
 		},
 		{
-			name:    "neither: Modal applies its own defaults, uncapped",
-			wantCPU: 0, wantCPULimit: 0,
-			wantMemMiB: 0, wantMemLimMiB: 0,
-		},
-		{
-			// A ceiling below Modal's unit must not truncate into the zero that means
-			// "no cap" on the limit fields: it would leave the Pod asking for the
-			// TIGHTEST ceiling running unbounded. The matching request is a different
-			// question — zero there means "Modal's default", so falling back to 0 is
-			// correct and the asymmetry is deliberate.
-			name: "sub-MiB ceiling floors at 1 MiB instead of becoming uncapped",
-			limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("1m"),
-				corev1.ResourceMemory: resource.MustParse("500Ki"),
+			name: "requests only: capped at the request",
+			requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
 			},
-			wantCPU: 0.001, wantCPULimit: 0.001,
-			wantMemMiB: 0, wantMemLimMiB: 1,
+			wantCPU:    0.25,
+			wantMemMiB: 1024,
+		},
+		{
+			name:       "neither: Modal applies its own defaults, uncapped",
+			wantCPU:    0,
+			wantMemMiB: 0,
+		},
+		{
+			name:    "cpu below Modal's minimum floors",
+			limits:  corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1m")},
+			wantCPU: minModalCores,
 		},
 	}
 
@@ -405,13 +421,9 @@ func TestProvision_MapsResourceLimits(t *testing.T) {
 			if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-lim"}); err != nil {
 				t.Fatalf("Provision: %v", err)
 			}
-			if f.lastSpec.CPU != tc.wantCPU || f.lastSpec.CPULimit != tc.wantCPULimit {
-				t.Fatalf("CPU/CPULimit = (%v, %v), want (%v, %v)",
-					f.lastSpec.CPU, f.lastSpec.CPULimit, tc.wantCPU, tc.wantCPULimit)
-			}
-			if f.lastSpec.MemoryMiB != tc.wantMemMiB || f.lastSpec.MemoryLimitMiB != tc.wantMemLimMiB {
-				t.Fatalf("MemoryMiB/MemoryLimitMiB = (%d, %d), want (%d, %d)",
-					f.lastSpec.MemoryMiB, f.lastSpec.MemoryLimitMiB, tc.wantMemMiB, tc.wantMemLimMiB)
+			if f.lastSpec.CPU != tc.wantCPU || f.lastSpec.MemoryMiB != tc.wantMemMiB {
+				t.Fatalf("CPU/MemoryMiB = (%v, %d), want (%v, %d)",
+					f.lastSpec.CPU, f.lastSpec.MemoryMiB, tc.wantCPU, tc.wantMemMiB)
 			}
 		})
 	}
@@ -1958,10 +1970,9 @@ func TestPricePerHour_AddsCPUAndMemory(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	od := nebulav1alpha1.CapacityOnDemand
 
-	// Modal's published per-second sandbox rates: 4 cores = $0.567648/hr, 8 GiB = $0.192096/hr.
-	// Transcribed again here rather than imported from data, so a slip in those constants fails
-	// this test instead of being multiplied through it.
-	const cpuAndMem = 4*0.00003942*60*60 + 8*0.00000667*60*60
+	// 4 vCPUs (2 physical cores) + 8 GiB at Modal's sandbox rates. Transcribed, not imported
+	// from data, so a slip in those constants fails here.
+	const cpuAndMem = 2*0.00003942*60*60 + 8*0.00000667*60*60
 
 	cases := map[string]struct {
 		req  provider.PriceRequest
