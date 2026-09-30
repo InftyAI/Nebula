@@ -37,21 +37,20 @@ func TestPodReservation(t *testing.T) {
 		wantMiB int
 		whatFor string
 	}{
-		"limits win over requests": {
+		"requests win over limits": {
 			pod: podWith(
 				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("16Gi")},
 			),
-			wantCPU: 8, wantMiB: 16384,
-			whatFor: "the limit bounds what Modal can bill, so pricing it is an upper bound",
-		},
-		"falls back to requests": {
-			pod: podWith(
-				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
-				nil,
-			),
 			wantCPU: 2, wantMiB: 4096,
-			whatFor: "a request-only Pod is sized by its request",
+			whatFor: "an idle burstable Pod must not be charged for its whole ceiling",
+		},
+		"falls back to limits": {
+			pod: podWith(nil,
+				corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8"), corev1.ResourceMemory: resource.MustParse("16Gi")},
+			),
+			wantCPU: 8, wantMiB: 16384,
+			whatFor: "Kubernetes defaults the request to the limit",
 		},
 		"sub-MiB memory rounds up to 1 MiB": {
 			pod:     podWith(nil, corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("500Ki")}),

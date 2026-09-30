@@ -55,19 +55,13 @@ func PodResources(pod *corev1.Pod) (requests, limits Resources) {
 	return requests, limits
 }
 
-// PodReservation is the size a Pod is priced at: its limit, else its request. Modal bills
-// the greater of reservation and usage, so a limit bounds the bill and the price is an
-// upper bound. A request-only Pod has no bound and may bill above its price.
+// PodReservation is the size a Pod is priced at: its requests (see PodResources). Modal
+// bills the greater of reservation and usage, so this is a floor: a Pod bursting above its
+// request is billed more than its price. Never the limit, which would charge an idle Pod
+// for its whole ceiling.
 func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
-	requests, limits := PodResources(pod)
-	cpuCores, memoryMiB = limits.CPU, limits.MemoryMiB
-	if cpuCores == 0 {
-		cpuCores = requests.CPU
-	}
-	if memoryMiB == 0 {
-		memoryMiB = requests.MemoryMiB
-	}
-	return cpuCores, memoryMiB
+	requests, _ := PodResources(pod)
+	return requests.CPU, requests.MemoryMiB
 }
 
 func vCPUs(q resource.Quantity) float64 { return float64(q.MilliValue()) / 1000.0 }

@@ -157,7 +157,7 @@ type SandboxSpec struct {
 	GPUCount int32
 	// CPU (physical cores) and MemoryMiB are the reservation, CPULimit and MemoryLimitMiB the
 	// hard cap, all from util.PodResources. Zero is Modal's default on a request and no cap on
-	// a limit. The claim is priced at the limit when one is set (see util.PodReservation).
+	// a limit. The claim is priced at the request (see util.PodReservation).
 	CPU            float64
 	MemoryMiB      int
 	CPULimit       float64
