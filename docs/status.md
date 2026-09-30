@@ -260,9 +260,11 @@ One RunPod Pod per NodeClaim, read through REST v2's `status`, which (unlike v1'
   code, so a workload that died reads as `Terminated`, indistinguishable from teardown.
 - **OnDemand only.** v2 has no interruptible tier, so nothing is reclaimed and the
   default poll cadence applies.
-- **Identity rides the Pod name**, not tags: RunPod Pods have none, so `List` filters
-  on the `nebula-` prefix and the claim name is recovered by stripping it. A Pod whose
-  name would exceed RunPod's 191-character cap is refused at `Provision` rather than
+- **Identity rides the Pod name**, not tags: RunPod Pods have none, so a Pod is named
+  after its claim (`<namespace>-<pod>`) and `List` reads the name back as the claim.
+  There is no ownership marker, so **the account must be dedicated to Nebula**: a Pod
+  someone else names like a claim is adopted and later terminated. A Pod whose name
+  would exceed RunPod's 191-character cap is refused at `Provision` rather than
   truncated — two truncated claims would collide onto one Pod.
 - The endpoint is **derived, not read back**: `https://<podID>-<port>.proxy.runpod.net`
   is known at create time, so it is published from `CreatePod` like Modal's, but with

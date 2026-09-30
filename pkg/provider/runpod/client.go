@@ -30,6 +30,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -74,6 +75,9 @@ type restClient struct {
 	http    *http.Client
 	baseURL string
 	apiKey  string
+	// registryIDs caches registryAuthName -> RunPod credential id. The key is derived from
+	// the credential, so an entry can never serve the wrong one; see EnsureRegistryAuth.
+	registryIDs sync.Map
 }
 
 // compile-time assertion that restClient satisfies the adapter's Client seam.
@@ -389,6 +393,12 @@ func (c *restClient) CreatePod(ctx context.Context, spec PodSpec) (string, error
 
 	var out podResponse
 	if err := c.do(ctx, http.MethodPost, "/v2/pods", body, &out); err != nil {
+		if spec.RegistryAuthID != "" {
+			// The cached id may name a credential deleted out from under us. Evicted on ANY
+			// failure, since RunPod's wording for that is undocumented and a spurious evict
+			// costs one list.
+			c.forgetRegistryID(spec.RegistryAuthID)
+		}
 		return "", classifyCreate(err)
 	}
 	if out.ID == "" {
@@ -481,6 +491,9 @@ type registryAuthResponse struct {
 //   - Correct across rotation. A changed password hashes differently, so it becomes a new
 //     object rather than silently reusing a stale one that would 401 at pull time.
 //
+// Resolved ids are cached, so only a credential's first Provision per process calls the API.
+// CreatePod evicts on failure, which bounds a stale entry to one failed Pod.
+//
 // Objects are never DELETED, and that is deliberate: one object is shared by every Pod using
 // that credential, so deleting it on any single teardown would break the others' next pull.
 // The population is bounded by the number of distinct credentials, not by the number of Pods.
@@ -492,6 +505,9 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 		return "", auth.Unsupported("runpod")
 	}
 	name := registryAuthName(auth.Basic.Username, auth.Basic.Password)
+	if id, ok := c.registryIDs.Load(name); ok {
+		return id.(string), nil
+	}
 
 	var existing struct {
 		Registries []registryAuthResponse `json:"registries"`
@@ -501,6 +517,7 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 	}
 	for _, e := range existing.Registries {
 		if e.Name == name && e.ID != "" {
+			c.registryIDs.Store(name, e.ID)
 			return e.ID, nil
 		}
 	}
@@ -521,7 +538,18 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 	if created.ID == "" {
 		return "", fmt.Errorf("runpod: store image pull credential %q: response carried no id", name)
 	}
+	c.registryIDs.Store(name, created.ID)
 	return created.ID, nil
+}
+
+// forgetRegistryID evicts every cache entry resolving to id.
+func (c *restClient) forgetRegistryID(id string) {
+	c.registryIDs.Range(func(name, cached any) bool {
+		if cached == id {
+			c.registryIDs.Delete(name)
+		}
+		return true
+	})
 }
 
 // registryAuthName is the content-addressed name of a stored credential: a fixed prefix
@@ -539,5 +567,5 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 func registryAuthName(username, password string) string {
 	// The NUL separator keeps ("ab", "c") from hashing the same as ("a", "bc").
 	sum := sha256.Sum256([]byte(username + "\x00" + password))
-	return namePrefix + hex.EncodeToString(sum[:])[:16]
+	return registryAuthPrefix + hex.EncodeToString(sum[:])[:16]
 }

@@ -196,8 +196,8 @@ func TestProvision_GPUPod(t *testing.T) {
 	}
 
 	s := f.lastSpec
-	if s.Name != "nebula-claim-a" {
-		t.Errorf("Name = %q, want nebula-claim-a", s.Name)
+	if s.Name != "claim-a" {
+		t.Errorf("Name = %q, want claim-a", s.Name)
 	}
 	if s.Image != "myimg:latest" {
 		t.Errorf("Image = %q", s.Image)
@@ -289,7 +289,7 @@ func TestProvision_Idempotent(t *testing.T) {
 	// A Pod already carrying this claim's name is the ONLY record of ownership RunPod
 	// offers, so a repeat after a partial create must find it rather than pay twice.
 	f := &fakeClient{pods: []Pod{{
-		ID: "pod-existing", Name: "nebula-claim-a", Status: statusRunning,
+		ID: "pod-existing", Name: "claim-a", Status: statusRunning,
 	}}}
 	p := newTestProvider(f)
 
@@ -319,7 +319,7 @@ func TestProvision_Idempotent(t *testing.T) {
 func TestProvision_DoesNotAdoptExitedPod(t *testing.T) {
 	// Claim names are reused across Pod restarts. Adopting a leftover EXITED Pod would hand
 	// the new Pod an instance toState reads as Terminated, failing it instead of replacing.
-	f := &fakeClient{pods: []Pod{{ID: "pod-exited", Name: "nebula-claim-a", Status: statusExited}}}
+	f := &fakeClient{pods: []Pod{{ID: "pod-exited", Name: "claim-a", Status: statusExited}}}
 	p := newTestProvider(f)
 
 	res, err := p.Provision(context.Background(), gpuPod("H100", 1), provider.ProvisionRequest{
@@ -336,8 +336,8 @@ func TestProvision_DoesNotAdoptExitedPod(t *testing.T) {
 
 func TestFindByClaim(t *testing.T) {
 	f := &fakeClient{pods: []Pod{
-		{ID: "pod-exited", Name: "nebula-claim-a", Status: statusExited},
-		{ID: "pod-gone", Name: "nebula-claim-b", Status: statusTerminated},
+		{ID: "pod-exited", Name: "claim-a", Status: statusExited},
+		{ID: "pod-gone", Name: "claim-b", Status: statusTerminated},
 	}}
 	p := newTestProvider(f)
 	ctx := context.Background()
@@ -365,7 +365,7 @@ func TestProvision_RefusesOverlongClaimName(t *testing.T) {
 	f := &fakeClient{}
 	p := newTestProvider(f)
 
-	long := strings.Repeat("a", maxNameLen-len(namePrefix)+1)
+	long := strings.Repeat("a", maxNameLen+1)
 	_, err := p.Provision(context.Background(), gpuPod("H100", 1), provider.ProvisionRequest{
 		ClaimName:    long,
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
@@ -378,7 +378,7 @@ func TestProvision_RefusesOverlongClaimName(t *testing.T) {
 	}
 
 	// One char shorter fits exactly, so the boundary is not off by one.
-	if _, err := podName(strings.Repeat("a", maxNameLen-len(namePrefix))); err != nil {
+	if _, err := podName(strings.Repeat("a", maxNameLen)); err != nil {
 		t.Errorf("podName rejected a name that fits exactly: %v", err)
 	}
 }
@@ -484,7 +484,7 @@ func TestPodSpecString_Redacts(t *testing.T) {
 	// resolved — Secret values included. Key NAMES are already in the Pod spec, so they
 	// may print; values never may.
 	s := PodSpec{
-		Name:  "nebula-claim-a",
+		Name:  "claim-a",
 		Image: "myimg:latest",
 		Env:   map[string]string{"HF_TOKEN": "hf_supersecret", "PLAIN": "visible"},
 	}
@@ -498,14 +498,11 @@ func TestPodSpecString_Redacts(t *testing.T) {
 	}
 }
 
-func TestList_FiltersToNebulaPods(t *testing.T) {
-	// The name prefix stands in for the tags RunPod does not have. A Pod without it belongs
-	// to someone else in the same account: reporting it would have the poll loop adopt it
-	// and the NodeClaim controller eventually TERMINATE it.
+func TestList_NameIsTheClaim(t *testing.T) {
+	// No ownership marker: every Pod in the account is reported, its name read as the claim.
 	f := &fakeClient{pods: []Pod{
-		{ID: "pod-1", Name: "nebula-claim-a", Status: statusRunning},
-		{ID: "pod-2", Name: "my-own-dev-box", Status: statusRunning},
-		{ID: "pod-3", Name: "nebula-claim-b", Status: statusExited},
+		{ID: "pod-1", Name: "claim-a", Status: statusRunning},
+		{ID: "pod-2", Name: "claim-b", Status: statusExited},
 	}}
 	p := newTestProvider(f)
 
@@ -514,10 +511,8 @@ func TestList_FiltersToNebulaPods(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("List returned %d instances, want the 2 Nebula-owned ones: %+v", len(got), got)
+		t.Fatalf("List returned %d instances, want 2: %+v", len(got), got)
 	}
-	// ClaimName is recovered by stripping the prefix — the tag read the naming scheme
-	// stands in for.
 	if got[0].ClaimName != "claim-a" || got[1].ClaimName != "claim-b" {
 		t.Errorf("claim names = %q/%q, want claim-a/claim-b", got[0].ClaimName, got[1].ClaimName)
 	}
@@ -528,7 +523,7 @@ func TestList_FiltersToNebulaPods(t *testing.T) {
 
 func TestGetAndTerminate(t *testing.T) {
 	f := &fakeClient{pods: []Pod{{
-		ID: "pod-1", Name: "nebula-claim-a", Status: statusRunning, DataCenterID: "EU-RO-1",
+		ID: "pod-1", Name: "claim-a", Status: statusRunning, DataCenterID: "EU-RO-1",
 		Ports: []string{"8000/http"},
 	}}}
 	p := newTestProvider(f)

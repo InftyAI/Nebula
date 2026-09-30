@@ -32,8 +32,8 @@ limitations under the License.
 //     declared region, each blocklistable on its own.
 //   - A create takes ONE GPU type, so interchangeable alternates cannot widen a launch the
 //     way AWS's fleet does; only the primary is sent.
-//   - Pods have NO tags. NativeTags=false, and Nebula's identity rides the Pod NAME
-//     (see podName/claimFromName), which is what List filters on.
+//   - Pods have NO tags. NativeTags=false, and Nebula's identity rides the Pod NAME,
+//     which is the claim name itself (see podName).
 //   - There is no outbound-allowlist knob at all, so SupportsEgressPolicy=false and
 //     placement skips RunPod for any pool that restricts egress rather than provisioning
 //     something with open internet access under a policy that says otherwise.
@@ -67,10 +67,8 @@ import (
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
-// namePrefix marks a RunPod Pod as Nebula's. RunPod has no tags, so the name is the
-// ONLY carrier of ownership and identity: List filters on this prefix so an unrelated
-// Pod in the same account is never adopted, terminated, or reported as an instance.
-const namePrefix = "nebula-"
+// registryAuthPrefix makes Nebula's registry-auth objects recognizable in RunPod's UI.
+const registryAuthPrefix = "nebula-"
 
 // maxNameLen is RunPod's own cap on the Pod name (191 chars). Nebula refuses a claim
 // whose name would exceed it rather than truncating — see podName.
@@ -106,8 +104,8 @@ type Client interface {
 // PodSpec is the resolved, RunPod-shaped request the Client turns into a Pod. The
 // adapter builds it from the Pod (source of truth) plus the resolved accelerator ids.
 type PodSpec struct {
-	// Name is the RunPod Pod name, which carries Nebula's identity because RunPod has no
-	// tags: namePrefix + the NodeClaim name. See podName.
+	// Name is the claim name (`<namespace>-<pod>`). RunPod has no tags, so the name is the
+	// only claim identity; see podName.
 	Name string
 	// Image is the container image, from the Pod's first container.
 	Image string
@@ -331,10 +329,8 @@ func (p *Provider) Get(ctx context.Context, instanceID, _ string) (*provider.Ins
 	return &inst, nil
 }
 
-// List implements provider.Provider. One API call, then the name filter that stands in for
-// the tags RunPod does not have: a Pod without Nebula's prefix belongs to someone else in
-// the same account and must never be reported (the poll loop would adopt it, and the
-// NodeClaim controller would eventually terminate it).
+// List implements provider.Provider. It reports EVERY Pod in the account: nothing marks a
+// Pod as Nebula's, so the account must be dedicated to Nebula (see podName).
 func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	pods, err := p.client.ListPods(ctx)
 	if err != nil {
@@ -342,9 +338,6 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	}
 	out := make([]provider.Instance, 0, len(pods))
 	for _, pd := range pods {
-		if !strings.HasPrefix(pd.Name, namePrefix) {
-			continue
-		}
 		out = append(out, toInstance(pd))
 	}
 	return out, nil
@@ -497,8 +490,10 @@ func (p *Provider) findByClaim(
 	return nil, nil
 }
 
-// podName is the RunPod Pod name for a NodeClaim: the prefix that marks ownership plus
-// the claim name, which is what makes List/FindByClaim work on a backend with no tags.
+// podName is the RunPod Pod name for a NodeClaim: the claim name itself, which is what
+// makes FindByClaim work on a backend with no tags. There is no ownership marker, so a Pod
+// someone else names like a claim ("default-web-0") would be adopted and later terminated;
+// the account must be dedicated to Nebula.
 //
 // A name that would exceed RunPod's cap is an ERROR, never a truncation. Truncating would
 // map two long claim names onto one Pod name, and every consequence of that collision is
@@ -506,19 +501,12 @@ func (p *Provider) findByClaim(
 // the other claim's teardown reaps the survivor. Refusing is loud and fixable (claim names
 // derive from the Pod's, so the workload can be renamed); a collision is silent.
 func podName(claimName string) (string, error) {
-	name := namePrefix + claimName
-	if len(name) > maxNameLen {
+	if len(claimName) > maxNameLen {
 		return "", fmt.Errorf(
 			"runpod: claim name %q is too long: RunPod caps a pod name at %d characters and identity "+
 				"rides that name, so it cannot be shortened", claimName, maxNameLen)
 	}
-	return name, nil
-}
-
-// claimFromName recovers the NodeClaim name podName encoded, or "" for a Pod that is not
-// Nebula's. It is the tag read that RunPod's lack of tags forces into the naming scheme.
-func claimFromName(name string) string {
-	return strings.TrimPrefix(name, namePrefix)
+	return claimName, nil
 }
 
 // podSpecFromPod reads the workload off the Pod (source of truth) and the placement
@@ -756,7 +744,7 @@ func toState(pd Pod) provider.InstanceState {
 func toInstance(pd Pod) provider.Instance {
 	return provider.Instance{
 		ID:           pd.ID,
-		ClaimName:    claimFromName(pd.Name),
+		ClaimName:    pd.Name,
 		State:        toState(pd),
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 		Region:       pd.DataCenterID,

@@ -426,9 +426,41 @@ func TestEnsureRegistryAuth(t *testing.T) {
 		if registryAuthName("ab", "c") == registryAuthName("a", "bc") {
 			t.Error("username/password boundary is not separated in the hash")
 		}
-		if !strings.HasPrefix(name, namePrefix) {
+		if !strings.HasPrefix(name, registryAuthPrefix) {
 			t.Errorf("name %q lacks the %q prefix that makes Nebula's objects recognizable",
-				name, namePrefix)
+				name, registryAuthPrefix)
+		}
+	})
+
+	t.Run("cached after the first call, evicted when a create using it fails", func(t *testing.T) {
+		c, seen := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/pods" {
+				jsonReply(400, problem(400, "registry not found"))(w, r)
+				return
+			}
+			jsonReply(200, fmt.Sprintf(`{"registries":[{"id":"cra-existing","name":%q}]}`, name))(w, r)
+		})
+		ctx := context.Background()
+
+		for range 2 {
+			if _, err := c.EnsureRegistryAuth(ctx, auth); err != nil {
+				t.Fatalf("EnsureRegistryAuth: %v", err)
+			}
+		}
+		if len(*seen) != 1 {
+			t.Fatalf("made %d calls for two resolves, want 1 (the second is cached)", len(*seen))
+		}
+
+		// A deleted credential leaves a stale cached id; the failed create must drop it so
+		// the next Provision re-lists rather than failing every Pod until restart.
+		if _, err := c.CreatePod(ctx, PodSpec{Name: "claim-a", RegistryAuthID: "cra-existing"}); err == nil {
+			t.Fatal("CreatePod succeeded against an error response")
+		}
+		if _, err := c.EnsureRegistryAuth(ctx, auth); err != nil {
+			t.Fatalf("EnsureRegistryAuth: %v", err)
+		}
+		if last := (*seen)[len(*seen)-1]; last.path != registryAuthPath {
+			t.Errorf("last call %s %s, want a re-list after eviction", last.method, last.path)
 		}
 	})
 
