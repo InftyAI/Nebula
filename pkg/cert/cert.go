@@ -71,21 +71,20 @@ const (
 	// while the manager still reports Running.
 	certDir = "/tmp/k8s-webhook-server/serving-certs"
 
-	// mutatingWebhookConfName is the MutatingWebhookConfiguration whose caBundle
-	// gets patched — the nebula- prefixed name from config/webhook/manifests.yaml.
-	//
-	// There is deliberately no ValidatingWebhookConfiguration here: Nebula has only
-	// the Pod defaulter (see internal/webhook/v1), and Sandbox validation is done
-	// with CEL in the CRD rather than a webhook. Naming a config that does not exist
-	// would make the rotator fail to patch it on every reconcile.
-	mutatingWebhookConfName = "nebula-mutating-webhook-configuration"
+	// mutatingWebhookConfName and validatingWebhookConfName are the webhook
+	// configurations whose caBundle gets patched — the nebula- prefixed names from
+	// config/webhook/manifests.yaml. Every configuration there must be listed: one
+	// left out never trusts the served cert, so the API server rejects every request
+	// it covers (failurePolicy=Fail).
+	mutatingWebhookConfName   = "nebula-mutating-webhook-configuration"
+	validatingWebhookConfName = "nebula-validating-webhook-configuration"
 
 	caName = "nebula-ca"
 	caOrg  = "nebula"
 )
 
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update
-// +kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=mutatingwebhookconfigurations,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups="admissionregistration.k8s.io",resources=mutatingwebhookconfigurations;validatingwebhookconfigurations,verbs=get;list;watch;update
 
 // CertsManager registers the cert rotator with the manager. It closes setupFinish
 // once the cert is on disk and the caBundle is patched.
@@ -114,10 +113,10 @@ func CertsManager(mgr ctrl.Manager, namespace string, setupFinish chan struct{})
 		CAOrganization: caOrg,
 		DNSName:        dnsName,
 		IsReady:        setupFinish,
-		Webhooks: []rotator.WebhookInfo{{
-			Type: rotator.Mutating,
-			Name: mutatingWebhookConfName,
-		}},
+		Webhooks: []rotator.WebhookInfo{
+			{Type: rotator.Mutating, Name: mutatingWebhookConfName},
+			{Type: rotator.Validating, Name: validatingWebhookConfName},
+		},
 		// RequireLeaderElection is deliberately left false. The rotator must run in
 		// EVERY replica, not just the leader: CertDir is each pod's own local disk, and a
 		// replica that never wrote the keypair there cannot serve the webhook — and
