@@ -53,6 +53,16 @@ func TestPodReservation(t *testing.T) {
 			wantCPU: 2, wantMiB: 4096,
 			whatFor: "a request-only Pod is sized by its request",
 		},
+		"sub-MiB memory rounds up to 1 MiB": {
+			pod:     podWith(nil, corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("500Ki")}),
+			wantCPU: 0, wantMiB: 1,
+			whatFor: "0 would leave memory unset: Modal's unpriced default",
+		},
+		"fractional MiB rounds up": {
+			pod:     podWith(nil, corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Ki")}),
+			wantCPU: 0, wantMiB: 2,
+			whatFor: "rounding down would cap the Pod below what it declared",
+		},
 		"fractional cores": {
 			pod: podWith(corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("250m"),
@@ -63,7 +73,7 @@ func TestPodReservation(t *testing.T) {
 		},
 		"decimal memory units convert to MiB": {
 			pod:     podWith(corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1G")}, nil),
-			wantCPU: 0, wantMiB: 953, // 1e9 / 1048576, truncated
+			wantCPU: 0, wantMiB: 954, // 1e9 / 1048576, rounded up
 			whatFor: "1G is not 1Gi, and the price is quoted per GiB",
 		},
 		"nothing declared": {

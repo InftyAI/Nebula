@@ -27,14 +27,8 @@ const mibBytes = 1024 * 1024
 // PodReservation returns the workload's CPU (vCPUs) and memory (MiB): limits, else
 // requests, else 0 (the provider's default). The limit wins because Modal bills the greater
 // of reservation and usage; it provisions this value as both request and limit, so the
-// price is exact.
-//
-// Memory below 1 MiB truncates to 0 (Modal's default, uncapped), so its cost cannot be
-// tracked correctly. Accepted: no working Pod declares one.
-//
-// The FIRST container only, matching the single-workload-container shape the whole
-// provisioning path assumes (see modal.sandboxSpecFromPod). Returns (0, 0) for a Pod with
-// no containers.
+// price is exact. Memory rounds UP to whole MiB: rounding down would turn a sub-MiB size
+// into 0, i.e. unset, which Modal fills with its own unpriced default.
 func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
 	if pod == nil || len(pod.Spec.Containers) == 0 {
 		return 0, 0
@@ -43,7 +37,7 @@ func PodReservation(pod *corev1.Pod) (cpuCores float64, memoryMiB int) {
 	cpu := reservedQty(c, corev1.ResourceCPU)
 	mem := reservedQty(c, corev1.ResourceMemory)
 	// MilliValue is cores*1000; Value is bytes.
-	return float64(cpu.MilliValue()) / 1000.0, int(mem.Value() / mibBytes)
+	return float64(cpu.MilliValue()) / 1000.0, int((mem.Value() + mibBytes - 1) / mibBytes)
 }
 
 // reservedQty returns the container's limit for name, falling back to its request, and a
