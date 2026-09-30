@@ -56,6 +56,7 @@ import (
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
+	"github.com/InftyAI/Nebula/pkg/provider/runpod"
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
 )
@@ -622,19 +623,15 @@ func registerProviders(ctx context.Context, c client.Client) {
 		setupLog.Info("registered provider", "provider", p.Name())
 	}
 
-	// AWS. There is NO region env/flag: the regions this provider may use are declared
-	// per-pool in the NodePool (ProviderSpec.Regions) and read at call time via the
-	// region source below, so a pool added at runtime widens the fan-out without a
-	// restart. One AWS provider spans every such region (per-region clients are built
-	// lazily). The adapter is otherwise self-configuring: it resolves each region's
-	// GPU AMI and default-VPC subnets itself, so no launch template or pre-created
-	// infra is needed. Credentials are secrets and are NEVER read here: the SDK client
-	// uses the default credential chain (IRSA / instance-role / AWS_ACCESS_KEY_ID
-	// delivered via a Secret), and one account-global credential authorizes every
-	// region. Registration only fails (and is a non-fatal skip) if the price catalog
-	// cannot load — region config can no longer make it fail.
 	if p, err := awsprovider.NewSDKClient(ctx, awsRegionSource(c)); err != nil {
 		setupLog.Info("skipping AWS provider registration", "reason", err.Error())
+	} else {
+		provider.Register(p)
+		setupLog.Info("registered provider", "provider", p.Name())
+	}
+
+	if p, err := runpod.NewSDKClient(ctx); err != nil {
+		setupLog.Info("skipping RunPod provider registration", "reason", err.Error())
 	} else {
 		provider.Register(p)
 		setupLog.Info("registered provider", "provider", p.Name())

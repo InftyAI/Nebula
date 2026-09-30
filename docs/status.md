@@ -25,6 +25,7 @@ enters the system.
 - [Provider mappings](#provider-mappings)
   - [AWS](#aws)
   - [Modal](#modal)
+  - [RunPod](#runpod)
   - [fake](#fake)
 - [Logs and exec](#logs-and-exec)
 - [What is not observable](#what-is-not-observable)
@@ -81,8 +82,9 @@ therefore emits without storing, and stores only once `Provision` returns.
 
 `Provision` returns `(id, reserved, error)`. `reserved` means the provider committed
 capacity, not merely accepted the request: AWS always does (`CreateFleet` with
-`FleetTypeInstant` is synchronous), a fresh Modal sandbox never does (the GPU may
-still be queued). Only a reserved instance advances to `Initializing`; an unreserved
+`FleetTypeInstant` is synchronous), RunPod always does for the same reason (`POST
+/pods` allocates a host before it answers, and a shortage comes back as an error), a
+fresh Modal sandbox never does (the GPU may still be queued). Only a reserved instance advances to `Initializing`; an unreserved
 id holds at `Provisioning`, which is still exactly true — the id is real and must be
 reclaimed, but nothing is allocated. Either way the Pod is now tracked: `reserved`
 constrains what the status may claim, not what is owed, and says nothing about
@@ -233,6 +235,42 @@ only two signals and has to record a third fact itself.
   `reserved=false` for a fresh sandbox and the Pod holds at `Provisioning` until the
   first poll tick. An *adopted* sandbox has been observed, so a `running` one is
   known to be reserved. See below for why queued is not reported distinctly.
+
+### RunPod
+
+One RunPod Pod per NodeClaim, read through REST v2's `status`, which (unlike v1's
+`desiredStatus`) is the state the Pod has *reached*.
+
+| `status` | `InstanceState` | Pod |
+|---|---|---|
+| `RUNNING` | `Running` | `Running` / `Ready=True` |
+| `PROVISIONING`, `STARTING` | `Pending` | `Pending` / `Initializing` |
+| `EXITED`, `TERMINATED` | `Terminated` | `Failed` / `Terminated` |
+| `ERROR` | `Failed` | `Failed` |
+| anything else | `Pending` | `Pending` / `Initializing` |
+| absent from `List` | `Terminated` | `Failed` / `Terminated` |
+
+- **There is no readiness concept beyond `RUNNING`.** RunPod has no probe, so "started"
+  is the strongest signal available; a container that is up but not yet serving reads
+  `Running`. Contrast Modal, which has a real probe and latches it.
+- **There is no queueing**, as with AWS: `POST /v2/pods` allocates a host before it
+  answers, and a shortfall is a synchronous error (`ErrNoCapacity`) that drives region
+  failover. So `Provision` always returns `reserved`.
+- **`EXITED` hides crashes.** It covers a clean exit and a crash alike, with no exit
+  code, so a workload that died reads as `Terminated`, indistinguishable from teardown.
+- **OnDemand only.** v2 has no interruptible tier, so nothing is reclaimed and the
+  default poll cadence applies.
+- **Identity rides the Pod name**, not tags: RunPod Pods have none, so `List` filters
+  on the `nebula-` prefix and the claim name is recovered by stripping it. A Pod whose
+  name would exceed RunPod's 191-character cap is refused at `Provision` rather than
+  truncated — two truncated claims would collide onto one Pod.
+- The endpoint is **derived, not read back**: `https://<podID>-<port>.proxy.runpod.net`
+  is known at create time, so it is published from `CreatePod` like Modal's, but with
+  no token — that proxy is unauthenticated. A Pod with a public IP and an assigned
+  `/tcp` port mapping reports that direct address instead, once the poll loop sees it.
+- **Neither `kubectl logs` nor `kubectl exec` works yet.** v2 streams logs over SSE
+  (`/v2/pods/{id}/logs`), which a `LogStreamer` could wrap; the only way into a
+  container is SSH, so exec answers NotFound.
 
 ### fake
 
