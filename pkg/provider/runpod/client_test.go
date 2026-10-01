@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -45,7 +46,10 @@ type recordedRequest struct {
 // recorded first. Returns the client under test and a pointer to the log.
 func testServer(t *testing.T, handler http.HandlerFunc) (*restClient, *[]recordedRequest) {
 	t.Helper()
-	var seen []recordedRequest
+	var (
+		mu   sync.Mutex
+		seen []recordedRequest
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := recordedRequest{
 			method: r.Method,
@@ -56,7 +60,9 @@ func testServer(t *testing.T, handler http.HandlerFunc) (*restClient, *[]recorde
 		if raw, err := io.ReadAll(r.Body); err == nil && len(raw) > 0 {
 			_ = json.Unmarshal(raw, &rec.body)
 		}
+		mu.Lock()
 		seen = append(seen, rec)
+		mu.Unlock()
 		handler(w, r)
 	}))
 	t.Cleanup(srv.Close)
@@ -127,6 +133,16 @@ func TestClassifyCreate(t *testing.T) {
 		name:          "a registry failure blocks nothing",
 		status:        400,
 		message:       "registry unauthorized: could not pull image",
+		blocksNothing: true,
+	}, {
+		// The capacity and GPU phrases are generic enough to match these too.
+		name: "an unavailable image blocks nothing", status: 400, message: "image not available",
+		blocksNothing: true,
+	}, {
+		name: "an unavailable manifest blocks nothing", status: 400, message: "manifest unavailable",
+		blocksNothing: true,
+	}, {
+		name: "an unsupported image blocks nothing", status: 400, message: "unsupported image format",
 		blocksNothing: true,
 	}, {
 		// v2's 400 also covers cross-field rule violations, with no code to tell them from
@@ -498,6 +514,82 @@ func TestEnsureRegistryAuth(t *testing.T) {
 		}
 		if len(*seen) != 0 {
 			t.Errorf("made %d API calls for a credential it cannot express", len(*seen))
+		}
+	})
+}
+
+// TestEnsureRegistryAuthRace pins that a name clash on RunPod's unique names never fails a Pod.
+func TestEnsureRegistryAuthRace(t *testing.T) {
+	auth := &provider.RegistryAuth{
+		Registry: "ghcr.io",
+		Basic:    &provider.BasicAuth{Username: "u", Password: "p4ssw0rd"},
+	}
+	name := registryAuthName("u", "p4ssw0rd")
+
+	t.Run("concurrent first calls create once", func(t *testing.T) {
+		var mu sync.Mutex
+		var created bool
+		posts := 0
+		c, _ := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			if r.Method == http.MethodPost {
+				posts++
+				created = true
+				jsonReply(201, `{"id":"cra-new","name":"whatever"}`)(w, r)
+				return
+			}
+			if created {
+				jsonReply(200, fmt.Sprintf(`{"registries":[{"id":"cra-new","name":%q}]}`, name))(w, r)
+				return
+			}
+			jsonReply(200, `{"registries":[]}`)(w, r)
+		})
+
+		const n = 8
+		ids := make([]string, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() {
+				id, err := c.EnsureRegistryAuth(context.Background(), auth)
+				if err != nil {
+					t.Errorf("EnsureRegistryAuth: %v", err)
+				}
+				ids[i] = id
+			})
+		}
+		wg.Wait()
+		if posts != 1 {
+			t.Errorf("issued %d creates, want 1", posts)
+		}
+		for i, id := range ids {
+			if id != "cra-new" {
+				t.Errorf("call %d got id %q, want cra-new", i, id)
+			}
+		}
+	})
+
+	t.Run("a create lost to another process resolves by re-listing", func(t *testing.T) {
+		lists := 0
+		c, _ := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				jsonReply(400, problem(400, "name already exists"))(w, r)
+				return
+			}
+			lists++
+			if lists == 1 {
+				jsonReply(200, `{"registries":[]}`)(w, r)
+				return
+			}
+			jsonReply(200, fmt.Sprintf(`{"registries":[{"id":"cra-theirs","name":%q}]}`, name))(w, r)
+		})
+
+		id, err := c.EnsureRegistryAuth(context.Background(), auth)
+		if err != nil {
+			t.Fatalf("EnsureRegistryAuth: %v", err)
+		}
+		if id != "cra-theirs" {
+			t.Errorf("id = %q, want cra-theirs", id)
 		}
 	})
 }

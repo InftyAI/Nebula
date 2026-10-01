@@ -78,6 +78,8 @@ type restClient struct {
 	// registryIDs caches registryAuthName -> RunPod credential id. The key is derived from
 	// the credential, so an entry can never serve the wrong one; see EnsureRegistryAuth.
 	registryIDs sync.Map
+	// registryMu serializes the uncached list-then-create; see EnsureRegistryAuth.
+	registryMu sync.Mutex
 }
 
 // compile-time assertion that restClient satisfies the adapter's Client seam.
@@ -257,6 +259,13 @@ func classifyCreate(err error) error {
 		util.ContainsAny(msg, "insufficient funds", "insufficient balance", "not enough credit"):
 		return fmt.Errorf("%w: %w", err, provider.ErrQuota)
 
+	case util.ContainsAny(msg, "registry", "image", "pull", "manifest"):
+		// Belongs to the REQUEST, not the candidate, so it must blocklist NOTHING. The phrase
+		// is what provider.ClassifyError keys on; left bare, a registry's "unauthorized" would
+		// read as OUR auth failing and fence the whole provider. Before the capacity and GPU
+		// cases, whose generic "unavailable"/"unsupported" also match an image message.
+		return fmt.Errorf("runpod: image pull credential or image rejected: %w", err)
+
 	case util.ContainsAny(msg, "no longer any instances available", "no instances available",
 		"no instance available", "out of capacity", "no capacity", "not available",
 		"unavailable", "sold out", "could not be placed"):
@@ -266,12 +275,6 @@ func classifyCreate(err error) error {
 		// A GPU id RunPod does not recognize: durable until runpod.csv is corrected, and
 		// accelerator-scoped so the rest of the provider stays usable.
 		return fmt.Errorf("%w: %w", err, provider.ErrUnsupportedAccelerator)
-
-	case util.ContainsAny(msg, "registry", "image", "pull", "manifest"):
-		// Belongs to the REQUEST, not the candidate, so it must blocklist NOTHING. The phrase
-		// is what provider.ClassifyError keys on; left bare, a registry's "unauthorized" would
-		// read as OUR auth failing and fence the whole provider.
-		return fmt.Errorf("runpod: image pull credential or image rejected: %w", err)
 
 	default:
 		// A 422 or an unrecognized 400. Left unwrapped rather than guessed at: every
@@ -509,6 +512,45 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 		return id.(string), nil
 	}
 
+	// RunPod names are unique, so two concurrent first Provisions that both miss the list
+	// would race to create and one would fail its Pod. Re-check once the lock is held: a
+	// waiter reuses the winner's id.
+	c.registryMu.Lock()
+	defer c.registryMu.Unlock()
+	if id, ok := c.registryIDs.Load(name); ok {
+		return id.(string), nil
+	}
+	if id, err := c.findRegistryAuth(ctx, name); err != nil || id != "" {
+		return id, err
+	}
+
+	body := struct {
+		Name     string `json:"name"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{Name: name, Username: auth.Basic.Username, Password: auth.Basic.Password}
+
+	var created registryAuthResponse
+	if err := c.do(ctx, http.MethodPost, registryAuthPath, body, &created); err != nil {
+		// The lock is per process; another replica (or a leader handoff) may have created
+		// the same object in between, so a name clash resolves by listing again.
+		if id, lerr := c.findRegistryAuth(ctx, name); lerr == nil && id != "" {
+			return id, nil
+		}
+		// Worded as an image-pull failure, which blocklists nothing: a credential RunPod
+		// would not store is a fact about this Pod's imagePullSecret, not about the
+		// accelerator or region the Pod was headed for.
+		return "", fmt.Errorf("runpod: store image pull credential %q: %w", name, err)
+	}
+	if created.ID == "" {
+		return "", fmt.Errorf("runpod: store image pull credential %q: response carried no id", name)
+	}
+	c.registryIDs.Store(name, created.ID)
+	return created.ID, nil
+}
+
+// findRegistryAuth returns the id of the object named name, caching it, or "" if absent.
+func (c *restClient) findRegistryAuth(ctx context.Context, name string) (string, error) {
 	var existing struct {
 		Registries []registryAuthResponse `json:"registries"`
 	}
@@ -521,25 +563,7 @@ func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.Regi
 			return e.ID, nil
 		}
 	}
-
-	body := struct {
-		Name     string `json:"name"`
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}{Name: name, Username: auth.Basic.Username, Password: auth.Basic.Password}
-
-	var created registryAuthResponse
-	if err := c.do(ctx, http.MethodPost, registryAuthPath, body, &created); err != nil {
-		// Worded as an image-pull failure, which blocklists nothing: a credential RunPod
-		// would not store is a fact about this Pod's imagePullSecret, not about the
-		// accelerator or region the Pod was headed for.
-		return "", fmt.Errorf("runpod: store image pull credential %q: %w", name, err)
-	}
-	if created.ID == "" {
-		return "", fmt.Errorf("runpod: store image pull credential %q: response carried no id", name)
-	}
-	c.registryIDs.Store(name, created.ID)
-	return created.ID, nil
+	return "", nil
 }
 
 // forgetRegistryID evicts every cache entry resolving to id.
