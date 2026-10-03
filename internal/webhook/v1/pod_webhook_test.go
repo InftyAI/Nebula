@@ -243,9 +243,9 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		pod.Spec.Containers = []corev1.Container{{Name: "main"}, {Name: "sidecar"}}
 		return pod
 	}
-	// ungatedPod is valid in shape but was created without the label, so it never got the gate.
-	ungatedPod := func(labels map[string]string, nodeName string) *corev1.Pod {
-		pod := podWith(labels, nodeName)
+	// validPod is valid in shape but was created without the label, so no defaulter ran on it.
+	validPod := func(labels map[string]string, nodeName string, gates ...string) *corev1.Pod {
+		pod := podWith(labels, nodeName, gates...)
 		pod.Spec.Containers = []corev1.Container{{Name: "main"}}
 		return pod
 	}
@@ -258,12 +258,14 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		old, new *corev1.Pod
 		wantErr  string // substring; empty means admitted
 	}{
-		// The bypass: created unlabelled (so no webhook ran) with the gate already set, then
-		// relabelled, which would hand placement a Pod it cannot run.
-		{"relabelled into opted-in", sidecarPod(nil), sidecarPod(optedIn), "exactly one container"},
-		// Without the gate placement never sees it, and the gate cannot be added after CREATE.
-		{"relabelled without the gate", ungatedPod(nil, ""), ungatedPod(optedIn, ""), "opt in at creation"},
-		{"relabelled without the gate but bound", ungatedPod(nil, "node-1"), ungatedPod(optedIn, "node-1"), ""},
+		// Created unlabelled, so the defaulter never ran: whatever it hand-copied, the Pod
+		// may lack the gate or the toleration placement needs.
+		{"relabelled with a bad shape", sidecarPod(nil), sidecarPod(optedIn), "opt in at creation"},
+		{"relabelled without the gate", validPod(nil, ""), validPod(optedIn, ""), "opt in at creation"},
+		{"relabelled with the gate but no toleration",
+			validPod(nil, "", nebulav1alpha1.ProviderSelectionGate),
+			validPod(optedIn, "", nebulav1alpha1.ProviderSelectionGate), "opt in at creation"},
+		{"relabelled while bound", validPod(nil, "node-1"), validPod(optedIn, "node-1"), "opt in at creation"},
 		// An opted-in Pod admitted before this check existed: rejecting its later writes
 		// would leave it gated forever.
 		{"already opted in", sidecarPod(optedIn), sidecarPod(optedIn), ""},

@@ -129,7 +129,7 @@ func (v *PodCustomValidator) ValidateCreate(_ context.Context, obj runtime.Objec
 }
 
 // ValidateUpdate implements webhook.CustomValidator. The shape is immutable but the opt-in
-// label is not, so only label transitions are judged: opting in gets the CREATE rules, and
+// label is not, so only label transitions are judged: opting in is refused outright, and
 // opting out must not strand Nebula's gate. A Pod staying opted in is left alone: one
 // admitted before this check existed would otherwise have every later write rejected,
 // placement's gate release among them, and stay gated forever.
@@ -151,13 +151,13 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 		}
 		return nil, nil
 	}
-	// Placement needs the gate, and only the CREATE defaulter can add it.
-	if optedIn(newPod) && newPod.Spec.NodeName == "" && !hasNebulaGate(newPod) {
-		return nil, fmt.Errorf("opt in at creation: label %s takes effect only on a new Pod, since "+
-			"Kubernetes cannot add scheduling gate %q afterwards",
-			nebulav1alpha1.EnabledLabel, nebulav1alpha1.ProviderSelectionGate)
+	// Opting in is CREATE-only: the defaulter's gate and toleration cannot be added later,
+	// and checking for hand-copied ones would drift whenever the defaulter adds another.
+	if optedIn(newPod) {
+		return nil, fmt.Errorf("opt in at creation: label %s takes effect only on a new Pod",
+			nebulav1alpha1.EnabledLabel)
 	}
-	return nil, validatePod(newPod)
+	return nil, nil
 }
 
 // ValidateDelete implements webhook.CustomValidator. Not registered for deletes.
