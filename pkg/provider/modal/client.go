@@ -330,8 +330,6 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 // provider off rather than be scoped to one request.
 func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) (Credential, error) {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
-		// Derived from the exposed set rather than carried separately, so the routed
-		// port cannot name one the sandbox was never told to accept traffic on.
 		Port: port,
 	})
 	if err != nil {
@@ -792,9 +790,7 @@ func (c *sdkClient) observe(ctx context.Context, sb *modal.Sandbox) (Sandbox, er
 	// minted at create and already persisted on the Pod's endpoint annotation, so
 	// re-deriving it per tick would be a round trip for a value the API server holds.
 	//
-	// The alternative — a tunnel URL — is worse than nothing: a tunnel is PUBLIC to
-	// whoever learns it, so substituting one for an authenticated URL silently downgrades
-	// access. A sandbox whose mint failed reports no address at all, and that stays a FACT
+	// A sandbox whose mint failed reports no address at all, and that stays a FACT
 	// rather than an error, since observe's errors fail the entire List.
 	return out, nil
 }

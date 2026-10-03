@@ -18,6 +18,7 @@ package v1
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -170,5 +171,99 @@ func TestDefault_RejectsNonPod(t *testing.T) {
 	d := &PodCustomDefaulter{}
 	if err := d.Default(context.Background(), &corev1.Service{}); err == nil {
 		t.Fatal("expected an error for a non-Pod object")
+	}
+}
+
+func TestValidateCreate_OneContainerOnePort(t *testing.T) {
+	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
+	container := func(name string, ports ...int32) corev1.Container {
+		c := corev1.Container{Name: name}
+		for _, p := range ports {
+			c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: p})
+		}
+		return c
+	}
+	cases := []struct {
+		name       string
+		labels     map[string]string
+		containers []corev1.Container
+		inits      []corev1.Container
+		wantErr    string
+	}{
+		{"one container, one port", optedIn, []corev1.Container{container("main", 8080)}, nil, ""},
+		{"one container, no port", optedIn, []corev1.Container{container("main")}, nil, ""},
+		{"two ports", optedIn, []corev1.Container{container("main", 8080, 9090)}, nil, "at most one port"},
+		{"two containers", optedIn, []corev1.Container{container("main", 8080), container("sidecar")}, nil, "exactly one container"},
+		{"no container", optedIn, nil, nil, "exactly one container"},
+		{"init container", optedIn, []corev1.Container{container("main")}, []corev1.Container{container("setup")}, "init containers"},
+		// Pods outside Nebula are never Nebula's to judge, whatever the selector says.
+		{"not opted in", nil, []corev1.Container{container("a", 1, 2), container("b")}, []corev1.Container{container("i")}, ""},
+	}
+	v := &PodCustomValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := podWith(tc.labels, "")
+			pod.Spec.Containers = tc.containers
+			pod.Spec.InitContainers = tc.inits
+			_, err := v.ValidateCreate(context.Background(), pod)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("ValidateCreate err = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("ValidateCreate err = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateCreate_RejectsNonPod(t *testing.T) {
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), &corev1.Service{}); err == nil {
+		t.Fatal("expected an error for a non-Pod object")
+	}
+}
+
+// A pre-bound Pod skips placement (see needsPlacement), so no provider ever runs it and its
+// shape is not Nebula's to judge, even when it carries the opt-in label.
+func TestValidateCreate_SkipsPreBoundPod(t *testing.T) {
+	pod := podWith(map[string]string{nebulav1alpha1.EnabledLabel: "true"}, "node-1")
+	pod.Spec.Containers = []corev1.Container{
+		{Name: "main", Ports: []corev1.ContainerPort{{ContainerPort: 8080}, {ContainerPort: 9090}}},
+		{Name: "sidecar"},
+	}
+	pod.Spec.InitContainers = []corev1.Container{{Name: "setup"}}
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), pod); err != nil {
+		t.Fatalf("ValidateCreate err = %v, want nil for a pre-bound Pod", err)
+	}
+}
+
+func TestValidateUpdate_JudgesOnlyTransitionsIntoOptedIn(t *testing.T) {
+	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
+	sidecarPod := func(labels map[string]string) *corev1.Pod {
+		pod := podWith(labels, "", nebulav1alpha1.ProviderSelectionGate)
+		pod.Spec.Containers = []corev1.Container{{Name: "main"}, {Name: "sidecar"}}
+		return pod
+	}
+	cases := []struct {
+		name     string
+		old, new *corev1.Pod
+		wantErr  bool
+	}{
+		// The bypass: created unlabelled (so no webhook ran) with the gate already set, then
+		// relabelled, which would hand placement a Pod it cannot run.
+		{"relabelled into opted-in", sidecarPod(nil), sidecarPod(optedIn), true},
+		// An opted-in Pod admitted before this check existed: rejecting its later writes
+		// would leave it gated forever.
+		{"already opted in", sidecarPod(optedIn), sidecarPod(optedIn), false},
+		{"still not opted in", sidecarPod(nil), sidecarPod(map[string]string{"other": "x"}), false},
+		{"opting out", sidecarPod(optedIn), sidecarPod(nil), false},
+	}
+	v := &PodCustomValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateUpdate(context.Background(), tc.old, tc.new)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateUpdate err = %v, want error: %t", err, tc.wantErr)
+			}
+		})
 	}
 }

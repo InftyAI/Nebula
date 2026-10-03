@@ -55,7 +55,7 @@ const (
 	fakeWorkloadPod  = "e2e-fake-workload"
 	// fakeWorkloadNS is a dedicated namespace for the placement-flow workload. It
 	// must NOT be the manager namespace: the mutating webhook's namespaceSelector
-	// excludes nebula-system (see config/webhook/selector_patch.yaml), so a Pod
+	// excludes nebula-system (see config/webhook/patches/mutating_pod_selector.yaml), so a Pod
 	// there would never get the scheduling gate and placement would never run.
 	fakeWorkloadNS = "nebula-e2e-workload"
 

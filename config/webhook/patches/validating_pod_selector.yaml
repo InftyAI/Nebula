@@ -1,0 +1,22 @@
+# The same narrowing as mutating_pod_selector.yaml, for the Pod VALIDATING webhook: it is
+# just as failurePolicy=Fail and on the Pod-CREATE path. Merged by webhook name rather than
+# by index, because this configuration also holds the NodePool webhook, which must stay
+# unselected.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- name: vpod-v1.nebula.inftyai.com
+  objectSelector:
+    matchLabels:
+      nebula.inftyai.com/enabled: "true"
+  namespaceSelector:
+    matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values:
+          - kube-system
+          - kube-node-lease
+          - kube-public
+          - nebula-system

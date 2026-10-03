@@ -5,11 +5,14 @@ resources:
 # but never Creates it, so without this the manager crash-loops. See secret.yaml.
 - secret.yaml
 
-# Narrow the generated Pod webhook to opt-in Pods outside system namespaces.
+# Narrow the generated Pod webhooks to opt-in Pods outside system namespaces. The patches
+# live in a subdirectory because envtest installs every webhook-kind file at THIS level
+# (non-recursively), and a patch read as an object breaks its setup.
 patches:
-- path: selector_patch.yaml
+- path: patches/mutating_pod_selector.yaml
   target:
     kind: MutatingWebhookConfiguration
+- path: patches/validating_pod_selector.yaml
 
 configurations:
 - kustomizeconfig.yaml

@@ -174,7 +174,7 @@ type SandboxSpec struct {
 	CPULimit       float64
 	MemoryLimitMiB int
 	// Ports are the Pod's containerPorts. Only the first is reachable from outside, via
-	// the connect URL (see firstPort); none is opened as a tunnel (see CreateSandbox).
+	// the connect URL (see firstPort); none is opened as a tunnel.
 	Ports []int
 	// Regions constrains where Modal may place the sandbox, in Modal's own
 	// vocabulary — a broad region ("us", "eu", "ap") or a narrow one ("us-east",
@@ -244,8 +244,7 @@ func (s SandboxSpec) GoString() string { return s.String() }
 // No endpoint here, deliberately: Modal's reachable address is the connect URL, minted at
 // CREATE time and published to the Pod's endpoint annotation, where it persists for the
 // sandbox's life. Re-deriving it per read would be a round trip for a value the API server
-// already holds. The only other candidate, a tunnel URL, is PUBLIC to anyone who learns
-// it, so substituting it for an authenticated URL would downgrade access.
+// already holds.
 type Sandbox struct {
 	ID     string
 	Tags   map[string]string

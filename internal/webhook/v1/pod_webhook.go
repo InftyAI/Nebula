@@ -25,6 +25,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
@@ -35,6 +36,7 @@ var podlog = logf.Log.WithName("pod-webhook")
 func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).For(&corev1.Pod{}).
 		WithDefaulter(&PodCustomDefaulter{}).
+		WithValidator(&PodCustomValidator{}).
 		Complete()
 }
 
@@ -104,6 +106,74 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 	})
 	podlog.Info("injected provider-selection scheduling gate and virtual-node toleration",
 		"namespace", pod.Namespace, "name", pod.Name)
+	return nil
+}
+
+// +kubebuilder:webhook:path=/validate--v1-pod,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create;update,versions=v1,name=vpod-v1.nebula.inftyai.com,admissionReviewVersions=v1
+
+// PodCustomValidator rejects an opted-in Pod the providers cannot run as written: they
+// launch one container and no init containers, and expose at most one port (Modal's
+// connect URL routes to one; see modal.firstPort). Admitting more would drop the rest
+// silently.
+type PodCustomValidator struct{}
+
+var _ webhook.CustomValidator = &PodCustomValidator{}
+
+// ValidateCreate implements webhook.CustomValidator.
+func (v *PodCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil, fmt.Errorf("expected a Pod object but got %T", obj)
+	}
+	return nil, validatePod(pod)
+}
+
+// ValidateUpdate implements webhook.CustomValidator. The shape is immutable but the opt-in
+// label is not, so only a transition INTO opted-in is judged. An already opted-in Pod is
+// left alone: one admitted before this check existed would otherwise have every later
+// write rejected, placement's gate release among them, and stay gated forever.
+func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	oldPod, ok := oldObj.(*corev1.Pod)
+	if !ok {
+		return nil, fmt.Errorf("expected a Pod object but got %T", oldObj)
+	}
+	newPod, ok := newObj.(*corev1.Pod)
+	if !ok {
+		return nil, fmt.Errorf("expected a Pod object but got %T", newObj)
+	}
+	if optedIn(oldPod) {
+		return nil, nil
+	}
+	return nil, validatePod(newPod)
+}
+
+// ValidateDelete implements webhook.CustomValidator. Not registered for deletes.
+func (v *PodCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+	return nil, nil
+}
+
+func optedIn(pod *corev1.Pod) bool {
+	return pod.Labels[nebulav1alpha1.EnabledLabel] == nebulav1alpha1.EnabledValue
+}
+
+// validatePod enforces PodCustomValidator's rules on an opted-in Pod placement would see.
+func validatePod(pod *corev1.Pod) error {
+	if !optedIn(pod) {
+		return nil
+	}
+	if pod.Spec.NodeName != "" {
+		return nil // pre-bound: never placed, so never run by a provider (see needsPlacement)
+	}
+	if n := len(pod.Spec.Containers); n != 1 {
+		return fmt.Errorf("nebula runs exactly one container per Pod, got %d", n)
+	}
+	// Native sidecars are init containers too, so this rejects them as well.
+	if n := len(pod.Spec.InitContainers); n > 0 {
+		return fmt.Errorf("nebula does not run init containers, got %d", n)
+	}
+	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
+		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
+	}
 	return nil
 }
 
