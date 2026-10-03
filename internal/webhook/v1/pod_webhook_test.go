@@ -28,7 +28,7 @@ import (
 )
 
 func gated(pod *corev1.Pod) bool {
-	return hasGate(pod, nebulav1alpha1.ProviderSelectionGate)
+	return hasNebulaGate(pod)
 }
 
 func podWith(labels map[string]string, nodeName string, gates ...string) *corev1.Pod {
@@ -243,6 +243,12 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		pod.Spec.Containers = []corev1.Container{{Name: "main"}, {Name: "sidecar"}}
 		return pod
 	}
+	// ungatedPod is valid in shape but was created without the label, so it never got the gate.
+	ungatedPod := func(labels map[string]string, nodeName string) *corev1.Pod {
+		pod := podWith(labels, nodeName)
+		pod.Spec.Containers = []corev1.Container{{Name: "main"}}
+		return pod
+	}
 	released := func(pod *corev1.Pod) *corev1.Pod {
 		pod.Spec.SchedulingGates = nil
 		return pod
@@ -250,26 +256,32 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 	cases := []struct {
 		name     string
 		old, new *corev1.Pod
-		wantErr  bool
+		wantErr  string // substring; empty means admitted
 	}{
 		// The bypass: created unlabelled (so no webhook ran) with the gate already set, then
 		// relabelled, which would hand placement a Pod it cannot run.
-		{"relabelled into opted-in", sidecarPod(nil), sidecarPod(optedIn), true},
+		{"relabelled into opted-in", sidecarPod(nil), sidecarPod(optedIn), "exactly one container"},
+		// Without the gate placement never sees it, and the gate cannot be added after CREATE.
+		{"relabelled without the gate", ungatedPod(nil, ""), ungatedPod(optedIn, ""), "opt in at creation"},
+		{"relabelled without the gate but bound", ungatedPod(nil, "node-1"), ungatedPod(optedIn, "node-1"), ""},
 		// An opted-in Pod admitted before this check existed: rejecting its later writes
 		// would leave it gated forever.
-		{"already opted in", sidecarPod(optedIn), sidecarPod(optedIn), false},
-		{"still not opted in", sidecarPod(nil), sidecarPod(map[string]string{"other": "x"}), false},
+		{"already opted in", sidecarPod(optedIn), sidecarPod(optedIn), ""},
+		{"still not opted in", sidecarPod(nil), sidecarPod(map[string]string{"other": "x"}), ""},
 		// Placement ignores an unlabelled Pod, so nothing would ever release the gate it keeps.
-		{"opting out while gated", sidecarPod(optedIn), sidecarPod(nil), true},
-		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), false},
-		{"opting out after placement", released(sidecarPod(optedIn)), released(sidecarPod(nil)), false},
+		{"opting out while gated", sidecarPod(optedIn), sidecarPod(nil), "gated forever"},
+		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), ""},
+		{"opting out after placement", released(sidecarPod(optedIn)), released(sidecarPod(nil)), ""},
 	}
 	v := &PodCustomValidator{}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := v.ValidateUpdate(context.Background(), tc.old, tc.new)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("ValidateUpdate err = %v, want error: %t", err, tc.wantErr)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("ValidateUpdate err = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("ValidateUpdate err = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
 	}

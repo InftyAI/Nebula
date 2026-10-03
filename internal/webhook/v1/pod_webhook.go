@@ -97,7 +97,7 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 		})
 	}
 
-	if hasGate(pod, nebulav1alpha1.ProviderSelectionGate) {
+	if hasNebulaGate(pod) {
 		return nil // already gated; nothing more to do
 	}
 
@@ -144,12 +144,18 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 	}
 	if optedIn(oldPod) {
 		// Placement ignores a Pod without the label, so it would never release the gate.
-		if !optedIn(newPod) && hasGate(newPod, nebulav1alpha1.ProviderSelectionGate) {
+		if !optedIn(newPod) && hasNebulaGate(newPod) {
 			return nil, fmt.Errorf("removing label %s would leave the Pod gated forever: also remove "+
 				"scheduling gate %q in the same update, or keep the label",
 				nebulav1alpha1.EnabledLabel, nebulav1alpha1.ProviderSelectionGate)
 		}
 		return nil, nil
+	}
+	// Placement needs the gate, and only the CREATE defaulter can add it.
+	if optedIn(newPod) && newPod.Spec.NodeName == "" && !hasNebulaGate(newPod) {
+		return nil, fmt.Errorf("opt in at creation: label %s takes effect only on a new Pod, since "+
+			"Kubernetes cannot add scheduling gate %q afterwards",
+			nebulav1alpha1.EnabledLabel, nebulav1alpha1.ProviderSelectionGate)
 	}
 	return nil, validatePod(newPod)
 }
@@ -184,10 +190,10 @@ func validatePod(pod *corev1.Pod) error {
 	return nil
 }
 
-// hasGate reports whether the Pod already carries the named scheduling gate.
-func hasGate(pod *corev1.Pod, name string) bool {
+// hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
+func hasNebulaGate(pod *corev1.Pod) bool {
 	for _, g := range pod.Spec.SchedulingGates {
-		if g.Name == name {
+		if g.Name == nebulav1alpha1.ProviderSelectionGate {
 			return true
 		}
 	}
