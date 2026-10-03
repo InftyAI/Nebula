@@ -180,7 +180,6 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 		MemoryMiB:      spec.MemoryMiB,
 		CPULimit:       spec.CPULimit,
 		MemoryLimitMiB: spec.MemoryLimitMiB,
-		EncryptedPorts: spec.Ports,
 		// Nil leaves Modal's SchedulerPlacement unset entirely (the SDK only builds one
 		// when Regions is non-empty), which is the unconstrained, un-multiplied case.
 		Regions: spec.Regions,
