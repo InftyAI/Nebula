@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -105,6 +107,7 @@ func main() {
 	var kubeletAddr, kubeletClientCA string
 	var costLabels string
 	var kubeletServingTLSBootstrap bool
+	var providers string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -147,6 +150,10 @@ func main() {
 			"x509: certificate signed by unknown authority. Off by default because it needs the "+
 			"RBAC to impersonate one virtual node identity — the signer signs for nobody else "+
 			"(see addServingCertificateBootstrap).")
+	flag.StringVar(&providers, "providers", strings.Join(knownProviders, ","),
+		"Comma-separated providers to register; all by default. A listed provider is still skipped "+
+			"when its credentials are absent; an unlisted one is never registered, even with them. "+
+			"An unknown name fails startup.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -160,6 +167,11 @@ func main() {
 	attribution, err := nebulametrics.ParseCostLabels(costLabels)
 	if err != nil {
 		setupLog.Error(err, "invalid --cost-labels")
+		os.Exit(1)
+	}
+	enabledProviders, err := parseProviders(providers)
+	if err != nil {
+		setupLog.Error(err, "invalid --providers")
 		os.Exit(1)
 	}
 	if err := nebulametrics.InitCost(attribution); err != nil {
@@ -314,7 +326,7 @@ func main() {
 	// startup already sees its provider. The manager's client backs the AWS region
 	// source (regions are read from NodePools at call time, not env), so it is
 	// threaded in; the client is only queried at runtime, after the cache has synced.
-	registerProviders(context.Background(), mgr.GetClient())
+	registerProviders(context.Background(), mgr.GetClient(), enabledProviders)
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
 	// Provision failure and read by the placement controller to skip a candidate
@@ -610,17 +622,30 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 // still run for the providers that ARE configured, and a pool referencing an
 // unregistered provider surfaces as a clear NodePool condition rather than a
 // crash loop.
-func registerProviders(ctx context.Context, c client.Client) {
+//
+// Only providers in enabled are attempted (see parseProviders).
+func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool) {
+	register := func(name string, build func() (provider.Provider, error)) {
+		if !enabled[name] {
+			setupLog.Info("provider disabled by --providers", "provider", name)
+			return
+		}
+		p, err := build()
+		if err != nil {
+			setupLog.Info("skipping provider registration", "provider", name, "reason", err.Error())
+			return
+		}
+		provider.Register(p)
+		setupLog.Info("registered provider", "provider", p.Name())
+	}
+
 	appName := os.Getenv("MODAL_APP_NAME")
 	if appName == "" {
 		appName = "nebula"
 	}
-	if p, err := modal.NewSDKClient(ctx, appName, os.Getenv("MODAL_ENVIRONMENT")); err != nil {
-		setupLog.Info("skipping Modal provider registration", "reason", err.Error())
-	} else {
-		provider.Register(p)
-		setupLog.Info("registered provider", "provider", p.Name())
-	}
+	register(provider.ProviderModal, func() (provider.Provider, error) {
+		return modal.NewSDKClient(ctx, appName, os.Getenv("MODAL_ENVIRONMENT"))
+	})
 
 	// AWS. There is NO region env/flag: the regions this provider may use are declared
 	// per-pool in the NodePool (ProviderSpec.Regions) and read at call time via the
@@ -633,12 +658,9 @@ func registerProviders(ctx context.Context, c client.Client) {
 	// delivered via a Secret), and one account-global credential authorizes every
 	// region. Registration only fails (and is a non-fatal skip) if the price catalog
 	// cannot load — region config can no longer make it fail.
-	if p, err := awsprovider.NewSDKClient(ctx, awsRegionSource(c)); err != nil {
-		setupLog.Info("skipping AWS provider registration", "reason", err.Error())
-	} else {
-		provider.Register(p)
-		setupLog.Info("registered provider", "provider", p.Name())
-	}
+	register(provider.ProviderAWS, func() (provider.Provider, error) {
+		return awsprovider.NewSDKClient(ctx, awsRegionSource(c))
+	})
 
 	// The fake provider is an in-memory backend used only by the e2e suite to
 	// exercise the full control-plane loop without cloud credentials. It ships in
@@ -649,6 +671,27 @@ func registerProviders(ctx context.Context, c client.Client) {
 		provider.Register(p)
 		setupLog.Info("registered provider", "provider", p.Name())
 	}
+}
+
+// knownProviders are the names --providers accepts, one per register call above. The fake
+// provider is not among them: it stays gated on its env var alone.
+var knownProviders = []string{provider.ProviderModal, provider.ProviderAWS}
+
+// parseProviders turns --providers into the enabled set. An unknown name is an error rather
+// than ignored, so a typo cannot silently leave a provider off.
+func parseProviders(s string) (map[string]bool, error) {
+	enabled := map[string]bool{}
+	for _, name := range strings.Split(s, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !slices.Contains(knownProviders, name) {
+			return nil, fmt.Errorf("unknown provider %q, want one of %v", name, knownProviders)
+		}
+		enabled[name] = true
+	}
+	return enabled, nil
 }
 
 // awsRegionSource returns the AWS adapter's RegionSource: ProviderSpec.Regions of every

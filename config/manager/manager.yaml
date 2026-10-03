@@ -64,6 +64,9 @@ spec:
           - --leader-elect
           - --health-probe-bind-address=:8081
           # - --kubelet-serving-tls-bootstrap=true
+          # Every provider is registered by default. Restrict with --providers; it is the
+          # only way to turn AWS off, which registers even without credentials.
+          # - --providers=modal
         image: controller:latest
         name: manager
         imagePullPolicy: IfNotPresent
