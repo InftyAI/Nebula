@@ -19,7 +19,6 @@ package v1
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -27,10 +26,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
 )
-
-// modalProvider is the provider name Modal registers its virtual node under.
-const modalProvider = "modal"
 
 // SetupNodePoolWebhookWithManager registers the webhook for NodePool in the manager.
 func SetupNodePoolWebhookWithManager(mgr ctrl.Manager) error {
@@ -41,25 +38,26 @@ func SetupNodePoolWebhookWithManager(mgr ctrl.Manager) error {
 
 // +kubebuilder:webhook:path=/validate-nebula-inftyai-com-v1alpha1-nodepool,mutating=false,failurePolicy=fail,sideEffects=None,groups=nebula.inftyai.com,resources=nodepools,verbs=create;update,versions=v1alpha1,name=vnodepool-v1alpha1.nebula.inftyai.com,admissionReviewVersions=v1
 
-// NodePoolCustomValidator rejects NodePools that ask for capacity a provider
-// cannot supply. Modal has no spot instances, so a pool that lists Modal and
-// Spot would hold a Spot tier that Modal can never fill.
-//
-// The API server applies the capacityTypes default ([OnDemand, Spot]) before
-// admission, so a Modal pool that leaves capacityTypes empty is rejected too;
-// it must list [OnDemand] explicitly.
-type NodePoolCustomValidator struct{}
+// NodePoolCustomValidator validates NodePools on create and update. A setting a listed
+// provider cannot serve (Spot on Modal, a restricted egress on RunPod) is NOT rejected:
+// placement skips that provider instead (see provider.Capabilities), so the rest of the pool
+// still works. It only WARNS, so a provider placement will never use is not a surprise.
+type NodePoolCustomValidator struct {
+	// Providers resolves a provider name to its backend; defaults to the registry. An
+	// unresolved name draws no warning: placement skips it too, and NodePool status reports it.
+	Providers func(name string) (provider.Provider, bool)
+}
 
 var _ webhook.CustomValidator = &NodePoolCustomValidator{}
 
 // ValidateCreate implements webhook.CustomValidator.
 func (v *NodePoolCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	return nil, validateNodePool(obj)
+	return v.validate(obj)
 }
 
 // ValidateUpdate implements webhook.CustomValidator.
 func (v *NodePoolCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	return nil, validateNodePool(newObj)
+	return v.validate(newObj)
 }
 
 // ValidateDelete implements webhook.CustomValidator. Deletes are always allowed.
@@ -67,29 +65,57 @@ func (v *NodePoolCustomValidator) ValidateDelete(_ context.Context, _ runtime.Ob
 	return nil, nil
 }
 
-func validateNodePool(obj runtime.Object) error {
+func (v *NodePoolCustomValidator) validate(obj runtime.Object) (admission.Warnings, error) {
 	np, ok := obj.(*nebulav1alpha1.NodePool)
 	if !ok {
-		return fmt.Errorf("expected a NodePool object but got %T", obj)
+		return nil, fmt.Errorf("expected a NodePool object but got %T", obj)
 	}
-	if hasProvider(np, modalProvider) && hasCapacityType(np, nebulav1alpha1.CapacitySpot) {
-		return fmt.Errorf("modal does not support spot instances; remove modal from providers or set capacityTypes to [OnDemand]")
-	}
-	return nil
+	return v.warnings(np), nil
 }
 
-func hasProvider(np *nebulav1alpha1.NodePool, name string) bool {
-	for _, p := range np.Spec.Providers {
-		if strings.EqualFold(p.Name, name) {
-			return true
+// warnings names every listed provider placement will never use, and says so once more when
+// that is all of them, since such a pool admits Pods it can never place.
+func (v *NodePoolCustomValidator) warnings(np *nebulav1alpha1.NodePool) admission.Warnings {
+	var warns admission.Warnings
+	known, usable := 0, 0
+	for _, ref := range np.Spec.Providers {
+		prov, ok := v.provider(ref.Name)
+		if !ok {
+			continue
+		}
+		known++
+		caps := prov.Capabilities()
+		switch {
+		case !caps.ServesEgress(np.Spec.Egress):
+			warns = append(warns, fmt.Sprintf("provider %q cannot enforce egress mode %q, so placement will never use it",
+				ref.Name, np.Spec.Egress.ModeOrOpen()))
+		case !servesAnyTier(caps, np.Spec.CapacityTypes):
+			warns = append(warns, fmt.Sprintf("provider %q serves none of capacityTypes %v, so placement will never use it",
+				ref.Name, np.Spec.CapacityTypes))
+		default:
+			usable++
 		}
 	}
-	return false
+	if known > 0 && usable == 0 {
+		warns = append(warns, "no provider in this pool can serve it; its Pods will stay unplaceable")
+	}
+	return warns
 }
 
-func hasCapacityType(np *nebulav1alpha1.NodePool, ct nebulav1alpha1.CapacityType) bool {
-	for _, c := range np.Spec.CapacityTypes {
-		if c == ct {
+func (v *NodePoolCustomValidator) provider(name string) (provider.Provider, bool) {
+	if v.Providers != nil {
+		return v.Providers(name)
+	}
+	return provider.Get(name)
+}
+
+// servesAnyTier mirrors placement's tier walk, where an empty list is one default tier.
+func servesAnyTier(caps provider.Capabilities, tiers []nebulav1alpha1.CapacityType) bool {
+	if len(tiers) == 0 {
+		return true
+	}
+	for _, t := range tiers {
+		if caps.ServesCapacityTier(t) {
 			return true
 		}
 	}

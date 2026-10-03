@@ -128,13 +128,13 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
 			}
-			if !servesCapacityTier(prov, tier) {
+			if !prov.Capabilities().ServesCapacityTier(tier) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipCapacityUnsupported)
 				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
 					"provider", ref.Name, "capacityType", tier)
 				continue
 			}
-			if !servesEgress(prov, pool.Spec.Egress) {
+			if !prov.Capabilities().ServesEgress(pool.Spec.Egress) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipEgressUnsupported)
 				log.V(1).Info("skipping candidate: provider cannot enforce the pool's egress policy",
 					"provider", ref.Name, "egressMode", pool.Spec.Egress.ModeOrOpen())
@@ -230,36 +230,6 @@ func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType 
 		return []nebulav1alpha1.CapacityType{""}
 	}
 	return pool.Spec.CapacityTypes
-}
-
-// servesCapacityTier reports whether prov can deliver the candidate's capacity tier. Only Spot
-// is ever refused: an OnDemand-only provider (Modal) has no interruptible tier, so placing a
-// Spot candidate there would stamp CapacityType=Spot on the Pod, hand it to an adapter that
-// drops the field, and bill OnDemand rates for capacity the user asked to be cheap — with no
-// error or event revealing the substitution. Skipping lets the pool's next tier take over
-// ([Spot, OnDemand] still lands on Modal, now truthfully labelled), and a Spot-only pool
-// leaves the Pod visibly unplaceable rather than quietly overcharged.
-//
-// The empty tier is "the provider's default", which every provider serves, so it passes.
-func servesCapacityTier(prov provider.Provider, tier nebulav1alpha1.CapacityType) bool {
-	if tier != nebulav1alpha1.CapacitySpot {
-		return true
-	}
-	return prov.Capabilities().SupportsSpot
-}
-
-// servesEgress reports whether prov can enforce the pool's egress policy. Open needs no
-// enforcement, so every provider serves it; anything else needs SupportsEgressPolicy.
-//
-// Same reasoning as servesCapacity, and load-bearing for a different reason: a provider
-// that drops the field would put the workload on the open internet while the pool claims
-// containment. Skipping makes that visible — an AWS-only pool asking for Blocked leaves the
-// Pod unplaceable instead of silently unprotected.
-func servesEgress(prov provider.Provider, policy *nebulav1alpha1.EgressPolicy) bool {
-	if !policy.RestrictsEgress() {
-		return true
-	}
-	return prov.Capabilities().SupportsEgressPolicy
 }
 
 // requestedGeographies reads the Pod's RegionsAnnotation into the narrowing ResolveRegions

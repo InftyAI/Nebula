@@ -18,58 +18,96 @@ package v1
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
-func nodePool(capacity []nebulav1alpha1.CapacityType, providers ...string) *nebulav1alpha1.NodePool {
+// capsOnly is a provider whose only behaviour is its Capabilities; the webhook reads nothing else.
+type capsOnly struct {
+	provider.Provider
+	caps provider.Capabilities
+}
+
+func (p capsOnly) Capabilities() provider.Capabilities { return p.caps }
+
+// Shaped like the real adapters: Modal enforces egress but has no Spot, RunPod neither, AWS Spot only.
+var testProviders = map[string]provider.Provider{
+	"modal":  capsOnly{caps: provider.Capabilities{SupportsEgressPolicy: true}},
+	"runpod": capsOnly{},
+	"aws":    capsOnly{caps: provider.Capabilities{SupportsSpot: true}},
+}
+
+func lookup(name string) (provider.Provider, bool) {
+	p, ok := testProviders[name]
+	return p, ok
+}
+
+func pool(capacity []nebulav1alpha1.CapacityType, egress nebulav1alpha1.EgressMode, providers ...string) *nebulav1alpha1.NodePool {
 	np := &nebulav1alpha1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "np"}}
 	for _, p := range providers {
 		np.Spec.Providers = append(np.Spec.Providers, nebulav1alpha1.ProviderSpec{Name: p})
 	}
 	np.Spec.CapacityTypes = capacity
+	if egress != "" {
+		np.Spec.Egress = &nebulav1alpha1.EgressPolicy{Mode: egress}
+	}
 	return np
 }
 
-func TestNodePoolValidator(t *testing.T) {
+// A setting a provider cannot serve is never an error, only a warning naming the provider
+// placement will skip, plus one more when nothing in the pool is left.
+func TestNodePoolValidatorWarnings(t *testing.T) {
 	spot, onDemand := nebulav1alpha1.CapacitySpot, nebulav1alpha1.CapacityOnDemand
+	both := []nebulav1alpha1.CapacityType{onDemand, spot}
 	cases := []struct {
-		name    string
-		np      *nebulav1alpha1.NodePool
-		wantErr bool
+		name string
+		np   *nebulav1alpha1.NodePool
+		want []string // substrings, one per expected warning, in order
 	}{
-		{"modal with spot", nodePool([]nebulav1alpha1.CapacityType{spot}, "modal"), true},
-		{"modal among others with spot", nodePool([]nebulav1alpha1.CapacityType{onDemand, spot}, "runpod", "modal"), true},
-		{"modal name is case-insensitive", nodePool([]nebulav1alpha1.CapacityType{spot}, "Modal"), true},
-		{"modal with on-demand only", nodePool([]nebulav1alpha1.CapacityType{onDemand}, "modal"), false},
-		{"other provider with spot", nodePool([]nebulav1alpha1.CapacityType{spot, onDemand}, "runpod"), false},
+		{"every provider usable", pool(both, "", "modal", "runpod", "aws"), nil},
+		// Modal still serves the OnDemand tier, so the default capacityTypes must stay quiet.
+		{"modal with spot as a fallback", pool(both, "", "modal"), nil},
+		{"modal with spot only", pool([]nebulav1alpha1.CapacityType{spot}, "", "modal", "aws"),
+			[]string{`"modal" serves none of capacityTypes`}},
+		{"runpod under a restricted egress", pool(both, nebulav1alpha1.EgressBlocked, "runpod", "modal"),
+			[]string{`"runpod" cannot enforce egress mode "Blocked"`}},
+		{"nothing can place", pool(both, nebulav1alpha1.EgressAllowlist, "runpod", "aws"),
+			[]string{`"runpod" cannot enforce`, `"aws" cannot enforce`, "will stay unplaceable"}},
+		// Unregistered is placement's skip and status's report, not a warning.
+		{"unregistered provider", pool(both, "", "lambda"), nil},
+		{"empty capacityTypes is the default tier", pool(nil, "", "modal"), nil},
 	}
-	v := &NodePoolCustomValidator{}
+	v := &NodePoolCustomValidator{Providers: lookup}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := v.ValidateCreate(context.Background(), tc.np); (err != nil) != tc.wantErr {
-				t.Fatalf("ValidateCreate err = %v, wantErr %v", err, tc.wantErr)
+			warns, err := v.ValidateCreate(context.Background(), tc.np)
+			if err != nil {
+				t.Fatalf("ValidateCreate err = %v, want nil", err)
 			}
-			old := nodePool([]nebulav1alpha1.CapacityType{onDemand}, "modal")
-			if _, err := v.ValidateUpdate(context.Background(), old, tc.np); (err != nil) != tc.wantErr {
-				t.Fatalf("ValidateUpdate err = %v, wantErr %v", err, tc.wantErr)
+			if len(warns) != len(tc.want) {
+				t.Fatalf("warnings = %q, want %d matching %q", warns, len(tc.want), tc.want)
+			}
+			for i, w := range tc.want {
+				if !strings.Contains(warns[i], w) {
+					t.Errorf("warning %d = %q, want it to contain %q", i, warns[i], w)
+				}
+			}
+			upd, err := v.ValidateUpdate(context.Background(), pool(both, "", "modal"), tc.np)
+			if err != nil || len(upd) != len(warns) {
+				t.Errorf("ValidateUpdate = %q, %v; want the create result %q", upd, err, warns)
 			}
 		})
 	}
 }
 
-func TestNodePoolValidatorAllowsDelete(t *testing.T) {
-	np := nodePool([]nebulav1alpha1.CapacityType{nebulav1alpha1.CapacitySpot}, "modal")
-	if _, err := (&NodePoolCustomValidator{}).ValidateDelete(context.Background(), np); err != nil {
-		t.Fatalf("ValidateDelete err = %v, want nil", err)
-	}
-}
-
 func TestNodePoolValidatorRejectsWrongType(t *testing.T) {
-	if _, err := (&NodePoolCustomValidator{}).ValidateCreate(context.Background(), &nebulav1alpha1.NodePoolList{}); err == nil {
+	v := &NodePoolCustomValidator{Providers: lookup}
+	if _, err := v.ValidateCreate(context.Background(), &nebulav1alpha1.NodePoolList{}); err == nil {
 		t.Fatal("expected an error for a non-NodePool object")
 	}
 }

@@ -340,6 +340,30 @@ type Capabilities struct {
 	ProvisionTimeout time.Duration
 }
 
+// ServesCapacityTier reports whether the provider can deliver tier. Only Spot is ever refused:
+// an OnDemand-only provider (Modal) has no interruptible tier, so placing a Spot candidate
+// there would stamp CapacityType=Spot on the Pod, hand it to an adapter that drops the field,
+// and bill OnDemand rates for capacity the user asked to be cheap — with no error or event
+// revealing the substitution. Skipping lets the pool's next tier take over ([Spot, OnDemand]
+// still lands on Modal, now truthfully labelled), and a Spot-only pool leaves the Pod visibly
+// unplaceable rather than quietly overcharged.
+//
+// The empty tier is "the provider's default", which every provider serves, so it passes.
+func (c Capabilities) ServesCapacityTier(tier nebulav1alpha1.CapacityType) bool {
+	return tier != nebulav1alpha1.CapacitySpot || c.SupportsSpot
+}
+
+// ServesEgress reports whether the provider can enforce policy. Open needs no enforcement,
+// so every provider serves it; anything else needs SupportsEgressPolicy.
+//
+// Load-bearing for a different reason than ServesCapacityTier: a provider that drops the
+// field would put the workload on the open internet while the pool claims containment.
+// Skipping makes that visible — an AWS-only pool asking for Blocked leaves the Pod
+// unplaceable instead of silently unprotected.
+func (c Capabilities) ServesEgress(policy *nebulav1alpha1.EgressPolicy) bool {
+	return !policy.RestrictsEgress() || c.SupportsEgressPolicy
+}
+
 // Instance is the provider-agnostic view of one external instance, as observed.
 type Instance struct {
 	ID        string
