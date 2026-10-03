@@ -18,6 +18,7 @@ package v1
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,7 +28,7 @@ import (
 )
 
 func gated(pod *corev1.Pod) bool {
-	return hasGate(pod, nebulav1alpha1.ProviderSelectionGate)
+	return hasNebulaGate(pod)
 }
 
 func podWith(labels map[string]string, nodeName string, gates ...string) *corev1.Pod {
@@ -170,5 +171,120 @@ func TestDefault_RejectsNonPod(t *testing.T) {
 	d := &PodCustomDefaulter{}
 	if err := d.Default(context.Background(), &corev1.Service{}); err == nil {
 		t.Fatal("expected an error for a non-Pod object")
+	}
+}
+
+func TestValidateCreate_OneContainerOnePort(t *testing.T) {
+	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
+	container := func(name string, ports ...int32) corev1.Container {
+		c := corev1.Container{Name: name}
+		for _, p := range ports {
+			c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: p})
+		}
+		return c
+	}
+	cases := []struct {
+		name       string
+		labels     map[string]string
+		containers []corev1.Container
+		inits      []corev1.Container
+		wantErr    string
+	}{
+		{"one container, one port", optedIn, []corev1.Container{container("main", 8080)}, nil, ""},
+		{"one container, no port", optedIn, []corev1.Container{container("main")}, nil, ""},
+		{"two ports", optedIn, []corev1.Container{container("main", 8080, 9090)}, nil, "at most one port"},
+		{"two containers", optedIn, []corev1.Container{container("main", 8080), container("sidecar")}, nil, "exactly one container"},
+		{"no container", optedIn, nil, nil, "exactly one container"},
+		{"init container", optedIn, []corev1.Container{container("main")}, []corev1.Container{container("setup")}, "init containers"},
+		// Pods outside Nebula are never Nebula's to judge, whatever the selector says.
+		{"not opted in", nil, []corev1.Container{container("a", 1, 2), container("b")}, []corev1.Container{container("i")}, ""},
+	}
+	v := &PodCustomValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := podWith(tc.labels, "")
+			pod.Spec.Containers = tc.containers
+			pod.Spec.InitContainers = tc.inits
+			_, err := v.ValidateCreate(context.Background(), pod)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("ValidateCreate err = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("ValidateCreate err = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateCreate_RejectsNonPod(t *testing.T) {
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), &corev1.Service{}); err == nil {
+		t.Fatal("expected an error for a non-Pod object")
+	}
+}
+
+// A pre-bound Pod skips placement (see needsPlacement), so no provider ever runs it and its
+// shape is not Nebula's to judge, even when it carries the opt-in label.
+func TestValidateCreate_SkipsPreBoundPod(t *testing.T) {
+	pod := podWith(map[string]string{nebulav1alpha1.EnabledLabel: "true"}, "node-1")
+	pod.Spec.Containers = []corev1.Container{
+		{Name: "main", Ports: []corev1.ContainerPort{{ContainerPort: 8080}, {ContainerPort: 9090}}},
+		{Name: "sidecar"},
+	}
+	pod.Spec.InitContainers = []corev1.Container{{Name: "setup"}}
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), pod); err != nil {
+		t.Fatalf("ValidateCreate err = %v, want nil for a pre-bound Pod", err)
+	}
+}
+
+func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
+	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
+	sidecarPod := func(labels map[string]string) *corev1.Pod {
+		pod := podWith(labels, "", nebulav1alpha1.ProviderSelectionGate)
+		pod.Spec.Containers = []corev1.Container{{Name: "main"}, {Name: "sidecar"}}
+		return pod
+	}
+	// validPod is valid in shape but was created without the label, so no defaulter ran on it.
+	validPod := func(labels map[string]string, nodeName string, gates ...string) *corev1.Pod {
+		pod := podWith(labels, nodeName, gates...)
+		pod.Spec.Containers = []corev1.Container{{Name: "main"}}
+		return pod
+	}
+	released := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.SchedulingGates = nil
+		return pod
+	}
+	cases := []struct {
+		name     string
+		old, new *corev1.Pod
+		wantErr  string // substring; empty means admitted
+	}{
+		// Created unlabelled, so the defaulter never ran: whatever it hand-copied, the Pod
+		// may lack the gate or the toleration placement needs.
+		{"relabelled with a bad shape", sidecarPod(nil), sidecarPod(optedIn), "opt in at creation"},
+		{"relabelled without the gate", validPod(nil, ""), validPod(optedIn, ""), "opt in at creation"},
+		{"relabelled with the gate but no toleration",
+			validPod(nil, "", nebulav1alpha1.ProviderSelectionGate),
+			validPod(optedIn, "", nebulav1alpha1.ProviderSelectionGate), "opt in at creation"},
+		{"relabelled while bound", validPod(nil, "node-1"), validPod(optedIn, "node-1"), "opt in at creation"},
+		// An opted-in Pod admitted before this check existed: rejecting its later writes
+		// would leave it gated forever.
+		{"already opted in", sidecarPod(optedIn), sidecarPod(optedIn), ""},
+		{"still not opted in", sidecarPod(nil), sidecarPod(map[string]string{"other": "x"}), ""},
+		// Placement ignores an unlabelled Pod, so nothing would ever release the gate it keeps.
+		{"opting out while gated", sidecarPod(optedIn), sidecarPod(nil), "gated forever"},
+		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), ""},
+		{"opting out after placement", released(sidecarPod(optedIn)), released(sidecarPod(nil)), ""},
+	}
+	v := &PodCustomValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateUpdate(context.Background(), tc.old, tc.new)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("ValidateUpdate err = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("ValidateUpdate err = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }

@@ -36,7 +36,9 @@ func SetupNodePoolWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/validate-nebula-inftyai-com-v1alpha1-nodepool,mutating=false,failurePolicy=fail,sideEffects=None,groups=nebula.inftyai.com,resources=nodepools,verbs=create;update,versions=v1alpha1,name=vnodepool-v1alpha1.nebula.inftyai.com,admissionReviewVersions=v1
+// failurePolicy=ignore: the validator only warns, so a webhook outage must not block
+// NodePool writes. The Pod validator enforces runtime limits and stays Fail.
+// +kubebuilder:webhook:path=/validate-nebula-inftyai-com-v1alpha1-nodepool,mutating=false,failurePolicy=ignore,sideEffects=None,groups=nebula.inftyai.com,resources=nodepools,verbs=create;update,versions=v1alpha1,name=vnodepool-v1alpha1.nebula.inftyai.com,admissionReviewVersions=v1
 
 // NodePoolCustomValidator validates NodePools on create and update. A setting a listed
 // provider cannot serve (Spot on Modal, a restricted egress on RunPod) is NOT rejected:

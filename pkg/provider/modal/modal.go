@@ -173,10 +173,8 @@ type SandboxSpec struct {
 	// size with an unbounded ceiling — the inverse of what it asked for, and billable.
 	CPULimit       float64
 	MemoryLimitMiB int
-	// Ports are the container ports to expose, from the Pod's containerPorts. They
-	// declare to Modal which ports may receive traffic at all, and the connect URL
-	// routes to the first of them (see firstPort) — one token routes to one port.
-	// Empty leaves both the exposed set and the routed port to Modal's own default.
+	// Ports are the Pod's containerPorts. Only the first is reachable from outside, via
+	// the connect URL (see firstPort); none is opened as a tunnel.
 	Ports []int
 	// Regions constrains where Modal may place the sandbox, in Modal's own
 	// vocabulary — a broad region ("us", "eu", "ap") or a narrow one ("us-east",
@@ -246,8 +244,7 @@ func (s SandboxSpec) GoString() string { return s.String() }
 // No endpoint here, deliberately: Modal's reachable address is the connect URL, minted at
 // CREATE time and published to the Pod's endpoint annotation, where it persists for the
 // sandbox's life. Re-deriving it per read would be a round trip for a value the API server
-// already holds. The only other candidate, a tunnel URL, is PUBLIC to anyone who learns
-// it, so substituting it for an authenticated URL would downgrade access.
+// already holds.
 type Sandbox struct {
 	ID     string
 	Tags   map[string]string
@@ -791,9 +788,8 @@ func limitQty(c *corev1.Container, name corev1.ResourceName) *resource.Quantity 
 	return nil
 }
 
-// containerPorts collects the container's declared ports, which is what tells Modal
-// which ports may receive traffic at all. The connect URL then routes to one of them
-// (see firstPort).
+// containerPorts collects the container's declared ports; the connect URL routes to
+// one of them (see firstPort).
 func containerPorts(c *corev1.Container) []int {
 	if len(c.Ports) == 0 {
 		return nil

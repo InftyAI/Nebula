@@ -869,11 +869,6 @@ func TestPlanProbe(t *testing.T) {
 	}
 }
 
-// The spec carries the container's declared ports verbatim: they are the set Modal is
-// told to accept traffic on, and the connect URL routes to the first of them (the
-// client derives it, so the routed port can never name one outside the set). No
-// declared port is not "no endpoint" — every workload is credentialed — it means Modal
-// picks, defaulting to 8080.
 func TestProvision_CarriesRegion(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1215,6 +1210,9 @@ func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	}
 }
 
+// The spec carries the declared ports verbatim and the connect URL routes to the first;
+// none is opened as a tunnel, so the rest have no outside address. No declared port still
+// gets a credential, routed to Modal's default 8080.
 func TestProvision_CarriesDeclaredPorts(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1226,10 +1224,9 @@ func TestProvision_CarriesDeclaredPorts(t *testing.T) {
 	}{
 		{"no ports leaves the port to Modal", nil, nil, 0},
 		{"single port", []corev1.ContainerPort{{ContainerPort: 8000}}, []int{8000}, 8000},
-		// Modal routes one port per token, so the first declared port wins — but the
-		// whole set is still exposed.
+		// Modal routes one port per token, so the first declared port wins.
 		{
-			"all exposed, first routed",
+			"first declared port is routed",
 			[]corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}},
 			[]int{8000, 9090},
 			8000,
@@ -1390,9 +1387,7 @@ func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
 
 // Modal reports NO observed endpoint. Its address is the connect URL, published from
 // the create path onto the Pod's annotation, where it persists; re-deriving it per tick
-// would be a round trip for a value the API server already holds. The alternative —
-// falling back to a tunnel URL — is worse than nothing, since a tunnel is public to
-// whoever learns it.
+// would be a round trip for a value the API server already holds.
 func TestToInstance_ReportsNoEndpoint(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 
