@@ -127,13 +127,15 @@ type PodSpec struct {
 	GPUCount int32
 	// VCPUPerGPU and RAMPerGPUGiB are the Pod's cpu/memory requests expressed RunPod's
 	// way — PER GPU, not in total, so the adapter divides by GPUCount and rounds UP
-	// (rounding down would hand the workload less than it asked for). Zero leaves
-	// RunPod's own defaults (2 vCPU, 8 GiB per GPU).
+	// (rounding down would hand the workload less than it asked for). Zero sends no
+	// filter, so any host with the GPU qualifies.
 	VCPUPerGPU   int
 	RAMPerGPUGiB int
 	// VCPUCount is the CPU-only equivalent, an absolute count rather than a per-GPU one,
 	// rounded up to the power of two (at least 2) v2 requires. Only read when GPUCount is 0.
-	// Memory follows from it (see cpuFlavor); the Pod's memory request is not honoured.
+	// v2 takes no memory for a CPU Pod: it is this count times the flavor's ramGbPerVcpu (see
+	// cpuFlavor), so the Pod's memory request is dropped. Honouring it means sizing this
+	// count from memory too; deferred until that ratio is known.
 	VCPUCount int
 	// ContainerDiskGiB is the writable container disk, from the Pod's ephemeral-storage
 	// request. Zero leaves RunPod's default (50 GiB).
@@ -556,7 +558,7 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 		spec.GPUTypeID = ids[0]
 		spec.GPUCount = count
 		// RunPod sizes a GPU Pod's cpu/memory PER GPU, so the Pod's totals are divided by
-		// the count. Zero (nothing requested) leaves RunPod's own per-GPU defaults.
+		// the count (see PodSpec.VCPUPerGPU).
 		spec.VCPUPerGPU = perGPU(cores(resourceQty(&c, corev1.ResourceCPU)), count)
 		spec.RAMPerGPUGiB = perGPU(gib(resourceQty(&c, corev1.ResourceMemory)), count)
 		return spec, nil

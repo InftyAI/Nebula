@@ -39,8 +39,7 @@ import (
 )
 
 // The RunPod REST API v2 (https://docs.runpod.io/api-reference-v2/overview; v1 retires
-// 2026-11-15). There is no official Go SDK, so this is plain net/http — which is also why the
-// whole surface is one small file: the adapter needs five operations.
+// 2026-11-15).
 const (
 	// defaultBaseURL is RunPod's API host; every path carries its own /v2 prefix.
 	// Overridable only in tests (see newClient).
