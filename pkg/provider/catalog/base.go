@@ -149,8 +149,8 @@ func (b Base) PricePerHour(req provider.PriceRequest) (float64, error) {
 		return 0, fmt.Errorf("catalog: %s: accelerator %q with count %d", b.ProviderName, req.AcceleratorType, req.Count)
 	}
 	// An empty tier is the candidate a pool declaring no capacityTypes emits.
-	// servesCapacityTier already reads that as non-Spot, so resolve it here rather than let
-	// row order decide — on AWS that is a threefold difference.
+	// Capabilities.ServesCapacityTier already reads that as non-Spot, so resolve it here
+	// rather than let row order decide — on AWS that is a threefold difference.
 	tier := req.CapacityType
 	if tier == "" {
 		tier = nebulav1alpha1.CapacityOnDemand
