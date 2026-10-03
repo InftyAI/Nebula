@@ -236,11 +236,15 @@ func TestValidateCreate_SkipsPreBoundPod(t *testing.T) {
 	}
 }
 
-func TestValidateUpdate_JudgesOnlyTransitionsIntoOptedIn(t *testing.T) {
+func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
 	sidecarPod := func(labels map[string]string) *corev1.Pod {
 		pod := podWith(labels, "", nebulav1alpha1.ProviderSelectionGate)
 		pod.Spec.Containers = []corev1.Container{{Name: "main"}, {Name: "sidecar"}}
+		return pod
+	}
+	released := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.SchedulingGates = nil
 		return pod
 	}
 	cases := []struct {
@@ -255,7 +259,10 @@ func TestValidateUpdate_JudgesOnlyTransitionsIntoOptedIn(t *testing.T) {
 		// would leave it gated forever.
 		{"already opted in", sidecarPod(optedIn), sidecarPod(optedIn), false},
 		{"still not opted in", sidecarPod(nil), sidecarPod(map[string]string{"other": "x"}), false},
-		{"opting out", sidecarPod(optedIn), sidecarPod(nil), false},
+		// Placement ignores an unlabelled Pod, so nothing would ever release the gate it keeps.
+		{"opting out while gated", sidecarPod(optedIn), sidecarPod(nil), true},
+		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), false},
+		{"opting out after placement", released(sidecarPod(optedIn)), released(sidecarPod(nil)), false},
 	}
 	v := &PodCustomValidator{}
 	for _, tc := range cases {

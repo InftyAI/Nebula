@@ -129,9 +129,10 @@ func (v *PodCustomValidator) ValidateCreate(_ context.Context, obj runtime.Objec
 }
 
 // ValidateUpdate implements webhook.CustomValidator. The shape is immutable but the opt-in
-// label is not, so only a transition INTO opted-in is judged. An already opted-in Pod is
-// left alone: one admitted before this check existed would otherwise have every later
-// write rejected, placement's gate release among them, and stay gated forever.
+// label is not, so only label transitions are judged: opting in gets the CREATE rules, and
+// opting out must not strand Nebula's gate. A Pod staying opted in is left alone: one
+// admitted before this check existed would otherwise have every later write rejected,
+// placement's gate release among them, and stay gated forever.
 func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
 	oldPod, ok := oldObj.(*corev1.Pod)
 	if !ok {
@@ -142,6 +143,12 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 		return nil, fmt.Errorf("expected a Pod object but got %T", newObj)
 	}
 	if optedIn(oldPod) {
+		// Placement ignores a Pod without the label, so it would never release the gate.
+		if !optedIn(newPod) && hasGate(newPod, nebulav1alpha1.ProviderSelectionGate) {
+			return nil, fmt.Errorf("removing label %s would leave the Pod gated forever: also remove "+
+				"scheduling gate %q in the same update, or keep the label",
+				nebulav1alpha1.EnabledLabel, nebulav1alpha1.ProviderSelectionGate)
+		}
 		return nil, nil
 	}
 	return nil, validatePod(newPod)
