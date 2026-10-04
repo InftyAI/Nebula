@@ -519,6 +519,30 @@ func TestProvision_UnsupportedAccelerator(t *testing.T) {
 	}
 }
 
+func TestProvision_DiskAboveDefaultRefused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		limit   string
+		wantErr bool
+	}{
+		"at the default":    {"512Gi", false},
+		"above the default": {"513Gi", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeClient{}
+			p := newTestProvider(f)
+			pod := gpuPod("claim-disk", "H100", 1)
+			pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(tc.limit)
+			_, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-disk"})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Provision err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && f.createCnt != 0 {
+				t.Fatalf("CreateSandbox called %d times for a refused disk", f.createCnt)
+			}
+		})
+	}
+}
+
 func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	denyAll := provider.BlockScope{DenyAll: true}
