@@ -681,8 +681,7 @@ func gib(q *resource.Quantity) int {
 // defaultContainerDiskGiB sizes the container disk of a Pod that requests no ephemeral
 // storage. It must be sent: despite the schema marking disk optional, a create without it
 // fails with "You must either provide a template id or pod configuration parameters".
-// 20 is the smallest size verified to create; the schema allows 1, which is untested.
-const defaultContainerDiskGiB = 20
+const defaultContainerDiskGiB = 1
 
 // ephemeralGiB reads the container's ephemeral-storage request as the container disk size,
 // or defaultContainerDiskGiB when unset.

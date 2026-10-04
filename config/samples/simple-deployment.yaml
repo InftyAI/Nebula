@@ -1,0 +1,44 @@
+# The smallest workload Nebula places: one replica on one L4, serving HTTP on 8080.
+# For a CPU-only Pod, drop the accelerator-type label and the nvidia.com/gpu limit.
+#
+# A Deployment, not a bare Pod, because a provision failure is terminal for the Pod: only a
+# controller recreating it gets the next region tried, past the blocklisted one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simple
+  template:
+    metadata:
+      labels:
+        app: simple
+        nebula.inftyai.com/enabled: "true"
+        nebula.inftyai.com/nodepool: sample
+        nebula.inftyai.com/accelerator-type: l4
+    spec:
+      containers:
+      - name: web
+        # python3 ships in the image, so nothing is installed at boot, and the image is small
+        # enough for RunPod's default container disk (see defaultContainerDiskGiB).
+        image: python:3.12-slim
+        # Serve an EMPTY directory: the endpoint is public and unauthenticated, and serving
+        # / would publish the whole filesystem, /proc/1/environ included.
+        command: ["sh", "-c", "cd \"$(mktemp -d)\" && exec python3 -m http.server 8080"]
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "1"
+            memory: 1Gi
+          limits:
+            nvidia.com/gpu: "1"

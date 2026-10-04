@@ -24,7 +24,7 @@ spec:
     # entry is one failover candidate, so a shortage in one blocklists only that one.
     regions:
     - us
-    - EU-RO-1
+    - eu
   # Outer axis: try OnDemand on every provider first, fall back to Spot.
   capacityTypes:
   - OnDemand
