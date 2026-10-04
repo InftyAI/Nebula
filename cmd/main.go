@@ -151,11 +151,9 @@ func main() {
 			"RBAC to impersonate one virtual node identity — the signer signs for nobody else "+
 			"(see addServingCertificateBootstrap).")
 	flag.StringVar(&providers, "providers", strings.Join(knownProviders, ","),
-		"Comma-separated providers to register; all by default. A listed provider is still skipped "+
-			"when its credentials are absent; an unlisted one is never registered, even with them. "+
-			"An unknown name fails startup. Drain a provider before dropping it: its running "+
-			"instances lose their teardown, since a NodeClaim deleted while its provider is "+
-			"unregistered releases its finalizer without terminating the instance.")
+		"Comma-separated production providers to enable; all by default. A listed provider is "+
+			"skipped if it fails to initialize. Drain a provider before dropping it: nothing "+
+			"terminates its running instances afterwards.")
 	opts := zap.Options{
 		Development: true,
 	}
