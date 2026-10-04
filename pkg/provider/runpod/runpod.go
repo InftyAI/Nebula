@@ -665,7 +665,7 @@ func gib(q *resource.Quantity) int {
 // storage, and PricePerHour charges the same floor. It must be sent: despite the schema
 // marking disk optional, a create without it fails with "You must either provide a template
 // id or pod configuration parameters".
-const defaultContainerDiskGiB = 1
+const defaultContainerDiskGiB = 5
 
 // perGPU divides a Pod-wide total by the accelerator count, rounding up, because RunPod
 // sizes cpu and memory PER GPU. Rounding up keeps the total at or above what the Pod asked
