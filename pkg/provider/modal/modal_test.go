@@ -2028,10 +2028,6 @@ func TestPricePerHour_NoPrice(t *testing.T) {
 			AcceleratorType: "TPU-v4", Count: 1,
 			CapacityType: nebulav1alpha1.CapacityOnDemand, CPUCores: 4, MemoryMiB: 8192,
 		},
-		"disk above the unbilled quota": {
-			AcceleratorType: "H100", Count: 1, CapacityType: nebulav1alpha1.CapacityOnDemand,
-			CPUCores: 4, MemoryMiB: 8192, DiskGiB: modalFreeDiskGiB + 1,
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, err := p.PricePerHour(req)

@@ -749,16 +749,12 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 const awsAMIRootGiB = 30
 
 // awsMaxDiskGiB is the most user space a Pod may ask for: gp3's 16 TiB volume cap less the OS
-// base. Refused at launch and unpriced above it, so it never reaches rootVolume's int32.
+// base. Refused at launch, so it never reaches rootVolume's int32.
 const awsMaxDiskGiB = 16*1024 - awsAMIRootGiB
 
 // PricePerHour overrides catalog.Base to add the root volume, which EBS bills by provisioned
 // size apart from the instance. It prices the size sdkClient.rootVolume launches.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
-	if req.DiskGiB > awsMaxDiskGiB {
-		return 0, fmt.Errorf("aws: %d GiB disk exceeds the %d GiB a root volume can add: %w",
-			req.DiskGiB, awsMaxDiskGiB, provider.ErrNoPrice)
-	}
 	rate, err := p.Base.PricePerHour(req)
 	if err != nil {
 		return 0, err

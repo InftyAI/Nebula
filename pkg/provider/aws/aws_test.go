@@ -1091,10 +1091,6 @@ func TestPricePerHour_AddsRootVolume(t *testing.T) {
 	if !errors.Is(err, provider.ErrNoPrice) {
 		t.Fatalf("PricePerHour(unknown accelerator) err = %v, want ErrNoPrice", err)
 	}
-	req.DiskGiB = awsMaxDiskGiB + 1
-	if _, err = p.PricePerHour(req); !errors.Is(err, provider.ErrNoPrice) {
-		t.Fatalf("PricePerHour(above awsMaxDiskGiB) err = %v, want ErrNoPrice", err)
-	}
 }
 
 func TestProvision_SizesDiskFromEphemeralStorage(t *testing.T) {
