@@ -117,6 +117,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 	}
 
 	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
+	skipped := map[string]string{}             // provider -> why, for the exhausted-walk log
 	for _, tier := range capacityTiers(pool) { // outer: capacity
 		for _, ref := range pool.Spec.Providers { // provider (Ordered = listed order)
 			prov, ok := r.provider(ref.Name)
@@ -124,24 +125,27 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				// No region on this skip and the two below: they are decided before the
 				// walk reaches the region axis, so they rule out every region at once.
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipProviderUnregistered)
+				skipped[ref.Name] = metrics.SkipProviderUnregistered
 				log.V(1).Info("skipping candidate: provider not registered",
 					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
 			}
 			if !prov.Capabilities().ServesCapacityTier(tier) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipCapacityUnsupported)
+				skipped[ref.Name] = metrics.SkipCapacityUnsupported
 				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
 					"provider", ref.Name, "capacityType", tier)
 				continue
 			}
 			if !prov.Capabilities().ServesEgress(pool.Spec.Egress) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipEgressUnsupported)
+				skipped[ref.Name] = metrics.SkipEgressUnsupported
 				log.V(1).Info("skipping candidate: provider cannot enforce the pool's egress policy",
 					"provider", ref.Name, "egressMode", pool.Spec.Egress.ModeOrOpen())
 				continue
 			}
-			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
-			// Pod only matches a provider whose catalog serves that (type, count).
+			// A CPU-only Pod (no accelerator) matches a provider that SupportsCPUOnly; an
+			// accelerator Pod only matches a provider whose catalog serves that (type, count).
 			// MapAccelerator is consulted only for that servability check — the block
 			// key and the reported identity are the POOL (type:count), not the
 			// provider's SKU, so a launch spanning alternates and a post-launch SKU
@@ -150,16 +154,23 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			if accel != "" {
 				if _, offered := prov.MapAccelerator(accel, count); !offered {
 					metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipAcceleratorUnsupported)
+					skipped[ref.Name] = metrics.SkipAcceleratorUnsupported
 					log.V(1).Info("skipping candidate: provider does not offer the accelerator",
 						"provider", ref.Name, "accelerator", accel, "count", count)
 					continue
 				}
+			} else if !prov.Capabilities().SupportsCPUOnly {
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipAcceleratorUnsupported)
+				skipped[ref.Name] = metrics.SkipAcceleratorUnsupported
+				log.V(1).Info("skipping candidate: provider does not run CPU-only Pods", "provider", ref.Name)
+				continue
 			}
 			// Empty means the pool's declaration, or the Pod's narrowing of it, reaches
 			// no region this provider can place in.
 			regions := prov.ResolveRegions(ref.Regions, narrowTo)
 			if len(regions) == 0 {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipNoAvailableRegions)
+				skipped[ref.Name] = metrics.SkipNoAvailableRegions
 				log.V(1).Info("skipping candidate: no available region serves the requested geographies",
 					"provider", ref.Name, "capacityType", tier, "regions", narrowTo)
 				continue
@@ -196,6 +207,8 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 		metrics.RecordDeferral(pool.Name, metrics.DeferAllBlocked)
 	} else {
 		metrics.RecordDeferral(pool.Name, metrics.DeferNoCandidate)
+		log.Info("no provider in pool can serve the Pod; leaving it gated",
+			"accelerator", util.AcceleratorPool(accel, count), "skipped", skipped)
 	}
 	return placement{}, false, soonest
 }

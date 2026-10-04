@@ -32,7 +32,6 @@ import (
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
-	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -247,10 +246,10 @@ func TestPlacement_NarrowingToNoRegionFilesNoAvailableRegions(t *testing.T) {
 	noRegions := skipLabels(provider.ProviderAWS, nebulav1alpha1.CapacityOnDemand, "", metrics.SkipNoAvailableRegions)
 	before := counterVal(t, metrics.CandidateSkips, noRegions)
 
-	pod := gatedPod("r1", "default", "uid-r1", "pool", "")
+	pod := gatedPod("r1", "default", "uid-r1", "pool", "T4")
 	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "af"}
 	pool := poolWith("pool", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderAWS)
-	r, _ := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+	r, _ := newPlacementReconciler(t, []client.Object{pod, pool}, catalogAWS(t))
 	reconcilePod(t, r, "default", "r1")
 
 	if got := counterVal(t, metrics.CandidateSkips, noRegions) - before; got != 1 {

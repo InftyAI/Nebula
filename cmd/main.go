@@ -58,6 +58,7 @@ import (
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
+	"github.com/InftyAI/Nebula/pkg/provider/runpod"
 	"github.com/InftyAI/Nebula/pkg/vnode"
 	// +kubebuilder:scaffold:imports
 )
@@ -544,7 +545,7 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBoots
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames=nebula-kubelet-serving,verbs=delete;get
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames=nebula-kubelet-serving,verbs=update
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=kubernetes.io/kubelet-serving,verbs=approve
-// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-fake"},verbs=impersonate
+// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-runpod","system:node:nebula-fake"},verbs=impersonate
 // +kubebuilder:rbac:groups="",resources=groups,resourceNames="system:nodes",verbs=impersonate
 
 // addServingCertificateBootstrap requests a trusted serving certificate for the kubelet
@@ -647,19 +648,12 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 		return modal.NewSDKClient(ctx, appName, os.Getenv("MODAL_ENVIRONMENT"))
 	})
 
-	// AWS. There is NO region env/flag: the regions this provider may use are declared
-	// per-pool in the NodePool (ProviderSpec.Regions) and read at call time via the
-	// region source below, so a pool added at runtime widens the fan-out without a
-	// restart. One AWS provider spans every such region (per-region clients are built
-	// lazily). The adapter is otherwise self-configuring: it resolves each region's
-	// GPU AMI and default-VPC subnets itself, so no launch template or pre-created
-	// infra is needed. Credentials are secrets and are NEVER read here: the SDK client
-	// uses the default credential chain (IRSA / instance-role / AWS_ACCESS_KEY_ID
-	// delivered via a Secret), and one account-global credential authorizes every
-	// region. Registration only fails (and is a non-fatal skip) if the price catalog
-	// cannot load — region config can no longer make it fail.
 	register(provider.ProviderAWS, func() (provider.Provider, error) {
 		return awsprovider.NewSDKClient(ctx, awsRegionSource(c))
+	})
+
+	register(provider.ProviderRunPod, func() (provider.Provider, error) {
+		return runpod.NewSDKClient(ctx)
 	})
 
 	// The fake provider is an in-memory backend used only by the e2e suite to
@@ -675,7 +669,7 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 
 // knownProviders are the names --providers accepts, one per register call above. The fake
 // provider is not among them: it stays gated on its env var alone.
-var knownProviders = []string{provider.ProviderModal, provider.ProviderAWS}
+var knownProviders = []string{provider.ProviderModal, provider.ProviderAWS, provider.ProviderRunPod}
 
 // parseProviders turns --providers into the enabled set. An unknown name is an error rather
 // than ignored, so a typo cannot silently leave a provider off.

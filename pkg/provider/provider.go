@@ -220,10 +220,10 @@ type ProvisionRequest struct {
 	// nowhere to live on the Pod.
 	CapacityType nebulav1alpha1.CapacityType
 	// Region is the ONE candidate placement chose, exactly as this provider's own
-	// ResolveRegions minted it — already resolved (never a group token) and opaque to the
-	// control plane. Usually one concrete region (AWS "us-east-1"), which is what lets a
-	// capacity failure blocklist just that region; a provider that cannot fail over
-	// (Modal) may encode several for its own scheduler, and only that adapter parses it.
+	// ResolveRegions minted it, opaque to the control plane: only that adapter parses it.
+	// Usually one concrete region (AWS "us-east-1"), which is what lets a capacity failure
+	// blocklist just that region; Modal encodes several for its own scheduler, and RunPod
+	// keeps a geography token that it expands to data centers at create time.
 	//
 	// Empty means "no region constraint".
 	Region string
@@ -321,6 +321,8 @@ type Capabilities struct {
 	// a policy that says otherwise (AWS: false — its instances land in the default VPC, so
 	// enforcement needs security-group egress rules and no NAT, not one API field).
 	SupportsEgressPolicy bool
+	// SupportsCPUOnly is true if the provider runs a Pod with no accelerator.
+	SupportsCPUOnly bool
 	// NativeTags is true if the provider has real instance tags/labels; when
 	// false, identity is encoded in the instance name (RunPod: false).
 	NativeTags bool
@@ -429,9 +431,16 @@ type Offering struct {
 	PricePerHour    float64
 	Available       bool
 	// Region is the provider region this row prices, in the provider's own
-	// vocabulary (e.g. AWS "us-east-1"). Empty for region-simple providers whose
-	// catalog is not region-partitioned (Modal, RunPod); a region-aware provider
-	// emits one row per {accelerator, capacityType, region}.
+	// vocabulary (e.g. AWS "us-east-1"). Empty when a provider's catalog is not
+	// region-partitioned; a region-aware provider emits one row per {accelerator,
+	// capacityType, region}.
+	//
+	// Empty here is about PRICING, and says nothing about whether the provider has a
+	// region axis at all — the two are independent. Modal has neither. RunPod prices
+	// every data center alike, so its rows carry no region, yet region IS a real
+	// placement axis for it (a pool's regions become RunPod dataCenterIds). AWS's rows
+	// are blank for a third reason: its per-region truth is probed live rather than
+	// hand-maintained.
 	Region string
 	// AcceleratorID is this provider's own name for what serves the canonical
 	// AcceleratorType (AWS "p5.48xlarge" for H100) — the lookup data MapAccelerator
@@ -473,9 +482,9 @@ type BlockScope struct {
 	Accelerator *string
 	// CapacityType empty => blocks all capacity types.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region: nil => the provider has no region axis (Modal/RunPod, whose candidates
-	// carry an empty region too); &"us-east-1" => that region only, so a shortage there
-	// does not disqualify us-west-2.
+	// Region: nil => the provider has no region axis (Modal, whose candidates carry an
+	// empty region too); &"us-east-1" => that region only, so a shortage there does not
+	// disqualify us-west-2.
 	Region *string
 	// DenyAll true => block everything on this provider (auth/quota errors), ignoring the
 	// fields above. Still scoped to this one provider; it never spans providers.

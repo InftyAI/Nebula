@@ -152,8 +152,6 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				"pod", pod.Name, "pool", pool.Name, "retryAfter", retryAfter.String())
 			return ctrl.Result{RequeueAfter: retryAfter}, nil
 		}
-		log.Info("no provider in pool can serve the Pod; leaving it gated",
-			"pod", pod.Name, "pool", pool.Name)
 		return ctrl.Result{}, nil
 	}
 

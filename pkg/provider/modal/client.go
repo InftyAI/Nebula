@@ -714,7 +714,7 @@ func (c *sdkClient) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
 }
 
 // FindSandbox implements Client. Modal's Tags filter matches exact key=value pairs, which is
-// useless for ListSandboxes (every claim value differs) but exactly one claim's lookup.
+// useless for ListSandboxes (every claim value differs) but is ideal for one claim's lookup.
 func (c *sdkClient) FindSandbox(ctx context.Context, claimName string) (*Sandbox, error) {
 	app, err := c.app(ctx)
 	if err != nil {
