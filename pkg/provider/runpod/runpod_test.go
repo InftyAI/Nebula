@@ -346,7 +346,7 @@ func TestFindByClaim(t *testing.T) {
 	}
 	// Provision refuses an overlong name, so nothing exists for it. An error here would
 	// wedge the NodeClaim finalizer on every retry.
-	long := strings.Repeat("x", maxNameLen)
+	long := strings.Repeat("x", maxNameLen+1)
 	if got, err := p.FindByClaim(ctx, long, ""); err != nil || got != nil {
 		t.Fatalf("FindByClaim(overlong) = %+v, %v; want nil, nil", got, err)
 	}

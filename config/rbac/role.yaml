@@ -66,6 +66,7 @@ rules:
   - system:node:nebula-aws
   - system:node:nebula-fake
   - system:node:nebula-modal
+  - system:node:nebula-runpod
   resources:
   - users
   verbs:

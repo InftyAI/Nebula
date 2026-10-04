@@ -545,7 +545,7 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBoots
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames=nebula-kubelet-serving,verbs=delete;get
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames=nebula-kubelet-serving,verbs=update
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=kubernetes.io/kubelet-serving,verbs=approve
-// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-fake"},verbs=impersonate
+// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-runpod","system:node:nebula-fake"},verbs=impersonate
 // +kubebuilder:rbac:groups="",resources=groups,resourceNames="system:nodes",verbs=impersonate
 
 // addServingCertificateBootstrap requests a trusted serving certificate for the kubelet

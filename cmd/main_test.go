@@ -18,9 +18,15 @@ package main
 
 import (
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"testing"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+	"sigs.k8s.io/yaml"
+
+	"github.com/InftyAI/Nebula/pkg/vnode"
 )
 
 func TestParseProviders(t *testing.T) {
@@ -56,5 +62,32 @@ func TestParseProviders(t *testing.T) {
 				t.Fatalf("parseProviders(%q) = %v, want %v", tc.in, names, want)
 			}
 		})
+	}
+}
+
+// TestImpersonateGrantCoversKnownProviders guards the serving-certificate bootstrap: it
+// impersonates whichever provider registers first, and a missing grant only surfaces at
+// runtime as a Forbidden retry loop. Reads the generated role, so a stale `make manifests`
+// fails too.
+func TestImpersonateGrantCoversKnownProviders(t *testing.T) {
+	raw, err := os.ReadFile("../config/rbac/role.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var role rbacv1.ClusterRole
+	if err := yaml.Unmarshal(raw, &role); err != nil {
+		t.Fatal(err)
+	}
+	var users []string
+	for _, r := range role.Rules {
+		if slices.Contains(r.Resources, "users") && slices.Contains(r.Verbs, "impersonate") {
+			users = append(users, r.ResourceNames...)
+		}
+	}
+	for _, name := range knownProviders {
+		if id := vnode.NodeIdentity(vnode.NodeName(name)); !slices.Contains(users, id) {
+			t.Errorf("role.yaml grants no impersonate on %s; add it to the marker in main.go "+
+				"and run `make manifests`", id)
+		}
 	}
 }
