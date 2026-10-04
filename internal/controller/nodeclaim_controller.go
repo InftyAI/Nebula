@@ -405,13 +405,18 @@ func (r *NodeClaimReconciler) recordPrice(ctx context.Context, nc *nebulav1alpha
 		return false
 	}
 	cpuCores, memoryMiB := util.PodReservation(pod)
+	diskGiB, err := util.PodEphemeralStorageGiB(pod)
+	if err != nil {
+		log.V(1).Info("skipping price: unsupported disk request", "error", err)
+		return false
+	}
 	rate, err := pricer.PricePerHour(provider.PriceRequest{
 		AcceleratorType: accelerator,
 		Count:           count,
 		CapacityType:    nc.Spec.CapacityType,
 		CPUCores:        cpuCores,
 		MemoryMiB:       memoryMiB,
-		DiskGiB:         util.PodEphemeralStorageGiB(pod),
+		DiskGiB:         diskGiB,
 	})
 	if err != nil {
 		if errors.Is(err, provider.ErrNoPrice) {

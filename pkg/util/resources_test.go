@@ -113,20 +113,28 @@ func TestPodEphemeralStorageGiB(t *testing.T) {
 		return corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(s)}
 	}
 	cases := map[string]struct {
-		pod  *corev1.Pod
-		want int
+		pod     *corev1.Pod
+		want    int
+		wantErr bool
 	}{
-		"limit wins over request": {podWith(storage("10Gi"), storage("50Gi")), 50},
-		"request alone":           {podWith(storage("10Gi"), nil), 10},
-		"rounds up to whole GiB":  {podWith(storage("1500Mi"), nil), 2},
-		"decimal units round up":  {podWith(storage("20G"), nil), 19},
-		"unset":                   {podWith(nil, nil), 0},
-		"no containers":           {&corev1.Pod{}, 0},
-		"nil pod":                 {nil, 0},
+		"limit wins over request": {podWith(storage("10Gi"), storage("50Gi")), 50, false},
+		"request alone":           {podWith(storage("10Gi"), nil), 10, false},
+		"rounds up to whole GiB":  {podWith(storage("1500Mi"), nil), 2, false},
+		"decimal units round up":  {podWith(storage("20G"), nil), 19, false},
+		"exactly the cap":         {podWith(nil, storage("16Ti")), MaxEphemeralStorageGiB, false},
+		"above the cap":           {podWith(nil, storage("16385Gi")), 0, true},
+		"near MaxInt64 bytes":     {podWith(storage("1Gi"), storage("9223372035Gi")), 0, true},
+		"unset":                   {podWith(nil, nil), 0, false},
+		"no containers":           {&corev1.Pod{}, 0, false},
+		"nil pod":                 {nil, 0, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := PodEphemeralStorageGiB(tc.pod); got != tc.want {
+			got, err := PodEphemeralStorageGiB(tc.pod)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("PodEphemeralStorageGiB err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
 				t.Errorf("PodEphemeralStorageGiB = %d, want %d", got, tc.want)
 			}
 		})

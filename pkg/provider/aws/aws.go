@@ -797,6 +797,10 @@ func (p *Provider) instanceSpecFromPod(
 		return InstanceSpec{}, errors.New(
 			"aws: pod requests no accelerator; EC2 GPU provisioning needs an accelerator type and count")
 	}
+	diskGiB, err := util.PodEphemeralStorageGiB(pod)
+	if err != nil {
+		return InstanceSpec{}, fmt.Errorf("aws: %w", err)
+	}
 	instanceTypes, ok := p.MapAccelerator(canonical, count)
 	if !ok {
 		return InstanceSpec{}, fmt.Errorf("aws: no EC2 instance type for %s x%d", canonical, count)
@@ -823,7 +827,7 @@ func (p *Provider) instanceSpecFromPod(
 		Spot:    req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:  req.Region,
 		Tags:    map[string]string{ClaimTagKey: req.ClaimName},
-		DiskGiB: util.PodEphemeralStorageGiB(pod),
+		DiskGiB: diskGiB,
 	}, nil
 }
 
