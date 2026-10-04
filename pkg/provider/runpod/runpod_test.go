@@ -166,7 +166,11 @@ func TestProvision_GPUPod(t *testing.T) {
 		corev1.ResourceMemory:           "100Gi",
 		corev1.ResourceEphemeralStorage: "80Gi",
 	})
-	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}}
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{
+		{ContainerPort: 5353, Protocol: corev1.ProtocolUDP}, // skipped, so not the ConnectURL port
+		{ContainerPort: 8000},
+		{ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
+	}
 
 	res, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName:    "claim-a",
@@ -229,7 +233,7 @@ func TestProvision_GPUPod(t *testing.T) {
 		t.Errorf("ContainerDiskGiB = %d, want 80", s.ContainerDiskGiB)
 	}
 	if strings.Join(s.Ports, ",") != "8000/http,9090/http" {
-		t.Errorf("Ports = %v, want both as /http", s.Ports)
+		t.Errorf("Ports = %v, want the TCP ports as /http, UDP skipped", s.Ports)
 	}
 	if strings.Join(s.DataCenterIDs, ",") != "US-KS-2" {
 		t.Errorf("DataCenterIDs = %v, want [US-KS-2]", s.DataCenterIDs)

@@ -602,13 +602,16 @@ func dataCentersOf(region string) []string {
 // assigned public port that must be read back after boot. A Pod serving raw TCP is
 // therefore not addressable today; a containerPort carries no hint of its protocol above
 // TCP/UDP, so the common case is what gets served.
+//
+// Only TCP ports are exposed (an unset Protocol is TCP). UDP and SCTP, which RunPod cannot
+// expose at all, are skipped rather than refused: a port the workload never serves
+// externally should not block creating the Pod. Skipping also keeps one out of proxyURL.
 func containerPorts(c *corev1.Container) []string {
-	if len(c.Ports) == 0 {
-		return nil
-	}
-	ports := make([]string, 0, len(c.Ports))
+	var ports []string
 	for _, p := range c.Ports {
-		ports = append(ports, fmt.Sprintf("%d/http", p.ContainerPort))
+		if p.Protocol == "" || p.Protocol == corev1.ProtocolTCP {
+			ports = append(ports, fmt.Sprintf("%d/http", p.ContainerPort))
+		}
 	}
 	return ports
 }
