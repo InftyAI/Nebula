@@ -17,6 +17,7 @@ limitations under the License.
 package util
 
 import (
+	"math"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -105,5 +106,32 @@ func TestPodReservation_FirstContainerOnly(t *testing.T) {
 
 	if cpu, _ := PodReservation(pod); cpu != 1 {
 		t.Fatalf("PodReservation cpu = %v, want 1 (the first container's)", cpu)
+	}
+}
+
+func TestPodEphemeralStorageGiB(t *testing.T) {
+	storage := func(s string) corev1.ResourceList {
+		return corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(s)}
+	}
+	cases := map[string]struct {
+		pod  *corev1.Pod
+		want int
+	}{
+		"limit wins over request": {podWith(storage("10Gi"), storage("50Gi")), 50},
+		"request alone":           {podWith(storage("10Gi"), nil), 10},
+		"rounds up to whole GiB":  {podWith(storage("1500Mi"), nil), 2},
+		"decimal units round up":  {podWith(storage("20G"), nil), 19},
+		// Value saturates at MaxInt64 bytes; rounding must not wrap it negative.
+		"near MaxInt64 bytes": {podWith(storage("1Gi"), storage("9223372035Gi")), math.MaxInt64/(1<<30) + 1},
+		"unset":               {podWith(nil, nil), 0},
+		"no containers":       {&corev1.Pod{}, 0},
+		"nil pod":             {nil, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := PodEphemeralStorageGiB(tc.pod); got != tc.want {
+				t.Errorf("PodEphemeralStorageGiB = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

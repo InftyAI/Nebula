@@ -36,6 +36,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -1037,8 +1038,8 @@ func TestResolveGPUAMI_PicksNewestAndErrsWhenAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveGPUAMI: %v", err)
 	}
-	if got != "ami-new" {
-		t.Fatalf("resolveGPUAMI = %q, want ami-new (newest)", got)
+	if id := awssdk.ToString(got.ImageId); id != "ami-new" {
+		t.Fatalf("resolveGPUAMI = %q, want ami-new (newest)", id)
 	}
 
 	// No matching image => ErrConfig (AWS unusable in the region, non-fatal skip).
@@ -1068,5 +1069,64 @@ func TestDiscoverDefaultSubnets_ReturnsPerAZTargets(t *testing.T) {
 	c2 := newSDKClient(f2)
 	if got, err := c2.discoverDefaultSubnets(context.Background()); err != nil || len(got) != 0 {
 		t.Fatalf("discoverDefaultSubnets(no default VPC) = (%+v, %v), want (nil, nil)", got, err)
+	}
+}
+
+func TestPricePerHour_AddsRootVolume(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	req := provider.PriceRequest{AcceleratorType: "T4", Count: 1, CapacityType: nebulav1alpha1.CapacityOnDemand}
+
+	// The OS base is billed even with no disk requested: EBS charges the provisioned size.
+	got, err := p.PricePerHour(req)
+	if want := 0.526 + data.AWSRootVolumeCostPerHour(awsAMIRootGiB); err != nil || got != want {
+		t.Fatalf("PricePerHour(no disk) = %v, %v; want instance + OS base %v", got, err, want)
+	}
+	req.DiskGiB = 100
+	got, err = p.PricePerHour(req)
+	if want := 0.526 + data.AWSRootVolumeCostPerHour(awsAMIRootGiB+100); err != nil || got != want {
+		t.Fatalf("PricePerHour(100 GiB) = %v, %v; want instance + base + 100 GiB %v", got, err, want)
+	}
+	// No instance price means no price at all, not a disk-only one.
+	_, err = p.PricePerHour(provider.PriceRequest{AcceleratorType: "B200", Count: 8, DiskGiB: 100})
+	if !errors.Is(err, provider.ErrNoPrice) {
+		t.Fatalf("PricePerHour(unknown accelerator) err = %v, want ErrNoPrice", err)
+	}
+	req.DiskGiB = awsMaxDiskGiB + 1
+	if _, err = p.PricePerHour(req); !errors.Is(err, provider.ErrNoPrice) {
+		t.Fatalf("PricePerHour(above awsMaxDiskGiB) err = %v, want ErrNoPrice", err)
+	}
+}
+
+func TestProvision_SizesDiskFromEphemeralStorage(t *testing.T) {
+	f := &fakeClient{runID: "i-disk"}
+	p := newTestProvider(f)
+	pod := gpuPod("T4", 1)
+	pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("200Gi")
+
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-disk",
+		Region:    "us-west-2",
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := f.lastSpec.DiskGiB; got != 200 {
+		t.Fatalf("spec DiskGiB = %d, want 200", got)
+	}
+}
+
+func TestProvision_RefusesDiskAboveVolumeCap(t *testing.T) {
+	f := &fakeClient{runID: "i-disk"}
+	p := newTestProvider(f)
+	pod := gpuPod("T4", 1)
+	pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("16Ti")
+
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-disk",
+		Region:    "us-west-2",
+	}); err == nil {
+		t.Fatal("Provision of 16 TiB user space succeeded, want refusal: the OS base pushes it past gp3's cap")
+	}
+	if f.runCnt != 0 {
+		t.Fatalf("RunInstance called %d times for a refused disk", f.runCnt)
 	}
 }

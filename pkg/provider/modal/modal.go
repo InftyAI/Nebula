@@ -395,6 +395,10 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 	return []string{strings.Join(regions, regionSeparator)}
 }
 
+// modalFreeDiskGiB is the per-container disk Modal grants by default, without charge, and the
+// most Nebula can get: sandboxSpecFromPod refuses a Pod asking for more.
+const modalFreeDiskGiB = 512
+
 // PricePerHour overrides catalog.Base's all-in reading of the catalog, because Modal
 // meters CPU and memory SEPARATELY from the accelerator: a modal.csv row prices ONE GPU
 // and nothing else, so the sandbox's real rate is that plus what its reservation costs.
@@ -408,7 +412,14 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 // applies its own defaults, and we do not know them. Unpriced is the honest answer — a 0
 // would be read as free. A GPU sandbox in that state still prices, understating by those
 // same defaults, which is immaterial beside the accelerator.
+//
+// Disk adds nothing up to modalFreeDiskGiB; above it is ErrNoPrice, since such a Pod is
+// never launched (see sandboxSpecFromPod).
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	if req.DiskGiB > modalFreeDiskGiB {
+		return 0, fmt.Errorf("modal: %d GiB disk exceeds the unbilled %d GiB: %w",
+			req.DiskGiB, modalFreeDiskGiB, provider.ErrNoPrice)
+	}
 	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
 
 	if req.AcceleratorType == "" {
@@ -609,6 +620,12 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		return SandboxSpec{}, errors.New("modal: pod has no containers")
 	}
 	c := pod.Spec.Containers[0]
+
+	// Refused, not launched short: Nebula cannot ask Modal for more than its default disk
+	// (the SDK has no field for it), so the workload's writes past modalFreeDiskGiB would fail.
+	if diskGiB := util.PodEphemeralStorageGiB(pod); diskGiB > modalFreeDiskGiB {
+		return SandboxSpec{}, fmt.Errorf("modal: %d GiB disk exceeds the %d GiB Modal provides", diskGiB, modalFreeDiskGiB)
+	}
 
 	tags := map[string]string{ClaimTagKey: req.ClaimName}
 	// Record probe-ness alongside identity so observe can recover it later; see

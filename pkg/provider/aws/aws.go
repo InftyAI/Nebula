@@ -50,6 +50,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -167,6 +168,9 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// DiskGiB is the user space added to the root volume's OS base, from
+	// util.PodEphemeralStorageGiB; see sdkClient.rootVolume.
+	DiskGiB int
 }
 
 // EC2Instance is the adapter-level view of one EC2 instance as observed.
@@ -739,6 +743,29 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
+// awsAMIRootGiB is the GPU AMI's root snapshot (30 GiB in every region checked, 2026-10-04),
+// the OS base of every root volume. A constant because pricing has no region to resolve the
+// AMI in; a larger snapshot is logged at client construction, since it under-prices.
+const awsAMIRootGiB = 30
+
+// awsMaxDiskGiB is the most user space a Pod may ask for: gp3's 16 TiB volume cap less the OS
+// base. Refused at launch and unpriced above it, so it never reaches rootVolume's int32.
+const awsMaxDiskGiB = 16*1024 - awsAMIRootGiB
+
+// PricePerHour overrides catalog.Base to add the root volume, which EBS bills by provisioned
+// size apart from the instance. It prices the size sdkClient.rootVolume launches.
+func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	if req.DiskGiB > awsMaxDiskGiB {
+		return 0, fmt.Errorf("aws: %d GiB disk exceeds the %d GiB a root volume can add: %w",
+			req.DiskGiB, awsMaxDiskGiB, provider.ErrNoPrice)
+	}
+	rate, err := p.Base.PricePerHour(req)
+	if err != nil {
+		return 0, err
+	}
+	return rate + data.AWSRootVolumeCostPerHour(awsAMIRootGiB+req.DiskGiB), nil
+}
+
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
 // accelerator type (from the AcceleratorTypeLabel), maps it to an EC2 instance
 // type via the catalog, and stamps the claim tag, capacity tier, and region.
@@ -778,6 +805,10 @@ func (p *Provider) instanceSpecFromPod(
 		return InstanceSpec{}, errors.New(
 			"aws: pod requests no accelerator; EC2 GPU provisioning needs an accelerator type and count")
 	}
+	diskGiB := util.PodEphemeralStorageGiB(pod)
+	if diskGiB > awsMaxDiskGiB {
+		return InstanceSpec{}, fmt.Errorf("aws: %d GiB disk exceeds the %d GiB a root volume can add", diskGiB, awsMaxDiskGiB)
+	}
 	instanceTypes, ok := p.MapAccelerator(canonical, count)
 	if !ok {
 		return InstanceSpec{}, fmt.Errorf("aws: no EC2 instance type for %s x%d", canonical, count)
@@ -800,10 +831,11 @@ func (p *Provider) instanceSpecFromPod(
 		// TODO: deliver Secret-derived values out-of-band — SSM Parameter Store / Secrets
 		// Manager under the claim, fetched at boot with the instance profile — and keep only
 		// non-sensitive values in user-data.
-		Env:    req.Env,
-		Spot:   req.CapacityType == nebulav1alpha1.CapacitySpot,
-		Region: req.Region,
-		Tags:   map[string]string{ClaimTagKey: req.ClaimName},
+		Env:     req.Env,
+		Spot:    req.CapacityType == nebulav1alpha1.CapacitySpot,
+		Region:  req.Region,
+		Tags:    map[string]string{ClaimTagKey: req.ClaimName},
+		DiskGiB: diskGiB,
 	}, nil
 }
 
