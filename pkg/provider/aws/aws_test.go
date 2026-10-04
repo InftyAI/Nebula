@@ -1072,18 +1072,19 @@ func TestDiscoverDefaultSubnets_ReturnsPerAZTargets(t *testing.T) {
 	}
 }
 
-func TestPricePerHour_AddsRequestedRootVolume(t *testing.T) {
+func TestPricePerHour_AddsRootVolume(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	req := provider.PriceRequest{AcceleratorType: "T4", Count: 1, CapacityType: nebulav1alpha1.CapacityOnDemand}
 
+	// The OS base is billed even with no disk requested: EBS charges the provisioned size.
 	got, err := p.PricePerHour(req)
-	if err != nil || got != 0.526 {
-		t.Fatalf("PricePerHour(no disk) = %v, %v; want the bare instance price 0.526", got, err)
+	if want := 0.526 + data.AWSRootVolumeCostPerHour(awsAMIRootGiB); err != nil || got != want {
+		t.Fatalf("PricePerHour(no disk) = %v, %v; want instance + OS base %v", got, err, want)
 	}
 	req.DiskGiB = 100
 	got, err = p.PricePerHour(req)
-	if want := 0.526 + data.AWSRootVolumeCostPerHour(100); err != nil || got != want {
-		t.Fatalf("PricePerHour(100 GiB) = %v, %v; want %v", got, err, want)
+	if want := 0.526 + data.AWSRootVolumeCostPerHour(awsAMIRootGiB+100); err != nil || got != want {
+		t.Fatalf("PricePerHour(100 GiB) = %v, %v; want instance + base + 100 GiB %v", got, err, want)
 	}
 	// No instance price means no price at all, not a disk-only one.
 	_, err = p.PricePerHour(provider.PriceRequest{AcceleratorType: "B200", Count: 8, DiskGiB: 100})

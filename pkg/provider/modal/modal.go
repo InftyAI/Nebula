@@ -395,6 +395,9 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 	return []string{strings.Join(regions, regionSeparator)}
 }
 
+// modalFreeDiskGiB is the per-container disk quota Modal grants without charge.
+const modalFreeDiskGiB = 512
+
 // PricePerHour overrides catalog.Base's all-in reading of the catalog, because Modal
 // meters CPU and memory SEPARATELY from the accelerator: a modal.csv row prices ONE GPU
 // and nothing else, so the sandbox's real rate is that plus what its reservation costs.
@@ -408,9 +411,14 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 // applies its own defaults, and we do not know them. Unpriced is the honest answer — a 0
 // would be read as free. A GPU sandbox in that state still prices, understating by those
 // same defaults, which is immaterial beside the accelerator.
+//
+// Disk adds nothing up to modalFreeDiskGiB. Above it Modal bills disk as extra memory, which
+// is not modelled yet, so such a request is ErrNoPrice rather than an understated rate.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
-	// Modal has a free 512GiB of disk, so we only charge for cpu and memory here.
-	// TODO: handle disk pricing if the sandbox requests more than the free 512GiB.
+	if req.DiskGiB > modalFreeDiskGiB {
+		return 0, fmt.Errorf("modal: %d GiB disk exceeds the unbilled %d GiB: %w",
+			req.DiskGiB, modalFreeDiskGiB, provider.ErrNoPrice)
+	}
 	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
 
 	if req.AcceleratorType == "" {

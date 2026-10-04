@@ -399,12 +399,16 @@ const nvidiaGPUResource = "nvidia.com/gpu"
 // (amd.com/gpu, a typed MIG key) would have its GPU Pods rejected before provisioning;
 // when one lands, have Capabilities declare its resource keys and build capacity from
 // that.
-// Support at least 1k workloads with 64 cpu, 256 Gib, 8GPU per virtual node.
+// Support at least 1k workloads with 64 cpu, 256 Gib, 8GPU, 16 TiB disk per virtual node.
+// ephemeral-storage must be listed: an unadvertised resource is zero allocatable, so every
+// Pod sizing its disk (util.PodEphemeralStorageGiB) would fail to schedule. 16 TiB is gp3's
+// largest volume.
 func virtualCapacity() corev1.ResourceList {
 	return corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse("64k"),
-		corev1.ResourceMemory: resource.MustParse("250Ti"),
-		corev1.ResourcePods:   resource.MustParse("1k"),
-		nvidiaGPUResource:     resource.MustParse("8k"),
+		corev1.ResourceCPU:              resource.MustParse("64k"),
+		corev1.ResourceMemory:           resource.MustParse("250Ti"),
+		corev1.ResourceEphemeralStorage: resource.MustParse("16Pi"),
+		corev1.ResourcePods:             resource.MustParse("1k"),
+		nvidiaGPUResource:               resource.MustParse("8k"),
 	}
 }

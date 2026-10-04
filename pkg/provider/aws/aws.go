@@ -168,8 +168,8 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
-	// DiskGiB sizes the gp3 root volume, from util.PodEphemeralStorageGiB. 0 keeps the AMI's
-	// own root volume untouched.
+	// DiskGiB is the user space added to the root volume's OS base, from
+	// util.PodEphemeralStorageGiB; see sdkClient.rootVolume.
 	DiskGiB int
 }
 
@@ -743,17 +743,19 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
-// PricePerHour overrides catalog.Base to add the root volume, which EBS bills apart from
-// the instance. Only a requested disk is priced: an unset one keeps the AMI's root volume,
-// whose size is per-region and unknown here, so its few mills an hour go unreported. A
-// request below that size launches at the AMI's size (see sdkClient.rootVolume) and is
-// priced at the request.
+// awsAMIRootGiB is the GPU AMI's root snapshot (30 GiB in every region checked, 2026-10-04),
+// the OS base of every root volume. A constant because pricing has no region to resolve the
+// AMI in; a larger snapshot is logged at client construction, since it under-prices.
+const awsAMIRootGiB = 30
+
+// PricePerHour overrides catalog.Base to add the root volume, which EBS bills by provisioned
+// size apart from the instance. It prices the size sdkClient.rootVolume launches.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
 	rate, err := p.Base.PricePerHour(req)
 	if err != nil {
 		return 0, err
 	}
-	return rate + data.AWSRootVolumeCostPerHour(req.DiskGiB), nil
+	return rate + data.AWSRootVolumeCostPerHour(awsAMIRootGiB+req.DiskGiB), nil
 }
 
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the

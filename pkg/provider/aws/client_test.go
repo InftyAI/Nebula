@@ -1281,17 +1281,17 @@ func TestRootDeviceOf(t *testing.T) {
 
 func TestSDKRunInstance_SizesRootVolume(t *testing.T) {
 	cases := map[string]struct {
-		disk     int
-		wantSize int32 // 0 => no mapping at all
+		disk, amiRoot int
+		wantSize      int32
 	}{
-		"unset keeps the AMI's volume": {0, 0},
-		"larger than the AMI":          {200, 200},
-		"never below the AMI snapshot": {10, 30},
+		"unset is the OS base alone, still gp3": {0, 30, 30},
+		"user space adds to the base":           {10, 30, 40},
+		"a larger snapshot raises the base":     {10, 50, 60},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := &fakeEC2{fleetOut: fleetWith("i-1")}
-			c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", rootDevice: "/dev/xvda", rootGiB: 30}
+			c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", rootDevice: "/dev/xvda", rootGiB: tc.amiRoot}
 			if _, err := c.RunInstance(context.Background(), InstanceSpec{
 				InstanceTypes: []string{"g4dn.xlarge"}, Image: "img", DiskGiB: tc.disk,
 				Tags: map[string]string{ClaimTagKey: "c"},
@@ -1299,12 +1299,6 @@ func TestSDKRunInstance_SizesRootVolume(t *testing.T) {
 				t.Fatalf("RunInstance: %v", err)
 			}
 			bdm := f.lastLTData.BlockDeviceMappings
-			if tc.wantSize == 0 {
-				if len(bdm) != 0 {
-					t.Fatalf("BlockDeviceMappings = %+v, want none", bdm)
-				}
-				return
-			}
 			if len(bdm) != 1 || awssdk.ToString(bdm[0].DeviceName) != "/dev/xvda" || bdm[0].Ebs == nil {
 				t.Fatalf("BlockDeviceMappings = %+v, want one root mapping on /dev/xvda", bdm)
 			}

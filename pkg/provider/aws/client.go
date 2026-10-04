@@ -220,6 +220,10 @@ func newSDKClientForRegion(ctx context.Context, region string) (Client, error) {
 	}
 	c.amiID = *ami.ImageId
 	c.rootDevice, c.rootGiB = rootDeviceOf(ami)
+	if c.rootGiB > awsAMIRootGiB {
+		logf.FromContext(ctx).Info("AMI root exceeds awsAMIRootGiB; instances are under-priced by the difference",
+			"region", cfg.Region, "ami", c.amiID, "rootGiB", c.rootGiB, "awsAMIRootGiB", awsAMIRootGiB)
+	}
 
 	subnets, err := c.discoverDefaultSubnets(ctx)
 	if err != nil {
@@ -666,17 +670,15 @@ func rootDeviceOf(img ec2types.Image) (device string, sizeGiB int) {
 	return device, 0
 }
 
-// rootVolume is the launch template's root-volume override for a disk of diskGiB, or nil
-// to keep the AMI's own. It never shrinks below the AMI's snapshot, which EC2 rejects, and
-// pins gp3 so the type matches what PricePerHour charges for.
+// rootVolume is the launch template's root volume: the OS base (awsAMIRootGiB, or the AMI's
+// snapshot if larger, which EC2 requires) plus diskGiB of user space for the pulled image and
+// the workload's writes. Always sent, even for 0, so the type is gp3, the one PricePerHour
+// charges for; the AMI's own root is gp2.
 func (c *sdkClient) rootVolume(diskGiB int) []ec2types.LaunchTemplateBlockDeviceMappingRequest {
-	if diskGiB <= 0 {
-		return nil
-	}
 	return []ec2types.LaunchTemplateBlockDeviceMappingRequest{{
 		DeviceName: awssdk.String(c.rootDevice),
 		Ebs: &ec2types.LaunchTemplateEbsBlockDeviceRequest{
-			VolumeSize:          awssdk.Int32(int32(max(diskGiB, c.rootGiB))),
+			VolumeSize:          awssdk.Int32(int32(max(awsAMIRootGiB, c.rootGiB) + diskGiB)),
 			VolumeType:          ec2types.VolumeTypeGp3,
 			DeleteOnTermination: awssdk.Bool(true),
 		},

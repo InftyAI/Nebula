@@ -1974,6 +1974,10 @@ func TestPricePerHour_AddsCPUAndMemory(t *testing.T) {
 			provider.PriceRequest{CPUCores: 4, MemoryMiB: 8192},
 			cpuAndMem,
 		},
+		"disk within the unbilled quota adds nothing": {
+			provider.PriceRequest{CPUCores: 4, MemoryMiB: 8192, DiskGiB: modalFreeDiskGiB},
+			cpuAndMem,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1999,6 +2003,10 @@ func TestPricePerHour_NoPrice(t *testing.T) {
 		"unknown accelerator": {
 			AcceleratorType: "TPU-v4", Count: 1,
 			CapacityType: nebulav1alpha1.CapacityOnDemand, CPUCores: 4, MemoryMiB: 8192,
+		},
+		"disk above the unbilled quota": {
+			AcceleratorType: "H100", Count: 1, CapacityType: nebulav1alpha1.CapacityOnDemand,
+			CPUCores: 4, MemoryMiB: 8192, DiskGiB: modalFreeDiskGiB + 1,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

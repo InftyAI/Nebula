@@ -27,6 +27,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
@@ -265,4 +266,33 @@ func firstEnvtestBinaryDir() string {
 		}
 	}
 	return ""
+}
+
+// TestVirtualCapacity_FitsTheScaleTarget replays the scheduler's resource-fit check: every
+// resource a workload may request must be allocatable, at 1k workloads of the per-workload
+// maximum, or those Pods are rejected before any provider sees them.
+func TestVirtualCapacity_FitsTheScaleTarget(t *testing.T) {
+	const workloads = 1000
+	perWorkload := corev1.ResourceList{
+		corev1.ResourceCPU:              resource.MustParse("64"),
+		corev1.ResourceMemory:           resource.MustParse("256Gi"),
+		corev1.ResourceEphemeralStorage: resource.MustParse("16Ti"),
+		nvidiaGPUResource:               resource.MustParse("8"),
+	}
+	allocatable := virtualCapacity()
+	for name, q := range perWorkload {
+		avail, ok := allocatable[name]
+		if !ok {
+			t.Errorf("%s is not advertised, so any Pod requesting it cannot schedule", name)
+			continue
+		}
+		total := q.DeepCopy()
+		total.Mul(workloads)
+		if avail.Cmp(total) < 0 {
+			t.Errorf("%s allocatable %s < %d workloads x %s", name, avail.String(), workloads, q.String())
+		}
+	}
+	if pods := allocatable[corev1.ResourcePods]; pods.Value() < workloads {
+		t.Errorf("pods allocatable %d < %d", pods.Value(), workloads)
+	}
 }
