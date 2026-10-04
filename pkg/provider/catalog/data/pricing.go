@@ -62,3 +62,18 @@ func ModalCPUCostPerHour(cpuCores float64) float64 {
 func ModalMemoryCostPerHour(memoryMiB int) float64 {
 	return float64(memoryMiB) / mibPerGiB * ModalMemoryPricePerGiBHour
 }
+
+// AWSGP3PricePerGBHour is gp3's US East (N. Virginia) $0.08/GB-month from
+// aws.amazon.com/ebs/pricing (2026-10-04), spread over an average month. One rate for
+// every region, since the catalog has no region axis (see provider.PriceRequest); other
+// regions differ by a few cents per GB-month.
+const AWSGP3PricePerGBHour = 0.08 / hoursPerMonth
+
+// hoursPerMonth is 365 days / 12, the conversion for a rate quoted per month.
+const hoursPerMonth = 730
+
+// AWSRootVolumeCostPerHour is what EBS charges for a gp3 root volume of diskGiB, to be ADDED
+// to the instance price, which covers no storage.
+func AWSRootVolumeCostPerHour(diskGiB int) float64 {
+	return float64(diskGiB) * AWSGP3PricePerGBHour
+}

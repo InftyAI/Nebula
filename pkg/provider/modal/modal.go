@@ -409,6 +409,8 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 // would be read as free. A GPU sandbox in that state still prices, understating by those
 // same defaults, which is immaterial beside the accelerator.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	// Modal has a free 512GiB of disk, so we only charge for cpu and memory here.
+	// TODO: handle disk pricing if the sandbox requests more than the free 512GiB.
 	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
 
 	if req.AcceleratorType == "" {

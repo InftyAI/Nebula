@@ -119,6 +119,10 @@ type sdkClient struct {
 	// amiID is the region's GPU AMI, resolved at construction. Every instance
 	// launches from it; it is NON-SECRET, AWS-published config, not a credential.
 	amiID string
+	// rootDevice and rootGiB are the AMI's root device name and snapshot size, which a
+	// resized root volume must reuse and may not shrink below (see rootVolume).
+	rootDevice string
+	rootGiB    int
 	// subnets are the default VPC's per-AZ subnets RunInstance fails over across on
 	// a capacity error, discovered at construction. Empty when the region has no
 	// default VPC: RunInstance then makes a single attempt letting EC2 pick the
@@ -210,11 +214,12 @@ func newSDKClientForRegion(ctx context.Context, region string) (Client, error) {
 	// Resolve the region's GPU AMI (required — no AMI, nothing to launch) and the
 	// default VPC's per-AZ subnets (best-effort — no default VPC leaves c.subnets
 	// empty and RunInstance lets EC2 pick the subnet, just without zone failover).
-	amiID, err := c.resolveGPUAMI(ctx)
+	ami, err := c.resolveGPUAMI(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("aws: resolve GPU AMI in %s: %w", cfg.Region, err)
 	}
-	c.amiID = amiID
+	c.amiID = *ami.ImageId
+	c.rootDevice, c.rootGiB = rootDeviceOf(ami)
 
 	subnets, err := c.discoverDefaultSubnets(ctx)
 	if err != nil {
@@ -436,8 +441,9 @@ func (c *sdkClient) createLaunchTemplate(ctx context.Context, spec InstanceSpec,
 	// template tier-agnostic, so the stable per-claim template is safely reused when
 	// failover retries the same claim under the other tier.
 	ltData := &ec2types.RequestLaunchTemplateData{
-		ImageId:  awssdk.String(c.amiID),
-		UserData: awssdk.String(userData),
+		ImageId:             awssdk.String(c.amiID),
+		UserData:            awssdk.String(userData),
+		BlockDeviceMappings: c.rootVolume(spec.DiskGiB),
 		TagSpecifications: []ec2types.LaunchTemplateTagSpecificationRequest{{
 			ResourceType: ec2types.ResourceTypeInstance,
 			Tags:         ec2Tags(spec.Tags),
@@ -620,7 +626,7 @@ func fleetErrorRank(code string) int {
 // the self-configuring model. A region that returns no matching image is a config
 // error (ErrConfig): AWS is effectively not usable there, and the caller skips it
 // non-fatally rather than launching from a missing AMI.
-func (c *sdkClient) resolveGPUAMI(ctx context.Context) (string, error) {
+func (c *sdkClient) resolveGPUAMI(ctx context.Context) (ec2types.Image, error) {
 	out, err := c.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{
 		Owners: []string{"amazon"},
 		Filters: []ec2types.Filter{
@@ -629,7 +635,7 @@ func (c *sdkClient) resolveGPUAMI(ctx context.Context) (string, error) {
 		},
 	})
 	if err != nil {
-		return "", err
+		return ec2types.Image{}, err
 	}
 	// Pick the newest by CreationDate (RFC3339 strings sort lexicographically in
 	// chronological order), so a driver/runtime refresh is picked up automatically.
@@ -643,9 +649,38 @@ func (c *sdkClient) resolveGPUAMI(ctx context.Context) (string, error) {
 		}
 	}
 	if newest.ImageId == nil {
-		return "", fmt.Errorf("no GPU AMI (%s) offered: %w", gpuAMINameFilter, ErrConfig)
+		return ec2types.Image{}, fmt.Errorf("no GPU AMI (%s) offered: %w", gpuAMINameFilter, ErrConfig)
 	}
-	return *newest.ImageId, nil
+	return newest, nil
+}
+
+// rootDeviceOf returns the image's root device name and its snapshot size in GiB, zero
+// values when the image does not describe one.
+func rootDeviceOf(img ec2types.Image) (device string, sizeGiB int) {
+	device = awssdk.ToString(img.RootDeviceName)
+	for _, m := range img.BlockDeviceMappings {
+		if awssdk.ToString(m.DeviceName) == device && m.Ebs != nil {
+			return device, int(awssdk.ToInt32(m.Ebs.VolumeSize))
+		}
+	}
+	return device, 0
+}
+
+// rootVolume is the launch template's root-volume override for a disk of diskGiB, or nil
+// to keep the AMI's own. It never shrinks below the AMI's snapshot, which EC2 rejects, and
+// pins gp3 so the type matches what PricePerHour charges for.
+func (c *sdkClient) rootVolume(diskGiB int) []ec2types.LaunchTemplateBlockDeviceMappingRequest {
+	if diskGiB <= 0 {
+		return nil
+	}
+	return []ec2types.LaunchTemplateBlockDeviceMappingRequest{{
+		DeviceName: awssdk.String(c.rootDevice),
+		Ebs: &ec2types.LaunchTemplateEbsBlockDeviceRequest{
+			VolumeSize:          awssdk.Int32(int32(max(diskGiB, c.rootGiB))),
+			VolumeType:          ec2types.VolumeTypeGp3,
+			DeleteOnTermination: awssdk.Bool(true),
+		},
+	}}
 }
 
 // discoverDefaultSubnets lists the default VPC's subnets — one default subnet per

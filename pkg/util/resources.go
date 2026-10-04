@@ -59,3 +59,21 @@ func reservedQty(c *corev1.Container, name corev1.ResourceName) resource.Quantit
 	}
 	return resource.Quantity{}
 }
+
+// gibBytes is one GiB, the unit provider.PriceRequest quotes disk in.
+const gibBytes = 1024 * mibBytes
+
+// PodEphemeralStorageGiB reads the first container's ephemeral-storage as whole GiB, rounded
+// UP, or 0 when unset. Limit first, unlike PodReservation: a provisioned disk is a hard cap,
+// so sizing it to the request would fail writes the limit entitles the workload to.
+func PodEphemeralStorageGiB(pod *corev1.Pod) int {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return 0
+	}
+	c := &pod.Spec.Containers[0]
+	q, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]
+	if !ok {
+		q = c.Resources.Requests[corev1.ResourceEphemeralStorage]
+	}
+	return int((q.Value() + gibBytes - 1) / gibBytes)
+}

@@ -1262,3 +1262,58 @@ func TestSDKList_StatusProbeFailureIsNonFatal(t *testing.T) {
 		t.Fatalf("list = %+v, want the instance returned with checks not passed", list)
 	}
 }
+
+func TestRootDeviceOf(t *testing.T) {
+	img := ec2types.Image{
+		RootDeviceName: awssdk.String("/dev/xvda"),
+		BlockDeviceMappings: []ec2types.BlockDeviceMapping{
+			{DeviceName: awssdk.String("/dev/sdb"), Ebs: &ec2types.EbsBlockDevice{VolumeSize: awssdk.Int32(500)}},
+			{DeviceName: awssdk.String("/dev/xvda"), Ebs: &ec2types.EbsBlockDevice{VolumeSize: awssdk.Int32(30)}},
+		},
+	}
+	if dev, size := rootDeviceOf(img); dev != "/dev/xvda" || size != 30 {
+		t.Fatalf("rootDeviceOf = %q, %d; want /dev/xvda, 30 (the root mapping, not the first)", dev, size)
+	}
+	if dev, size := rootDeviceOf(ec2types.Image{}); dev != "" || size != 0 {
+		t.Fatalf("rootDeviceOf(empty) = %q, %d; want zero values", dev, size)
+	}
+}
+
+func TestSDKRunInstance_SizesRootVolume(t *testing.T) {
+	cases := map[string]struct {
+		disk     int
+		wantSize int32 // 0 => no mapping at all
+	}{
+		"unset keeps the AMI's volume": {0, 0},
+		"larger than the AMI":          {200, 200},
+		"never below the AMI snapshot": {10, 30},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeEC2{fleetOut: fleetWith("i-1")}
+			c := &sdkClient{ec2: f, region: testRegion, amiID: "ami-123", rootDevice: "/dev/xvda", rootGiB: 30}
+			if _, err := c.RunInstance(context.Background(), InstanceSpec{
+				InstanceTypes: []string{"g4dn.xlarge"}, Image: "img", DiskGiB: tc.disk,
+				Tags: map[string]string{ClaimTagKey: "c"},
+			}); err != nil {
+				t.Fatalf("RunInstance: %v", err)
+			}
+			bdm := f.lastLTData.BlockDeviceMappings
+			if tc.wantSize == 0 {
+				if len(bdm) != 0 {
+					t.Fatalf("BlockDeviceMappings = %+v, want none", bdm)
+				}
+				return
+			}
+			if len(bdm) != 1 || awssdk.ToString(bdm[0].DeviceName) != "/dev/xvda" || bdm[0].Ebs == nil {
+				t.Fatalf("BlockDeviceMappings = %+v, want one root mapping on /dev/xvda", bdm)
+			}
+			ebs := bdm[0].Ebs
+			if awssdk.ToInt32(ebs.VolumeSize) != tc.wantSize || ebs.VolumeType != ec2types.VolumeTypeGp3 ||
+				!awssdk.ToBool(ebs.DeleteOnTermination) {
+				t.Fatalf("root EBS = size %d type %q delete %v; want %d gp3 true",
+					awssdk.ToInt32(ebs.VolumeSize), ebs.VolumeType, awssdk.ToBool(ebs.DeleteOnTermination), tc.wantSize)
+			}
+		})
+	}
+}

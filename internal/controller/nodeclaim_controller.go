@@ -411,6 +411,7 @@ func (r *NodeClaimReconciler) recordPrice(ctx context.Context, nc *nebulav1alpha
 		CapacityType:    nc.Spec.CapacityType,
 		CPUCores:        cpuCores,
 		MemoryMiB:       memoryMiB,
+		DiskGiB:         util.PodEphemeralStorageGiB(pod),
 	})
 	if err != nil {
 		if errors.Is(err, provider.ErrNoPrice) {

@@ -50,6 +50,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -167,6 +168,9 @@ type InstanceSpec struct {
 	Region string
 	// Tags carry Nebula identity; ClaimTagKey holds the NodeClaim name.
 	Tags map[string]string
+	// DiskGiB sizes the gp3 root volume, from util.PodEphemeralStorageGiB. 0 keeps the AMI's
+	// own root volume untouched.
+	DiskGiB int
 }
 
 // EC2Instance is the adapter-level view of one EC2 instance as observed.
@@ -739,6 +743,19 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
+// PricePerHour overrides catalog.Base to add the root volume, which EBS bills apart from
+// the instance. Only a requested disk is priced: an unset one keeps the AMI's root volume,
+// whose size is per-region and unknown here, so its few mills an hour go unreported. A
+// request below that size launches at the AMI's size (see sdkClient.rootVolume) and is
+// priced at the request.
+func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	rate, err := p.Base.PricePerHour(req)
+	if err != nil {
+		return 0, err
+	}
+	return rate + data.AWSRootVolumeCostPerHour(req.DiskGiB), nil
+}
+
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the
 // accelerator type (from the AcceleratorTypeLabel), maps it to an EC2 instance
 // type via the catalog, and stamps the claim tag, capacity tier, and region.
@@ -800,10 +817,11 @@ func (p *Provider) instanceSpecFromPod(
 		// TODO: deliver Secret-derived values out-of-band — SSM Parameter Store / Secrets
 		// Manager under the claim, fetched at boot with the instance profile — and keep only
 		// non-sensitive values in user-data.
-		Env:    req.Env,
-		Spot:   req.CapacityType == nebulav1alpha1.CapacitySpot,
-		Region: req.Region,
-		Tags:   map[string]string{ClaimTagKey: req.ClaimName},
+		Env:     req.Env,
+		Spot:    req.CapacityType == nebulav1alpha1.CapacitySpot,
+		Region:  req.Region,
+		Tags:    map[string]string{ClaimTagKey: req.ClaimName},
+		DiskGiB: util.PodEphemeralStorageGiB(pod),
 	}, nil
 }
 

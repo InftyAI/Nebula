@@ -56,6 +56,10 @@ type PriceRequest struct {
 	// instance price is all-in.
 	CPUCores  float64
 	MemoryMiB int
+	// DiskGiB is the workload's disk (see util.PodEphemeralStorageGiB), 0 when unset. Priced
+	// only where disk is a billed line of its own; Modal ignores it, since its default disk
+	// is unbilled and Nebula never requests more.
+	DiskGiB int
 }
 
 // Pricer reports the hourly USD cost of what a Provision would create: ONE rate, with every
