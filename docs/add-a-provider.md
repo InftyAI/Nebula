@@ -112,18 +112,18 @@ ProviderRunPod = "runpod"
 
 ## 4. Wire it into the manager
 
-In `registerProviders` (`cmd/main.go`), build the adapter and register it. A
-provider whose credentials are absent must be **logged and skipped, not fatal** —
-follow the existing Modal/AWS pattern:
+In `registerProviders` (`cmd/main.go`), build the adapter through `register`. A
+provider whose credentials are absent must return an error from its constructor, which
+is **logged and skipped, not fatal**:
 
 ```go
-if p, err := runpod.NewSDKClient(ctx); err != nil {
-    setupLog.Info("skipping RunPod provider registration", "reason", err.Error())
-} else {
-    provider.Register(p)
-    setupLog.Info("registered provider", "provider", p.Name())
-}
+register(provider.ProviderRunPod, func() (provider.Provider, error) {
+    return runpod.NewSDKClient(ctx)
+})
 ```
+
+Then add its name to `knownProviders`, so `--providers` accepts it and enables it by
+default.
 
 ## 5. Wire its credentials
 
