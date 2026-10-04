@@ -768,6 +768,10 @@ func TestPricePerHour(t *testing.T) {
 		{name: "cpu-only pod is priced per created vCPU",
 			req:  provider.PriceRequest{CPUCores: 3},
 			want: data.RunPodCPUCostPerHour(4) + defaultDisk},
+		// The disk is priced at what is created, the request or the default floor.
+		{name: "requested disk is priced",
+			req:  provider.PriceRequest{AcceleratorType: "L4", Count: 1, DiskGiB: 50},
+			want: 0.39 + data.RunPodContainerDiskCostPerHour(50)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

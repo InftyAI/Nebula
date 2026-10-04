@@ -415,11 +415,8 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 // PricePerHour overrides catalog.Base to add the container disk, which RunPod bills on top
 // of the GPU, and to price the CPU-only Pod that Base refuses. vCPU and RAM add nothing to
 // a GPU Pod: they come with the GPU (see data.RunPodCPU5cPricePerVCPUHour).
-//
-// The disk is priced at defaultContainerDiskGiB even when the Pod requests more, since
-// PriceRequest carries no ephemeral-storage size yet.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
-	disk := data.RunPodContainerDiskCostPerHour(defaultContainerDiskGiB)
+	disk := data.RunPodContainerDiskCostPerHour(max(defaultContainerDiskGiB, req.DiskGiB))
 	if req.AcceleratorType == "" {
 		return data.RunPodCPUCostPerHour(powerOfTwoVCPUs(int(math.Ceil(req.CPUCores)))) + disk, nil
 	}
@@ -546,7 +543,7 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
 		// here: it holds references this adapter has no cluster access to follow.
 		Env:              req.Env,
-		ContainerDiskGiB: ephemeralGiB(&c),
+		ContainerDiskGiB: max(defaultContainerDiskGiB, util.PodEphemeralStorageGiB(pod)),
 		Ports:            containerPorts(&c),
 		DataCenterIDs:    dataCentersOf(req.Region),
 	}
@@ -679,18 +676,10 @@ func gib(q *resource.Quantity) int {
 }
 
 // defaultContainerDiskGiB sizes the container disk of a Pod that requests no ephemeral
-// storage. It must be sent: despite the schema marking disk optional, a create without it
-// fails with "You must either provide a template id or pod configuration parameters".
+// storage, and PricePerHour charges the same floor. It must be sent: despite the schema
+// marking disk optional, a create without it fails with "You must either provide a template
+// id or pod configuration parameters".
 const defaultContainerDiskGiB = 1
-
-// ephemeralGiB reads the container's ephemeral-storage request as the container disk size,
-// or defaultContainerDiskGiB when unset.
-func ephemeralGiB(c *corev1.Container) int {
-	if n := gib(resourceQty(c, corev1.ResourceEphemeralStorage)); n > 0 {
-		return n
-	}
-	return defaultContainerDiskGiB
-}
 
 // perGPU divides a Pod-wide total by the accelerator count, rounding up, because RunPod
 // sizes cpu and memory PER GPU. Rounding up keeps the total at or above what the Pod asked

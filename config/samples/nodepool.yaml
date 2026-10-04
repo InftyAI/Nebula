@@ -7,18 +7,18 @@ metadata:
 spec:
   # strategy (the inner, provider-ranking axis).
   providers:
-  # - name: aws
-  #   regions:
-  #   - us
-  #   - eu
-  #   - ap
-  #   - ca-central-1
-  #   - sa-east-1
-  # - name: modal
-  #   regions:
-  #   - us
-  #   - eu
-  #   - ap-melbourne
+  - name: aws
+    regions:
+    - us
+    - eu
+    - ap
+    - ca-central-1
+    - sa-east-1
+  - name: modal
+    regions:
+    - us
+    - eu
+    - ap-melbourne
   - name: runpod
     # A region is a geography (us, eu, ...) or one exact data center (EU-RO-1). Each
     # entry is one failover candidate, so a shortage in one blocklists only that one.
