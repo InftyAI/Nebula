@@ -65,7 +65,8 @@ spec:
           - --health-probe-bind-address=:8081
           # - --kubelet-serving-tls-bootstrap=true
           # Every provider is registered by default. Restrict with --providers; it is the
-          # only way to turn AWS off, which registers even without credentials.
+          # only way to turn AWS off, which registers even without credentials. Drain a
+          # provider first: once dropped, nothing terminates its running instances.
           # - --providers=modal
         image: controller:latest
         name: manager

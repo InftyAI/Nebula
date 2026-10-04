@@ -153,7 +153,9 @@ func main() {
 	flag.StringVar(&providers, "providers", strings.Join(knownProviders, ","),
 		"Comma-separated providers to register; all by default. A listed provider is still skipped "+
 			"when its credentials are absent; an unlisted one is never registered, even with them. "+
-			"An unknown name fails startup.")
+			"An unknown name fails startup. Drain a provider before dropping it: its running "+
+			"instances lose their teardown, since a NodeClaim deleted while its provider is "+
+			"unregistered releases its finalizer without terminating the instance.")
 	opts := zap.Options{
 		Development: true,
 	}
