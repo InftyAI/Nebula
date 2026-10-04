@@ -623,11 +623,7 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 
 	// Refused, not launched short: Nebula cannot ask Modal for more than its default disk
 	// (the SDK has no field for it), so the workload's writes past modalFreeDiskGiB would fail.
-	diskGiB, err := util.PodEphemeralStorageGiB(pod)
-	if err != nil {
-		return SandboxSpec{}, fmt.Errorf("modal: %w", err)
-	}
-	if diskGiB > modalFreeDiskGiB {
+	if diskGiB := util.PodEphemeralStorageGiB(pod); diskGiB > modalFreeDiskGiB {
 		return SandboxSpec{}, fmt.Errorf("modal: %d GiB disk exceeds the %d GiB Modal provides", diskGiB, modalFreeDiskGiB)
 	}
 

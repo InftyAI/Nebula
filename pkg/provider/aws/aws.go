@@ -748,9 +748,17 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 // AMI in; a larger snapshot is logged at client construction, since it under-prices.
 const awsAMIRootGiB = 30
 
+// awsMaxDiskGiB is the most user space a Pod may ask for: gp3's 16 TiB volume cap less the OS
+// base. Refused at launch and unpriced above it, so it never reaches rootVolume's int32.
+const awsMaxDiskGiB = 16*1024 - awsAMIRootGiB
+
 // PricePerHour overrides catalog.Base to add the root volume, which EBS bills by provisioned
 // size apart from the instance. It prices the size sdkClient.rootVolume launches.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	if req.DiskGiB > awsMaxDiskGiB {
+		return 0, fmt.Errorf("aws: %d GiB disk exceeds the %d GiB a root volume can add: %w",
+			req.DiskGiB, awsMaxDiskGiB, provider.ErrNoPrice)
+	}
 	rate, err := p.Base.PricePerHour(req)
 	if err != nil {
 		return 0, err
@@ -797,9 +805,9 @@ func (p *Provider) instanceSpecFromPod(
 		return InstanceSpec{}, errors.New(
 			"aws: pod requests no accelerator; EC2 GPU provisioning needs an accelerator type and count")
 	}
-	diskGiB, err := util.PodEphemeralStorageGiB(pod)
-	if err != nil {
-		return InstanceSpec{}, fmt.Errorf("aws: %w", err)
+	diskGiB := util.PodEphemeralStorageGiB(pod)
+	if diskGiB > awsMaxDiskGiB {
+		return InstanceSpec{}, fmt.Errorf("aws: %d GiB disk exceeds the %d GiB a root volume can add", diskGiB, awsMaxDiskGiB)
 	}
 	instanceTypes, ok := p.MapAccelerator(canonical, count)
 	if !ok {

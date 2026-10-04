@@ -17,8 +17,6 @@ limitations under the License.
 package util
 
 import (
-	"fmt"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -65,31 +63,28 @@ func reservedQty(c *corev1.Container, name corev1.ResourceName) resource.Quantit
 // gibBytes is one GiB, the unit provider.PriceRequest quotes disk in.
 const gibBytes = 1024 * mibBytes
 
-// MaxEphemeralStorageGiB is the largest disk a workload may ask for, gp3's 16 TiB volume cap.
-// Checked on the Quantity before converting: Kubernetes admits values near MaxInt64 bytes,
-// where rounding up to GiB overflows into a negative size, and so a negative price.
-const MaxEphemeralStorageGiB = 16 * 1024
-
-var maxEphemeralStorage = *resource.NewQuantity(MaxEphemeralStorageGiB*gibBytes, resource.BinarySI)
-
 // PodEphemeralStorageGiB reads the first container's ephemeral-storage as whole GiB, rounded
-// UP, or 0 when unset; an error above MaxEphemeralStorageGiB. Limit first, unlike
-// PodReservation: a provisioned disk is a hard cap, so sizing it to the request would fail
-// writes the limit entitles the workload to.
-func PodEphemeralStorageGiB(pod *corev1.Pod) (int, error) {
+// UP, or 0 when unset. Limit first, unlike PodReservation: a provisioned disk is a hard cap,
+// so sizing it to the request would fail writes the limit entitles the workload to. Unbounded:
+// each provider enforces its own maximum.
+func PodEphemeralStorageGiB(pod *corev1.Pod) int {
 	if pod == nil || len(pod.Spec.Containers) == 0 {
-		return 0, nil
+		return 0
 	}
 	c := &pod.Spec.Containers[0]
 	q, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]
 	if !ok {
 		q = c.Resources.Requests[corev1.ResourceEphemeralStorage]
 	}
-	if q.Cmp(maxEphemeralStorage) > 0 {
-		return 0, fmt.Errorf("ephemeral-storage %s exceeds the supported %d GiB", q.String(), MaxEphemeralStorageGiB)
-	}
 	if q.Sign() <= 0 {
-		return 0, nil
+		return 0
 	}
-	return int((q.Value() + gibBytes - 1) / gibBytes), nil
+	// Not (v + gibBytes - 1) / gibBytes: Value saturates at MaxInt64 for an admitted but huge
+	// Quantity, and the addition would wrap that negative.
+	v := q.Value()
+	gib := v / gibBytes
+	if v%gibBytes != 0 {
+		gib++
+	}
+	return int(gib)
 }

@@ -1091,6 +1091,10 @@ func TestPricePerHour_AddsRootVolume(t *testing.T) {
 	if !errors.Is(err, provider.ErrNoPrice) {
 		t.Fatalf("PricePerHour(unknown accelerator) err = %v, want ErrNoPrice", err)
 	}
+	req.DiskGiB = awsMaxDiskGiB + 1
+	if _, err = p.PricePerHour(req); !errors.Is(err, provider.ErrNoPrice) {
+		t.Fatalf("PricePerHour(above awsMaxDiskGiB) err = %v, want ErrNoPrice", err)
+	}
 }
 
 func TestProvision_SizesDiskFromEphemeralStorage(t *testing.T) {
@@ -1107,5 +1111,22 @@ func TestProvision_SizesDiskFromEphemeralStorage(t *testing.T) {
 	}
 	if got := f.lastSpec.DiskGiB; got != 200 {
 		t.Fatalf("spec DiskGiB = %d, want 200", got)
+	}
+}
+
+func TestProvision_RefusesDiskAboveVolumeCap(t *testing.T) {
+	f := &fakeClient{runID: "i-disk"}
+	p := newTestProvider(f)
+	pod := gpuPod("T4", 1)
+	pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("16Ti")
+
+	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
+		ClaimName: "claim-disk",
+		Region:    "us-west-2",
+	}); err == nil {
+		t.Fatal("Provision of 16 TiB user space succeeded, want refusal: the OS base pushes it past gp3's cap")
+	}
+	if f.runCnt != 0 {
+		t.Fatalf("RunInstance called %d times for a refused disk", f.runCnt)
 	}
 }
