@@ -463,10 +463,10 @@ type registryAuthResponse struct {
 // that credential, so deleting it on any single teardown would break the others' next pull.
 // The population is bounded by the number of distinct credentials, not by the number of Pods.
 func (c *restClient) EnsureRegistryAuth(ctx context.Context, auth *provider.RegistryAuth) (string, error) {
-	if auth == nil || auth.Basic == nil {
-		// The adapter vets the kind before calling (checkRegistryAuth), so this is a
-		// programming error rather than a user-facing one — but it must not become a silent
-		// anonymous pull.
+	if auth == nil {
+		return "", errors.New("runpod: nil image pull credential")
+	}
+	if auth.Basic == nil {
 		return "", auth.Unsupported("runpod")
 	}
 	name := registryAuthName(auth.Basic.Username, auth.Basic.Password)
