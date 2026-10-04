@@ -413,13 +413,8 @@ const modalFreeDiskGiB = 512
 // would be read as free. A GPU sandbox in that state still prices, understating by those
 // same defaults, which is immaterial beside the accelerator.
 //
-// Disk adds nothing up to modalFreeDiskGiB; above it is ErrNoPrice, since such a Pod is
-// never launched (see sandboxSpecFromPod).
+// Disk adds nothing: Pods asking for more than modalFreeDiskGiB are never launched.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
-	if req.DiskGiB > modalFreeDiskGiB {
-		return 0, fmt.Errorf("modal: %d GiB disk exceeds the unbilled %d GiB: %w",
-			req.DiskGiB, modalFreeDiskGiB, provider.ErrNoPrice)
-	}
 	metered := data.ModalCPUCostPerHour(req.CPUCores) + data.ModalMemoryCostPerHour(req.MemoryMiB)
 
 	if req.AcceleratorType == "" {
