@@ -69,6 +69,17 @@ func ModalMemoryCostPerHour(memoryMiB int) float64 {
 // regions differ by a few cents per GB-month.
 const AWSGP3PricePerGBHour = 0.08 / hoursPerMonth
 
+// RunPod bundles a GPU Pod's vCPU and RAM into the GPU price, so its only extra on a GPU
+// Pod is the container disk. A CPU-only Pod is priced per vCPU of its flavor, RAM included.
+//
+// RunPodCPU5cPricePerVCPUHour is cpu5c's `price.securePerVcpu` from GET /v2/catalog/cpus
+// (2026-10-04); it must follow runpod's cpuFlavor. The disk rate is the pricing page's
+// $0.10/GB/month for a running Pod, spread over an average month.
+const (
+	RunPodCPU5cPricePerVCPUHour       = 0.035
+	RunPodContainerDiskPricePerGBHour = 0.10 / hoursPerMonth
+)
+
 // hoursPerMonth is 365 days / 12, the conversion for a rate quoted per month.
 const hoursPerMonth = 730
 
@@ -76,4 +87,14 @@ const hoursPerMonth = 730
 // to the instance price, which covers no storage.
 func AWSRootVolumeCostPerHour(diskGiB int) float64 {
 	return float64(diskGiB) * AWSGP3PricePerGBHour
+}
+
+// RunPodCPUCostPerHour and RunPodContainerDiskCostPerHour take what the Pod is created
+// with — the rounded vCPU count and disk size — not the Pod's raw request.
+func RunPodCPUCostPerHour(vcpus int) float64 {
+	return float64(vcpus) * RunPodCPU5cPricePerVCPUHour
+}
+
+func RunPodContainerDiskCostPerHour(diskGB int) float64 {
+	return float64(diskGB) * RunPodContainerDiskPricePerGBHour
 }

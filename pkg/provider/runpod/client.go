@@ -322,7 +322,7 @@ type cpuRequest struct {
 }
 
 // podResponse is the subset of RunPod's Pod object this adapter reads. Fields it ignores
-// (ssh, cost, template, mounts) are omitted rather than carried, so the struct states exactly
+// (runtime, ssh, cost, template, mounts) are omitted rather than carried, so the struct states exactly
 // what the adapter's behaviour depends on.
 type podResponse struct {
 	ID     string   `json:"id"`
@@ -332,40 +332,17 @@ type podResponse struct {
 	// DataCenterID is null until the scheduler assigns one, which decodes to "" — Region
 	// then stays empty rather than reporting a placement we did not observe.
 	DataCenterID string `json:"dataCenterId"`
-	// Runtime is null unless the Pod is RUNNING.
-	Runtime *struct {
-		Ports []struct {
-			Private int     `json:"private"`
-			Public  *int    `json:"public"`
-			IP      *string `json:"ip"`
-		} `json:"ports"`
-	} `json:"runtime"`
 }
 
-// toPod converts the wire shape into the adapter's view. Only a port RunPod has published on
-// a public IP becomes a mapping; the rest are reachable through the proxy alone.
+// toPod converts the wire shape into the adapter's view.
 func (r podResponse) toPod() Pod {
-	pd := Pod{
+	return Pod{
 		ID:           r.ID,
 		Name:         r.Name,
 		Status:       r.Status,
 		Ports:        r.Ports,
 		DataCenterID: r.DataCenterID,
 	}
-	if r.Runtime == nil {
-		return pd
-	}
-	for _, m := range r.Runtime.Ports {
-		if m.Public == nil || m.IP == nil || *m.IP == "" {
-			continue
-		}
-		if pd.PortMappings == nil {
-			pd.PortMappings = make(map[string]int)
-		}
-		pd.PortMappings[strconv.Itoa(m.Private)] = *m.Public
-		pd.PublicIP = *m.IP
-	}
-	return pd
 }
 
 // CreatePod implements Client.

@@ -54,8 +54,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
-	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -64,6 +64,7 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -138,7 +139,7 @@ type PodSpec struct {
 	// count from memory too; deferred until that ratio is known.
 	VCPUCount int
 	// ContainerDiskGiB is the writable container disk, from the Pod's ephemeral-storage
-	// request. Zero leaves RunPod's default (50 GiB).
+	// request (see ephemeralGiB for the unset case).
 	//
 	// No persistent volume is ever requested: RunPod defaults to a billable 20 GiB one,
 	// and a Nebula instance is cattle with nothing to persist, so the Client pins it to 0.
@@ -182,15 +183,8 @@ type Pod struct {
 	// DataCenterID is where RunPod placed it, in RunPod's own vocabulary.
 	DataCenterID string
 	// Ports are the exposed ports RunPod echoes back, in the same "<port>/<proto>" form
-	// PodSpec.Ports sends. They are what the proxy URL routes to, and unlike PortMappings
-	// they are present from creation, which is what makes an /http-only Pod addressable.
+	// PodSpec.Ports sends; the proxy URL routes to the first.
 	Ports []string
-	// PublicIP and PortMappings are the DIRECT address, keyed by container port, and only
-	// ever populated for a port RunPod has published on a public IP. Both empty otherwise —
-	// including for every /http port, which is why they are a preference and not the
-	// endpoint's only source.
-	PublicIP     string
-	PortMappings map[string]int
 }
 
 // Provider is the RunPod implementation of provider.Provider. It embeds catalog.Base for
@@ -416,6 +410,24 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 		}
 	}
 	return out
+}
+
+// PricePerHour overrides catalog.Base to add the container disk, which RunPod bills on top
+// of the GPU, and to price the CPU-only Pod that Base refuses. vCPU and RAM add nothing to
+// a GPU Pod: they come with the GPU (see data.RunPodCPU5cPricePerVCPUHour).
+//
+// The disk is priced at defaultContainerDiskGiB even when the Pod requests more, since
+// PriceRequest carries no ephemeral-storage size yet.
+func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
+	disk := data.RunPodContainerDiskCostPerHour(defaultContainerDiskGiB)
+	if req.AcceleratorType == "" {
+		return data.RunPodCPUCostPerHour(powerOfTwoVCPUs(int(math.Ceil(req.CPUCores)))) + disk, nil
+	}
+	gpu, err := p.Base.PricePerHour(req)
+	if err != nil {
+		return 0, err
+	}
+	return gpu + disk, nil
 }
 
 // geographyOf reports whether data center dc is listed under any of geographies.
@@ -666,11 +678,19 @@ func gib(q *resource.Quantity) int {
 	return ceilDiv(int(q.Value()), giB)
 }
 
-// ephemeralGiB reads the container's ephemeral-storage request as the container disk size.
-// Zero (unset) leaves RunPod's 50 GiB default, which is generous enough that most workloads
-// never need to state one.
+// defaultContainerDiskGiB sizes the container disk of a Pod that requests no ephemeral
+// storage. It must be sent: despite the schema marking disk optional, a create without it
+// fails with "You must either provide a template id or pod configuration parameters".
+// 20 is the smallest size verified to create; the schema allows 1, which is untested.
+const defaultContainerDiskGiB = 20
+
+// ephemeralGiB reads the container's ephemeral-storage request as the container disk size,
+// or defaultContainerDiskGiB when unset.
 func ephemeralGiB(c *corev1.Container) int {
-	return gib(resourceQty(c, corev1.ResourceEphemeralStorage))
+	if n := gib(resourceQty(c, corev1.ResourceEphemeralStorage)); n > 0 {
+		return n
+	}
+	return defaultContainerDiskGiB
 }
 
 // perGPU divides a Pod-wide total by the accelerator count, rounding up, because RunPod
@@ -738,10 +758,9 @@ func toState(pd Pod) provider.InstanceState {
 
 // toInstance normalizes an observed RunPod Pod into the provider-agnostic Instance.
 //
-// Endpoint prefers the public IP and mapped port when RunPod has assigned them, because
-// that is the address that reaches a Pod directly; the derived proxy URL is the fallback,
-// and the only address a /http-only Pod ever has. Either way it is re-reported on every
-// tick, and an empty value never clears what is already on the Pod (the write paths skip "").
+// Endpoint is always the proxy URL: every port goes out /http, and runtime.ports carries
+// only RunPod-internal 100.64/10 addresses plus a port RunPod injects, none of them
+// public. An empty value never clears what is already on the Pod (the write paths skip "").
 func toInstance(pd Pod) provider.Instance {
 	return provider.Instance{
 		ID:           pd.ID,
@@ -749,25 +768,6 @@ func toInstance(pd Pod) provider.Instance {
 		State:        toState(pd),
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 		Region:       pd.DataCenterID,
-		Endpoint:     endpointOf(pd),
+		Endpoint:     proxyURL(pd.ID, pd.Ports),
 	}
-}
-
-// endpointOf renders the Pod's reachable address: host:port from the public IP and its
-// first port mapping, else the derived HTTP proxy URL, else empty while the Pod is still
-// coming up.
-//
-// The mapping is walked in sorted key order because Go randomizes map iteration and this
-// value is written to the Pod: an unsorted pick would rewrite the endpoint on alternating
-// poll ticks for a Pod exposing two ports, which reads as flapping.
-func endpointOf(pd Pod) string {
-	if pd.PublicIP != "" && len(pd.PortMappings) > 0 {
-		keys := make([]string, 0, len(pd.PortMappings))
-		for k := range pd.PortMappings {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		return fmt.Sprintf("%s:%d", pd.PublicIP, pd.PortMappings[keys[0]])
-	}
-	return proxyURL(pd.ID, pd.Ports)
 }

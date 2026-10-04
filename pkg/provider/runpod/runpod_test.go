@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog/data"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -258,6 +260,10 @@ func TestProvision_GeographyRegion(t *testing.T) {
 	// The label's casing is the user's; the catalog id that goes out is not.
 	if s.GPUTypeID != "NVIDIA L4" {
 		t.Errorf("GPUTypeID = %q, want NVIDIA L4 from a lowercase label", s.GPUTypeID)
+	}
+	// No ephemeral-storage request: the disk must still go out, or RunPod rejects the create.
+	if s.ContainerDiskGiB != defaultContainerDiskGiB {
+		t.Errorf("ContainerDiskGiB = %d, want the %d GiB default", s.ContainerDiskGiB, defaultContainerDiskGiB)
 	}
 }
 
@@ -592,26 +598,15 @@ func TestToState(t *testing.T) {
 	}
 }
 
-func TestEndpointOf_PrefersDirectAddress(t *testing.T) {
-	// A public IP with an assigned port reaches the Pod directly, so it wins over the
-	// proxy. The mapping is walked in sorted key order because Go randomizes map iteration
-	// and this value is written to the Pod: an unsorted pick would rewrite the endpoint on
-	// alternating poll ticks, which reads as flapping.
-	pd := Pod{
-		ID:           "pod-1",
-		Ports:        []string{"8000/http"},
-		PublicIP:     "1.2.3.4",
-		PortMappings: map[string]int{"22": 40022, "8000": 41234},
-	}
-	for range 8 {
-		if got := endpointOf(pd); got != "1.2.3.4:40022" {
-			t.Fatalf("endpointOf = %q, want the lowest-keyed mapping 1.2.3.4:40022", got)
-		}
+func TestToInstance_EndpointIsProxyURL(t *testing.T) {
+	pd := Pod{ID: "pod-1", Ports: []string{"8080/http"}}
+	if got := toInstance(pd).Endpoint; got != "https://pod-1-8080.proxy.runpod.net" {
+		t.Errorf("Endpoint = %q, want the proxy URL", got)
 	}
 	// No port at all: no address to publish, and a guess would advertise something that
 	// answers nothing.
-	if got := endpointOf(Pod{ID: "pod-2"}); got != "" {
-		t.Errorf("endpointOf(no ports) = %q, want empty", got)
+	if got := toInstance(Pod{ID: "pod-2"}).Endpoint; got != "" {
+		t.Errorf("Endpoint(no ports) = %q, want empty", got)
 	}
 }
 
@@ -754,5 +749,39 @@ func TestPowerOfTwoVCPUs(t *testing.T) {
 		if got := powerOfTwoVCPUs(n); got != want {
 			t.Errorf("powerOfTwoVCPUs(%d) = %d, want %d", n, got, want)
 		}
+	}
+}
+
+func TestPricePerHour(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	defaultDisk := data.RunPodContainerDiskCostPerHour(defaultContainerDiskGiB)
+	cases := []struct {
+		name string
+		req  provider.PriceRequest
+		want float64
+	}{
+		// vCPU and RAM ride the GPU price, so only the disk is added.
+		{name: "gpu pod adds the default disk",
+			req:  provider.PriceRequest{AcceleratorType: "L4", Count: 2, CPUCores: 8, MemoryMiB: 65536},
+			want: 2*0.39 + defaultDisk},
+		// 3 cores is created as 4 vCPUs, the power of two v2 requires.
+		{name: "cpu-only pod is priced per created vCPU",
+			req:  provider.PriceRequest{CPUCores: 3},
+			want: data.RunPodCPUCostPerHour(4) + defaultDisk},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := p.PricePerHour(tc.req)
+			if err != nil {
+				t.Fatalf("PricePerHour: %v", err)
+			}
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("PricePerHour = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	_, err := p.PricePerHour(provider.PriceRequest{AcceleratorType: "T4", Count: 1})
+	if !errors.Is(err, provider.ErrNoPrice) {
+		t.Errorf("unlisted accelerator: err = %v, want ErrNoPrice", err)
 	}
 }

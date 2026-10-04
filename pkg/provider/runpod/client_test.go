@@ -330,14 +330,13 @@ func TestListPods_DecodesPlacementAndPorts(t *testing.T) {
 	if pods[0].DataCenterID != "EU-RO-1" || pods[0].Status != "RUNNING" {
 		t.Errorf("pod-1 = %+v", pods[0])
 	}
-	// Only a port published on a public IP is a direct address; the /http one is proxy-only.
-	if pods[0].PublicIP != "195.26.233.3" || !reflect.DeepEqual(pods[0].PortMappings, map[string]int{"22": 34446}) {
-		t.Errorf("pod-1 direct address = %q %v", pods[0].PublicIP, pods[0].PortMappings)
+	if !reflect.DeepEqual(pods[0].Ports, []string{"8000/http", "22/tcp"}) {
+		t.Errorf("pod-1 ports = %v", pods[0].Ports)
 	}
 	// A null data center must leave the region EMPTY rather than reporting a placement that
 	// was never observed.
-	if pods[1].DataCenterID != "" || pods[1].PortMappings != nil {
-		t.Errorf("pod-2 = %+v, want no region and no mappings", pods[1])
+	if pods[1].DataCenterID != "" || pods[1].Ports != nil {
+		t.Errorf("pod-2 = %+v, want no region and no ports", pods[1])
 	}
 }
 
