@@ -36,6 +36,7 @@ import (
 	"github.com/InftyAI/Nebula/pkg/failover"
 	"github.com/InftyAI/Nebula/pkg/provider"
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -244,8 +245,9 @@ func TestPlacement_NoMatchingProviderLeavesPodGated(t *testing.T) {
 	}
 }
 
-func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
-	// No GPU annotation => any provider matches; even one offering nothing.
+func TestPlacement_CPUOnlyPodMatchesAnyCPUOnlyProvider(t *testing.T) {
+	// No GPU annotation => any provider that runs CPU-only Pods matches; even one offering
+	// no GPUs.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
 	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, provider.ProviderModal)
 	modal := &fakeProvider{name: provider.ProviderModal, gpus: []string{}} // offers no GPUs
@@ -264,6 +266,23 @@ func TestPlacement_CPUOnlyPodMatchesAnyProvider(t *testing.T) {
 	}
 	if nc.Spec.Accelerator != "" {
 		t.Fatalf("expected empty accelerator for a CPU-only claim, got %q", nc.Spec.Accelerator)
+	}
+}
+
+func TestPlacement_CPUOnlyPodSkipsGPUOnlyProvider(t *testing.T) {
+	// RunPod is listed first but runs GPU Pods only, so the CPU-only Pod lands on Modal.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderRunPod, provider.ProviderModal)
+	runpod := &fakeProvider{name: provider.ProviderRunPod, gpuOnly: true}
+	modal := &fakeProvider{name: provider.ProviderModal}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, runpod, modal)
+
+	reconcilePod(t, r, "default", "p1")
+
+	got := getPod(t, c, "default", "p1")
+	if got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != provider.ProviderModal {
+		t.Fatalf("expected the CPU-only Pod to skip runpod for modal, got %v", got.Spec.NodeSelector)
 	}
 }
 
@@ -572,19 +591,28 @@ func TestRequestedGeographies(t *testing.T) {
 	}
 }
 
+// catalogAWS is the real AWS adapter with no client: enough for placement, which reads only
+// its catalog and region table. AWS runs GPU Pods only, so a test Pod must request one.
+func catalogAWS(t *testing.T) *awsprovider.Provider {
+	t.Helper()
+	cat, err := catalog.Load()
+	if err != nil {
+		t.Fatalf("loading the embedded catalog: %v", err)
+	}
+	return awsprovider.New(nil, cat, nil)
+}
+
 func TestPlacement_PodAnnotationNarrowsToTheRequestedJurisdiction(t *testing.T) {
 	// The pool is unconstrained, so AWS offers all 17 default-enabled regions. The Pod asks
 	// for "uk", which AWS serves from London alone — so the claim must carry eu-west-2 and
 	// not the first region of the walk. This is the whole point of the annotation: data
 	// residency for ONE workload, without an operator carving out a per-jurisdiction pool.
 	//
-	// CPU-only on purpose: it keeps MapAccelerator (and so the catalog) out of the path, so
-	// the real adapter's region table can be exercised with no client and no CSV.
-	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "T4")
 	pod.Annotations = map[string]string{nebulav1alpha1.RegionsAnnotation: "uk"}
 	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
 		provider.ProviderAWS)
-	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, awsprovider.New(nil, nil, nil))
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, catalogAWS(t))
 
 	reconcilePod(t, r, "default", "p1")
 

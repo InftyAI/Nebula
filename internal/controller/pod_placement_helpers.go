@@ -144,8 +144,8 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					"provider", ref.Name, "egressMode", pool.Spec.Egress.ModeOrOpen())
 				continue
 			}
-			// A CPU-only Pod (no accelerator) matches any provider; an accelerator
-			// Pod only matches a provider whose catalog serves that (type, count).
+			// A CPU-only Pod (no accelerator) matches a provider that SupportsCPUOnly; an
+			// accelerator Pod only matches a provider whose catalog serves that (type, count).
 			// MapAccelerator is consulted only for that servability check — the block
 			// key and the reported identity are the POOL (type:count), not the
 			// provider's SKU, so a launch spanning alternates and a post-launch SKU
@@ -159,6 +159,11 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 						"provider", ref.Name, "accelerator", accel, "count", count)
 					continue
 				}
+			} else if !prov.Capabilities().SupportsCPUOnly {
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipAcceleratorUnsupported)
+				skipped[ref.Name] = metrics.SkipAcceleratorUnsupported
+				log.V(1).Info("skipping candidate: provider does not run CPU-only Pods", "provider", ref.Name)
+				continue
 			}
 			// Empty means the pool's declaration, or the Pod's narrowing of it, reaches
 			// no region this provider can place in.

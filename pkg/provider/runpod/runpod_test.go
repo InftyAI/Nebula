@@ -225,9 +225,6 @@ func TestProvision_GPUPod(t *testing.T) {
 		t.Errorf("VCPUPerGPU = %d, RAMPerGPUGiB = %d, want 5/50 (per-GPU, rounded up)",
 			s.VCPUPerGPU, s.RAMPerGPUGiB)
 	}
-	if s.VCPUCount != 0 {
-		t.Errorf("VCPUCount = %d, want 0; it is only read for a CPU-only Pod", s.VCPUCount)
-	}
 	if s.ContainerDiskGiB != 80 {
 		t.Errorf("ContainerDiskGiB = %d, want 80", s.ContainerDiskGiB)
 	}
@@ -267,7 +264,7 @@ func TestProvision_GeographyRegion(t *testing.T) {
 	}
 }
 
-func TestProvision_CPUOnlyPod(t *testing.T) {
+func TestProvision_CPUOnlyPodRefused(t *testing.T) {
 	f := &fakeClient{createID: "pod-cpu"}
 	p := newTestProvider(f)
 
@@ -275,19 +272,11 @@ func TestProvision_CPUOnlyPod(t *testing.T) {
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName:    "claim-c",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
-	}); err != nil {
-		t.Fatalf("Provision: %v", err)
+	}); err == nil {
+		t.Fatal("Provision of a CPU-only Pod succeeded, want refusal")
 	}
-	s := f.lastSpec
-	// No accelerator: an ABSOLUTE vCPU count, 2500m rounded up to 3 and then to the power of
-	// two v2 accepts. Rounding down would under-provision the request.
-	if s.VCPUCount != 4 || s.VCPUPerGPU != 0 || s.GPUCount != 0 || s.GPUTypeID != "" {
-		t.Errorf("VCPUCount = %d, VCPUPerGPU = %d, GPUCount = %d, GPUTypeID = %q",
-			s.VCPUCount, s.VCPUPerGPU, s.GPUCount, s.GPUTypeID)
-	}
-	// No region declared leaves placement empty — the widest capacity pool.
-	if len(s.DataCenterIDs) != 0 {
-		t.Errorf("DataCenterIDs = %v, want empty when unconstrained", s.DataCenterIDs)
+	if f.createCnt != 0 {
+		t.Errorf("CreatePod called %d times for a refused Pod", f.createCnt)
 	}
 }
 
@@ -744,14 +733,6 @@ func TestResolveRegions(t *testing.T) {
 	}
 }
 
-func TestPowerOfTwoVCPUs(t *testing.T) {
-	for n, want := range map[int]int{0: 2, 1: 2, 2: 2, 3: 4, 8: 8, 9: 16} {
-		if got := powerOfTwoVCPUs(n); got != want {
-			t.Errorf("powerOfTwoVCPUs(%d) = %d, want %d", n, got, want)
-		}
-	}
-}
-
 func TestPricePerHour(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	defaultDisk := data.RunPodContainerDiskCostPerHour(defaultContainerDiskGiB)
@@ -764,10 +745,6 @@ func TestPricePerHour(t *testing.T) {
 		{name: "gpu pod adds the default disk",
 			req:  provider.PriceRequest{AcceleratorType: "L4", Count: 2, CPUCores: 8, MemoryMiB: 65536},
 			want: 2*0.39 + defaultDisk},
-		// 3 cores is created as 4 vCPUs, the power of two v2 requires.
-		{name: "cpu-only pod is priced per created vCPU",
-			req:  provider.PriceRequest{CPUCores: 3},
-			want: data.RunPodCPUCostPerHour(4) + defaultDisk},
 		// The disk is priced at what is created, the request or the default floor.
 		{name: "requested disk is priced",
 			req:  provider.PriceRequest{AcceleratorType: "L4", Count: 1, DiskGiB: 50},

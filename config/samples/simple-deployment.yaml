@@ -1,5 +1,6 @@
 # The smallest workload Nebula places: one replica on one L4, serving HTTP on 8080.
-# For a CPU-only Pod, drop the accelerator-type label and the nvidia.com/gpu limit.
+# For a CPU-only Pod, drop the accelerator-type label and the nvidia.com/gpu limit; only Modal
+# runs one (see Capabilities.SupportsCPUOnly).
 #
 # A Deployment, not a bare Pod, because a provision failure is terminal for the Pod: only a
 # controller recreating it gets the next region tried, past the blocklisted one.
@@ -37,8 +38,9 @@ spec:
             port: 8080
           periodSeconds: 5
         resources:
-          requests:
-            cpu: "1"
-            memory: 1Gi
+          # requests:
+          #   cpu: "32"
+          #   memory: 64Gi
           limits:
             nvidia.com/gpu: "1"
+            ephemeral-storage: 100Gi

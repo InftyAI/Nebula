@@ -247,24 +247,6 @@ func TestCreatePod_WireForm(t *testing.T) {
 	}
 }
 
-func TestCreatePod_CPUOnly(t *testing.T) {
-	// v2 takes exactly one of gpu or cpu, and a CPU Pod names a flavor.
-	c, seen := testServer(t, jsonReply(201, `{"id":"pod-cpu"}`))
-	if _, err := c.CreatePod(context.Background(), PodSpec{
-		Name: "nebula-c", Image: "img", VCPUCount: 4,
-	}); err != nil {
-		t.Fatalf("CreatePod: %v", err)
-	}
-	body := (*seen)[0].body
-	if _, ok := body["gpu"]; ok {
-		t.Error("gpu sent on a CPU-only Pod")
-	}
-	want := map[string]any{"id": cpuFlavor, "vcpuCount": float64(4)}
-	if !reflect.DeepEqual(body["cpu"], want) {
-		t.Errorf("cpu = %v, want %v", body["cpu"], want)
-	}
-}
-
 func TestCreatePod_SuccessWithNoID(t *testing.T) {
 	// A 2xx with no id is worse than an error: a Pod may exist that we can never name to
 	// terminate. It must fail WITHOUT a sentinel so nothing is blocklisted — Provision is

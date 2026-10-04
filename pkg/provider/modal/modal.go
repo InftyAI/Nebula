@@ -435,9 +435,10 @@ func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
 // trait is set the way it is.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:         false,            // create/terminate only
-		SupportsSpot:         false,            // no user-facing preemptible tier
-		SupportsEgressPolicy: true,             // outbound allowlists on the sandbox itself
+		SupportsStop:         false, // create/terminate only
+		SupportsSpot:         false, // no user-facing preemptible tier
+		SupportsEgressPolicy: true,  // outbound allowlists on the sandbox itself
+		SupportsCPUOnly:      true,
 		NativeTags:           true,             // sandbox tags carry identity
 		PreemptionNotice:     0,                // no push; poll-based detection
 		PollInterval:         0,                // OnDemand-only (never preempts) → the default cadence is fine

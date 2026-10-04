@@ -407,6 +407,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		// which routes to an internet gateway. Enforcing a pool's policy means managing SG
 		// egress rules (and no NAT for the Blocked case), so it is unsupported until then.
 		SupportsEgressPolicy: false,
+		SupportsCPUOnly:      false,            // the catalog is GPU instance types only
 		NativeTags:           true,             // EC2 tags carry identity
 		PreemptionNotice:     preemptionNotice, // Spot 2-minute warning
 		PollInterval:         spotPollInterval, // Spot reclaims are abrupt; poll faster than default

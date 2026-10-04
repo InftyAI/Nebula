@@ -61,9 +61,6 @@ const (
 	// cloudTypeSecure is the only cloud type Nebula requests; see the package doc for why
 	// COMMUNITY is out until the catalog can price it.
 	cloudTypeSecure = "SECURE"
-	// cpuFlavor is the CPU flavor a CPU-only Pod runs on; v2 requires one. A flavor fixes
-	// memory as a multiple of vCPUs, so the Pod's memory request has nowhere to go.
-	cpuFlavor = "cpu5c"
 	// listPageSize is the largest page GET /v2/pods serves.
 	listPageSize = 1000
 )
@@ -294,7 +291,6 @@ type createPodRequest struct {
 	Image string      `json:"image"`
 	Cloud string      `json:"cloud"`
 	GPU   *gpuRequest `json:"gpu,omitempty"`
-	CPU   *cpuRequest `json:"cpu,omitempty"`
 
 	Disk       int               `json:"disk,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
@@ -313,12 +309,6 @@ type gpuRequest struct {
 	Count              int32  `json:"count"`
 	MinVCPUCountPerGPU int    `json:"minVcpuCountPerGpu,omitempty"`
 	MinRAMPerGPU       int    `json:"minRamPerGpu,omitempty"`
-}
-
-// cpuRequest is a CPU-only Pod's compute; v2 takes exactly one of it or gpuRequest.
-type cpuRequest struct {
-	ID        string `json:"id"`
-	VCPUCount int    `json:"vcpuCount"`
 }
 
 // podResponse is the subset of RunPod's Pod object this adapter reads. Fields it ignores
@@ -358,16 +348,12 @@ func (c *restClient) CreatePod(ctx context.Context, spec PodSpec) (string, error
 		Ports:         spec.Ports,
 		DataCenterIDs: spec.DataCenterIDs,
 		Registry:      spec.RegistryAuthID,
-	}
-	if spec.GPUCount > 0 {
-		body.GPU = &gpuRequest{
+		GPU: &gpuRequest{
 			ID:                 spec.GPUTypeID,
 			Count:              spec.GPUCount,
 			MinVCPUCountPerGPU: spec.VCPUPerGPU,
 			MinRAMPerGPU:       spec.RAMPerGPUGiB,
-		}
-	} else {
-		body.CPU = &cpuRequest{ID: cpuFlavor, VCPUCount: spec.VCPUCount}
+		},
 	}
 
 	var out podResponse

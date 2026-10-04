@@ -321,6 +321,8 @@ type Capabilities struct {
 	// a policy that says otherwise (AWS: false — its instances land in the default VPC, so
 	// enforcement needs security-group egress rules and no NAT, not one API field).
 	SupportsEgressPolicy bool
+	// SupportsCPUOnly is true if the provider runs a Pod with no accelerator.
+	SupportsCPUOnly bool
 	// NativeTags is true if the provider has real instance tags/labels; when
 	// false, identity is encoded in the instance name (RunPod: false).
 	NativeTags bool

@@ -54,7 +54,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"slices"
 	"strings"
 
@@ -122,24 +121,17 @@ type PodSpec struct {
 	// SECRET-BEARING, hence the redacting String below.
 	Env map[string]string
 	// GPUTypeID is RunPod's own id for the accelerator — MapAccelerator's PRIMARY, since a
-	// v2 create takes exactly one. Empty for a CPU-only Pod.
+	// v2 create takes exactly one.
 	GPUTypeID string
-	// GPUCount is how many accelerators to attach; 0 selects a CPU-only Pod.
-	GPUCount int32
+	GPUCount  int32
 	// VCPUPerGPU and RAMPerGPUGiB are the Pod's cpu/memory requests expressed RunPod's
 	// way — PER GPU, not in total, so the adapter divides by GPUCount and rounds UP
 	// (rounding down would hand the workload less than it asked for). Zero sends no
 	// filter, so any host with the GPU qualifies.
 	VCPUPerGPU   int
 	RAMPerGPUGiB int
-	// VCPUCount is the CPU-only equivalent, an absolute count rather than a per-GPU one,
-	// rounded up to the power of two (at least 2) v2 requires. Only read when GPUCount is 0.
-	// v2 takes no memory for a CPU Pod: it is this count times the flavor's ramGbPerVcpu (see
-	// cpuFlavor), so the Pod's memory request is dropped. Honouring it means sizing this
-	// count from memory too; deferred until that ratio is known.
-	VCPUCount int
-	// ContainerDiskGiB is the writable container disk, from the Pod's ephemeral-storage
-	// request (see ephemeralGiB for the unset case).
+	// ContainerDiskGiB is the writable container disk: util.PodEphemeralStorageGiB, at least
+	// defaultContainerDiskGiB.
 	//
 	// No persistent volume is ever requested: RunPod defaults to a billable 20 GiB one,
 	// and a Nebula instance is cattle with nothing to persist, so the Client pins it to 0.
@@ -162,11 +154,11 @@ type PodSpec struct {
 // object id, not a credential, so it prints as-is.
 func (s PodSpec) String() string {
 	return fmt.Sprintf("PodSpec{Name:%s Image:%s Entrypoint:%v StartCmd:%v Env:%s "+
-		"GPUTypeID:%s GPUCount:%d VCPUPerGPU:%d RAMPerGPUGiB:%d VCPUCount:%d "+
+		"GPUTypeID:%s GPUCount:%d VCPUPerGPU:%d RAMPerGPUGiB:%d "+
 		"ContainerDiskGiB:%d Ports:%v DataCenterIDs:%v "+
 		"RegistryAuthID:%s}",
 		s.Name, s.Image, s.Entrypoint, s.StartCmd, provider.RedactedEnv(s.Env),
-		s.GPUTypeID, s.GPUCount, s.VCPUPerGPU, s.RAMPerGPUGiB, s.VCPUCount,
+		s.GPUTypeID, s.GPUCount, s.VCPUPerGPU, s.RAMPerGPUGiB,
 		s.ContainerDiskGiB, s.Ports, s.DataCenterIDs,
 		s.RegistryAuthID)
 }
@@ -214,6 +206,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		SupportsStop:         false, // a stopped Pod still bills and loses its GPU
 		SupportsSpot:         false, // v2 has no interruptible tier
 		SupportsEgressPolicy: false, // no outbound allowlist in the API at all
+		SupportsCPUOnly:      false, // CPU flavors are rarely available
 		NativeTags:           false, // identity rides the Pod name
 		PreemptionNotice:     0,     // OnDemand-only: nothing is reclaimed
 		PollInterval:         0,     // OnDemand-only → the default cadence is fine
@@ -413,18 +406,13 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 }
 
 // PricePerHour overrides catalog.Base to add the container disk, which RunPod bills on top
-// of the GPU, and to price the CPU-only Pod that Base refuses. vCPU and RAM add nothing to
-// a GPU Pod: they come with the GPU (see data.RunPodCPU5cPricePerVCPUHour).
+// of the GPU. vCPU and RAM add nothing: they come with the GPU.
 func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
-	disk := data.RunPodContainerDiskCostPerHour(max(defaultContainerDiskGiB, req.DiskGiB))
-	if req.AcceleratorType == "" {
-		return data.RunPodCPUCostPerHour(powerOfTwoVCPUs(int(math.Ceil(req.CPUCores)))) + disk, nil
-	}
 	gpu, err := p.Base.PricePerHour(req)
 	if err != nil {
 		return 0, err
 	}
-	return gpu + disk, nil
+	return gpu + data.RunPodContainerDiskCostPerHour(max(defaultContainerDiskGiB, req.DiskGiB)), nil
 }
 
 // geographyOf reports whether data center dc is listed under any of geographies.
@@ -554,23 +542,21 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 	if err != nil {
 		return PodSpec{}, fmt.Errorf("runpod: %w", err)
 	}
-	if canonical != "" {
-		ids, ok := p.MapAccelerator(canonical, count)
-		if !ok {
-			return PodSpec{}, fmt.Errorf("runpod: unsupported accelerator %q: %w",
-				canonical, provider.ErrUnsupportedAccelerator)
-		}
-		spec.GPUTypeID = ids[0]
-		spec.GPUCount = count
-		// RunPod sizes a GPU Pod's cpu/memory PER GPU, so the Pod's totals are divided by
-		// the count (see PodSpec.VCPUPerGPU).
-		spec.VCPUPerGPU = perGPU(cores(resourceQty(&c, corev1.ResourceCPU)), count)
-		spec.RAMPerGPUGiB = perGPU(gib(resourceQty(&c, corev1.ResourceMemory)), count)
-		return spec, nil
+	if canonical == "" || count <= 0 {
+		// Placement never routes one here (see Capabilities.SupportsCPUOnly).
+		return PodSpec{}, errors.New("runpod: pod requests no accelerator; RunPod runs GPU Pods only")
 	}
-	// No accelerator label => a CPU-only Pod, which RunPod sizes with an absolute vCPU
-	// count instead of a per-GPU one.
-	spec.VCPUCount = powerOfTwoVCPUs(cores(resourceQty(&c, corev1.ResourceCPU)))
+	ids, ok := p.MapAccelerator(canonical, count)
+	if !ok {
+		return PodSpec{}, fmt.Errorf("runpod: unsupported accelerator %q: %w",
+			canonical, provider.ErrUnsupportedAccelerator)
+	}
+	spec.GPUTypeID = ids[0]
+	spec.GPUCount = count
+	// RunPod sizes a GPU Pod's cpu/memory PER GPU, so the Pod's totals are divided by
+	// the count (see PodSpec.VCPUPerGPU).
+	spec.VCPUPerGPU = perGPU(cores(resourceQty(&c, corev1.ResourceCPU)), count)
+	spec.RAMPerGPUGiB = perGPU(gib(resourceQty(&c, corev1.ResourceMemory)), count)
 	return spec, nil
 }
 
@@ -695,16 +681,6 @@ func perGPU(total int, count int32) int {
 		return total
 	}
 	return ceilDiv(total, int(count))
-}
-
-// powerOfTwoVCPUs rounds a vCPU count up to the power of two v2 requires of a CPU-only
-// Pod, with 2 as its floor — so an unset request also gets the smallest legal size.
-func powerOfTwoVCPUs(n int) int {
-	v := 2
-	for v < n {
-		v *= 2
-	}
-	return v
 }
 
 // ceilDiv divides rounding away from zero for positive inputs. Its own function because
