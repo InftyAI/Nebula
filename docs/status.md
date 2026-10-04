@@ -268,8 +268,8 @@ One RunPod Pod per NodeClaim, read through REST v2's `status`, which (unlike v1'
   truncated — two truncated claims would collide onto one Pod.
 - The endpoint is **derived, not read back**: `https://<podID>-<port>.proxy.runpod.net`
   is known at create time, so it is published from `CreatePod` like Modal's, but with
-  no token — that proxy is unauthenticated. A Pod with a public IP and an assigned
-  `/tcp` port mapping reports that direct address instead, once the poll loop sees it.
+  no token — that proxy is unauthenticated. Every TCP port is exposed as `/http`, so a
+  raw-TCP service is not reachable through it; UDP and SCTP ports are not exposed.
 - **Neither `kubectl logs` nor `kubectl exec` works yet.** v2 streams logs over SSE
   (`/v2/pods/{id}/logs`), which a `LogStreamer` could wrap; the only way into a
   container is SSH, so exec answers NotFound.
