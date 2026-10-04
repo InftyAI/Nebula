@@ -1,10 +1,8 @@
 # RunPod price/availability catalog — community-maintained.
 #
-# RunPod exposes GPU prices through its API, but only per GPU TYPE and without the
-# canonical-name mapping Nebula needs, so these are SECURE-cloud list prices
-# transcribed from https://runpod.io/pricing by hand. Treat them as a starting
-# point, not a billing source, and refresh via `make update-catalog`
-# (see hack/refresh.go).
+# Prices are `price.secure` from GET https://api.runpod.io/v2/catalog/gpus, copied by
+# hand: the API has no canonical-name mapping, so there is no refresh tool. Treat them
+# as a starting point, not a billing source. Only list an id whose `secure` is true.
 #
 # Prices are per GPU-HOUR, as Modal's are — not per instance-hour like aws.csv.
 # RunPod bills per GPU, and the adapter passes the count as a runtime parameter.
@@ -44,14 +42,13 @@
 #                     it is just not a pricing one.
 #   updated           documentation only, ignored by the parser
 accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
-L4,NVIDIA L4,,OnDemand,0.43,true,,2026-08-29
-A40,NVIDIA A40,,OnDemand,0.40,true,,2026-08-29
-RTX4090,NVIDIA GeForce RTX 4090,,OnDemand,0.69,true,,2026-08-29
-L40S,NVIDIA L40S,,OnDemand,0.86,true,,2026-08-29
-A100-40GB,NVIDIA A100-PCIE-40GB,,OnDemand,1.19,true,,2026-08-29
-A100-80GB,NVIDIA A100-SXM4-80GB,,OnDemand,1.74,true,,2026-08-29
-A100-80GB,NVIDIA A100 80GB PCIe,,OnDemand,1.64,true,,2026-08-29
-H100,NVIDIA H100 80GB HBM3,,OnDemand,2.99,true,,2026-08-29
-H100,NVIDIA H100 NVL,,OnDemand,2.79,true,,2026-08-29
-H100,NVIDIA H100 PCIe,,OnDemand,2.39,true,,2026-08-29
-H200,NVIDIA H200,,OnDemand,3.99,true,,2026-08-29
+L4,NVIDIA L4,,OnDemand,0.49,true,,2026-10-04
+A40,NVIDIA A40,,OnDemand,0.49,true,,2026-10-04
+RTX4090,NVIDIA GeForce RTX 4090,,OnDemand,0.74,true,,2026-10-04
+L40S,NVIDIA L40S,,OnDemand,1.09,true,,2026-10-04
+A100-80GB,NVIDIA A100-SXM4-80GB,,OnDemand,1.59,true,,2026-10-04
+A100-80GB,NVIDIA A100 80GB PCIe,,OnDemand,1.59,true,,2026-10-04
+H100,NVIDIA H100 80GB HBM3,,OnDemand,3.49,true,,2026-10-04
+H100,NVIDIA H100 NVL,,OnDemand,3.19,true,,2026-10-04
+H100,NVIDIA H100 PCIe,,OnDemand,2.89,true,,2026-10-04
+H200,NVIDIA H200,,OnDemand,4.59,true,,2026-10-04

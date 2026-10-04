@@ -241,8 +241,8 @@ func TestProvision_GeographyRegion(t *testing.T) {
 	f := &fakeClient{createID: "pod-ca"}
 	p := newTestProvider(f)
 
-	// A geography reaches Provision already joined by ResolveRegions; it must split back into
-	// the exact data centers, or RunPod is sent an id it has never heard of.
+	// A geography reaches Provision as the bare token; it must expand into the exact data
+	// centers, or RunPod is sent an id it has never heard of.
 	region := p.ResolveRegions([]string{"ca"}, nil)[0]
 	if _, err := p.Provision(context.Background(), gpuPod("l4", 1), provider.ProvisionRequest{
 		ClaimName:    "claim-g",
@@ -721,24 +721,22 @@ func TestRegionsByGeography_IsResolvable(t *testing.T) {
 
 func TestResolveRegions(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
-	us := strings.Join(regionsByGeography["us"], regionSeparator)
-	eu := strings.Join(regionsByGeography["eu"], regionSeparator)
 	cases := []struct {
 		name               string
 		declared, narrowTo []string
 		want               []string
 	}{
 		{name: "unconstrained is unpinned", want: []string{""}},
-		{name: "a geography is one joined candidate", declared: []string{"us"}, want: []string{us}},
+		{name: "a geography is one candidate", declared: []string{"us"}, want: []string{"us"}},
 		{name: "a data center passes through", declared: []string{"EU-RO-1"}, want: []string{"EU-RO-1"}},
 		// No RunPod data center is in the UK, so the token resolves to no candidate at all
 		// rather than to the literal "uk".
 		{name: "an empty geography yields nothing", declared: []string{"uk"}, want: nil},
 		{name: "duplicates collapse", declared: []string{"us", "US", "EU-RO-1", "EU-RO-1"},
-			want: []string{us, "EU-RO-1"}},
-		{name: "narrowing an unpinned pool", narrowTo: []string{"eu"}, want: []string{eu}},
+			want: []string{"us", "EU-RO-1"}},
+		{name: "narrowing an unpinned pool", narrowTo: []string{"eu"}, want: []string{"eu"}},
 		{name: "narrowing drops other geographies", declared: []string{"us", "eu"},
-			narrowTo: []string{"eu"}, want: []string{eu}},
+			narrowTo: []string{"eu"}, want: []string{"eu"}},
 		{name: "narrowing keeps a data center inside it", declared: []string{"EU-RO-1", "US-KS-2"},
 			narrowTo: []string{"eu"}, want: []string{"EU-RO-1"}},
 	}

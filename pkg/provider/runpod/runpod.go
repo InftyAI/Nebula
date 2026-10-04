@@ -345,10 +345,6 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	return out, nil
 }
 
-// regionSeparator joins a geography's data centers into ONE candidate; see ResolveRegions.
-// Not a comma, for the reason given at modal's regionSeparator.
-const regionSeparator = "|"
-
 // regionsByGeography maps a geography token to the RunPod data centers it encompasses. The
 // ids are GET /v2/catalog/datacenters as of 2026-09-29; the grouping is ours, by each id's
 // country, since the catalog's continent is coarser (it puts Canada with the US). Empty
@@ -373,12 +369,12 @@ var regionsByGeography = map[string][]string{
 }
 
 // ResolveRegions implements provider.Provider. Each declared token is ONE candidate, and a
-// geography's candidate carries all its data centers: RunPod places by availability within
-// the dataCenterIds it is given, so a geography costs one create, while failover still walks
-// the declared tokens one by one.
+// geography stays a geography: dataCentersOf expands it at create time, where RunPod places
+// by availability within the dataCenterIds it is given. So a geography costs one create,
+// while failover still walks the declared tokens one by one.
 //
 //	nil/[]       => [""], unpinned: RunPod's widest pool
-//	["us"]       => ["US-CA-2|US-CO-1|..."]
+//	["US"]       => ["us"]
 //	["EU-RO-1"]  => itself, verbatim and unvalidated
 //
 // narrowTo keeps the candidates inside those geographies; an unconstrained pool becomes one
@@ -405,16 +401,16 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 	var out []string
 	for _, d := range tokens {
 		d = strings.TrimSpace(d)
-		var dcs []string
+		c := ""
 		if g := strings.ToLower(d); provider.IsGeography(g) {
-			if within != nil && !within[g] {
-				continue
+			// A geography with no data center here is no candidate, not a literal id.
+			if (within == nil || within[g]) && len(regionsByGeography[g]) > 0 {
+				c = g
 			}
-			dcs = regionsByGeography[g]
-		} else if d != "" && (within == nil || geographyOf(d, within)) {
-			dcs = []string{d}
+		} else if within == nil || geographyOf(d, within) {
+			c = d
 		}
-		if c := strings.Join(dcs, regionSeparator); c != "" && !seen[c] {
+		if c != "" && !seen[c] {
 			seen[c] = true
 			out = append(out, c)
 		}
@@ -591,13 +587,16 @@ func checkRegistryAuth(a *provider.RegistryAuth) error {
 	}
 }
 
-// dataCentersOf splits a candidate ResolveRegions minted back into RunPod data centers.
-// Empty is unconstrained and yields none.
+// dataCentersOf expands a candidate ResolveRegions minted into RunPod data centers. Empty is
+// unconstrained and yields none.
 func dataCentersOf(region string) []string {
 	if region == "" {
 		return nil
 	}
-	return strings.Split(region, regionSeparator)
+	if dcs, ok := regionsByGeography[region]; ok {
+		return slices.Clone(dcs)
+	}
+	return []string{region}
 }
 
 // containerPorts renders the container's declared ports in RunPod's "<port>/<proto>" form.

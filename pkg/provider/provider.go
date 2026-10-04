@@ -220,10 +220,10 @@ type ProvisionRequest struct {
 	// nowhere to live on the Pod.
 	CapacityType nebulav1alpha1.CapacityType
 	// Region is the ONE candidate placement chose, exactly as this provider's own
-	// ResolveRegions minted it — already resolved (never a group token) and opaque to the
-	// control plane. Usually one concrete region (AWS "us-east-1"), which is what lets a
-	// capacity failure blocklist just that region; a provider that cannot fail over
-	// (Modal) may encode several for its own scheduler, and only that adapter parses it.
+	// ResolveRegions minted it, opaque to the control plane: only that adapter parses it.
+	// Usually one concrete region (AWS "us-east-1"), which is what lets a capacity failure
+	// blocklist just that region; Modal encodes several for its own scheduler, and RunPod
+	// keeps a geography token that it expands to data centers at create time.
 	//
 	// Empty means "no region constraint".
 	Region string

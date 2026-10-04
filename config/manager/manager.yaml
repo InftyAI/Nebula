@@ -67,7 +67,7 @@ spec:
           # Every provider is registered by default. Restrict with --providers; it is the
           # only way to turn AWS off, which registers even without credentials. Drain a
           # provider first: once dropped, nothing terminates its running instances.
-          # - --providers=modal
+          - --providers=runpod
         image: controller:latest
         name: manager
         imagePullPolicy: IfNotPresent
