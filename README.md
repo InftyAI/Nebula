@@ -29,7 +29,7 @@ per-cloud glue. The API follows a Karpenter-style split:
 ## Features
 
 - **Kubernetes-native experience.** Existing Deployments or Jobs opt in via labels; no new workload type and no per-cloud glue.
-- **Multi-provider support.** Modal and AWS today, with more to come.
+- **Multi-provider support.** Modal, RunPod and AWS today, with more providers coming soon.
 - **Policy-driven placement.** Flexible NodePool spec to pick providers by cost, availability, and region, with failover and network egress policy.
 - **Cost tracking.** Out-of-the-box per-instance cost tracking.
 - **Observability.** Rich metrics and logs for placement, provisioning, and instance lifecycle.
