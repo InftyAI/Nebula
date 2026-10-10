@@ -119,7 +119,7 @@ func TestSampleGPUShapesAreProvisionable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("globbing samples: %v", err)
 	}
-	var shapes []sampleGPUShape
+	shapes := make([]sampleGPUShape, 0, len(files))
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {

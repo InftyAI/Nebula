@@ -8,9 +8,6 @@
 //	NodeClaim - one provisioned external instance and its lifecycle. Owns the
 //	            terminate finalizer so a paid instance is never leaked.
 //
-// There are no workload types: Nebula places Pods, so a workload is whatever
-// Kubernetes object creates them (Job, Deployment, a bare Pod).
-//
 // +kubebuilder:object:generate=true
 // +groupName=nebula.inftyai.com
 package v1alpha1
