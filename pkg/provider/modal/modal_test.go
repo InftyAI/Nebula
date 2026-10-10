@@ -51,15 +51,6 @@ type fakeClient struct {
 	cred       Credential // credential CreateSandbox returns alongside its id
 	terminated []string
 
-	// The mint path: what MintConnectCredential returns, and what it was asked for.
-	// mintCnt is the assertion that matters most — minting when a token is already held
-	// is the one mistake nothing can undo.
-	mintCred Credential
-	mintErr  error
-	mintCnt  int
-	mintID   string
-	mintPort int
-
 	// logs is the stream SandboxLogs hands back, and logsFor records the id it was
 	// asked for — the one thing the adapter decides on that path.
 	logs    string
@@ -85,15 +76,6 @@ func (f *fakeClient) CreateSandbox(_ context.Context, spec SandboxSpec) (string,
 	}
 	f.sandboxes = append(f.sandboxes, Sandbox{ID: id, Tags: spec.Tags, Status: "pending"})
 	return id, f.cred, nil
-}
-
-func (f *fakeClient) MintConnectCredential(_ context.Context, id string, port int) (Credential, error) {
-	f.mintCnt++
-	f.mintID, f.mintPort = id, port
-	if f.mintErr != nil {
-		return Credential{}, f.mintErr
-	}
-	return f.mintCred, nil
 }
 
 func (f *fakeClient) TerminateSandbox(_ context.Context, id string) error {
@@ -1293,9 +1275,10 @@ func TestProvision_ReturnsMintedCredential(t *testing.T) {
 		cred:     Credential{URL: "https://x.modal.host", Token: "tok-abc"},
 	}
 	p := newTestProvider(f)
+	pod := gpuPod("claim-a", "H100", 1)
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 8000}}
 
-	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
-		provider.ProvisionRequest{ClaimName: "claim-a"})
+	res, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{ClaimName: "claim-a"})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -1311,6 +1294,29 @@ func TestProvision_ReturnsMintedCredential(t *testing.T) {
 		if v == "tok-abc" {
 			t.Fatalf("token leaked into sandbox tag %q", k)
 		}
+	}
+}
+
+// A portless Pod is still minted for (the mint is the placement wait), but the credential
+// routes to the SDK's default 8080, which the Pod never declared, so none is published.
+func TestProvision_PortlessPodPublishesNoCredential(t *testing.T) {
+	f := &fakeClient{
+		createID: "sb-1",
+		cred:     Credential{URL: "https://x.modal.host", Token: "tok-abc"},
+	}
+	p := newTestProvider(f)
+
+	res, err := p.Provision(context.Background(), gpuPod("claim-a", "H100", 1),
+		provider.ProvisionRequest{ClaimName: "claim-a"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if !res.Reserved {
+		t.Fatal("Reserved = false; the mint still ran, so the GPU is placed")
+	}
+	if res.ConnectURL != "" || res.ConnectToken != "" {
+		t.Fatalf("a portless Pod must carry no credential, got url=%q token set=%t",
+			res.ConnectURL, res.ConnectToken != "")
 	}
 }
 
@@ -1373,8 +1379,7 @@ func adoptable() *fakeClient {
 			Tags:   map[string]string{ClaimTagKey: "claim-a"},
 			Status: statusRunning,
 		}},
-		cred:     Credential{URL: "https://created.modal.host", Token: "tok-created"},
-		mintCred: Credential{URL: "https://minted.modal.host", Token: "tok-minted"},
+		cred: Credential{URL: "https://created.modal.host", Token: "tok-created"},
 	}
 }
 
@@ -1399,9 +1404,6 @@ func TestProvision_IdempotentReturnsNoCredential(t *testing.T) {
 	}
 	if f.createCnt != 0 {
 		t.Fatalf("created %d sandboxes; the claim tag must be adopted, not duplicated", f.createCnt)
-	}
-	if f.mintCnt != 0 {
-		t.Fatalf("minted %d credentials for an adopted sandbox; want 0", f.mintCnt)
 	}
 	if res.ConnectURL != "" || res.ConnectToken != "" {
 		t.Fatalf("an adopted sandbox must carry no credential, got url=%q token set=%t",

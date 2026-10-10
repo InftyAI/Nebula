@@ -101,16 +101,11 @@ type Client interface {
 	// a worker, because the mint blocks on that (see sdkClient.mintCredential) — so a queued
 	// GPU is a call that blocks for minutes, and a successful return means real capacity.
 	//
-	// Minting is one-shot and there is no read-back, so
-	// a caller that drops the credential can only get another from MintConnectCredential.
+	// Minting is one-shot and there is no read-back, so a dropped credential is lost.
 	// A sandbox that could not be given one is unreachable, so a failed mint is an ERROR
 	// with no id, not a zero credential — the sandbox may exist, and the claim tag is what
 	// reclaims it (see sdkClient.CreateSandbox).
 	CreateSandbox(ctx context.Context, spec SandboxSpec) (id string, cred Credential, err error)
-	// MintConnectCredential mints a NEW credential for a sandbox that already exists,
-	// which Modal allows from the id alone. Every call returns a different token and none
-	// can be revoked, so it is only safe where nothing holds the previous one.
-	MintConnectCredential(ctx context.Context, id string, port int) (Credential, error)
 	// TerminateSandbox terminates a sandbox by id. Must be idempotent:
 	// terminating an already-gone sandbox returns nil.
 	TerminateSandbox(ctx context.Context, id string) error
@@ -455,7 +450,8 @@ func (p *Provider) Capabilities() provider.Capabilities {
 // bounded by Modal's own ~3m43s cap on the mint, not by provisionTimeout.
 //
 // The connect credential comes back on this call and only this call, since Modal mints it
-// once with no read-back. The caller must persist it or it is lost; see mintCredential.
+// once with no read-back, and only for a Pod that declares a containerPort. The caller must
+// persist it or it is lost; see mintCredential.
 func (p *Provider) Provision(
 	ctx context.Context, pod *corev1.Pod, req provider.ProvisionRequest,
 ) (provider.ProvisionResult, error) {
@@ -493,12 +489,17 @@ func (p *Provider) Provision(
 	if err != nil {
 		return provider.ProvisionResult{}, err
 	}
-	return provider.ProvisionResult{
-		InstanceID:   id,
-		Reserved:     true, // mintCredential is a blocking call, so the GPU is reserved on return
-		ConnectURL:   cred.URL,
-		ConnectToken: cred.Token,
-	}, nil
+	res := provider.ProvisionResult{
+		InstanceID: id,
+		Reserved:   true, // mintCredential is a blocking call, so the GPU is reserved on return
+	}
+	// A portless Pod is minted for too, since the mint is the placement wait, and the SDK routes
+	// its token to 8080. Publishing it would advertise an endpoint nothing declared, so the
+	// credential is dropped; it is unrevocable but held by no one.
+	if len(spec.Ports) > 0 {
+		res.ConnectURL, res.ConnectToken = cred.URL, cred.Token
+	}
+	return res, nil
 }
 
 // Terminate implements provider.Provider. Idempotent by the Client contract. The region

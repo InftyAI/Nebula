@@ -202,6 +202,8 @@ func (c *sdkClient) CreateSandbox(ctx context.Context, spec SandboxSpec) (string
 	log.V(1).Info("modal sandbox created", "sandboxID", sb.SandboxID,
 		"imageBuild", imageBuild.String(), "create", time.Since(createStart).String())
 
+	// TODO: stop minting as the placement wait once the SDK exports one (the task-id poll
+	// behind its unexported ensureTaskID); then mint only for a Pod that declares a port.
 	mintStart := time.Now()
 	cred, err := c.mintCredential(ctx, sb, firstPort(spec.Ports))
 	if err != nil {
@@ -344,16 +346,6 @@ func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port 
 			sb.SandboxID)
 	}
 	return Credential{URL: creds.URL, Token: creds.Token}, nil
-}
-
-// MintConnectCredential implements Client. FromID attaches to a live sandbox and creates
-// nothing, which is what lets a credential be minted for one this process never created.
-func (c *sdkClient) MintConnectCredential(ctx context.Context, id string, port int) (Credential, error) {
-	sb, err := c.mc.Sandboxes.FromID(ctx, id, nil)
-	if err != nil {
-		return Credential{}, fmt.Errorf("modal: attach sandbox %s: %w", id, err)
-	}
-	return c.mintCredential(ctx, sb, port)
 }
 
 // modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only
