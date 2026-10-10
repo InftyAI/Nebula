@@ -17,7 +17,7 @@ limitations under the License.
 package controller
 
 // concurrentReconciles is how many objects a FLEET-SCALED controller reconciles at once —
-// one whose object count tracks the number of workloads (NodeClaims, Pods, Sandboxes)
+// one whose object count tracks the number of workloads (NodeClaims, Pods)
 // rather than the number of policies.
 //
 // controller-runtime defaults to 1, which is right for a controller with a handful of
@@ -36,8 +36,8 @@ package controller
 // state needs no locking, and the only state shared ACROSS objects is read-only (the
 // provider registry) or already guarded (pkg/failover.Blocklist).
 //
-// Not applied to the NodePool or SandboxSet controllers: their object counts track policy,
-// not fleet size, and their fan-in watches collapse thousands of child events onto a few
+// Not applied to the NodePool controller: its object count tracks policy, not fleet size,
+// and its fan-in watches collapse thousands of child events onto a few
 // keys (the workqueue dedups by key), so a second worker would mostly add conflict retries
 // on the same status.
 const concurrentReconciles = 8

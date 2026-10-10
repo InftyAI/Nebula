@@ -32,7 +32,6 @@ rules:
   - ""
   resources:
   - nodes
-  - pods
   verbs:
   - create
   - delete
@@ -50,6 +49,17 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - ""
   resources:
@@ -129,8 +139,6 @@ rules:
   resources:
   - nodeclaims
   - nodepools
-  - sandboxes
-  - sandboxsets
   verbs:
   - create
   - delete
@@ -144,8 +152,6 @@ rules:
   resources:
   - nodeclaims/finalizers
   - nodepools/finalizers
-  - sandboxes/finalizers
-  - sandboxsets/finalizers
   verbs:
   - update
 - apiGroups:
@@ -153,9 +159,6 @@ rules:
   resources:
   - nodeclaims/status
   - nodepools/status
-  - sandboxes/status
-  - sandboxsets/scale
-  - sandboxsets/status
   verbs:
   - get
   - patch

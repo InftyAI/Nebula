@@ -129,9 +129,9 @@ kubectl apply Pod/Deployment
 ```
 
 Everything runs in one controller-runtime manager binary (`cmd/main.go`) today.
-Virtual nodes are started as manager runnables, one per registered provider. The
-same manager also owns `Sandbox` and `SandboxSet` controllers, which synthesize
-Nebula-managed Pods for long-lived interactive boxes.
+Virtual nodes are started as manager runnables, one per registered provider.
+There are no workload CRDs: Nebula places Pods, so a workload is whatever
+Kubernetes object creates them (Job, Deployment, a bare Pod).
 
 ---
 
@@ -484,9 +484,6 @@ All CRDs are under `nebula.inftyai.com/v1alpha1`.
 
 - `NodePool` (`np`) is cluster-scoped placement policy.
 - `NodeClaim` (`nc`) is a cluster-scoped instance ledger.
-- `Sandbox` is a namespaced workload-facing object for one interactive remote
-  box.
-- `SandboxSet` is a namespaced controller object that maintains N Sandboxes.
 
 ### NodePool (`np`)
 
@@ -549,13 +546,6 @@ status:
 Valid phases are `Provisioning`, `Bound`, `Terminating`, and `Terminated`. The
 claim deliberately does not duplicate PodSpec and does not mirror fine-grained
 runtime status — `Bound` answers existence, not readiness.
-
-### Sandbox and SandboxSet
-
-`Sandbox` and `SandboxSet` are namespaced user-facing abstractions for
-interactive boxes. The controllers synthesize Nebula-managed Pods, so they reuse
-the same admission, placement, virtual-node provisioning, status, and teardown
-paths as direct Pod/Deployment workloads.
 
 ---
 
@@ -642,7 +632,6 @@ Implemented:
 - Virtual Kubelet provider nodes with CreatePod/DeletePod/List polling.
 - NodeClaim terminate finalizer and 15-second cache-lag guard.
 - Modal, AWS, and e2e fake providers.
-- Sandbox and SandboxSet controllers layered on the same Pod placement path.
 
 Planned or partial:
 
