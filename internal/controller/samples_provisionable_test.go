@@ -24,6 +24,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
 
@@ -31,20 +32,20 @@ import (
 // provision. This is not a style check: on EC2 the GPU COUNT is baked into the
 // instance type rather than being a free knob, so (acceleratorType, nvidia.com/gpu)
 // is a single lookup key into the catalog. A pair with no row maps to nothing and
-// Provision fails with "no EC2 instance type for <type> x<n>" — after the Sandbox is
-// admitted and placed, so the only symptom is a box that never becomes Ready.
+// Provision fails with "no EC2 instance type for <type> x<n>" — after the Pod is
+// admitted and placed, so the only symptom is a Pod that never becomes Ready.
 //
 // The samples shipped exactly that bug: acceleratorType a100-40gb with
 // nvidia.com/gpu 1, against a NodePool listing aws alone. AWS's smallest A100-40GB
 // instance is p4d.24xlarge, which has 8 — so `kubectl apply -f config/samples/` could
-// never provision, and the SandboxSet sample multiplied it by three replicas.
+// never provision.
 //
 // It reads the real YAML and the real embedded catalog rather than restating the
 // shapes, so editing a sample to an unprovisionable pair fails here instead of on a
 // user's cluster.
 
-// sampleGPUShape is the fragment of a Sandbox/SandboxSet sample this test needs: the
-// accelerator type, the GPU count, and the pool the shape must be servable by.
+// sampleGPUShape is the fragment of a workload sample this test needs: the accelerator
+// type, the GPU count, and the pool the shape must be servable by.
 type sampleGPUShape struct {
 	file        string
 	accelerator string
@@ -52,24 +53,20 @@ type sampleGPUShape struct {
 	nodePoolRef string
 }
 
-// sandboxSample mirrors the two sample kinds' spec shape. SandboxSet nests the same
-// spec under template, so one struct with an optional Template covers both.
-type sandboxSample struct {
+// podTemplateSample is the shape every Pod-template workload (Deployment, Job, ...)
+// shares: the pool and accelerator ride the template's labels, the count its limits.
+type podTemplateSample struct {
 	Spec struct {
-		NodePoolRef     string `json:"nodePoolRef"`
-		AcceleratorType string `json:"acceleratorType"`
-		Resources       struct {
-			Limits   map[string]string `json:"limits"`
-			Requests map[string]string `json:"requests"`
-		} `json:"resources"`
 		Template *struct {
+			Metadata struct {
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
 			Spec struct {
-				NodePoolRef     string `json:"nodePoolRef"`
-				AcceleratorType string `json:"acceleratorType"`
-				Resources       struct {
-					Limits   map[string]string `json:"limits"`
-					Requests map[string]string `json:"requests"`
-				} `json:"resources"`
+				Containers []struct {
+					Resources struct {
+						Limits map[string]string `json:"limits"`
+					} `json:"resources"`
+				} `json:"containers"`
 			} `json:"spec"`
 		} `json:"template"`
 	} `json:"spec"`
@@ -118,38 +115,38 @@ func TestSampleGPUShapesAreProvisionable(t *testing.T) {
 		poolProviders[nodePoolNameFromFile(t, raw)] = names
 	}
 
-	var shapes []sampleGPUShape
-	for _, kind := range []string{"*sandbox.yaml", "*sandboxset.yaml"} {
-		files, err := filepath.Glob(filepath.Join(samplesDir, kind))
+	files, err := filepath.Glob(filepath.Join(samplesDir, "*.yaml"))
+	if err != nil {
+		t.Fatalf("globbing samples: %v", err)
+	}
+	shapes := make([]sampleGPUShape, 0, len(files))
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
 		if err != nil {
-			t.Fatalf("globbing %s: %v", kind, err)
+			t.Fatalf("reading %s: %v", f, err)
 		}
-		for _, f := range files {
-			raw, err := os.ReadFile(f)
-			if err != nil {
-				t.Fatalf("reading %s: %v", f, err)
-			}
-			var s sandboxSample
-			if err := yaml.Unmarshal(raw, &s); err != nil {
-				t.Fatalf("parsing %s: %v", f, err)
-			}
-
-			accel, pool, limits := s.Spec.AcceleratorType, s.Spec.NodePoolRef, s.Spec.Resources.Limits
-			if s.Spec.Template != nil {
-				accel = s.Spec.Template.Spec.AcceleratorType
-				pool = s.Spec.Template.Spec.NodePoolRef
-				limits = s.Spec.Template.Spec.Resources.Limits
-			}
-			if accel == "" {
-				continue // a CPU-only sample has no shape to check
-			}
-			shapes = append(shapes, sampleGPUShape{
-				file:        filepath.Base(f),
-				accelerator: accel,
-				count:       gpuCount(t, limits),
-				nodePoolRef: pool,
-			})
+		var s podTemplateSample
+		if err := yaml.Unmarshal(raw, &s); err != nil {
+			t.Fatalf("parsing %s: %v", f, err)
 		}
+		if s.Spec.Template == nil {
+			continue // not a Pod-template workload (e.g. the NodePool itself)
+		}
+		labels := s.Spec.Template.Metadata.Labels
+		accel := labels[nebulav1alpha1.AcceleratorTypeLabel]
+		if accel == "" {
+			continue // a CPU-only sample has no shape to check
+		}
+		var count int32
+		for _, c := range s.Spec.Template.Spec.Containers {
+			count += gpuCount(t, c.Resources.Limits)
+		}
+		shapes = append(shapes, sampleGPUShape{
+			file:        filepath.Base(f),
+			accelerator: accel,
+			count:       count,
+			nodePoolRef: labels[nebulav1alpha1.PoolLabel],
+		})
 	}
 
 	if len(shapes) == 0 {
