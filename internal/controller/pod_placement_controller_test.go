@@ -988,3 +988,17 @@ func TestReap_NonNebulaTerminalPodIsIgnored(t *testing.T) {
 		t.Fatal("must not reap a non-Nebula Pod")
 	}
 }
+
+func TestReap_SucceededJobPodIsKept(t *testing.T) {
+	// Deleting a Succeeded Job pod makes the Job lose its success record and read as Failed.
+	pod := terminalOwnedPod("p1", "default", "uid-1", corev1.PodSucceeded, true)
+	pod.OwnerReferences[0].APIVersion = "batch/v1"
+	pod.OwnerReferences[0].Kind = "Job"
+	r, c := newPlacementReconciler(t, []client.Object{pod})
+
+	reconcilePod(t, r, "default", "p1")
+
+	if !podPresent(c, "default", "p1") {
+		t.Fatal("expected a Succeeded Job Pod to be kept")
+	}
+}

@@ -414,6 +414,12 @@ func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev
 	if !util.IsTerminalPodPhase(pod.Status.Phase) {
 		return false, nil
 	}
+	// Do not delete succeeded Pods owned by Jobs; keep for status reporting.
+	if pod.Status.Phase == corev1.PodSucceeded {
+		if owner := metav1.GetControllerOf(pod); owner != nil && owner.Kind == "Job" {
+			return false, nil
+		}
+	}
 	if !isControllerOwned(pod) {
 		return false, nil // bare Pod: leave it as a record
 	}
