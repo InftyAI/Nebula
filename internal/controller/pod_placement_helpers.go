@@ -23,9 +23,11 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -418,6 +420,7 @@ func removeGate(gates []corev1.PodSchedulingGate, name string) []corev1.PodSched
 //   - terminal phase: only Failed/Succeeded (a live Pod is never touched).
 //   - controller-owned: only Pods a ReplicaSet/Job will recreate; a bare Pod is
 //     left as an inspectable record.
+//   - not a succeeded Job Pod: the Job counts it as a completion.
 //
 // Delete is UID-pinned so a Pod already replaced by a same-name recreate is not
 // clobbered, and a NotFound (already gone) is treated as success.
@@ -431,14 +434,11 @@ func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev
 	if !util.IsTerminalPodPhase(pod.Status.Phase) {
 		return false, nil
 	}
-	// Do not delete succeeded Pods owned by Jobs; keep for status reporting.
-	if pod.Status.Phase == corev1.PodSucceeded {
-		if owner := metav1.GetControllerOf(pod); owner != nil && owner.Kind == "Job" {
-			return false, nil
-		}
-	}
 	if !isControllerOwned(pod) {
 		return false, nil // bare Pod: leave it as a record
+	}
+	if isSucceededPodOwnedByJob(pod) {
+		return false, nil // the Job counts it as a completion; deleting it loses that
 	}
 
 	preconditions := metav1.Preconditions{UID: &pod.UID}
@@ -452,6 +452,20 @@ func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev
 // ReplicaSet or Job) that will recreate it after deletion.
 func isControllerOwned(pod *corev1.Pod) bool {
 	return metav1.GetControllerOf(pod) != nil
+}
+
+// isSucceededPodOwnedByJob reports whether the Pod has succeeded and is
+// controlled by a batch Job.
+func isSucceededPodOwnedByJob(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodSucceeded {
+		return false
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.Kind != "Job" {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	return err == nil && gv.Group == batchv1.GroupName
 }
 
 // SetupWithManager wires the controller. It watches Pods; NodePool edits are not
