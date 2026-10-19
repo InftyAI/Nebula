@@ -9,50 +9,52 @@
 #
 # The `region` column is left BLANK here on purpose. This file holds only the
 # durable facts — the (accelerator, count) -> instance-type mapping and a seed
-# on-demand price — one row per {accelerator, count, capacity_type}. Region truth
-# (which types a region actually offers, and live spot prices) is NOT
-# hand-maintained: AWS exposes it at runtime, so the adapter's Offerings(ctx)
-# probes DescribeInstanceTypeOfferings per configured region and stamps/filters
-# these rows. That keeps this file small and stops per-region availability from
-# drifting out of date.
+# price — one row per {accelerator, count, capacity_type}. Region truth is NOT
+# hand-maintained: AWS exposes it at runtime. The adapter's Offerings(ctx) probes
+# DescribeInstanceTypeOfferings per configured region for which types the region
+# offers, and PricePerHour reads the region's live Spot price through
+# DescribeSpotPriceHistory. That keeps this file small and stops per-region
+# availability and Spot prices from drifting out of date.
 #
 # On-demand prices are approximate USD per INSTANCE-hour transcribed by hand from
 # https://aws.amazon.com/ec2/pricing/on-demand/ (us-east-1 rates as the seed);
 # treat them as a starting point, not a billing source. Spot prices vary by
-# region and minute and are left to the live probe (the seed spot rows carry a
-# recent us-east-1 typical rate only as a fallback).
+# region, AZ and hour, so PricePerHour prices a Spot claim at its region's live
+# price (the lowest across AZs, cached for an hour). The Spot rows here are the
+# same figure, the lowest us-east-1 AZ price on the `updated` date, used only when
+# the live price cannot be read.
 #
 # Columns (shared header across all provider CSVs; unused cells left blank):
 #   accelerator_type  canonical Nebula accelerator type
 #   accelerator_id    EC2 instance type that serves {accelerator_type, gpu_count}
 #   gpu_count         accelerators the instance type provides (the lookup key)
 #   capacity_type     Spot | OnDemand
-#   price_per_hour    approximate USD/instance-hour (seed; live probe may override)
-#   available         seed availability (the live probe is authoritative per region)
-#   region            BLANK — stamped per configured region by the live probe
+#   price_per_hour    approximate USD/instance-hour (Spot: fallback for the live price)
+#   available         seed availability (the per-region probe is authoritative)
+#   region            BLANK — stamped per configured region by the availability probe
 #   updated           YYYY-MM-DD the row was last verified
 accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
-T4,g4dn.xlarge,1,OnDemand,0.526,true,,2026-09-30
-T4,g4dn.xlarge,1,Spot,0.274,true,,2026-09-30
-T4,g4dn.12xlarge,4,OnDemand,3.912,true,,2026-09-30
-T4,g4dn.12xlarge,4,Spot,1.561,true,,2026-09-30
-T4,g4dn.metal,8,OnDemand,7.824,true,,2026-09-30
-T4,g4dn.metal,8,Spot,5.683,true,,2026-09-30
-A10G,g5.xlarge,1,OnDemand,1.006,true,,2026-09-30
-A10G,g5.xlarge,1,Spot,0.466,true,,2026-09-30
-A10G,g5.12xlarge,4,OnDemand,5.672,true,,2026-09-30
-A10G,g5.12xlarge,4,Spot,4.576,true,,2026-09-30
-A10G,g5.48xlarge,8,OnDemand,16.288,true,,2026-09-30
-A10G,g5.48xlarge,8,Spot,8.402,true,,2026-09-30
-L4,g6.xlarge,1,OnDemand,0.805,true,,2026-09-30
-L4,g6.xlarge,1,Spot,0.601,true,,2026-09-30
-L4,g6.12xlarge,4,OnDemand,4.602,true,,2026-09-30
-L4,g6.12xlarge,4,Spot,3.300,true,,2026-09-30
-L4,g6.48xlarge,8,OnDemand,13.350,true,,2026-09-30
-L4,g6.48xlarge,8,Spot,8.292,true,,2026-09-30
-A100-40GB,p4d.24xlarge,8,OnDemand,21.958,true,,2026-09-30
-A100-40GB,p4d.24xlarge,8,Spot,17.861,true,,2026-09-30
-A100-80GB,p4de.24xlarge,8,OnDemand,27.447,true,,2026-09-30
-A100-80GB,p4de.24xlarge,8,Spot,21.514,true,,2026-09-30
-H100,p5.48xlarge,8,OnDemand,55.040,true,,2026-09-30
-H100,p5.48xlarge,8,Spot,20.839,true,,2026-09-30
+T4,g4dn.xlarge,1,OnDemand,0.526,true,,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.297,true,,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,3.912,true,,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.594,true,,2026-10-19
+T4,g4dn.metal,8,OnDemand,7.824,true,,2026-10-19
+T4,g4dn.metal,8,Spot,4.658,true,,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.006,true,,2026-10-19
+A10G,g5.xlarge,1,Spot,0.439,true,,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,5.672,true,,2026-10-19
+A10G,g5.12xlarge,4,Spot,2.471,true,,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,16.288,true,,2026-10-19
+A10G,g5.48xlarge,8,Spot,4.640,true,,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.805,true,,2026-10-19
+L4,g6.xlarge,1,Spot,0.487,true,,2026-10-19
+L4,g6.12xlarge,4,OnDemand,4.602,true,,2026-10-19
+L4,g6.12xlarge,4,Spot,1.445,true,,2026-10-19
+L4,g6.48xlarge,8,OnDemand,13.350,true,,2026-10-19
+L4,g6.48xlarge,8,Spot,4.435,true,,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,21.958,true,,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,16.721,true,,2026-10-19
+A100-80GB,p4de.24xlarge,8,OnDemand,27.447,true,,2026-10-19
+A100-80GB,p4de.24xlarge,8,Spot,21.387,true,,2026-10-19
+H100,p5.48xlarge,8,OnDemand,55.040,true,,2026-10-19
+H100,p5.48xlarge,8,Spot,29.168,true,,2026-10-19

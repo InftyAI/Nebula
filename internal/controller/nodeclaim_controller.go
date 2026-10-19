@@ -409,6 +409,7 @@ func (r *NodeClaimReconciler) recordPrice(ctx context.Context, nc *nebulav1alpha
 		AcceleratorType: accelerator,
 		Count:           count,
 		CapacityType:    nc.Spec.CapacityType,
+		Region:          nc.Spec.Region,
 		CPUCores:        cpuCores,
 		MemoryMiB:       memoryMiB,
 		DiskGiB:         util.PodEphemeralStorageGiB(pod),
