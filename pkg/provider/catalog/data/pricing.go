@@ -53,8 +53,7 @@ const mibPerGiB = 1024
 // (see modal.SandboxSpec) — so no conversion happens at the call site, which is where a
 // factor-of-1024 slip would hide.
 //
-// Reservation, not usage: a sandbox bursting above its request toward CPULimit may bill
-// above these.
+// A floor, since Modal bills usage above the reservation (see util.PodReservation).
 func ModalCPUCostPerHour(cpuCores float64) float64 {
 	return cpuCores * ModalCPUPricePerCoreHour
 }
