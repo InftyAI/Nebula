@@ -140,9 +140,10 @@ func (c fakeCatalog) Offerings(_ string) []provider.Offering { return c.rows }
 
 const testRegion = "us-east-1"
 
-// offering is a compact constructor for a region-aware test catalog row (the
-// full struct literal is too wide to read inline). count is the gpu_count, the
-// AWS lookup key that (with the accelerator type) selects the instance type.
+// offering is a compact constructor for a test catalog row (the full struct literal
+// is too wide to read inline). count is the gpu_count, the AWS lookup key that (with
+// the accelerator type) selects the instance type. The region is blank, as in the real
+// catalog's default rows; Offerings stamps it per region.
 func offering(accel, id string, count int32, tier nebulav1alpha1.CapacityType, price float64) provider.Offering {
 	return provider.Offering{
 		AcceleratorType: accel,
@@ -151,7 +152,6 @@ func offering(accel, id string, count int32, tier nebulav1alpha1.CapacityType, p
 		CapacityType:    tier,
 		PricePerHour:    price,
 		Available:       true,
-		Region:          testRegion,
 	}
 }
 
@@ -1206,5 +1206,31 @@ func TestPricePerHour_LivePriceOnlyForSpotWithRegion(t *testing.T) {
 	}
 	if f.spotCalls != 0 {
 		t.Fatalf("spot lookups = %d, want 0 for these requests", f.spotCalls)
+	}
+}
+
+func TestRegionRows(t *testing.T) {
+	od, spot := nebulav1alpha1.CapacityOnDemand, nebulav1alpha1.CapacitySpot
+	withRegion := func(o provider.Offering, region string) provider.Offering { o.Region = region; return o }
+	rows := []provider.Offering{
+		offering("H100", "p5.48xlarge", 8, od, 55.040),
+		offering("H100", "p5.48xlarge", 8, spot, 29.168),
+		withRegion(offering("H100", "p5.48xlarge", 8, od, 58.893), "eu-north-1"),
+		withRegion(offering("H100", "p5.48xlarge", 8, od, 71.552), "eu-west-2"),
+	}
+	got := regionRows(rows, "eu-north-1")
+	if len(got) != 2 {
+		t.Fatalf("regionRows(eu-north-1) = %d rows, want 2 (its own on-demand + the default spot): %+v", len(got), got)
+	}
+	for _, o := range got {
+		switch {
+		case o.CapacityType == od && (o.Region != "eu-north-1" || o.PricePerHour != 58.893):
+			t.Errorf("on-demand row = %+v, want eu-north-1's own 58.893, not the default or eu-west-2's", o)
+		case o.CapacityType == spot && o.Region != "":
+			t.Errorf("spot row = %+v, want the default (eu-north-1 has none of its own)", o)
+		}
+	}
+	if got := regionRows(rows, "us-east-2"); len(got) != 2 || got[0].Region != "" || got[1].Region != "" {
+		t.Fatalf("regionRows(us-east-2) = %+v, want just the two defaults", got)
 	}
 }

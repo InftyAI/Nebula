@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -72,13 +73,31 @@ func TestLoad_EmbeddedAWS(t *testing.T) {
 	}
 
 	// AWS requests by instance type, so every row must carry an accelerator_id (the
-	// EC2 instance type). The embedded catalog is REGION-LESS — region is stamped by
-	// the adapter's live probe, not hand-maintained here — so rows have no region.
-	// Both capacity tiers appear.
+	// EC2 instance type). Blank-region rows are the defaults; a row with a region prices
+	// that region only, so every regional offering needs a default for the regions
+	// without one. Both capacity tiers appear.
+	type offeringKey struct {
+		id    string
+		count int32
+		tier  nebulav1alpha1.CapacityType
+	}
+	defaults := map[offeringKey]bool{}
+	for _, o := range offs {
+		if o.Region == "" {
+			defaults[offeringKey{o.AcceleratorID, o.GPUCount, o.CapacityType}] = true
+		}
+	}
+	regionName := regexp.MustCompile(`^[a-z]{2}-[a-z]+-[0-9]$`)
 	var haveSpot, haveOnDemand bool
 	for _, o := range offs {
 		if o.Region != "" {
-			t.Fatalf("embedded aws catalog must be region-less, got region %q for %q", o.Region, o.AcceleratorType)
+			if !regionName.MatchString(o.Region) {
+				t.Fatalf("aws row %s has malformed region %q", o.AcceleratorID, o.Region)
+			}
+			if !defaults[offeringKey{o.AcceleratorID, o.GPUCount, o.CapacityType}] {
+				t.Fatalf("aws row %s x%d %s in %s has no default (blank-region) row",
+					o.AcceleratorID, o.GPUCount, o.CapacityType, o.Region)
+			}
 		}
 		if o.AcceleratorID == "" {
 			t.Fatalf("aws offering %q has no accelerator_id (EC2 instance type)", o.AcceleratorType)
@@ -405,6 +424,44 @@ func TestBasePricePerHour_EmbeddedCatalog(t *testing.T) {
 	}
 	if got != 55.040 {
 		t.Fatalf("aws H100 x8 = %v, want 55.040 (whole-instance rate, unscaled)", got)
+	}
+
+	// A region with rows of its own is priced from them; one without uses the default.
+	got, err = aws.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: od, Region: "eu-north-1"})
+	if err != nil || got != 58.893 {
+		t.Fatalf("aws H100 x8 in eu-north-1 = %v, %v; want its own row, 58.893", got, err)
+	}
+	got, err = aws.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: od, Region: "il-central-1"})
+	if err != nil || got != 55.040 {
+		t.Fatalf("aws H100 x8 in a region without rows = %v, %v; want the default 55.040", got, err)
+	}
+}
+
+func TestBasePricePerHour_RegionPreference(t *testing.T) {
+	od := nebulav1alpha1.CapacityOnDemand
+	row := func(region string, price float64) provider.Offering {
+		return provider.Offering{AcceleratorType: "H100", AcceleratorID: "p5.48xlarge", GPUCount: 8,
+			CapacityType: od, PricePerHour: price, Available: true, Region: region}
+	}
+	b := Base{ProviderName: "aws", Catalog: fakeLookup{rows: []provider.Offering{
+		row("eu-west-2", 71.552), row("", 55.040), row("eu-north-1", 58.893),
+	}}}
+	for region, want := range map[string]float64{
+		"eu-north-1": 58.893, // its own row, though listed after the default
+		"eu-west-2":  71.552,
+		"us-east-2":  55.040, // no row of its own: the default
+		"":           55.040, // no region: the default, never another region's row
+	} {
+		got, err := b.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: od, Region: region})
+		if err != nil || got != want {
+			t.Errorf("PricePerHour(region %q) = %v, %v; want %v", region, got, err, want)
+		}
+	}
+
+	// Only other regions' rows: no price, rather than borrowing one.
+	b.Catalog = fakeLookup{rows: []provider.Offering{row("eu-west-2", 71.552)}}
+	if _, err := b.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: od, Region: "us-east-2"}); !errors.Is(err, provider.ErrNoPrice) {
+		t.Errorf("PricePerHour(only another region's row) err = %v, want ErrNoPrice", err)
 	}
 }
 

@@ -486,7 +486,7 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 			log.Error(err, "probe instance-type availability failed; skipping region", "region", region)
 			continue
 		}
-		for _, o := range rows {
+		for _, o := range regionRows(rows, region) {
 			o.Region = region
 			o.Available = o.Available && avail[o.AcceleratorID]
 			out = append(out, o)
@@ -496,6 +496,36 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 		return nil, fmt.Errorf("aws: offerings probe failed in all %d region(s)", failed)
 	}
 	return out, nil
+}
+
+// regionRows returns the catalog rows that price region: its own rows, plus a blank-region
+// (default) row for each offering the region has no row of its own for. Rows for other
+// regions are dropped.
+func regionRows(rows []provider.Offering, region string) []provider.Offering {
+	type offeringKey struct {
+		id    string
+		count int32
+		tier  nebulav1alpha1.CapacityType
+	}
+	key := func(o provider.Offering) offeringKey {
+		return offeringKey{id: o.AcceleratorID, count: o.GPUCount, tier: o.CapacityType}
+	}
+	own := map[offeringKey]bool{}
+	for _, o := range rows {
+		if o.Region == region {
+			own[key(o)] = true
+		}
+	}
+	out := make([]provider.Offering, 0, len(rows))
+	for _, o := range rows {
+		switch {
+		case o.Region == region:
+			out = append(out, o)
+		case o.Region == "" && !own[key(o)]:
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // Provision implements provider.Provider. The Pod is the source of truth for the

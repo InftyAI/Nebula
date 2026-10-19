@@ -7,22 +7,21 @@
 # serves that pair, and the AWS adapter selects it by matching BOTH the canonical
 # accelerator and the Pod's requested GPU count.
 #
-# The `region` column is left BLANK here on purpose. This file holds only the
-# durable facts — the (accelerator, count) -> instance-type mapping and a seed
-# price — one row per {accelerator, count, capacity_type}. Region truth is NOT
-# hand-maintained: AWS exposes it at runtime. The adapter's Offerings(ctx) probes
-# DescribeInstanceTypeOfferings per configured region for which types the region
-# offers, and PricePerHour reads the region's live Spot price through
-# DescribeSpotPriceHistory. That keeps this file small and stops per-region
-# availability and Spot prices from drifting out of date.
+# Rows with a BLANK region are the defaults, priced at us-east-1 rates: the
+# (accelerator, count) -> instance-type mapping, plus a price for any region
+# without rows of its own. Rows with a region price that region; PricePerHour
+# prefers them over the default. Which types a region offers is not
+# hand-maintained: the adapter's Offerings(ctx) probes
+# DescribeInstanceTypeOfferings per configured region and stamps/filters these
+# rows.
 #
-# On-demand prices are approximate USD per INSTANCE-hour transcribed by hand from
-# https://aws.amazon.com/ec2/pricing/on-demand/ (us-east-1 rates as the seed);
-# treat them as a starting point, not a billing source. Spot prices vary by
-# region, AZ and hour, so PricePerHour prices a Spot claim at its region's live
-# price (the lowest across AZs, cached for an hour). The Spot rows here are the
-# same figure, the lowest us-east-1 AZ price on the `updated` date, used only when
-# the live price cannot be read.
+# On-demand prices are USD per INSTANCE-hour (Linux), from AWS's published
+# on-demand price list (https://aws.amazon.com/ec2/pricing/on-demand/); treat
+# them as a starting point, not a billing source. Spot prices vary by region, AZ
+# and hour, so PricePerHour prices a Spot claim at its region's live price (the
+# lowest across AZs, cached for an hour). The Spot rows here are the same figure,
+# the lowest AZ price in that region on the `updated` date, used only when the
+# live price cannot be read.
 #
 # Columns (shared header across all provider CSVs; unused cells left blank):
 #   accelerator_type  canonical Nebula accelerator type
@@ -31,7 +30,7 @@
 #   capacity_type     Spot | OnDemand
 #   price_per_hour    approximate USD/instance-hour (Spot: fallback for the live price)
 #   available         seed availability (the per-region probe is authoritative)
-#   region            BLANK — stamped per configured region by the availability probe
+#   region            the AWS region this row prices; BLANK = default for any region
 #   updated           YYYY-MM-DD the row was last verified
 accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
 T4,g4dn.xlarge,1,OnDemand,0.526,true,,2026-10-19
@@ -58,3 +57,323 @@ A100-80GB,p4de.24xlarge,8,OnDemand,27.447,true,,2026-10-19
 A100-80GB,p4de.24xlarge,8,Spot,21.387,true,,2026-10-19
 H100,p5.48xlarge,8,OnDemand,55.040,true,,2026-10-19
 H100,p5.48xlarge,8,Spot,29.168,true,,2026-10-19
+
+# Per-region rows. A region without a row for an offering uses the default
+# (blank-region, us-east-1) row above.
+# us-east-2
+T4,g4dn.xlarge,1,OnDemand,0.526,true,us-east-2,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.283,true,us-east-2,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,3.912,true,us-east-2,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.948,true,us-east-2,2026-10-19
+T4,g4dn.metal,8,OnDemand,7.824,true,us-east-2,2026-10-19
+T4,g4dn.metal,8,Spot,4.066,true,us-east-2,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.006,true,us-east-2,2026-10-19
+A10G,g5.xlarge,1,Spot,0.542,true,us-east-2,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,5.672,true,us-east-2,2026-10-19
+A10G,g5.12xlarge,4,Spot,2.901,true,us-east-2,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,16.288,true,us-east-2,2026-10-19
+A10G,g5.48xlarge,8,Spot,7.418,true,us-east-2,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.805,true,us-east-2,2026-10-19
+L4,g6.xlarge,1,Spot,0.414,true,us-east-2,2026-10-19
+L4,g6.12xlarge,4,OnDemand,4.602,true,us-east-2,2026-10-19
+L4,g6.12xlarge,4,Spot,2.469,true,us-east-2,2026-10-19
+L4,g6.48xlarge,8,OnDemand,13.350,true,us-east-2,2026-10-19
+L4,g6.48xlarge,8,Spot,6.181,true,us-east-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,21.958,true,us-east-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,4.104,true,us-east-2,2026-10-19
+H100,p5.48xlarge,8,OnDemand,55.040,true,us-east-2,2026-10-19
+H100,p5.48xlarge,8,Spot,22.768,true,us-east-2,2026-10-19
+# us-west-1
+T4,g4dn.xlarge,1,OnDemand,0.631,true,us-west-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.295,true,us-west-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.694,true,us-west-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,2.240,true,us-west-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,9.389,true,us-west-1,2026-10-19
+T4,g4dn.metal,8,Spot,2.015,true,us-west-1,2026-10-19
+H100,p5.48xlarge,8,OnDemand,68.800,true,us-west-1,2026-10-19
+H100,p5.48xlarge,8,Spot,23.705,true,us-west-1,2026-10-19
+# us-west-2
+T4,g4dn.xlarge,1,OnDemand,0.526,true,us-west-2,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.239,true,us-west-2,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,3.912,true,us-west-2,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.555,true,us-west-2,2026-10-19
+T4,g4dn.metal,8,OnDemand,7.824,true,us-west-2,2026-10-19
+T4,g4dn.metal,8,Spot,4.548,true,us-west-2,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.006,true,us-west-2,2026-10-19
+A10G,g5.xlarge,1,Spot,0.505,true,us-west-2,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,5.672,true,us-west-2,2026-10-19
+A10G,g5.12xlarge,4,Spot,1.878,true,us-west-2,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,16.288,true,us-west-2,2026-10-19
+A10G,g5.48xlarge,8,Spot,4.617,true,us-west-2,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.805,true,us-west-2,2026-10-19
+L4,g6.xlarge,1,Spot,0.414,true,us-west-2,2026-10-19
+L4,g6.12xlarge,4,OnDemand,4.602,true,us-west-2,2026-10-19
+L4,g6.12xlarge,4,Spot,3.012,true,us-west-2,2026-10-19
+L4,g6.48xlarge,8,OnDemand,13.350,true,us-west-2,2026-10-19
+L4,g6.48xlarge,8,Spot,5.747,true,us-west-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,21.958,true,us-west-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,12.266,true,us-west-2,2026-10-19
+A100-80GB,p4de.24xlarge,8,OnDemand,27.447,true,us-west-2,2026-10-19
+A100-80GB,p4de.24xlarge,8,Spot,15.849,true,us-west-2,2026-10-19
+H100,p5.48xlarge,8,OnDemand,55.040,true,us-west-2,2026-10-19
+H100,p5.48xlarge,8,Spot,28.707,true,us-west-2,2026-10-19
+# ca-central-1
+T4,g4dn.xlarge,1,OnDemand,0.584,true,ca-central-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.226,true,ca-central-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.343,true,ca-central-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.618,true,ca-central-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,8.687,true,ca-central-1,2026-10-19
+T4,g4dn.metal,8,Spot,4.460,true,ca-central-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.117,true,ca-central-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.399,true,ca-central-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,6.298,true,ca-central-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,2.029,true,ca-central-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,18.085,true,ca-central-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,18.085,true,ca-central-1,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.894,true,ca-central-1,2026-10-19
+L4,g6.xlarge,1,Spot,0.181,true,ca-central-1,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.109,true,ca-central-1,2026-10-19
+L4,g6.12xlarge,4,Spot,5.109,true,ca-central-1,2026-10-19
+L4,g6.48xlarge,8,OnDemand,14.823,true,ca-central-1,2026-10-19
+L4,g6.48xlarge,8,Spot,14.823,true,ca-central-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,25.252,true,ca-central-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,11.110,true,ca-central-1,2026-10-19
+H100,p5.48xlarge,8,OnDemand,63.296,true,ca-central-1,2026-10-19
+H100,p5.48xlarge,8,Spot,17.672,true,ca-central-1,2026-10-19
+# sa-east-1
+T4,g4dn.xlarge,1,OnDemand,0.894,true,sa-east-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.089,true,sa-east-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,6.649,true,sa-east-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.579,true,sa-east-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,13.298,true,sa-east-1,2026-10-19
+T4,g4dn.metal,8,Spot,1.330,true,sa-east-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.710,true,sa-east-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.365,true,sa-east-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,9.641,true,sa-east-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,8.036,true,sa-east-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,27.686,true,sa-east-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,23.064,true,sa-east-1,2026-10-19
+L4,g6.xlarge,1,OnDemand,1.368,true,sa-east-1,2026-10-19
+L4,g6.xlarge,1,Spot,0.243,true,sa-east-1,2026-10-19
+L4,g6.12xlarge,4,OnDemand,7.822,true,sa-east-1,2026-10-19
+L4,g6.12xlarge,4,Spot,0.995,true,sa-east-1,2026-10-19
+L4,g6.48xlarge,8,OnDemand,22.693,true,sa-east-1,2026-10-19
+L4,g6.48xlarge,8,Spot,3.280,true,sa-east-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,35.557,true,sa-east-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,29.621,true,sa-east-1,2026-10-19
+H100,p5.48xlarge,8,OnDemand,92.467,true,sa-east-1,2026-10-19
+H100,p5.48xlarge,8,Spot,50.433,true,sa-east-1,2026-10-19
+# eu-central-1
+T4,g4dn.xlarge,1,OnDemand,0.658,true,eu-central-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.320,true,eu-central-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.890,true,eu-central-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,2.021,true,eu-central-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,9.780,true,eu-central-1,2026-10-19
+T4,g4dn.metal,8,Spot,4.446,true,eu-central-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.258,true,eu-central-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.594,true,eu-central-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,7.093,true,eu-central-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,2.108,true,eu-central-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,20.368,true,eu-central-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,20.368,true,eu-central-1,2026-10-19
+L4,g6.xlarge,1,OnDemand,1.006,true,eu-central-1,2026-10-19
+L4,g6.xlarge,1,Spot,0.469,true,eu-central-1,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.754,true,eu-central-1,2026-10-19
+L4,g6.12xlarge,4,Spot,2.835,true,eu-central-1,2026-10-19
+L4,g6.48xlarge,8,OnDemand,16.695,true,eu-central-1,2026-10-19
+L4,g6.48xlarge,8,Spot,4.149,true,eu-central-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,27.433,true,eu-central-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,15.729,true,eu-central-1,2026-10-19
+A100-80GB,p4de.24xlarge,8,OnDemand,34.291,true,eu-central-1,2026-10-19
+A100-80GB,p4de.24xlarge,8,Spot,12.976,true,eu-central-1,2026-10-19
+# eu-north-1
+T4,g4dn.xlarge,1,OnDemand,0.558,true,eu-north-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.077,true,eu-north-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.150,true,eu-north-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,0.645,true,eu-north-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,8.300,true,eu-north-1,2026-10-19
+T4,g4dn.metal,8,Spot,1.762,true,eu-north-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.067,true,eu-north-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.265,true,eu-north-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,6.016,true,eu-north-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,1.190,true,eu-north-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,17.276,true,eu-north-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,3.299,true,eu-north-1,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.854,true,eu-north-1,2026-10-19
+L4,g6.xlarge,1,Spot,0.150,true,eu-north-1,2026-10-19
+L4,g6.12xlarge,4,OnDemand,4.881,true,eu-north-1,2026-10-19
+L4,g6.12xlarge,4,Spot,1.335,true,eu-north-1,2026-10-19
+L4,g6.48xlarge,8,OnDemand,14.160,true,eu-north-1,2026-10-19
+L4,g6.48xlarge,8,Spot,2.545,true,eu-north-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,23.716,true,eu-north-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,7.810,true,eu-north-1,2026-10-19
+H100,p5.48xlarge,8,OnDemand,58.893,true,eu-north-1,2026-10-19
+H100,p5.48xlarge,8,Spot,38.691,true,eu-north-1,2026-10-19
+# eu-west-1
+T4,g4dn.xlarge,1,OnDemand,0.587,true,eu-west-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.337,true,eu-west-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.362,true,eu-west-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.899,true,eu-west-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,8.724,true,eu-west-1,2026-10-19
+T4,g4dn.metal,8,Spot,4.323,true,eu-west-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.123,true,eu-west-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.622,true,eu-west-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,6.332,true,eu-west-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,2.603,true,eu-west-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,18.182,true,eu-west-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,4.447,true,eu-west-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,23.716,true,eu-west-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,15.787,true,eu-west-1,2026-10-19
+# eu-west-2
+T4,g4dn.xlarge,1,OnDemand,0.615,true,eu-west-2,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.191,true,eu-west-2,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.577,true,eu-west-2,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.581,true,eu-west-2,2026-10-19
+T4,g4dn.metal,8,OnDemand,9.154,true,eu-west-2,2026-10-19
+T4,g4dn.metal,8,Spot,1.260,true,eu-west-2,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.277,true,eu-west-2,2026-10-19
+A10G,g5.xlarge,1,Spot,0.588,true,eu-west-2,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,7.200,true,eu-west-2,2026-10-19
+A10G,g5.12xlarge,4,Spot,4.100,true,eu-west-2,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,20.676,true,eu-west-2,2026-10-19
+A10G,g5.48xlarge,8,Spot,20.676,true,eu-west-2,2026-10-19
+L4,g6.xlarge,1,OnDemand,1.022,true,eu-west-2,2026-10-19
+L4,g6.xlarge,1,Spot,0.369,true,eu-west-2,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.841,true,eu-west-2,2026-10-19
+L4,g6.12xlarge,4,Spot,2.547,true,eu-west-2,2026-10-19
+L4,g6.48xlarge,8,OnDemand,16.947,true,eu-west-2,2026-10-19
+L4,g6.48xlarge,8,Spot,4.683,true,eu-west-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,28.545,true,eu-west-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,11.194,true,eu-west-2,2026-10-19
+H100,p5.48xlarge,8,OnDemand,71.552,true,eu-west-2,2026-10-19
+H100,p5.48xlarge,8,Spot,20.340,true,eu-west-2,2026-10-19
+# eu-west-3
+T4,g4dn.xlarge,1,OnDemand,0.615,true,eu-west-3,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.188,true,eu-west-3,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.574,true,eu-west-3,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.339,true,eu-west-3,2026-10-19
+T4,g4dn.metal,8,OnDemand,9.148,true,eu-west-3,2026-10-19
+T4,g4dn.metal,8,Spot,3.333,true,eu-west-3,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.277,true,eu-west-3,2026-10-19
+A10G,g5.xlarge,1,Spot,0.392,true,eu-west-3,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,7.200,true,eu-west-3,2026-10-19
+A10G,g5.12xlarge,4,Spot,3.864,true,eu-west-3,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,20.676,true,eu-west-3,2026-10-19
+A10G,g5.48xlarge,8,Spot,20.676,true,eu-west-3,2026-10-19
+L4,g6.xlarge,1,OnDemand,1.022,true,eu-west-3,2026-10-19
+L4,g6.xlarge,1,Spot,0.355,true,eu-west-3,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.841,true,eu-west-3,2026-10-19
+L4,g6.12xlarge,4,Spot,1.819,true,eu-west-3,2026-10-19
+L4,g6.48xlarge,8,OnDemand,16.947,true,eu-west-3,2026-10-19
+L4,g6.48xlarge,8,Spot,5.268,true,eu-west-3,2026-10-19
+# ap-northeast-1
+T4,g4dn.xlarge,1,OnDemand,0.710,true,ap-northeast-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.342,true,ap-northeast-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,5.281,true,ap-northeast-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,2.631,true,ap-northeast-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,10.562,true,ap-northeast-1,2026-10-19
+T4,g4dn.metal,8,Spot,5.407,true,ap-northeast-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.459,true,ap-northeast-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.708,true,ap-northeast-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,8.226,true,ap-northeast-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,5.041,true,ap-northeast-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,23.622,true,ap-northeast-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,21.260,true,ap-northeast-1,2026-10-19
+L4,g6.xlarge,1,OnDemand,1.167,true,ap-northeast-1,2026-10-19
+L4,g6.xlarge,1,Spot,0.563,true,ap-northeast-1,2026-10-19
+L4,g6.12xlarge,4,OnDemand,6.674,true,ap-northeast-1,2026-10-19
+L4,g6.12xlarge,4,Spot,3.071,true,ap-northeast-1,2026-10-19
+L4,g6.48xlarge,8,OnDemand,19.362,true,ap-northeast-1,2026-10-19
+L4,g6.48xlarge,8,Spot,8.765,true,ap-northeast-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,30.098,true,ap-northeast-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,7.065,true,ap-northeast-1,2026-10-19
+A100-80GB,p4de.24xlarge,8,OnDemand,37.622,true,ap-northeast-1,2026-10-19
+A100-80GB,p4de.24xlarge,8,Spot,14.447,true,ap-northeast-1,2026-10-19
+H100,p5.48xlarge,8,OnDemand,68.800,true,ap-northeast-1,2026-10-19
+H100,p5.48xlarge,8,Spot,25.740,true,ap-northeast-1,2026-10-19
+# ap-northeast-2
+T4,g4dn.xlarge,1,OnDemand,0.647,true,ap-northeast-2,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.316,true,ap-northeast-2,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.812,true,ap-northeast-2,2026-10-19
+T4,g4dn.12xlarge,4,Spot,2.454,true,ap-northeast-2,2026-10-19
+T4,g4dn.metal,8,OnDemand,9.624,true,ap-northeast-2,2026-10-19
+T4,g4dn.metal,8,Spot,4.331,true,ap-northeast-2,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.237,true,ap-northeast-2,2026-10-19
+A10G,g5.xlarge,1,Spot,0.567,true,ap-northeast-2,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,6.974,true,ap-northeast-2,2026-10-19
+A10G,g5.12xlarge,4,Spot,3.498,true,ap-northeast-2,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,20.028,true,ap-northeast-2,2026-10-19
+A10G,g5.48xlarge,8,Spot,9.492,true,ap-northeast-2,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.990,true,ap-northeast-2,2026-10-19
+L4,g6.xlarge,1,Spot,0.456,true,ap-northeast-2,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.658,true,ap-northeast-2,2026-10-19
+L4,g6.12xlarge,4,Spot,2.581,true,ap-northeast-2,2026-10-19
+L4,g6.48xlarge,8,OnDemand,16.416,true,ap-northeast-2,2026-10-19
+L4,g6.48xlarge,8,Spot,7.420,true,ap-northeast-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,30.410,true,ap-northeast-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,8.978,true,ap-northeast-2,2026-10-19
+H100,p5.48xlarge,8,OnDemand,75.955,true,ap-northeast-2,2026-10-19
+H100,p5.48xlarge,8,Spot,62.219,true,ap-northeast-2,2026-10-19
+# ap-northeast-3
+T4,g4dn.xlarge,1,OnDemand,0.710,true,ap-northeast-3,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.197,true,ap-northeast-3,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,5.281,true,ap-northeast-3,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.389,true,ap-northeast-3,2026-10-19
+T4,g4dn.metal,8,OnDemand,10.562,true,ap-northeast-3,2026-10-19
+T4,g4dn.metal,8,Spot,4.026,true,ap-northeast-3,2026-10-19
+# ap-south-1
+T4,g4dn.xlarge,1,OnDemand,0.579,true,ap-south-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.213,true,ap-south-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,4.306,true,ap-south-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.770,true,ap-south-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,8.612,true,ap-south-1,2026-10-19
+T4,g4dn.metal,8,Spot,2.677,true,ap-south-1,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.208,true,ap-south-1,2026-10-19
+A10G,g5.xlarge,1,Spot,0.555,true,ap-south-1,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,6.811,true,ap-south-1,2026-10-19
+A10G,g5.12xlarge,4,Spot,1.987,true,ap-south-1,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,19.559,true,ap-south-1,2026-10-19
+A10G,g5.48xlarge,8,Spot,8.952,true,ap-south-1,2026-10-19
+L4,g6.xlarge,1,OnDemand,0.966,true,ap-south-1,2026-10-19
+L4,g6.xlarge,1,Spot,0.528,true,ap-south-1,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.526,true,ap-south-1,2026-10-19
+L4,g6.12xlarge,4,Spot,2.369,true,ap-south-1,2026-10-19
+L4,g6.48xlarge,8,OnDemand,16.031,true,ap-south-1,2026-10-19
+L4,g6.48xlarge,8,Spot,16.031,true,ap-south-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,26.344,true,ap-south-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,26.344,true,ap-south-1,2026-10-19
+H100,p5.48xlarge,8,OnDemand,66.048,true,ap-south-1,2026-10-19
+H100,p5.48xlarge,8,Spot,21.223,true,ap-south-1,2026-10-19
+# ap-southeast-1
+T4,g4dn.xlarge,1,OnDemand,0.736,true,ap-southeast-1,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.316,true,ap-southeast-1,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,5.474,true,ap-southeast-1,2026-10-19
+T4,g4dn.12xlarge,4,Spot,1.716,true,ap-southeast-1,2026-10-19
+T4,g4dn.metal,8,OnDemand,10.948,true,ap-southeast-1,2026-10-19
+T4,g4dn.metal,8,Spot,3.313,true,ap-southeast-1,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,26.349,true,ap-southeast-1,2026-10-19
+A100-80GB,p4de.24xlarge,8,OnDemand,32.936,true,ap-southeast-1,2026-10-19
+A100-80GB,p4de.24xlarge,8,Spot,32.937,true,ap-southeast-1,2026-10-19
+# ap-southeast-2
+T4,g4dn.xlarge,1,OnDemand,0.684,true,ap-southeast-2,2026-10-19
+T4,g4dn.xlarge,1,Spot,0.268,true,ap-southeast-2,2026-10-19
+T4,g4dn.12xlarge,4,OnDemand,5.087,true,ap-southeast-2,2026-10-19
+T4,g4dn.12xlarge,4,Spot,2.111,true,ap-southeast-2,2026-10-19
+T4,g4dn.metal,8,OnDemand,10.174,true,ap-southeast-2,2026-10-19
+T4,g4dn.metal,8,Spot,4.837,true,ap-southeast-2,2026-10-19
+A10G,g5.xlarge,1,OnDemand,1.308,true,ap-southeast-2,2026-10-19
+A10G,g5.xlarge,1,Spot,0.663,true,ap-southeast-2,2026-10-19
+A10G,g5.12xlarge,4,OnDemand,7.375,true,ap-southeast-2,2026-10-19
+A10G,g5.12xlarge,4,Spot,7.375,true,ap-southeast-2,2026-10-19
+A10G,g5.48xlarge,8,OnDemand,21.178,true,ap-southeast-2,2026-10-19
+A10G,g5.48xlarge,8,Spot,21.178,true,ap-southeast-2,2026-10-19
+L4,g6.xlarge,1,OnDemand,1.046,true,ap-southeast-2,2026-10-19
+L4,g6.xlarge,1,Spot,0.556,true,ap-southeast-2,2026-10-19
+L4,g6.12xlarge,4,OnDemand,5.983,true,ap-southeast-2,2026-10-19
+L4,g6.12xlarge,4,Spot,0.598,true,ap-southeast-2,2026-10-19
+L4,g6.48xlarge,8,OnDemand,17.358,true,ap-southeast-2,2026-10-19
+L4,g6.48xlarge,8,Spot,2.797,true,ap-southeast-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,OnDemand,28.545,true,ap-southeast-2,2026-10-19
+A100-40GB,p4d.24xlarge,8,Spot,12.890,true,ap-southeast-2,2026-10-19
+H100,p5.48xlarge,8,OnDemand,71.552,true,ap-southeast-2,2026-10-19
+H100,p5.48xlarge,8,Spot,26.005,true,ap-southeast-2,2026-10-19
