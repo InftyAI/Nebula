@@ -49,8 +49,12 @@ type PriceRequest struct {
 	// matched row's GPUCount rather than hardcoded per provider — see Offering.GPUCount.
 	Count int32
 	// CapacityType selects between a row's Spot and OnDemand prices, which differ
-	// sharply (AWS p5.48xlarge: $20.839 Spot vs $55.040 OnDemand).
+	// sharply (AWS p5.48xlarge in us-east-1: about $29.17 Spot vs $55.040 OnDemand).
 	CapacityType nebulav1alpha1.CapacityType
+	// Region is where the instance runs (NodeClaim.Spec.Region), in the provider's own
+	// vocabulary. Empty when unknown or when the provider has no region axis. Only a provider
+	// whose price varies by region reads it (AWS Spot, priced live per region).
+	Region string
 	// CPUCores (vCPUs) and MemoryMiB are the workload's priced size (see util.PodReservation),
 	// priced only by providers that meter them apart from the accelerator.
 	CPUCores  float64

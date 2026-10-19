@@ -132,9 +132,13 @@ func (b Base) MapAccelerator(canonical string, count int32) (providerAccelerator
 // adds them.
 //
 // Rows match as MapAccelerator matches them, plus capacity type: the one dimension
-// MapAccelerator can ignore and pricing cannot (AWS p5.48xlarge is $20.839 Spot against
-// $55.040 OnDemand). Among interchangeable alternates the FIRST row wins, so the price
-// describes the id a launch actually tries first.
+// MapAccelerator can ignore and pricing cannot (AWS p5.48xlarge is about $29.17 Spot
+// against $55.040 OnDemand in us-east-1). Among interchangeable alternates the FIRST row
+// wins, so the price describes the id a launch actually tries first.
+//
+// Region: a row priced for the request's region wins over a blank-region row, which is the
+// default for every region without one of its own. A row for another region never matches.
+// Providers whose rows all have a blank region (Modal, RunPod) price as before.
 func (b Base) PricePerHour(req provider.PriceRequest) (float64, error) {
 	// A CPU-only request. No row can match an empty type, so this is the same ErrNoPrice the
 	// loop below would reach; it is stated here for a clearer message, and because it MUST
@@ -156,7 +160,10 @@ func (b Base) PricePerHour(req provider.PriceRequest) (float64, error) {
 		tier = nebulav1alpha1.CapacityOnDemand
 	}
 
-	for _, o := range b.Catalog.Offerings(b.ProviderName) {
+	var regional, fallback *provider.Offering
+	offerings := b.Catalog.Offerings(b.ProviderName)
+	for i := range offerings {
+		o := &offerings[i]
 		if !strings.EqualFold(o.AcceleratorType, req.AcceleratorType) || !o.Available {
 			continue
 		}
@@ -170,14 +177,30 @@ func (b Base) PricePerHour(req provider.PriceRequest) (float64, error) {
 		if o.PricePerHour <= 0 {
 			continue
 		}
-		rate := o.PricePerHour
-		// GPUCount 0 => the row prices ONE accelerator and the count is a runtime knob, so
-		// the rate scales with it. A row carrying a count prices the whole offering already.
-		if o.GPUCount == 0 {
-			rate *= float64(req.Count)
+		switch {
+		case o.Region == "":
+			if fallback == nil {
+				fallback = o
+			}
+		case req.Region != "" && o.Region == req.Region:
+			if regional == nil {
+				regional = o
+			}
 		}
-		return rate, nil
 	}
-	return 0, fmt.Errorf("catalog: %s has no available %s x%d row on %s: %w",
-		b.ProviderName, req.AcceleratorType, req.Count, tier, provider.ErrNoPrice)
+	row := regional
+	if row == nil {
+		row = fallback
+	}
+	if row == nil {
+		return 0, fmt.Errorf("catalog: %s has no available %s x%d row on %s: %w",
+			b.ProviderName, req.AcceleratorType, req.Count, tier, provider.ErrNoPrice)
+	}
+	rate := row.PricePerHour
+	// GPUCount 0 => the row prices ONE accelerator and the count is a runtime knob, so the
+	// rate scales with it. A row carrying a count prices the whole offering already.
+	if row.GPUCount == 0 {
+		rate *= float64(req.Count)
+	}
+	return rate, nil
 }

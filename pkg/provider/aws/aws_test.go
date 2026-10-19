@@ -55,6 +55,11 @@ type fakeClient struct {
 	// Offerings call on a bare fake reports every row unavailable but still present.
 	available map[string]bool
 	availErr  error
+	// spotPrices is what SpotPrice returns per instance type; spotErr injects a failure.
+	// spotCalls counts lookups so a test can assert the cache.
+	spotPrices map[string]float64
+	spotErr    error
+	spotCalls  int
 }
 
 func (f *fakeClient) RunInstance(_ context.Context, spec InstanceSpec) (string, error) {
@@ -107,6 +112,18 @@ func (f *fakeClient) FindInstance(_ context.Context, claimName string, states []
 	return nil, nil
 }
 
+func (f *fakeClient) SpotPrice(_ context.Context, instanceType string) (float64, error) {
+	f.spotCalls++
+	if f.spotErr != nil {
+		return 0, f.spotErr
+	}
+	price, ok := f.spotPrices[instanceType]
+	if !ok {
+		return 0, errNoSpotPrice
+	}
+	return price, nil
+}
+
 func (f *fakeClient) AvailableInstanceTypes(_ context.Context) (map[string]bool, error) {
 	if f.availErr != nil {
 		return nil, f.availErr
@@ -123,9 +140,10 @@ func (c fakeCatalog) Offerings(_ string) []provider.Offering { return c.rows }
 
 const testRegion = "us-east-1"
 
-// offering is a compact constructor for a region-aware test catalog row (the
-// full struct literal is too wide to read inline). count is the gpu_count, the
-// AWS lookup key that (with the accelerator type) selects the instance type.
+// offering is a compact constructor for a test catalog row (the full struct literal
+// is too wide to read inline). count is the gpu_count, the AWS lookup key that (with
+// the accelerator type) selects the instance type. The region is blank, as in the real
+// catalog's default rows; Offerings stamps it per region.
 func offering(accel, id string, count int32, tier nebulav1alpha1.CapacityType, price float64) provider.Offering {
 	return provider.Offering{
 		AcceleratorType: accel,
@@ -134,7 +152,6 @@ func offering(accel, id string, count int32, tier nebulav1alpha1.CapacityType, p
 		CapacityType:    tier,
 		PricePerHour:    price,
 		Available:       true,
-		Region:          testRegion,
 	}
 }
 
@@ -1124,5 +1141,96 @@ func TestProvision_RefusesDiskAboveVolumeCap(t *testing.T) {
 	}
 	if f.runCnt != 0 {
 		t.Fatalf("RunInstance called %d times for a refused disk", f.runCnt)
+	}
+}
+
+func TestPricePerHour_SpotUsesLivePrice(t *testing.T) {
+	f := &fakeClient{spotPrices: map[string]float64{"p5.48xlarge": 30.692}}
+	p := newTestProvider(f)
+	req := provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: nebulav1alpha1.CapacitySpot, Region: testRegion}
+	want := 30.692 + data.AWSRootVolumeCostPerHour(awsAMIRootGiB)
+
+	got, err := p.PricePerHour(req)
+	if err != nil || got != want {
+		t.Fatalf("PricePerHour(spot) = %v, %v; want the live price + root volume %v, not the 34.41 seed", got, err, want)
+	}
+	if _, _ = p.PricePerHour(req); f.spotCalls != 1 {
+		t.Fatalf("spot lookups = %d after two calls, want 1 (cached)", f.spotCalls)
+	}
+
+	// Past the TTL the price is read again.
+	key := spotPriceKey{region: testRegion, instanceType: "p5.48xlarge"}
+	e := p.spotPrices[key]
+	e.at = time.Now().Add(-spotPriceTTL - time.Minute)
+	p.spotPrices[key] = e
+	f.spotPrices["p5.48xlarge"] = 31.0
+	if got, _ := p.PricePerHour(req); f.spotCalls != 2 || got != 31.0+data.AWSRootVolumeCostPerHour(awsAMIRootGiB) {
+		t.Fatalf("after TTL: price %v, lookups %d; want the refreshed 31.0 from a second lookup", got, f.spotCalls)
+	}
+}
+
+func TestPricePerHour_SpotFallsBackToSeed(t *testing.T) {
+	seed := 34.41 + data.AWSRootVolumeCostPerHour(awsAMIRootGiB)
+	req := provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: nebulav1alpha1.CapacitySpot, Region: testRegion}
+
+	f := &fakeClient{spotErr: errors.New("UnauthorizedOperation")}
+	p := newTestProvider(f)
+	if got, err := p.PricePerHour(req); err != nil || got != seed {
+		t.Fatalf("PricePerHour(lookup fails) = %v, %v; want the seed %v, never an error", got, err, seed)
+	}
+	if _, _ = p.PricePerHour(req); f.spotCalls != 1 {
+		t.Fatalf("spot lookups = %d after two failing calls, want 1 (the failure is cached)", f.spotCalls)
+	}
+
+	// No live price for the type (e.g. not sold on Spot in the region) is the same fallback.
+	p = newTestProvider(&fakeClient{spotPrices: map[string]float64{}})
+	if got, err := p.PricePerHour(req); err != nil || got != seed {
+		t.Fatalf("PricePerHour(no live price) = %v, %v; want the seed %v", got, err, seed)
+	}
+}
+
+func TestPricePerHour_LivePriceOnlyForSpotWithRegion(t *testing.T) {
+	f := &fakeClient{spotPrices: map[string]float64{"p5.48xlarge": 30.692}}
+	p := newTestProvider(f)
+	root := data.AWSRootVolumeCostPerHour(awsAMIRootGiB)
+
+	// Spot with no region: nothing to look up.
+	got, err := p.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: nebulav1alpha1.CapacitySpot})
+	if err != nil || got != 34.41+root {
+		t.Fatalf("PricePerHour(spot, no region) = %v, %v; want the seed %v", got, err, 34.41+root)
+	}
+	// On-demand: the catalog's list price, untouched.
+	got, err = p.PricePerHour(provider.PriceRequest{AcceleratorType: "H100", Count: 8, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: testRegion})
+	if err != nil || got != 98.32+root {
+		t.Fatalf("PricePerHour(on-demand) = %v, %v; want the catalog price %v", got, err, 98.32+root)
+	}
+	if f.spotCalls != 0 {
+		t.Fatalf("spot lookups = %d, want 0 for these requests", f.spotCalls)
+	}
+}
+
+func TestRegionRows(t *testing.T) {
+	od, spot := nebulav1alpha1.CapacityOnDemand, nebulav1alpha1.CapacitySpot
+	withRegion := func(o provider.Offering, region string) provider.Offering { o.Region = region; return o }
+	rows := []provider.Offering{
+		offering("H100", "p5.48xlarge", 8, od, 55.040),
+		offering("H100", "p5.48xlarge", 8, spot, 29.168),
+		withRegion(offering("H100", "p5.48xlarge", 8, od, 58.893), "eu-north-1"),
+		withRegion(offering("H100", "p5.48xlarge", 8, od, 71.552), "eu-west-2"),
+	}
+	got := regionRows(rows, "eu-north-1")
+	if len(got) != 2 {
+		t.Fatalf("regionRows(eu-north-1) = %d rows, want 2 (its own on-demand + the default spot): %+v", len(got), got)
+	}
+	for _, o := range got {
+		switch {
+		case o.CapacityType == od && (o.Region != "eu-north-1" || o.PricePerHour != 58.893):
+			t.Errorf("on-demand row = %+v, want eu-north-1's own 58.893, not the default or eu-west-2's", o)
+		case o.CapacityType == spot && o.Region != "":
+			t.Errorf("spot row = %+v, want the default (eu-north-1 has none of its own)", o)
+		}
+	}
+	if got := regionRows(rows, "us-east-2"); len(got) != 2 || got[0].Region != "" || got[1].Region != "" {
+		t.Fatalf("regionRows(us-east-2) = %+v, want just the two defaults", got)
 	}
 }

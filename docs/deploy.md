@@ -172,6 +172,26 @@ identity, the `system:nodes` organization, and the current manager Pod IP as the
 
 ---
 
+## AWS IAM permissions
+
+The AWS adapter uses the SDK's default credential chain (IRSA or an instance role in production).
+That identity needs these EC2 actions:
+
+| Action | Used for |
+|---|---|
+| `ec2:CreateFleet` | Launching an instance (an *instant* fleet across the region's AZs) |
+| `ec2:RunInstances`, `ec2:CreateTags` | Required by `CreateFleet` to launch and tag the instance |
+| `ec2:CreateLaunchTemplate`, `ec2:DeleteLaunchTemplate`, `ec2:DescribeLaunchTemplates` | The ephemeral launch template each launch creates, and sweeping leaked ones |
+| `ec2:TerminateInstances` | Deleting an instance |
+| `ec2:DescribeInstances` | Finding and listing Nebula's instances |
+| `ec2:DescribeInstanceStatus` | The 2/2 status checks that gate `Running` (a separate grant from `DescribeInstances`) |
+| `ec2:DescribeInstanceTypeOfferings` | Which instance types a region and each AZ offer |
+| `ec2:DescribeImages`, `ec2:DescribeSubnets` | The region's GPU AMI and default-VPC subnets |
+| `ec2:DescribeSpotPriceHistory` | The live Spot price a Spot claim is priced at |
+
+Without `ec2:DescribeSpotPriceHistory`, Spot claims are priced at the catalog's seed rate (a
+us-east-1 snapshot) instead of the region's current price. Placement and launches still work.
+
 ## Modal Environments
 
 Optional, and off unless you set it. A Modal **Environment** is a named partition of
