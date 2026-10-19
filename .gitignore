@@ -50,3 +50,4 @@ __pycache__
 .devcontainer
 bin
 .claude
+*.html
