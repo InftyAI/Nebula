@@ -321,14 +321,14 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Deliberately NOT stored: tracking a pod makes GetPod return non-nil, which suppresses
 	// the retry this branch wants. (The provision-failure branch below stores for exactly
 	// that reason — it does not want one.)
-	env, err := resolveEnv(ctx, h.client, pod)
+	env, secrets, err := resolveEnv(ctx, h.client, pod)
 	if err != nil {
 		log.Error(err, "cannot resolve the Pod's environment; nothing provisioned, retrying")
 		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
 		h.emit(pod)
 		return err
 	}
-	req.Env = env
+	req.Env = provider.Env{Config: env, Secrets: secrets}
 
 	// Same resolve-before-requesting rule, and the same non-terminal treatment, for the
 	// image pull credential: an imagePullSecret names a Secret in the Pod's namespace that
@@ -360,7 +360,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// The env COUNT, never its content: a value here may have come from a Secret.
 	log.Info("provisioning external instance",
 		"capacityType", req.CapacityType, "region", req.Region,
-		"envVars", len(req.Env), "timeout", timeout.String())
+		"envVars", len(req.Env.Config)+len(req.Env.Secrets), "timeout", timeout.String())
 
 	// Two clocks for two different waits: provisioningAt measures the end-to-end wait a
 	// user feels (until the instance reports Running; handed to store below), callStart
@@ -676,21 +676,36 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		byClaim[inst.ClaimName] = inst
 	}
 
+	trackedCount := len(h.tracked)
 	h.mu.Lock()
-	emit := make([]*corev1.Pod, 0, len(h.tracked))
-	tracked := len(h.tracked)
-	matched, frozen := 0, 0
+	emit := make([]*corev1.Pod, 0, trackedCount)
+	// failed are placements to block once the lock is released: the TTL comes from the
+	// pod's NodePool, and that read does not belong under h.mu.
+	var failed []failedPlacement
+	updated, finished, gone := 0, 0, 0
 	for _, tp := range h.tracked {
 		inst, present := byClaim[tp.claimName]
 		before := statusSignature(tp.pod)
 		switch {
 		// No reverse for a terminal or deleting pod.
-		case util.IsTerminalPodPhase(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
-			frozen++
+		case util.Finished(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
+			finished++
 		case !present:
+			gone++
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
+		case inst.State == provider.InstanceUnschedulable:
+			// An unreserved instance that never got capacity: the Provision error path,
+			// arriving late. Failing the Pod is once only, as Finished freezes it above.
+			updated++
+			log.Info("no capacity for unreserved instance; failing the pod",
+				"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance)
+			applyNoCapacity(tp.pod, h.nowFn())
+			failed = append(failed, failedPlacement{
+				pod: tp.pod.DeepCopy(), region: inst.Region,
+				err: fmt.Errorf("external instance got no capacity: %w", provider.ErrNoCapacity),
+			})
 		default:
-			matched++
+			updated++
 			if waited, over := h.readyExpired(tp, inst.State); over {
 				// Failing the Pod is the whole action: teardown follows from the
 				// terminal phase, via the reap (see readyExpired).
@@ -717,12 +732,21 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	notify := h.notify
 	h.mu.Unlock()
 
-	// V(1) so a healthy steady state stays quiet. tracked>0 with matched==0 means the
-	// claim names don't line up with what List returns — the classic "provisioned but
-	// never Running". frozen is what keeps that reading valid: a terminal or deleting pod is
-	// deliberately not matched, so without it those would look like the same failure.
+	for _, b := range failed {
+		pool, err := h.poolFor(ctx, b.pod)
+		if err != nil {
+			pool = nil // the default TTL; a block with the wrong length beats no block
+		}
+		h.recordBlock(ctx, b.pod, b.region, blocklistTTLOf(pool), b.err)
+	}
+
+	// V(1) so a healthy steady state stays quiet. updated, finished and gone split the tracked
+	// pods between them. All of them gone means the claim names don't line up with what List
+	// returns — the classic "provisioned but never Running"; finished keeps that reading valid,
+	// since a finished or deleting pod is never matched and would otherwise look the same.
 	log.V(1).Info("poll tick",
-		"listed", len(instances), "tracked", tracked, "matched", matched, "frozen", frozen)
+		"listedInstances", len(instances), "trackedCount", trackedCount,
+		"updated", updated, "finished", finished, "gone", gone)
 
 	// Re-emit EVERY tracked pod each tick, which makes status propagation
 	// level-triggered. VK dedups an emit against the last status IT received from us,
@@ -1126,6 +1150,14 @@ func (h *Handler) recordBlock(
 		"recording blocklist entry for failed placement",
 		"provider", h.prov.Name(), "scope", scope, "ttl", ttl.String(), "error", err.Error())
 	h.blocklist.Record(h.prov.Name(), scope, ttl)
+}
+
+// failedPlacement is a placement the poll loop found failed, whose block it records after
+// unlocking. The provider's classification of err decides the scope.
+type failedPlacement struct {
+	pod    *corev1.Pod
+	region string
+	err    error
 }
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }

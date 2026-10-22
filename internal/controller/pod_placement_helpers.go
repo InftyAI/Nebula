@@ -411,7 +411,7 @@ func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev
 	if !pod.DeletionTimestamp.IsZero() {
 		return true, nil // already being deleted; nothing more to place
 	}
-	if !util.IsTerminalPodPhase(pod.Status.Phase) {
+	if !util.Finished(pod.Status.Phase) {
 		return false, nil
 	}
 	if !isControllerOwned(pod) {

@@ -26,8 +26,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // envPod is a Pod whose single container carries the given env sources.
@@ -74,7 +77,7 @@ func TestResolveEnv_Precedence(t *testing.T) {
 		[]corev1.EnvVar{{Name: "SHARED", Value: "explicit"}, {Name: "PLAIN", Value: "p"}},
 	)
 
-	got, err := resolveEnv(context.Background(), client, pod)
+	got, err := resolveAll(context.Background(), client, pod)
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
@@ -98,7 +101,7 @@ func TestResolveEnv_Prefix(t *testing.T) {
 		ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}},
 	}}, nil)
 
-	got, err := resolveEnv(context.Background(), client, pod)
+	got, err := resolveAll(context.Background(), client, pod)
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
@@ -135,7 +138,7 @@ func TestResolveEnv_SecretKeyRef(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveEnv(context.Background(), client, envPod(nil, tc.env))
+			got, err := resolveAll(context.Background(), client, envPod(nil, tc.env))
 			switch {
 			case tc.wantErr != "":
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -170,7 +173,7 @@ func TestResolveEnv_ReadFailureIsNeverOptional(t *testing.T) {
 		},
 	}}, nil)
 
-	if _, err := resolveEnv(context.Background(), client, pod); err == nil {
+	if _, err := resolveAll(context.Background(), client, pod); err == nil {
 		t.Fatal("expected a read failure to fail the resolve even though the ref is optional")
 	}
 }
@@ -198,7 +201,7 @@ func TestResolveEnv_MemoizesReads(t *testing.T) {
 		[]corev1.EnvVar{keyRef("X", "A"), keyRef("Y", "B")},
 	)
 
-	got, err := resolveEnv(context.Background(), client, pod)
+	got, err := resolveAll(context.Background(), client, pod)
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
@@ -229,7 +232,7 @@ func TestResolveEnv_MemoizesMisses(t *testing.T) {
 		}}
 	}
 
-	got, err := resolveEnv(context.Background(), client, envPod(nil, []corev1.EnvVar{optRef("A"), optRef("B")}))
+	got, err := resolveAll(context.Background(), client, envPod(nil, []corev1.EnvVar{optRef("A"), optRef("B")}))
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
@@ -296,7 +299,7 @@ func TestResolveEnv_ResourceFieldRefRefused(t *testing.T) {
 		ResourceFieldRef: &corev1.ResourceFieldSelector{Resource: "limits.memory"},
 	}}})
 
-	_, err := resolveEnv(context.Background(), fake.NewSimpleClientset(), pod)
+	_, err := resolveAll(context.Background(), fake.NewSimpleClientset(), pod)
 	if err == nil || !strings.Contains(err.Error(), "limits.memory") {
 		t.Fatalf("expected a resourceFieldRef refusal naming the resource, got %v", err)
 	}
@@ -319,7 +322,7 @@ func TestResolveEnv_DropsIllegalNames(t *testing.T) {
 		ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}},
 	}}, nil)
 
-	got, err := resolveEnv(context.Background(), client, pod)
+	got, err := resolveAll(context.Background(), client, pod)
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
@@ -344,7 +347,7 @@ func TestResolveEnv_NilClient(t *testing.T) {
 		},
 	)
 
-	got, err := resolveEnv(context.Background(), nil, pod)
+	got, err := resolveAll(context.Background(), nil, pod)
 	if err != nil {
 		t.Fatalf("resolveEnv: %v", err)
 	}
@@ -373,8 +376,10 @@ func TestCreatePod_PassesResolvedEnvToProvider(t *testing.T) {
 	if err := h.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	if !maps.Equal(fp.lastReq.Env, map[string]string{"PLAIN": "p", "TOKEN": "t0ken"}) {
-		t.Fatalf("provider got env %v", fp.lastReq.Env)
+	if !maps.Equal(fp.lastReq.Env.Config, map[string]string{"PLAIN": "p"}) ||
+		!maps.Equal(fp.lastReq.Env.Secrets, map[string]string{"TOKEN": "t0ken"}) {
+		t.Fatalf("provider got config %v, secrets %v; the Secret's value belongs in Secrets",
+			fp.lastReq.Env.Config, fp.lastReq.Env.Secrets)
 	}
 	if vf := pod.Spec.Containers[0].Env[1].ValueFrom; vf == nil || vf.SecretKeyRef == nil {
 		t.Fatal("the Pod's env must keep its reference; resolution belongs on the request")
@@ -418,8 +423,49 @@ func TestCreatePod_UnresolvableEnvIsNonTerminal(t *testing.T) {
 // TestResolveEnv_NoEnvIsNil keeps the common case allocation-free and the request field nil,
 // so a provider can tell "nothing to set" from "an empty environment".
 func TestResolveEnv_NoEnvIsNil(t *testing.T) {
-	got, err := resolveEnv(context.Background(), fake.NewSimpleClientset(), testPod("default", "p1"))
+	got, err := resolveAll(context.Background(), fake.NewSimpleClientset(), testPod("default", "p1"))
 	if err != nil || got != nil {
 		t.Fatalf("expected (nil, nil) for a Pod with no env, got (%v, %v)", got, err)
+	}
+}
+
+// resolveAll is resolveEnv with its two maps merged, for tests about which value wins rather
+// than where it lands.
+func resolveAll(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod) (map[string]string, error) {
+	env, secrets, err := resolveEnv(ctx, client, pod)
+	if err != nil {
+		return nil, err
+	}
+	return provider.Env{Config: env, Secrets: secrets}.All(), nil
+}
+
+// A variable is a secret when the value that WON came from a Secret, so precedence decides
+// the map as well as the value.
+func TestResolveEnv_SplitsSecrets(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		configMapObj("cm", map[string]string{"FROM_CM": "c", "CM_THEN_SECRET": "c"}),
+		secretObj("sec", map[string]string{"FROM_SECRET": "s", "SECRET_THEN_LITERAL": "s"}),
+	)
+	pod := envPod(
+		[]corev1.EnvFromSource{
+			{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}}},
+			{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "sec"}}},
+		},
+		[]corev1.EnvVar{
+			{Name: "SECRET_THEN_LITERAL", Value: "plain"},
+			{Name: "CM_THEN_SECRET", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "sec"}, Key: "FROM_SECRET",
+			}}},
+		},
+	)
+
+	env, secrets, err := resolveEnv(context.Background(), client, pod)
+	if err != nil {
+		t.Fatalf("resolveEnv: %v", err)
+	}
+	wantEnv := map[string]string{"FROM_CM": "c", "SECRET_THEN_LITERAL": "plain"}
+	wantSecrets := map[string]string{"FROM_SECRET": "s", "CM_THEN_SECRET": "s"}
+	if !maps.Equal(env, wantEnv) || !maps.Equal(secrets, wantSecrets) {
+		t.Fatalf("env = %v, secrets = %v; want %v and %v", env, secrets, wantEnv, wantSecrets)
 	}
 }

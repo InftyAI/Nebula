@@ -18,12 +18,8 @@ package util
 
 import corev1 "k8s.io/api/core/v1"
 
-// IsTerminalPodPhase reports whether a Pod phase is an end state that will not progress.
-//
-// Shared because the two readers must agree: the control plane reaps and un-gates on a terminal
-// Pod, while the virtual node refuses to move one (a provider still listing the instance would
-// otherwise walk a Failed Pod back to Running). A predicate that drifted between them would
-// resurrect exactly the Pods the other side had written off.
-func IsTerminalPodPhase(phase corev1.PodPhase) bool {
+// Finished reports whether a Pod phase is final (Succeeded or Failed). Shared so the control
+// plane, which reaps finished Pods, and the virtual node, which never moves one back, agree.
+func Finished(phase corev1.PodPhase) bool {
 	return phase == corev1.PodFailed || phase == corev1.PodSucceeded
 }

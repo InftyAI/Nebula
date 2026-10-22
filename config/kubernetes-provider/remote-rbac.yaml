@@ -1,0 +1,36 @@
+# What Nebula may do in a target cluster, the host cluster included. Apply it in every
+# target cluster, and map Nebula's IAM identity to the "nebula" group with an EKS access
+# entry:
+#
+#   aws eks create-access-entry --cluster-name <cluster> \
+#     --principal-arn <Nebula's IAM user or role ARN> --kubernetes-groups nebula
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nebula-remote
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nebula-remote
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nebula-remote
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: nebula

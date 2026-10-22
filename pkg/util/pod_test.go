@@ -22,7 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func TestIsTerminalPodPhase(t *testing.T) {
+func TestFinished(t *testing.T) {
 	// Pending is the one worth stating: a Pod that has not started yet is not terminal, and
 	// treating it as one would reap a workload mid-provision.
 	for phase, want := range map[corev1.PodPhase]bool{
@@ -33,8 +33,8 @@ func TestIsTerminalPodPhase(t *testing.T) {
 		corev1.PodUnknown:   false,
 		"":                  false,
 	} {
-		if got := IsTerminalPodPhase(phase); got != want {
-			t.Errorf("IsTerminalPodPhase(%q) = %v, want %v", phase, got, want)
+		if got := Finished(phase); got != want {
+			t.Errorf("Finished(%q) = %v, want %v", phase, got, want)
 		}
 	}
 }

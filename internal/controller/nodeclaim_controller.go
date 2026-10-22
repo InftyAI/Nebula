@@ -287,7 +287,7 @@ func (r *NodeClaimReconciler) provider(name string) (provider.Provider, bool) {
 //     still reclaims by asking the provider what exists.
 func (r *NodeClaimReconciler) desiredPhase(nc *nebulav1alpha1.NodeClaim, pod *corev1.Pod) nebulav1alpha1.NodeClaimPhase {
 	switch {
-	case util.IsTerminalPodPhase(pod.Status.Phase):
+	case util.Finished(pod.Status.Phase):
 		return nebulav1alpha1.NodeClaimTerminated
 	case !pod.DeletionTimestamp.IsZero():
 		return nebulav1alpha1.NodeClaimTerminating

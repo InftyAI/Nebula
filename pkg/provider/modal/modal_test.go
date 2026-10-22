@@ -1762,7 +1762,9 @@ func TestProvision_UsesResolvedEnv(t *testing.T) {
 
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName: "claim-env",
-		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+		Env: provider.Env{
+			Config: map[string]string{"FOO": "bar"}, Secrets: map[string]string{"TOKEN": "t0ken"},
+		},
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

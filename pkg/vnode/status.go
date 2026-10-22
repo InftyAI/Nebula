@@ -123,6 +123,21 @@ func applyReadinessTimeout(pod *corev1.Pod, waited time.Duration, now metav1.Tim
 	}, false)
 }
 
+// applyNoCapacity fails a pod whose unreserved instance was found to have no capacity, with
+// the same reason as a Provision that failed outright.
+func applyNoCapacity(pod *corev1.Pod, now metav1.Time) {
+	const msg = "external instance got no capacity"
+	setPhase(pod, corev1.PodFailed, reasonProvisionFailed, msg, now)
+	setReady(pod, corev1.ConditionFalse, now)
+	setContainerStatuses(pod, corev1.ContainerState{
+		Terminated: &corev1.ContainerStateTerminated{
+			Reason:     reasonProvisionFailed,
+			Message:    msg,
+			FinishedAt: now,
+		},
+	}, false)
+}
+
 // setContainerStatuses mirrors the one instance's state onto every container in the spec.
 // The READY column, `kubectl wait`, and anything keying off container readiness read
 // Status.ContainerStatuses, so an empty array reads as 0/N even with Ready=True. There is

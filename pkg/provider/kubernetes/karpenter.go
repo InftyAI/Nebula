@@ -1,0 +1,143 @@
+/*
+Copyright 2026 The InftyAI Team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kubernetes
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
+)
+
+// Karpenter v1 (sigs.k8s.io/karpenter): its well-known labels, the annotation that keeps
+// consolidation off a node, and the pod events it emits. FailedScheduling is also the
+// kube-scheduler's reason, expected on every pod that needs a new node, so only Karpenter's
+// counts.
+const (
+	instanceFamilyLabel    = "karpenter.k8s.aws/instance-family"
+	capacityTypeLabel      = "karpenter.sh/capacity-type"
+	doNotDisruptAnnotation = "karpenter.sh/do-not-disrupt"
+	capacityTypeSpot       = "spot"
+	capacityTypeOnDemand   = "on-demand"
+
+	reasonInsufficientCapacity = "InsufficientCapacityError"
+	reasonFailedScheduling     = "FailedScheduling"
+	karpenterComponent         = "karpenter"
+
+	// karpenterBindTimeout covers a healthy launch up to binding: Karpenter's decision, the
+	// EC2 launch and node boot until the GPUs are advertised. Measured p-family boots may need
+	// more; image pull comes after binding and is the readiness deadline's.
+	karpenterBindTimeout = 5 * time.Minute
+	// karpenterProvisionTimeout covers the slow end of Karpenter's decision: its batch window
+	// (up to 10s by default), the scheduling pass and the EC2 call. A refusal arriving after
+	// it is only caught by bindTimeout, so err long.
+	karpenterProvisionTimeout = 30 * time.Second
+)
+
+// nodeClaimGV is Karpenter v1's API, only checked for presence (see verify).
+var nodeClaimGV = schema.GroupVersion{Group: "karpenter.sh", Version: "v1"}
+
+type karpenter struct{}
+
+func (karpenter) bindTimeout() time.Duration      { return karpenterBindTimeout }
+func (karpenter) provisionTimeout() time.Duration { return karpenterProvisionTimeout }
+
+// selection pins the GPU model through the instance family (one model per NVIDIA family on
+// AWS) and the tier through the capacity type, and keeps consolidation and drift from
+// evicting a running sandbox to repack.
+func (karpenter) selection(families []string, tier nebulav1alpha1.CapacityType) nodeSelection {
+	var reqs []corev1.NodeSelectorRequirement
+	if len(families) > 0 {
+		reqs = append(reqs, corev1.NodeSelectorRequirement{
+			Key: instanceFamilyLabel, Operator: corev1.NodeSelectorOpIn, Values: families,
+		})
+	}
+	if ct := karpenterCapacityType(tier); ct != "" {
+		reqs = append(reqs, corev1.NodeSelectorRequirement{
+			Key: capacityTypeLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{ct},
+		})
+	}
+	sel := nodeSelection{annotations: map[string]string{doNotDisruptAnnotation: labelTrue}}
+	if len(reqs) > 0 {
+		// Reschedule takes time, let's be conservative here.
+		sel.affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: reqs}},
+			},
+		}}
+	}
+	return sel
+}
+
+func karpenterCapacityType(tier nebulav1alpha1.CapacityType) string {
+	switch tier {
+	case nebulav1alpha1.CapacitySpot:
+		return capacityTypeSpot
+	case nebulav1alpha1.CapacityOnDemand:
+		return capacityTypeOnDemand
+	default:
+		return ""
+	}
+}
+
+// refused returns Karpenter's verdict that it will not get the pod a node, from the pod's
+// own events, or nil. EC2 refusing a launch shows nowhere else: Karpenter deletes that
+// NodeClaim without recording why. These events are rate-limited, so a dropped one only costs
+// the bind timeout.
+func (karpenter) refused(ctx context.Context, cc clusterClients, pod *corev1.Pod) error {
+	evs, err := cc.kube.CoreV1().Events(pod.Namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("involvedObject.uid", string(pod.UID)).String(),
+	})
+	if err != nil {
+		return nil
+	}
+	for _, ev := range evs.Items {
+		// Filtered again here: the selector is the server's job, and not every client honours it.
+		if ev.InvolvedObject.UID != pod.UID || !fromKarpenter(ev) {
+			continue
+		}
+		if ev.Reason == reasonInsufficientCapacity || ev.Reason == reasonFailedScheduling {
+			return fmt.Errorf("kubernetes: karpenter: %s: %w", ev.Message, provider.ErrNoCapacity)
+		}
+	}
+	return nil
+}
+
+func (karpenter) verify(_ context.Context, cc clusterClients) error {
+	res, err := cc.kube.Discovery().ServerResourcesForGroupVersion(nodeClaimGV.String())
+	if err == nil && slices.ContainsFunc(res.APIResources, func(r metav1.APIResource) bool {
+		return r.Name == "nodeclaims"
+	}) {
+		return nil
+	}
+	return fmt.Errorf("kubernetes: Karpenter %s NodeClaims not found (%v); is Karpenter v1 installed?",
+		nodeClaimGV, err)
+}
+
+func fromKarpenter(ev corev1.Event) bool {
+	return strings.Contains(ev.Source.Component, karpenterComponent) ||
+		strings.Contains(ev.ReportingController, karpenterComponent)
+}

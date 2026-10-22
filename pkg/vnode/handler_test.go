@@ -1983,3 +1983,38 @@ func TestCreatePod_FailsClosedWithoutClusterState(t *testing.T) {
 		})
 	}
 }
+
+// An unreserved instance the provider later reports as having no capacity is the Provision
+// error path arriving late: the candidate is blocklisted with the pool's TTL, the Pod fails
+// with the provision-failed reason, and a second tick neither re-fails nor re-blocks it.
+func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
+	scope := provider.BlockScope{Region: ptrTo("eks-use1")}
+	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
+	h.jitterFn = func() time.Duration { return 0 }
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", Region: "eks-use1",
+		State: provider.InstanceUnschedulable,
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != reasonProvisionFailed {
+		t.Fatalf("status = %s/%s, want Failed/%s", got.Status.Phase, got.Status.Reason, reasonProvisionFailed)
+	}
+	if bl.calls != 1 || bl.ttl != 30*time.Second || fp.classifyRegion != "eks-use1" {
+		t.Fatalf("block = %d calls, ttl %v, region %q; want one, 30s, eks-use1", bl.calls, bl.ttl, fp.classifyRegion)
+	}
+
+	h.reconcileOnce(context.Background())
+	if bl.calls != 1 {
+		t.Fatalf("Record calls = %d after a second tick, want 1", bl.calls)
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }

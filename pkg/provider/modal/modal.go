@@ -644,8 +644,8 @@ func (p *Provider) sandboxSpecFromPod(pod *corev1.Pod, req provider.ProvisionReq
 		// The caller's resolved map is the whole environment — the Pod's literals plus
 		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
 		// here: it holds references this adapter has no cluster access to follow. See
-		// provider.ProvisionRequest.Env.
-		Env:            req.Env,
+		// provider.Env.All.
+		Env:            req.Env.All(),
 		CPU:            physicalCores(requests.CPU),
 		MemoryMiB:      requests.MemoryMiB,
 		CPULimit:       physicalCores(limits.CPU),

@@ -186,7 +186,9 @@ func TestProvision_UsesResolvedEnv(t *testing.T) {
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName: "claim-env",
 		Region:    "us-west-2", // EC2 needs one; the test client is not configured with a default
-		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+		Env: provider.Env{
+			Config: map[string]string{"FOO": "bar"}, Secrets: map[string]string{"TOKEN": "t0ken"},
+		},
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

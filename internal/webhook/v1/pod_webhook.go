@@ -19,6 +19,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -112,9 +113,9 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 // +kubebuilder:webhook:path=/validate--v1-pod,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create;update,versions=v1,name=vpod-v1.nebula.inftyai.com,admissionReviewVersions=v1
 
 // PodCustomValidator rejects an opted-in Pod the providers cannot run as written: they
-// launch one container and no init containers, and expose at most one port (Modal's
-// connect URL routes to one; see modal.firstPort). Admitting more would drop the rest
-// silently.
+// launch one container and no init containers, expose at most one port (Modal's connect URL
+// routes to one; see modal.firstPort), and mount nothing from the cluster, so no volumes and
+// no service account. Admitting more would drop the rest silently.
 type PodCustomValidator struct{}
 
 var _ webhook.CustomValidator = &PodCustomValidator{}
@@ -187,8 +188,22 @@ func validatePod(pod *corev1.Pod) error {
 	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
 		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
 	}
+	if sa := pod.Spec.ServiceAccountName; sa != "" && sa != "default" {
+		return fmt.Errorf("nebula does not mount service accounts, got %q", sa)
+	}
+	for _, v := range pod.Spec.Volumes {
+		// The API server adds this one to every Pod before validation; it is simply not mounted.
+		if v.Projected != nil && strings.HasPrefix(v.Name, serviceAccountTokenVolumePrefix) {
+			continue
+		}
+		return fmt.Errorf("nebula does not mount volumes, got %q", v.Name)
+	}
 	return nil
 }
+
+// serviceAccountTokenVolumePrefix names the projected token volume the ServiceAccount
+// admission plugin adds ("kube-api-access-<suffix>").
+const serviceAccountTokenVolumePrefix = "kube-api-access-"
 
 // hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
 func hasNebulaGate(pod *corev1.Pod) bool {

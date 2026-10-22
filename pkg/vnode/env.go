@@ -29,9 +29,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// resolveEnv builds the environment a provider gets as ProvisionRequest.Env, following the
-// references the Pod makes. The only place envFrom/valueFrom are read, since a provider has
-// no cluster access to follow them with.
+// resolveEnv builds the environment a provider gets as ProvisionRequest.Env (Config, Secrets),
+// following the references the Pod makes. A variable lands in secrets when the value that
+// won under kubelet precedence came from a Secret, and in env otherwise. The only place
+// envFrom/valueFrom are read, since a provider has no cluster access to follow them with.
 //
 // Kubelet rules: envFrom first in listed order with each Prefix, then env overriding it.
 // optional means "the object or key may not exist" — NOT "we may fail to look", so a read
@@ -46,25 +47,37 @@ import (
 // Reads bypass node.go's Secret/ConfigMap informers on purpose: VK waits only for the POD
 // informer to sync before CreatePod, and a cold cache reports an existing Secret as absent —
 // the one signal this function acts on. A nil client is the usual test seam (literals only).
-func resolveEnv(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod) (map[string]string, error) {
+func resolveEnv(
+	ctx context.Context, client kubernetes.Interface, pod *corev1.Pod,
+) (env, secrets map[string]string, err error) {
 	if len(pod.Spec.Containers) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// One container per Nebula Pod, as everywhere else that reads the workload.
 	c := pod.Spec.Containers[0]
 	if len(c.Env) == 0 && len(c.EnvFrom) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	r := &envResolver{client: client, pod: pod}
+	r := &envResolver{client: client, pod: pod, fromSecret: map[string]bool{}}
 	out := make(map[string]string, len(c.Env))
 	if err := r.fromSources(ctx, out, c.EnvFrom); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := r.fromVars(ctx, out, c.Env); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	for k, v := range out {
+		dst := &env
+		if r.fromSecret[k] {
+			dst = &secrets
+		}
+		if *dst == nil {
+			*dst = map[string]string{}
+		}
+		(*dst)[k] = v
+	}
+	return env, secrets, nil
 }
 
 // envResolver resolves one container's references, memoizing what it reads so ten
@@ -75,6 +88,9 @@ type envResolver struct {
 	pod     *corev1.Pod
 	secrets map[string]*corev1.Secret
 	configs map[string]*corev1.ConfigMap
+	// fromSecret records, per variable, whether its current value came from a Secret; the
+	// last write wins, as the value does.
+	fromSecret map[string]bool
 }
 
 // fromSources applies envFrom in listed order. Every key of each source becomes a variable,
@@ -116,6 +132,7 @@ func (r *envResolver) fromVars(ctx context.Context, out map[string]string, vars 
 	for _, e := range vars {
 		if e.ValueFrom == nil {
 			out[e.Name] = e.Value
+			r.fromSecret[e.Name] = false
 			continue
 		}
 		v, found, err := r.valueFrom(ctx, e.ValueFrom)
@@ -126,6 +143,7 @@ func (r *envResolver) fromVars(ctx context.Context, out map[string]string, vars 
 		// variable unset, as the kubelet does.
 		if found {
 			out[e.Name] = v
+			r.fromSecret[e.Name] = e.ValueFrom.SecretKeyRef != nil
 		}
 	}
 	return nil
@@ -302,6 +320,7 @@ func (r *envResolver) put(ctx context.Context, out map[string]string, name, valu
 		return
 	}
 	out[name] = value
+	r.fromSecret[name] = kind == "Secret"
 }
 
 // optional dereferences the *bool the API uses for optional, where nil means false.

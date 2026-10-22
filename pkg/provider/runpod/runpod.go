@@ -530,7 +530,7 @@ func (p *Provider) podSpecFromPod(pod *corev1.Pod, req provider.ProvisionRequest
 		// The caller's resolved map is the whole environment — the Pod's literals plus
 		// everything envFrom/valueFrom referenced. pod.Spec.Containers[0].Env is NOT read
 		// here: it holds references this adapter has no cluster access to follow.
-		Env:              req.Env,
+		Env:              req.Env.All(),
 		ContainerDiskGiB: max(defaultContainerDiskGiB, util.PodEphemeralStorageGiB(pod)),
 		Ports:            containerPorts(&c),
 		DataCenterIDs:    dataCentersOf(req.Region),

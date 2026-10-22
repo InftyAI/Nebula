@@ -1,0 +1,12 @@
+# The kubernetes provider's cluster table (pkg/provider/kubernetes.Config), rendered into the
+# manager's ConfigMap by this directory's kustomization. Read once at startup: restart the
+# manager after a change. No credentials go here: each EKS cluster is reached with Nebula's
+# own AWS identity.
+clusters:
+  # The host cluster itself, the first target to verify the provider against.
+  - name: my-cluster          # the EKS cluster's own name
+    provider: eks
+    region: us-east-1          # the EKS cluster's AWS region
+    geography: us              # set explicitly; a NodePool's regions match either this or region
+    # roleARN: arn:aws:iam::123456789012:role/nebula-remote   # only for another account
+    # nodeAutoscaler: karpenter   # what adds nodes; the default and only one supported today
