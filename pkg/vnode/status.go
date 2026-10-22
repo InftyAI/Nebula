@@ -71,6 +71,13 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 		if endpoint != "" && net.ParseIP(endpoint) != nil {
 			pod.Status.PodIP = endpoint
 		}
+	case provider.InstanceNotReady:
+		setPhase(pod, corev1.PodRunning, reasonRunning, "external instance is running but not ready", now)
+		setReady(pod, corev1.ConditionFalse, now)
+		setContainerStatuses(pod, corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}}, false)
+		if endpoint != "" && net.ParseIP(endpoint) != nil {
+			pod.Status.PodIP = endpoint
+		}
 	case provider.InstancePending:
 		setPhase(pod, corev1.PodPending, reasonInitializing, "external instance is initializing", now)
 		setReady(pod, corev1.ConditionFalse, now)
@@ -111,7 +118,7 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 // verdict, so it must not read as a provider-reported failure — see
 // PodReasonReadinessTimeout.
 func applyReadinessTimeout(pod *corev1.Pod, waited time.Duration, now metav1.Time) {
-	msg := fmt.Sprintf("external instance did not become ready within %s", waited.Round(time.Second))
+	msg := fmt.Sprintf("external instance was not ready for %s", waited.Round(time.Second))
 	setPhase(pod, corev1.PodFailed, reasonReadinessTimeout, msg, now)
 	setReady(pod, corev1.ConditionFalse, now)
 	setContainerStatuses(pod, corev1.ContainerState{

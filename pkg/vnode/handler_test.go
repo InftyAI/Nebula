@@ -2018,3 +2018,36 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 }
 
 func ptrTo[T any](v T) *T { return &v }
+
+// NotReady shows as it is, Running with Ready=False, and counts toward the readiness deadline
+// like Pending: unusable for the whole deadline fails the Pod, before or after it was ready.
+// Running in between resets the clock.
+func TestReconcileOnce_NotReadyIsShownAndCounted(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	tick := func(state provider.InstanceState) *corev1.Pod {
+		fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: state}}
+		h.reconcileOnce(context.Background())
+		got, _ := h.GetPod(context.Background(), "default", "p1")
+		return got
+	}
+
+	got := tick(provider.InstanceNotReady)
+	if got.Status.Phase != corev1.PodRunning || isPodReadyStatus(got) {
+		t.Fatalf("not-ready instance = %s, ready=%v; want Running, not ready", got.Status.Phase, isPodReadyStatus(got))
+	}
+	if got := tick(provider.InstanceRunning); !isPodReadyStatus(got) {
+		t.Fatal("a ready instance must make the Pod ready")
+	}
+
+	tick(provider.InstanceNotReady) // the clock starts again, from zero
+	rewindInitializing(t, h, "default", "p1", 11*time.Minute)
+	got = tick(provider.InstanceNotReady)
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != reasonReadinessTimeout {
+		t.Fatalf("unusable past the deadline = %s/%s, want Failed/%s",
+			got.Status.Phase, got.Status.Reason, reasonReadinessTimeout)
+	}
+}

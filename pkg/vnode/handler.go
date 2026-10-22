@@ -706,7 +706,8 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			})
 		default:
 			updated++
-			if waited, over := h.readyExpired(tp, inst.State); over {
+			state := inst.State
+			if waited, over := h.readyExpired(tp, state); over {
 				// Failing the Pod is the whole action: teardown follows from the
 				// terminal phase, via the reap (see readyExpired).
 				log.Info("readiness deadline exceeded; failing the pod",
@@ -715,11 +716,11 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 				applyReadinessTimeout(tp.pod, waited, h.nowFn())
 				break
 			}
-			applyState(tp.pod, inst.State, inst.Endpoint, h.nowFn())
+			applyState(tp.pod, state, inst.Endpoint, h.nowFn())
 			// The observed address, for a provider that cannot know it before boot.
 			// Empty for one that published at create, which must not clear it.
 			setEndpoint(tp.pod, inst.Endpoint)
-			h.observeReady(tp, inst.State)
+			h.observeReady(tp, state)
 		}
 		// Log before -> after every tick: a differing pair is the lifecycle moving
 		// (Provisioning -> Initializing -> Running, or -> Terminated), an equal pair
@@ -767,10 +768,13 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// readyExpired maintains the Initializing clock and reports whether it has run
-// past the deadline, with how long the pod has been there.
+// readyExpired maintains the not-usable clock and reports whether it has run past the
+// deadline, with how long the pod has been there. It counts InstancePending and
+// InstanceNotReady alike, so a workload that never comes up and one that stops being ready
+// both fail once unusable for the whole deadline; Running resets it, so a brief unready spell
+// costs nothing.
 //
-// It anchors on the FIRST observation of InstancePending, not on provisioningAt: the
+// It anchors on the FIRST observation of a not-usable state, not on provisioningAt: the
 // provision call is bounded separately (see defaultProvisionTimeout), so measuring from
 // there would spend the readiness budget on a box that had barely started booting. Any
 // other state RESETS the clock rather than merely pausing it — a demoted pod gets a fresh
@@ -788,7 +792,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 //
 // Callers must hold h.mu.
 func (h *Handler) readyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
-	if state != provider.InstancePending {
+	if state != provider.InstancePending && state != provider.InstanceNotReady {
 		tp.initializingAt = time.Time{}
 		return 0, false
 	}

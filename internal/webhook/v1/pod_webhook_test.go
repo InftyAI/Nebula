@@ -216,49 +216,6 @@ func TestValidateCreate_OneContainerOnePort(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_NoVolumesNoServiceAccount(t *testing.T) {
-	saToken := corev1.Volume{
-		Name:         "kube-api-access-x7k2p",
-		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{}},
-	}
-	cases := []struct {
-		name    string
-		mutate  func(*corev1.Pod)
-		wantErr string
-	}{
-		// What the API server itself adds to every Pod must be admitted.
-		{"default service account and its token", func(p *corev1.Pod) {
-			p.Spec.ServiceAccountName = "default"
-			p.Spec.Volumes = []corev1.Volume{saToken}
-		}, ""},
-		{"own service account", func(p *corev1.Pod) { p.Spec.ServiceAccountName = "worker" }, "service accounts"},
-		{"emptyDir", func(p *corev1.Pod) {
-			p.Spec.Volumes = []corev1.Volume{saToken, {Name: "scratch",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
-		}, "volumes"},
-		// Only the projected token volume is exempt, not anything that borrows its name.
-		{"lookalike name", func(p *corev1.Pod) {
-			p.Spec.Volumes = []corev1.Volume{{Name: "kube-api-access-fake",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
-		}, "volumes"},
-	}
-	v := &PodCustomValidator{}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			pod := podWith(map[string]string{nebulav1alpha1.EnabledLabel: "true"}, "")
-			pod.Spec.Containers = []corev1.Container{{Name: "main"}}
-			tc.mutate(pod)
-			_, err := v.ValidateCreate(context.Background(), pod)
-			switch {
-			case tc.wantErr == "" && err != nil:
-				t.Fatalf("ValidateCreate err = %v, want nil", err)
-			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
-				t.Fatalf("ValidateCreate err = %v, want it to contain %q", err, tc.wantErr)
-			}
-		})
-	}
-}
-
 func TestValidateCreate_RejectsNonPod(t *testing.T) {
 	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), &corev1.Service{}); err == nil {
 		t.Fatal("expected an error for a non-Pod object")

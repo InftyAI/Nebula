@@ -443,6 +443,10 @@ const (
 	InstancePending InstanceState = "Pending"
 	// InstanceRunning: up and reachable.
 	InstanceRunning InstanceState = "Running"
+	// InstanceNotReady: running, but not ready (a failing readiness probe, a crash loop). The
+	// Pod shows Running with Ready=False, and the readiness deadline fails it if it stays
+	// unusable that long.
+	InstanceNotReady InstanceState = "NotReady"
 	// InstanceTerminated: gone (also the mapping for "absent from List").
 	InstanceTerminated InstanceState = "Terminated"
 	// InstanceFailed: entered a terminal error state.

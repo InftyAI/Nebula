@@ -576,7 +576,11 @@ func (p *Provider) toInstance(cl cluster, pod *corev1.Pod) provider.Instance {
 func toState(pod *corev1.Pod) provider.InstanceState {
 	switch pod.Status.Phase {
 	case corev1.PodRunning:
-		return provider.InstanceRunning
+		// Running only says the containers started; Ready is what makes the workload available.
+		if podReady(pod) {
+			return provider.InstanceRunning
+		}
+		return provider.InstanceNotReady
 	case corev1.PodSucceeded:
 		return provider.InstanceTerminated
 	case corev1.PodFailed:
@@ -584,6 +588,15 @@ func toState(pod *corev1.Pod) provider.InstanceState {
 	default:
 		return provider.InstancePending
 	}
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // classifyAPI marks a 401 or 403 as ErrAuth. ClassifyProvisionError narrows that to the one
