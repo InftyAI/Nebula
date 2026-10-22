@@ -203,9 +203,16 @@ func (r *NodeClaimReconciler) reconcileDelete(ctx context.Context, nc *nebulav1a
 	// case this backstop exists for), or a failed Provision created an instance without
 	// ever returning its id. The Pod-derived claim name is then the only way to reclaim
 	// it. If DeletePod already ran, nothing matches and id stays "" (a no-op Terminate).
+	//
+	// A recorded id is only trusted once the provider says it is this claim's instance: it
+	// is copied from a Pod annotation the workload's owner can write (see recordInstanceID),
+	// so taken as-is it would let anyone have Nebula terminate an instance of their choosing.
+	claim := util.ClaimName(nc.Spec.PodRef.Namespace, nc.Spec.PodRef.Name)
 	id := nc.Status.InstanceID
+	if id != "" && !r.instanceOfClaim(ctx, prov, id, claim, nc.Spec.Region) {
+		id = ""
+	}
 	if id == "" {
-		claim := util.ClaimName(nc.Spec.PodRef.Namespace, nc.Spec.PodRef.Name)
 		var err error
 		if id, err = r.findInstanceID(ctx, prov, claim, nc.Spec.Region); err != nil {
 			log.Error(err, "looking up the claim's instance for teardown; will retry")
@@ -233,6 +240,21 @@ func (r *NodeClaimReconciler) reconcileDelete(ctx context.Context, nc *nebulav1a
 
 // findInstanceID returns the id of claim's live instance, or "" when none exists
 // (already gone or never provisioned), which Terminate treats as a no-op.
+// instanceOfClaim reports whether the provider knows id as claim's instance. Anything short of
+// that, gone, unreadable or another claim's, is false, and teardown falls back to the lookup
+// by claim rather than retrying on an id that may be forged.
+func (r *NodeClaimReconciler) instanceOfClaim(
+	ctx context.Context, prov provider.Provider, id, claim, region string,
+) bool {
+	inst, err := prov.Get(ctx, id, region)
+	if err == nil && inst != nil && inst.ClaimName == claim {
+		return true
+	}
+	logf.FromContext(ctx).Info("recorded instance id is not this claim's; looking the instance up by claim",
+		"instanceID", id, "claim", claim, "error", err)
+	return false
+}
+
 func (r *NodeClaimReconciler) findInstanceID(ctx context.Context, prov provider.Provider, claim, region string) (string, error) {
 	inst, err := prov.FindByClaim(ctx, claim, region)
 	if err != nil || inst == nil {

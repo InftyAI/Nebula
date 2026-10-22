@@ -258,7 +258,9 @@ func (p *Provider) Provision(
 // A failure is only logged: the Pod fails regardless, and the NodeClaim teardown finds the
 // leftover through FindByClaim.
 func cleanup(ctx context.Context, cc clusterClients, namespace, name string) {
-	if err := deleteInstance(context.WithoutCancel(ctx), cc, namespace, name); err != nil {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), provisionSlack)
+	defer cancel()
+	if err := deleteInstance(ctx, cc, namespace, name); err != nil {
 		logf.FromContext(ctx).Error(err, "kubernetes: could not delete pod without capacity; teardown will retry",
 			"namespace", namespace, "pod", name)
 	}
