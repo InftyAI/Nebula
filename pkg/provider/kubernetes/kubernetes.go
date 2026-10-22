@@ -231,12 +231,12 @@ func (p *Provider) Provision(
 	if err := ensureNamespace(ctx, kube, real.Namespace); err != nil {
 		return provider.ProvisionResult{}, err
 	}
-	created, err := createOrAdopt(ctx, cl.clients, real)
+	created, adopted, err := createOrAdopt(ctx, cl.clients, real)
 	if err != nil {
 		return provider.ProvisionResult{}, err
 	}
 	if len(req.Env.Secrets) > 0 {
-		if err := ensureEnvSecret(ctx, kube, created, req.Env.Secrets); err != nil {
+		if err := ensureEnvSecret(ctx, kube, created, adopted, req.Env.Secrets); err != nil {
 			cleanup(ctx, cl.clients, real.Namespace, real.Name)
 			return provider.ProvisionResult{}, err
 		}
@@ -474,35 +474,46 @@ func parseInstanceID(id string) (region, namespace, name string, err error) {
 	return parts[0], parts[1], parts[2], nil
 }
 
-// createOrAdopt creates the real pod, or returns the live one a crashed or retried Provision
-// left behind. A finished one is the previous incarnation of a reused claim name and is
-// replaced; anything else holding the name is refused rather than adopted.
-func createOrAdopt(ctx context.Context, cc clusterClients, want *corev1.Pod) (*corev1.Pod, error) {
+// createOrAdopt creates the real pod, or adopts the live one an interrupted Provision left
+// (adopted=true). Anything else holding the pod's or env Secret's name is refused, not
+// replaced: a new pod could start on a warm node with whatever Secret of that name exists.
+func createOrAdopt(
+	ctx context.Context, cc clusterClients, want *corev1.Pod,
+) (pod *corev1.Pod, adopted bool, err error) {
 	pods := cc.kube.CoreV1().Pods(want.Namespace)
 	got, err := pods.Get(ctx, want.Name, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 	case err != nil:
-		return nil, fmt.Errorf("kubernetes: get pod %s/%s: %w", want.Namespace, want.Name, classifyAPI(err))
+		return nil, false, fmt.Errorf("kubernetes: get pod %s/%s: %w", want.Namespace, want.Name, classifyAPI(err))
 	case !ownedByUs(got):
-		return nil, fmt.Errorf("kubernetes: pod %s/%s exists and is not Nebula's", want.Namespace, want.Name)
+		return nil, false, fmt.Errorf("kubernetes: pod %s/%s exists and is not Nebula's", want.Namespace, want.Name)
 	case got.DeletionTimestamp == nil && !util.Finished(got.Status.Phase):
-		return got, nil
+		return got, true, nil
 	default:
-		if err := deleteAndWait(ctx, cc, want.Namespace, want.Name); err != nil {
-			return nil, err
-		}
+		return nil, false, fmt.Errorf("kubernetes: pod %s/%s from an earlier sandbox is still present",
+			want.Namespace, want.Name)
 	}
+
+	secret := envSecretName(want.Name)
+	_, err = cc.kube.CoreV1().Secrets(want.Namespace).Get(ctx, secret, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return nil, false, fmt.Errorf("kubernetes: secret %s/%s already exists", want.Namespace, secret)
+	case !apierrors.IsNotFound(err):
+		return nil, false, fmt.Errorf("kubernetes: get secret %s/%s: %w", want.Namespace, secret, classifyAPI(err))
+	}
+
 	created, err := pods.Create(ctx, want, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes: create pod %s/%s: %w", want.Namespace, want.Name, classifyAPI(err))
+		return nil, false, fmt.Errorf("kubernetes: create pod %s/%s: %w", want.Namespace, want.Name, classifyAPI(err))
 	}
-	return created, nil
+	return created, false, nil
 }
 
 // ensureEnvSecret writes the Secret-sourced env, owned by the pod so Kubernetes deletes it with
-// the pod; nothing else deletes it.
-func ensureEnvSecret(ctx context.Context, kube kubeClient, pod *corev1.Pod, env map[string]string) error {
+// it. An existing one is accepted only for an adopted pod, and only if it is Nebula's.
+func ensureEnvSecret(ctx context.Context, kube kubeClient, pod *corev1.Pod, adopted bool, env map[string]string) error {
 	want := envSecret(pod.Namespace, pod.Name, env)
 	want.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: "v1", Kind: "Pod", Name: pod.Name, UID: pod.UID,
@@ -510,31 +521,19 @@ func ensureEnvSecret(ctx context.Context, kube kubeClient, pod *corev1.Pod, env 
 	secrets := kube.CoreV1().Secrets(pod.Namespace)
 	_, err := secrets.Create(ctx, want, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
-		err = replaceEnvSecret(ctx, kube, want)
+		var got *corev1.Secret
+		switch got, err = secrets.Get(ctx, want.Name, metav1.GetOptions{}); {
+		case err != nil:
+		case !adopted:
+			err = fmt.Errorf("secret %s/%s appeared before this pod's", want.Namespace, want.Name)
+		case !ownedByUs(got):
+			err = fmt.Errorf("secret %s/%s exists and is not Nebula's", want.Namespace, want.Name)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("kubernetes: write env secret for %s/%s: %w", pod.Namespace, pod.Name, classifyAPI(err))
 	}
 	return nil
-}
-
-// replaceEnvSecret deletes the existing env Secret, a previous pod's of the same name, and
-// creates it afresh. Only if Nebula made it: a user's own Secret with the name is refused,
-// never deleted.
-func replaceEnvSecret(ctx context.Context, kube kubeClient, want *corev1.Secret) error {
-	secrets := kube.CoreV1().Secrets(want.Namespace)
-	got, err := secrets.Get(ctx, want.Name, metav1.GetOptions{})
-	if err == nil && !ownedByUs(got) {
-		return fmt.Errorf("secret %s/%s exists and is not Nebula's", want.Namespace, want.Name)
-	}
-	if err == nil {
-		err = secrets.Delete(ctx, want.Name, metav1.DeleteOptions{Preconditions: metav1.NewUIDPreconditions(string(got.UID))})
-	}
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	_, err = secrets.Create(ctx, want, metav1.CreateOptions{})
-	return err
 }
 
 // deleteInstance removes the real pod; already gone is success. Its env Secret follows
@@ -545,26 +544,6 @@ func deleteInstance(ctx context.Context, cc clusterClients, namespace, name stri
 		return fmt.Errorf("kubernetes: delete pod %s/%s: %w", namespace, name, classifyAPI(err))
 	}
 	return nil
-}
-
-// deleteAndWait deletes the pod and waits for the name to free up, so a replacement can take it.
-func deleteAndWait(ctx context.Context, cc clusterClients, namespace, name string) error {
-	if err := deleteInstance(ctx, cc, namespace, name); err != nil {
-		return err
-	}
-	t := time.NewTicker(waitInterval)
-	defer t.Stop()
-	for {
-		_, err := cc.kube.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("kubernetes: previous pod %s/%s still terminating: %w", namespace, name, ctx.Err())
-		case <-t.C:
-		}
-	}
 }
 
 // toInstance normalizes a real pod. Region is the cluster's AWS region, the token the claim

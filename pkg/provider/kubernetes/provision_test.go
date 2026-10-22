@@ -328,21 +328,63 @@ func TestProvisionRefusesToOverwriteForeignSecret(t *testing.T) {
 	}
 }
 
-// A previous pod's env Secret, Nebula's own, is replaced with the new values and owner.
-func TestProvisionReplacesOwnEnvSecret(t *testing.T) {
+// Whatever already holds the names is refused before anything is created, so no container can
+// start with a Secret that is not this request's; the error blocks nothing, the Pod's owner
+// retries.
+func TestProvisionRefusesWhatHoldsTheName(t *testing.T) {
+	finished := func() *corev1.Pod {
+		pod := buildPod(placeholder(), podSpec{claim: "org-1-work-1"})
+		pod.Status.Phase = corev1.PodSucceeded
+		return pod
+	}
+	stale := func() *corev1.Secret {
+		sec := envSecret("org-1", "org-1-work-1", map[string]string{"K": "stale"})
+		sec.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: "old"}}
+		return sec
+	}
+	cases := map[string]runtime.Object{
+		"earlier pod, finished": finished(),
+		"earlier pod's secret":  stale(),
+	}
+	for name, obj := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := newTestCluster(t, true)
+			if err := tc.kube.Tracker().Add(obj); err != nil {
+				t.Fatal(err)
+			}
+			p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+
+			_, err := p.Provision(context.Background(), placeholder(), provisionRequest())
+			if err == nil {
+				t.Fatal("Provision took a name already held")
+			}
+			if scope := p.ClassifyProvisionError(err, "H100:1", "us-east-1"); scope != (provider.BlockScope{}) {
+				t.Errorf("a name collision blocked %+v; it says nothing about capacity", scope)
+			}
+			if sec, err := tc.kube.CoreV1().Secrets("org-1").Get(context.Background(), "org-1-work-1-env",
+				metav1.GetOptions{}); err == nil && sec.StringData["K"] == "v" {
+				t.Error("the request's Secret was written despite the refusal")
+			}
+		})
+	}
+}
+
+// A live pod of ours is the one an interrupted Provision left behind: adopted, with its Secret.
+func TestProvisionAdoptsLivePod(t *testing.T) {
 	tc := newTestCluster(t, true)
-	old := envSecret("org-1", "org-1-work-1", map[string]string{"K": "stale"})
-	old.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: "old-uid"}}
-	if _, err := tc.kube.CoreV1().Secrets("org-1").Create(context.Background(), old, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
+	live := buildPod(placeholder(), podSpec{claim: "org-1-work-1"})
+	live.UID, live.Spec.NodeName, live.Status.Phase = testUID, "node-1", corev1.PodRunning
+	sec := envSecret("org-1", "org-1-work-1", map[string]string{"K": "v"})
+	sec.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: testUID}}
+	for _, obj := range []runtime.Object{live, sec} {
+		if err := tc.kube.Tracker().Add(obj); err != nil {
+			t.Fatal(err)
+		}
 	}
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
 
-	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
-		t.Fatal(err)
-	}
-	got, err := tc.kube.CoreV1().Secrets("org-1").Get(context.Background(), "org-1-work-1-env", metav1.GetOptions{})
-	if err != nil || got.StringData["K"] != "v" || got.OwnerReferences[0].UID != testUID {
-		t.Fatalf("secret = %+v, %v; want the new values, owned by the new pod", got, err)
+	res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
+	if err != nil || !res.Reserved || res.InstanceID != "us-east-1/org-1/org-1-work-1" {
+		t.Fatalf("Provision = %+v, %v; want the live pod adopted", res, err)
 	}
 }
