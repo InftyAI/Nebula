@@ -79,6 +79,7 @@ type fakeProvider struct {
 	// timeout does. It exists to prove the provision deadline does not leak into the
 	// writes that follow.
 	provisionBlocksUntilDeadline bool
+	classifyErr                  error // the error last passed to ClassifyProvisionError
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
@@ -139,7 +140,8 @@ func (f *fakeProvider) FindByClaim(_ context.Context, claim, _ string) (*provide
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool)      { return []string{c}, true }
 func (f *fakeProvider) ResolveRegions(declared, _ []string) []string           { return declared }
-func (f *fakeProvider) ClassifyProvisionError(_ error, accel, region string) provider.BlockScope {
+func (f *fakeProvider) ClassifyProvisionError(err error, accel, region string) provider.BlockScope {
+	f.classifyErr = err
 	f.classifyAccel = accel
 	f.classifyRegion = region
 	return f.classifyScope
@@ -1990,7 +1992,9 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 	scope := provider.BlockScope{Region: ptrTo("eks-use1")}
 	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
 	bl := &recordingBlocklist{}
-	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
+	cluster := clusterWithTTL(30 * time.Second)
+	cluster.claim.Spec.CapacityType = nebulav1alpha1.CapacitySpot
+	h := NewHandler(fp, nil, bl, cluster)
 	h.jitterFn = func() time.Duration { return 0 }
 	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -2008,6 +2012,10 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 	}
 	if bl.calls != 1 || bl.ttl != 30*time.Second || fp.classifyRegion != "eks-use1" {
 		t.Fatalf("block = %d calls, ttl %v, region %q; want one, 30s, eks-use1", bl.calls, bl.ttl, fp.classifyRegion)
+	}
+	// The claim's tier rides on the error, so the provider blocks Spot alone, not every tier.
+	if tier := provider.TierOf(fp.classifyErr); tier != nebulav1alpha1.CapacitySpot {
+		t.Fatalf("classified a late failure with tier %q, want the claim's %q", tier, nebulav1alpha1.CapacitySpot)
 	}
 
 	h.reconcileOnce(context.Background())

@@ -244,7 +244,7 @@ func (p *Provider) Provision(
 	bound, err := waitForProvision(ctx, cl.clients, cl.nodeAutoscaler, real.Namespace, real.Name)
 	if err != nil {
 		cleanup(ctx, cl.clients, real.Namespace, real.Name)
-		return provider.ProvisionResult{}, withTier(req.CapacityType, err)
+		return provider.ProvisionResult{}, provider.WithTier(req.CapacityType, err)
 	}
 	// Unbound is accepted, not reserved: the node may still be booting. List settles it,
 	// reporting no capacity once the pod is unbound past its node autoscaler's bindTimeout.
@@ -403,12 +403,7 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	if err == nil {
 		return provider.BlockScope{}
 	}
-	var te *tierError
-	var tier nebulav1alpha1.CapacityType
-	if errors.As(err, &te) {
-		tier = te.tier
-	}
-	scope := provider.ClassifyError(err, tier, accelerator)
+	scope := provider.ClassifyError(err, provider.TierOf(err), accelerator)
 	if scope == (provider.BlockScope{}) {
 		return scope // block nothing; decorating it would create a block
 	}
@@ -606,18 +601,4 @@ func classifyAPI(err error) error {
 		return fmt.Errorf("%w: %w", provider.ErrAuth, err)
 	}
 	return err
-}
-
-// tierError carries the requested tier to ClassifyProvisionError, which is not handed one,
-// so a Spot shortage does not block OnDemand.
-type tierError struct {
-	tier nebulav1alpha1.CapacityType
-	err  error
-}
-
-func (e *tierError) Error() string { return e.err.Error() }
-func (e *tierError) Unwrap() error { return e.err }
-
-func withTier(tier nebulav1alpha1.CapacityType, err error) error {
-	return &tierError{tier: tier, err: err}
 }

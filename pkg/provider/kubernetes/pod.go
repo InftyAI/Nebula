@@ -211,14 +211,17 @@ func isExtendedResource(name corev1.ResourceName) bool {
 	return len(validation.IsQualifiedName(corev1.DefaultResourceRequestsPrefix+n)) == 0
 }
 
-// envVars renders env in sorted order, so the same request always yields the same spec.
+// envVars renders env in sorted order, so the same request always yields the same spec. Each
+// "$" is doubled because the kubelet expands $(VAR) in env values (and folds "$$" to "$"):
+// the values are already resolved and must reach the container verbatim, as resolveEnv
+// promises, not pick up another variable such as one from the env Secret.
 func envVars(env map[string]string) []corev1.EnvVar {
 	if len(env) == 0 {
 		return nil
 	}
 	out := make([]corev1.EnvVar, 0, len(env))
 	for _, k := range slices.Sorted(maps.Keys(env)) {
-		out = append(out, corev1.EnvVar{Name: k, Value: env[k]})
+		out = append(out, corev1.EnvVar{Name: k, Value: strings.ReplaceAll(env[k], "$", "$$")})
 	}
 	return out
 }

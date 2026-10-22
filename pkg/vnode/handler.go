@@ -701,7 +701,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 				"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance)
 			applyNoCapacity(tp.pod, h.nowFn())
 			failed = append(failed, failedPlacement{
-				pod: tp.pod.DeepCopy(), region: inst.Region,
+				pod: tp.pod.DeepCopy(), claim: tp.claimName, region: inst.Region,
 				err: fmt.Errorf("external instance got no capacity: %w", provider.ErrNoCapacity),
 			})
 		default:
@@ -737,6 +737,11 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		pool, err := h.poolFor(ctx, b.pod)
 		if err != nil {
 			pool = nil // the default TTL; a block with the wrong length beats no block
+		}
+		// The tier the instance was placed under, from the claim that recorded it, so a
+		// late Spot shortage blocks Spot alone, as a failed Provision would.
+		if nc, err := h.claimFor(ctx, b.pod, b.claim); err == nil {
+			b.err = provider.WithTier(nc.Spec.CapacityType, b.err)
 		}
 		h.recordBlock(ctx, b.pod, b.region, blocklistTTLOf(pool), b.err)
 	}
@@ -1160,6 +1165,7 @@ func (h *Handler) recordBlock(
 // unlocking. The provider's classification of err decides the scope.
 type failedPlacement struct {
 	pod    *corev1.Pod
+	claim  string
 	region string
 	err    error
 }

@@ -247,7 +247,7 @@ func TestClassifyProvisionError(t *testing.T) {
 		t.Errorf("nil error blocked %+v", s)
 	}
 
-	spot := p.ClassifyProvisionError(withTier(nebulav1alpha1.CapacitySpot,
+	spot := p.ClassifyProvisionError(provider.WithTier(nebulav1alpha1.CapacitySpot,
 		fmt.Errorf("x: %w", provider.ErrNoCapacity)), "H100:1", region)
 	if spot.CapacityType != nebulav1alpha1.CapacitySpot || *spot.Region != region || *spot.Accelerator != "H100:1" {
 		t.Errorf("spot shortage scope = %+v", spot)
@@ -426,5 +426,15 @@ func TestToStateNeedsReady(t *testing.T) {
 		if got := toState(tc.pod); got != tc.want {
 			t.Errorf("%s: toState = %s, want %s", name, got, tc.want)
 		}
+	}
+}
+
+// The kubelet expands $(VAR) and folds $$ in env values; resolved values must come out as
+// they went in, so every $ is escaped.
+func TestEnvVarsEscapeDollar(t *testing.T) {
+	got := envVars(map[string]string{"REF": "$(TOKEN)", "TWO": "a$$b", "PLAIN": "x"})
+	want := []corev1.EnvVar{{Name: "PLAIN", Value: "x"}, {Name: "REF", Value: "$$(TOKEN)"}, {Name: "TWO", Value: "a$$$$b"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("envVars = %+v, want %+v", got, want)
 	}
 }
