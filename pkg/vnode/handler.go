@@ -676,8 +676,8 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		byClaim[inst.ClaimName] = inst
 	}
 
-	trackedCount := len(h.tracked)
 	h.mu.Lock()
+	trackedCount := len(h.tracked)
 	emit := make([]*corev1.Pod, 0, trackedCount)
 	// failed are placements to block once the lock is released: the TTL comes from the
 	// pod's NodePool, and that read does not belong under h.mu.

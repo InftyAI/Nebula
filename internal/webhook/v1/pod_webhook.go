@@ -19,7 +19,6 @@ package v1
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -188,22 +187,8 @@ func validatePod(pod *corev1.Pod) error {
 	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
 		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
 	}
-	if sa := pod.Spec.ServiceAccountName; sa != "" && sa != "default" {
-		return fmt.Errorf("nebula does not mount service accounts, got %q", sa)
-	}
-	for _, v := range pod.Spec.Volumes {
-		// The API server adds this one to every Pod before validation; it is simply not mounted.
-		if v.Projected != nil && strings.HasPrefix(v.Name, serviceAccountTokenVolumePrefix) {
-			continue
-		}
-		return fmt.Errorf("nebula does not mount volumes, got %q", v.Name)
-	}
 	return nil
 }
-
-// serviceAccountTokenVolumePrefix names the projected token volume the ServiceAccount
-// admission plugin adds ("kube-api-access-<suffix>").
-const serviceAccountTokenVolumePrefix = "kube-api-access-"
 
 // hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
 func hasNebulaGate(pod *corev1.Pod) bool {
