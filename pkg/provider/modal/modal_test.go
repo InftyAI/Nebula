@@ -294,6 +294,7 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 			corev1.ResourceCPU:    resource.MustParse("2500m"),
 			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
+		Limits: corev1.ResourceList{util.NvidiaGPUResource: resource.MustParse("1")},
 	}
 	c.Ports = []corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}}
 	deadline := int64(3600)

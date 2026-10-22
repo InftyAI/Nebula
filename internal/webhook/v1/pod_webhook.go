@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 var podlog = logf.Log.WithName("pod-webhook")
@@ -186,6 +187,10 @@ func validatePod(pod *corev1.Pod) error {
 	}
 	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
 		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
+	}
+	// The accelerator type and the GPU count must come together; see util.AcceleratorRequest.
+	if _, _, err := util.AcceleratorRequest(pod); err != nil {
+		return err
 	}
 	return nil
 }

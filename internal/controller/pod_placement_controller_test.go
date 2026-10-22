@@ -106,10 +106,9 @@ func gatedPod(name, ns, uid, pool, gpu string) *corev1.Pod {
 		},
 	}
 	if gpu != "" {
-		// The placement controller matches on the accelerator TYPE only, which
-		// rides on the accelerator-type label; the count (nvidia.com/gpu) is a
-		// provisioning detail the adapter reads, not needed here.
+		// The type and the nvidia.com/gpu count come together (see util.AcceleratorRequest).
 		pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = gpu
+		pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{util.NvidiaGPUResource: resource.MustParse("1")}
 	}
 	return pod
 }

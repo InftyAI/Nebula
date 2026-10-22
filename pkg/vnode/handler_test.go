@@ -516,8 +516,7 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	h := NewHandler(fp, nil, bl, clusterWithTTL(7*time.Minute))
 	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base TTL is asserted exactly
 
-	pod := testPod("default", "p1")
-	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = "H100"
+	pod := withGPU(testPod("default", "p1"), "H100")
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
 		t.Fatal("expected CreatePod to return the provision error")
