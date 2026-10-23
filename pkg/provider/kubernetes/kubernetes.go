@@ -311,7 +311,7 @@ func (p *Provider) Get(ctx context.Context, instanceID, _ string) (*provider.Ins
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes: get pod %s: %w", instanceID, classifyAPI(err))
 	}
-	inst := p.toInstance(cl, pod, false)
+	inst := p.toInstance(cl, pod, "")
 	return &inst, nil
 }
 
@@ -339,7 +339,7 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 
 // refusals reads cl's node autoscaler refusals, but only while some of pods is still waiting
 // for a node: nothing else needs them. A failed read is no verdict; the bind timeout remains.
-func (p *Provider) refusals(ctx context.Context, cl cluster, pods []corev1.Pod) map[types.UID]bool {
+func (p *Provider) refusals(ctx context.Context, cl cluster, pods []corev1.Pod) map[types.UID]provider.InstanceState {
 	if !slices.ContainsFunc(pods, func(pod corev1.Pod) bool { return pod.Spec.NodeName == "" }) {
 		return nil
 	}
@@ -368,7 +368,7 @@ func (p *Provider) FindByClaim(ctx context.Context, claimName, region string) (*
 		for i := range pods {
 			// Checked again here: the selector is the server's job, and not every client honours it.
 			if pods[i].Name == claimName {
-				inst := p.toInstance(p.clusters[r], &pods[i], false)
+				inst := p.toInstance(p.clusters[r], &pods[i], "")
 				return &inst, nil
 			}
 		}
@@ -551,10 +551,10 @@ func deleteInstance(ctx context.Context, cc clusterClients, namespace, name stri
 // toInstance normalizes a real pod. Region is the cluster's AWS region, the token the claim
 // carries.
 //
-// An unbound pod reports InstanceUnschedulable when its node autoscaler refused it, or once it
-// stays unbound past bindTimeout, timed from the pod's creation so a manager restart does not
-// reset it. That is the bind wait an unreserved Provision handed over.
-func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refused bool) provider.Instance {
+// A pod still waiting for a node reports refusal ("" for none) if set, else
+// InstanceUnschedulable once it outlasts bindTimeout, timed from creation so a restart does
+// not reset it. The refusal wins so a non-capacity reason never becomes a block by waiting.
+func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.InstanceState) provider.Instance {
 	inst := provider.Instance{
 		ID:        instanceID(cl.cfg.Region, pod.Namespace, pod.Name),
 		ClaimName: pod.Name,
@@ -562,9 +562,13 @@ func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refused bool) provide
 		Region:    cl.cfg.Region,
 		Endpoint:  pod.Status.PodIP,
 	}
-	timeout := cl.nodeAutoscaler.bindTimeout()
-	if pod.Spec.NodeName == "" && inst.State == provider.InstancePending &&
-		(refused || p.now().Sub(pod.CreationTimestamp.Time) > timeout) {
+	if pod.Spec.NodeName != "" || inst.State != provider.InstancePending {
+		return inst
+	}
+	switch {
+	case refusal != "":
+		inst.State = refusal
+	case p.now().Sub(pod.CreationTimestamp.Time) > cl.nodeAutoscaler.bindTimeout():
 		inst.State = provider.InstanceUnschedulable
 	}
 	return inst

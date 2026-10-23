@@ -2024,6 +2024,32 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 	}
 }
 
+// A Failed instance fails the Pod without blocking the candidate: that is how a provider
+// reports a refusal that is not capacity (Karpenter's FailedScheduling, a missing toleration),
+// which must not exclude the candidate for every other Pod.
+func TestReconcileOnce_FailedFailsPodWithoutBlock(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1", classifyScope: provider.BlockScope{Region: ptrTo("eks-use1")}}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
+	h.jitterFn = func() time.Duration { return 0 }
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", Region: "eks-use1", State: provider.InstanceFailed,
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != reasonFailed {
+		t.Fatalf("status = %s/%s, want Failed/%s", got.Status.Phase, got.Status.Reason, reasonFailed)
+	}
+	if bl.calls != 0 {
+		t.Fatalf("Record calls = %d, want none", bl.calls)
+	}
+}
+
 func ptrTo[T any](v T) *T { return &v }
 
 // NotReady shows as it is, Running with Ready=False, and counts toward the readiness deadline

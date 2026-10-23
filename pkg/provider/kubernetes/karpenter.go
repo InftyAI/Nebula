@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // Karpenter v1 (sigs.k8s.io/karpenter): its well-known labels, the annotation that keeps
@@ -104,7 +105,10 @@ func karpenterCapacityType(tier nebulav1alpha1.CapacityType) string {
 // recording why. The selector leaves out the kube-scheduler's FailedScheduling, which every
 // pod needing a new node gets. Karpenter rate-limits these events, so a dropped one only costs
 // the bind timeout.
-func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID]bool, error) {
+//
+// Only InsufficientCapacityError is capacity. FailedScheduling is usually the pod's own spec
+// (a missing toleration, a selector no NodePool allows), so it fails the pod without blocking.
+func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID]provider.InstanceState, error) {
 	evs, err := cc.kube.CoreV1().Events(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 		FieldSelector: fields.Set{
 			"involvedObject.kind": "Pod", "source": karpenterComponent, "type": corev1.EventTypeWarning,
@@ -114,11 +118,21 @@ func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID
 	if err != nil {
 		return nil, err
 	}
-	out := map[types.UID]bool{}
+	out := map[types.UID]provider.InstanceState{}
 	for _, ev := range evs.Items {
 		// Checked again here: the selector is the server's job, and not every client honours it.
-		if fromKarpenter(ev) && (ev.Reason == reasonInsufficientCapacity || ev.Reason == reasonFailedScheduling) {
-			out[ev.InvolvedObject.UID] = true
+		if !fromKarpenter(ev) {
+			continue
+		}
+		uid := ev.InvolvedObject.UID
+		switch ev.Reason {
+		case reasonInsufficientCapacity:
+			out[uid] = provider.InstanceUnschedulable
+		case reasonFailedScheduling:
+			// A launch that reached EC2 had passed scheduling, so capacity wins.
+			if out[uid] != provider.InstanceUnschedulable {
+				out[uid] = provider.InstanceFailed
+			}
 		}
 	}
 	return out, nil

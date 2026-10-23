@@ -112,9 +112,13 @@ func TestProvisionBoundToWarmNode(t *testing.T) {
 }
 
 // Provision never waits for Karpenter: it accepts the pod unreserved, and List reports a
-// refusal on the next poll, whenever it arrives.
+// refusal on the next poll, whenever it arrives. Only EC2's InsufficientCapacityError is
+// capacity; Karpenter's FailedScheduling is the pod's spec, so it fails without blocking.
 func TestListReportsKarpenterRefusal(t *testing.T) {
-	for _, reason := range []string{reasonInsufficientCapacity, reasonFailedScheduling} {
+	for reason, want := range map[string]provider.InstanceState{
+		reasonInsufficientCapacity: provider.InstanceUnschedulable,
+		reasonFailedScheduling:     provider.InstanceFailed,
+	} {
 		t.Run(reason, func(t *testing.T) {
 			tc := newTestCluster(t, false)
 			p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
@@ -127,13 +131,50 @@ func TestListReportsKarpenterRefusal(t *testing.T) {
 				t.Fatalf("before any refusal: %s, want Pending", got)
 			}
 			if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
-				karpenterEvent(reason, "no p5 capacity"), metav1.CreateOptions{}); err != nil {
+				karpenterEvent(reason, "refused"), metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			if got := listState(t, p); got != provider.InstanceUnschedulable {
-				t.Fatalf("after Karpenter's %s: %s, want Unschedulable", reason, got)
+			if got := listState(t, p); got != want {
+				t.Fatalf("after Karpenter's %s: %s, want %s", reason, got, want)
 			}
 		})
+	}
+}
+
+// A launch that reached EC2 had passed scheduling, so an ICE outranks a FailedScheduling on
+// the same pod.
+func TestListCapacityRefusalWins(t *testing.T) {
+	tc := newTestCluster(t, false)
+	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{reasonInsufficientCapacity, reasonFailedScheduling} {
+		if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
+			karpenterEvent(reason, "refused"), metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := listState(t, p); got != provider.InstanceUnschedulable {
+		t.Fatalf("with both refusals: %s, want Unschedulable", got)
+	}
+}
+
+// A FailedScheduling outranks the bind timeout: a pod Karpenter has explained must not turn
+// into a block just by outlasting the wait.
+func TestListSpecRefusalOutranksBindTimeout(t *testing.T) {
+	tc := newTestCluster(t, false)
+	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
+		karpenterEvent(reasonFailedScheduling, "did not tolerate taint"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	p.now = func() time.Time { return time.Now().Add(karpenterBindTimeout + time.Second) }
+	if got := listState(t, p); got != provider.InstanceFailed {
+		t.Fatalf("past the bind timeout after a FailedScheduling: %s, want Failed", got)
 	}
 }
 
@@ -173,8 +214,8 @@ func TestListIgnoresWhatIsNotARefusal(t *testing.T) {
 	if _, err := tc.kube.CoreV1().Pods("org-1").Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := listState(t, p); got == provider.InstanceUnschedulable {
-		t.Fatal("a bound pod must not be reported Unschedulable for an earlier refusal")
+	if got := listState(t, p); got != provider.InstancePending {
+		t.Fatalf("a bound pod must not be reported refused for an earlier refusal, got %s", got)
 	}
 }
 
