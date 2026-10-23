@@ -777,7 +777,8 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 // deadline, with how long the pod has been there. It counts InstancePending and
 // InstanceNotReady alike, so a workload that never comes up and one that stops being ready
 // both fail once unusable for the whole deadline; Running resets it, so a brief unready spell
-// costs nothing.
+// costs nothing. InstanceProvisioning is not counted: a wait for capacity is the provider's
+// to bound (the Kubernetes provider's bindTimeout), and the budget is for booting.
 //
 // It anchors on the FIRST observation of a not-usable state, not on provisioningAt: the
 // provision call is bounded separately (see defaultProvisionTimeout), so measuring from

@@ -439,6 +439,9 @@ func RedactedEnv(m map[string]string) string {
 type InstanceState string
 
 const (
+	// InstanceProvisioning: the instance exists (it has an id and must be terminated), but no
+	// capacity is allocated to it yet, e.g. a real pod Karpenter has not given a node.
+	InstanceProvisioning InstanceState = "Provisioning"
 	// InstancePending: created but not yet reachable/ready.
 	InstancePending InstanceState = "Pending"
 	// InstanceRunning: up and reachable.

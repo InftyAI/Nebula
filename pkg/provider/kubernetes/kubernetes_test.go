@@ -421,7 +421,10 @@ func TestToStateNeedsReady(t *testing.T) {
 		"ready":            {running(corev1.ConditionTrue), provider.InstanceRunning},
 		"probe failing":    {running(corev1.ConditionFalse), provider.InstanceNotReady},
 		"no condition yet": {running(""), provider.InstanceNotReady},
-		"pending":          {&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, provider.InstancePending},
+		"unbound":          {&corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, provider.InstanceProvisioning},
+		"bound, starting": {&corev1.Pod{
+			Spec: corev1.PodSpec{NodeName: "node-1"}, Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}, provider.InstancePending},
 	} {
 		if got := toState(tc.pod); got != tc.want {
 			t.Errorf("%s: toState = %s, want %s", name, got, tc.want)

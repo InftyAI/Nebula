@@ -78,6 +78,12 @@ func applyState(pod *corev1.Pod, state provider.InstanceState, endpoint string, 
 		if endpoint != "" && net.ParseIP(endpoint) != nil {
 			pod.Status.PodIP = endpoint
 		}
+	case provider.InstanceProvisioning:
+		setPhase(pod, corev1.PodPending, reasonProvisioning, "allocating external instance", now)
+		setReady(pod, corev1.ConditionFalse, now)
+		setContainerStatuses(pod, corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: reasonProvisioning, Message: "allocating external instance"},
+		}, false)
 	case provider.InstancePending:
 		setPhase(pod, corev1.PodPending, reasonInitializing, "external instance is initializing", now)
 		setReady(pod, corev1.ConditionFalse, now)

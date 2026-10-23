@@ -127,8 +127,8 @@ func TestListReportsKarpenterRefusal(t *testing.T) {
 			if err != nil || res.Reserved {
 				t.Fatalf("Provision = %+v, %v; want accepted, unreserved", res, err)
 			}
-			if got := listState(t, p); got != provider.InstancePending {
-				t.Fatalf("before any refusal: %s, want Pending", got)
+			if got := listState(t, p); got != provider.InstanceProvisioning {
+				t.Fatalf("before any refusal: %s, want Provisioning", got)
 			}
 			if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
 				karpenterEvent(reason, "refused"), metav1.CreateOptions{}); err != nil {
@@ -201,8 +201,8 @@ func TestListIgnoresWhatIsNotARefusal(t *testing.T) {
 	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(), ev, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := listState(t, p); got != provider.InstancePending {
-		t.Fatalf("with the scheduler's event: %s, want Pending", got)
+	if got := listState(t, p); got != provider.InstanceProvisioning {
+		t.Fatalf("with the scheduler's event: %s, want Provisioning", got)
 	}
 
 	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
@@ -248,8 +248,13 @@ func TestListReportsUnschedulablePastBindTimeout(t *testing.T) {
 		}
 		return out
 	}
-	if got := states()["org-1-work-1"].State; got != provider.InstancePending {
-		t.Fatalf("young unbound pod = %s, want Pending", got)
+	// Unbound has no node behind it yet; bound has one booting, which is Initializing's Pending.
+	young := states()
+	if got := young["org-1-work-1"].State; got != provider.InstanceProvisioning {
+		t.Fatalf("young unbound pod = %s, want Provisioning", got)
+	}
+	if got := young["org-1-work-2"].State; got != provider.InstancePending {
+		t.Fatalf("young bound pod = %s, want Pending", got)
 	}
 
 	p.now = func() time.Time { return time.Now().Add(karpenterBindTimeout + time.Second) }

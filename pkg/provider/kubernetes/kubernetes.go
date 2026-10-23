@@ -551,9 +551,9 @@ func deleteInstance(ctx context.Context, cc clusterClients, namespace, name stri
 // toInstance normalizes a real pod. Region is the cluster's AWS region, the token the claim
 // carries.
 //
-// A pod still waiting for a node reports refusal ("" for none) if set, else
-// InstanceUnschedulable once it outlasts bindTimeout, timed from creation so a restart does
-// not reset it. The refusal wins so a non-capacity reason never becomes a block by waiting.
+// A pod still provisioning reports refusal ("" for none) if set, else InstanceUnschedulable
+// once it outlasts bindTimeout, timed from creation so a restart does not reset it. The
+// refusal wins so a non-capacity reason never becomes a block by waiting.
 func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.InstanceState) provider.Instance {
 	inst := provider.Instance{
 		ID:        instanceID(cl.cfg.Region, pod.Namespace, pod.Name),
@@ -562,7 +562,7 @@ func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.Inst
 		Region:    cl.cfg.Region,
 		Endpoint:  pod.Status.PodIP,
 	}
-	if pod.Spec.NodeName != "" || inst.State != provider.InstancePending {
+	if inst.State != provider.InstanceProvisioning {
 		return inst
 	}
 	switch {
@@ -574,8 +574,9 @@ func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.Inst
 	return inst
 }
 
-// toState maps the real pod's phase. Unknown stays Pending, so a node that stopped reporting
-// keeps the poll loop watching rather than going terminal on a pod that may still run.
+// toState maps the real pod's phase. Pending splits on binding: unbound has no node behind it
+// yet. Unknown stays Pending, so a node that stopped reporting keeps the poll loop watching
+// rather than going terminal on a pod that may still run.
 func toState(pod *corev1.Pod) provider.InstanceState {
 	switch pod.Status.Phase {
 	case corev1.PodRunning:
@@ -589,6 +590,9 @@ func toState(pod *corev1.Pod) provider.InstanceState {
 	case corev1.PodFailed:
 		return provider.InstanceFailed
 	default:
+		if pod.Spec.NodeName == "" {
+			return provider.InstanceProvisioning
+		}
 		return provider.InstancePending
 	}
 }

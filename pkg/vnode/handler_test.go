@@ -2050,6 +2050,30 @@ func TestReconcileOnce_FailedFailsPodWithoutBlock(t *testing.T) {
 	}
 }
 
+// Provisioning is an instance with no capacity yet: the Pod stays at Provisioning, so its
+// claim is not Bound and nothing accrues, and the readiness clock does not start, since that
+// wait is the provider's to bound.
+func TestReconcileOnce_ProvisioningIsNotInitializing(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceProvisioning}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodPending || got.Status.Reason != reasonProvisioning {
+		t.Fatalf("status = %s/%s, want Pending/%s", got.Status.Phase, got.Status.Reason, reasonProvisioning)
+	}
+	h.mu.Lock()
+	clock := h.tracked[key("default", "p1")].initializingAt
+	h.mu.Unlock()
+	if !clock.IsZero() {
+		t.Fatal("the readiness clock must not start while the instance has no capacity")
+	}
+}
+
 func ptrTo[T any](v T) *T { return &v }
 
 // NotReady shows as it is, Running with Ready=False, and counts toward the readiness deadline
