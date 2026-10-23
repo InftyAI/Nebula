@@ -7,6 +7,11 @@ metadata:
 spec:
   # strategy (the inner, provider-ranking axis).
   providers:
+  # EKS clusters from --kubernetes-clusters. A region matches a cluster's geography ("us") or
+  # its exact AWS region ("us-east-1"), both as set in that file.
+  - name: kubernetes
+    regions:
+    - us-east-1
   - name: aws
     regions:
     - us

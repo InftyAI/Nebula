@@ -176,7 +176,7 @@ func TestProvision_GPUPod(t *testing.T) {
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 		Region:       "US-KS-2",
-		Env:          map[string]string{"HF_TOKEN": "hf_secret"},
+		Env:          provider.Env{Secrets: map[string]string{"HF_TOKEN": "hf_secret"}},
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)

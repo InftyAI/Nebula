@@ -294,6 +294,7 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 			corev1.ResourceCPU:    resource.MustParse("2500m"),
 			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
+		Limits: corev1.ResourceList{util.NvidiaGPUResource: resource.MustParse("1")},
 	}
 	c.Ports = []corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}}
 	deadline := int64(3600)
@@ -1762,7 +1763,9 @@ func TestProvision_UsesResolvedEnv(t *testing.T) {
 
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName: "claim-env",
-		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+		Env: provider.Env{
+			Config: map[string]string{"FOO": "bar"}, Secrets: map[string]string{"TOKEN": "t0ken"},
+		},
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

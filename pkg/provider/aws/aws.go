@@ -816,7 +816,7 @@ func (p *Provider) instanceSpecFromPod(
 		Image:         c.Image,
 		Command:       append([]string{}, c.Command...),
 		Args:          append([]string{}, c.Args...),
-		// The caller's resolved environment, whole (provider.ProvisionRequest.Env). The Pod's
+		// The caller's resolved environment, whole (provider.Env.All). The Pod's
 		// own env is not read: it holds references this adapter cannot follow.
 		//
 		// CAVEAT, and the reason this is called out: buildUserData renders env into cloud-init
@@ -828,7 +828,7 @@ func (p *Provider) instanceSpecFromPod(
 		// TODO: deliver Secret-derived values out-of-band — SSM Parameter Store / Secrets
 		// Manager under the claim, fetched at boot with the instance profile — and keep only
 		// non-sensitive values in user-data.
-		Env:     req.Env,
+		Env:     req.Env.All(),
 		Spot:    req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:  req.Region,
 		Tags:    map[string]string{ClaimTagKey: req.ClaimName},

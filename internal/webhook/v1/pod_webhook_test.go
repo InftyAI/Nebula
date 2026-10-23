@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -213,6 +214,25 @@ func TestValidateCreate_OneContainerOnePort(t *testing.T) {
 				t.Fatalf("ValidateCreate err = %v, want it to contain %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// The accelerator type and the GPU count come together; a type alone is rejected up front,
+// rather than placed as a GPU request the container itself does not make.
+func TestValidateCreate_AcceleratorNeedsGPUCount(t *testing.T) {
+	pod := podWith(map[string]string{
+		nebulav1alpha1.EnabledLabel:         "true",
+		nebulav1alpha1.AcceleratorTypeLabel: "h100",
+	}, "")
+	pod.Spec.Containers = []corev1.Container{{Name: "main"}}
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), pod); err == nil ||
+		!strings.Contains(err.Error(), "nvidia.com/gpu") {
+		t.Fatalf("ValidateCreate err = %v, want a missing nvidia.com/gpu rejection", err)
+	}
+
+	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), pod); err != nil {
+		t.Fatalf("ValidateCreate err = %v for a type with its count, want nil", err)
 	}
 }
 

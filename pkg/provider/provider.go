@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -234,19 +235,12 @@ type ProvisionRequest struct {
 	// otherwise. Resolved from the NodePool at provision time, never from the Pod, which
 	// the workload's own owner can patch (see vnode.Handler.egressFor).
 	Egress *nebulav1alpha1.EgressPolicy
-	// Env is the container's environment, fully RESOLVED: literals plus everything
-	// envFrom/valueFrom referenced, merged in kubelet precedence (envFrom in listed order,
-	// then env overriding it). A provider forwards it and never re-reads the Pod's env,
-	// which holds references it cannot follow.
+	// Env is the container's environment, fully RESOLVED (see Env). A provider forwards it and
+	// never re-reads the Pod's env, which holds references it cannot follow.
 	//
 	// Resolved by the caller (pkg/vnode): reading a Secret needs cluster access an adapter
 	// deliberately lacks, and kubelet precedence should be implemented once.
-	//
-	// SECRET-BEARING, and why this struct redacts itself — a secretKeyRef's value lands here
-	// in the clear. Never log the map, never put it on the Pod, never in an error string,
-	// the same rule as ProvisionResult.ConnectToken. Nil is normal: no env, or an
-	// unresolving caller.
-	Env map[string]string
+	Env Env
 	// RegistryAuth authenticates the pull of the container image, from the Pod's
 	// imagePullSecrets; nil is an anonymous pull. Resolved by the caller (pkg/vnode) for the
 	// same reason as Env — it names a Secret an adapter cannot read.
@@ -259,9 +253,43 @@ type ProvisionRequest struct {
 func (r ProvisionRequest) String() string {
 	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Egress:%s Env:%s "+
 		"RegistryAuth:%s}",
-		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), RedactedEnv(r.Env),
-		r.RegistryAuth)
+		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), r.Env, r.RegistryAuth)
 }
+
+// Env is a container's resolved environment: literals plus everything envFrom/valueFrom
+// referenced, merged in kubelet precedence (envFrom in listed order, then env overriding it).
+// It is split by how a value must be handled, and each variable is in exactly one part,
+// decided by the source whose value won.
+//
+// SECRET-BEARING, and the reason it redacts itself: never log Secrets, never put them on a
+// Pod or in an error string, the same rule as ProvisionResult.ConnectToken. Config is
+// redacted too, since a literal can hold a secret as well. The zero value is no env.
+type Env struct {
+	// Config is literals, ConfigMap values and fieldRefs.
+	Config map[string]string
+	// Secrets is the values that came from a Secret.
+	Secrets map[string]string
+}
+
+// All is every variable, for a provider that ships the environment one way. The parts never
+// share a key, so nothing is lost. SECRET-BEARING, like Secrets.
+func (e Env) All() map[string]string {
+	if len(e.Config) == 0 && len(e.Secrets) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(e.Config)+len(e.Secrets))
+	maps.Copy(out, e.Config)
+	maps.Copy(out, e.Secrets)
+	return out
+}
+
+// String redacts both parts: key names print, values never do.
+func (e Env) String() string {
+	return fmt.Sprintf("{Config:%s Secrets:%s}", RedactedEnv(e.Config), RedactedEnv(e.Secrets))
+}
+
+// GoString implements fmt.GoStringer so %#v is redacted too.
+func (e Env) GoString() string { return e.String() }
 
 // GoString implements fmt.GoStringer so %#v is redacted too.
 func (r ProvisionRequest) GoString() string { return r.String() }
@@ -411,14 +439,25 @@ func RedactedEnv(m map[string]string) string {
 type InstanceState string
 
 const (
+	// InstanceProvisioning: the instance exists (it has an id and must be terminated), but no
+	// capacity is allocated to it yet, e.g. a real pod Karpenter has not given a node.
+	InstanceProvisioning InstanceState = "Provisioning"
 	// InstancePending: created but not yet reachable/ready.
 	InstancePending InstanceState = "Pending"
 	// InstanceRunning: up and reachable.
 	InstanceRunning InstanceState = "Running"
+	// InstanceNotReady: running, but not ready (a failing readiness probe, a crash loop). The
+	// Pod shows Running with Ready=False, and the readiness deadline fails it if it stays
+	// unusable that long.
+	InstanceNotReady InstanceState = "NotReady"
 	// InstanceTerminated: gone (also the mapping for "absent from List").
 	InstanceTerminated InstanceState = "Terminated"
 	// InstanceFailed: entered a terminal error state.
 	InstanceFailed InstanceState = "Failed"
+	// InstanceUnschedulable: accepted by a Provision that returned unreserved, then never
+	// placed on capacity. The poll loop treats it like a Provision capacity error: it
+	// blocklists the candidate and fails the Pod.
+	InstanceUnschedulable InstanceState = "Unschedulable"
 )
 
 // Offering is one row of the price/availability catalog. The price/availability

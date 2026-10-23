@@ -126,6 +126,31 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 	}
 }
 
+// WithTier records the capacity tier a provision failure happened under. ClassifyProvisionError
+// is not handed one, so an adapter whose errors do not say it themselves reads it back with
+// TierOf, and a Spot shortage does not block OnDemand. The poll loop wraps the failures it
+// finds late the same way, so they block what a synchronous Provision failure would.
+func WithTier(tier nebulav1alpha1.CapacityType, err error) error {
+	return &tierError{tier: tier, err: err}
+}
+
+// TierOf returns the tier WithTier recorded on err, or "" if none was.
+func TierOf(err error) nebulav1alpha1.CapacityType {
+	var te *tierError
+	if errors.As(err, &te) {
+		return te.tier
+	}
+	return ""
+}
+
+type tierError struct {
+	tier nebulav1alpha1.CapacityType
+	err  error
+}
+
+func (e *tierError) Error() string { return e.err.Error() }
+func (e *tierError) Unwrap() error { return e.err }
+
 // IsDeadline reports whether err is a provision deadline that fired.
 func IsDeadline(err error) bool {
 	return err != nil && (errors.Is(err, context.DeadlineExceeded) ||

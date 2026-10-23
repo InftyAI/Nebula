@@ -67,7 +67,7 @@ which is the whole reason for splitting them:
 | `reason` | Means | Clears when |
 | --- | --- | --- |
 | `no_pool` | The Pod names a NodePool that does not exist, or carries no pool label. | A human fixes the Pod (or the workload generating it). |
-| `invalid_request` | The request is malformed — `nvidia.com/gpu` with no accelerator-type label (*not* treated as CPU-only), or a `nebula.inftyai.com/regions` annotation naming no known geography. | A human fixes the Pod spec. |
+| `invalid_request` | The request is malformed — `nvidia.com/gpu` with no accelerator-type label (*not* treated as CPU-only), an accelerator-type label with no `nvidia.com/gpu` request, or a `nebula.inftyai.com/regions` annotation naming no known geography. | A human fixes the Pod spec. |
 | `all_blocked` | A servable candidate exists, but failover is holding every one of them off. | By itself — the Pod is already requeued for the block's expiry. |
 | `no_candidate` | No provider in the pool can serve this request at all. | An operator adds a provider, or a provider registers. |
 | `stale_claim` | A NodeClaim from a prior same-named Pod has not been reaped yet. | By itself, in seconds. A sustained rate means the NodeClaim backstop is stuck. |

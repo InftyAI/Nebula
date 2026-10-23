@@ -1,0 +1,16 @@
+# Renders clusters.yaml into the ConfigMap the manager mounts at /etc/nebula/kubernetes.
+# Included by config/default, which applies the `nebula-` prefix and `nebula-system`
+# namespace and rewrites the Deployment's `kubernetes-clusters` reference to match.
+#
+# remote-rbac.yaml is deliberately NOT a resource here: it belongs in each target cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+- name: kubernetes-clusters
+  files:
+  - clusters.yaml
+
+generatorOptions:
+  # A stable name, so the volume reference and `kubectl edit` keep working.
+  disableNameSuffixHash: true

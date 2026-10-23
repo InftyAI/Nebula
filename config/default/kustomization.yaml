@@ -22,6 +22,9 @@ resources:
 # the manager uses the CSVs embedded in its binary. Uncommenting this also needs
 # the catalog env var and volume in config/manager/manager.yaml.
 # - ../catalog
+# The kubernetes provider's cluster table (config/kubernetes-provider/clusters.yaml). Off:
+# without it the kubernetes provider is not registered. Fill in clusters.yaml first.
+# - ../kubernetes-provider
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 - ../webhook

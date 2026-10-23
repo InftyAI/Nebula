@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/util"
 )
 
 var podlog = logf.Log.WithName("pod-webhook")
@@ -112,9 +113,9 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 // +kubebuilder:webhook:path=/validate--v1-pod,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create;update,versions=v1,name=vpod-v1.nebula.inftyai.com,admissionReviewVersions=v1
 
 // PodCustomValidator rejects an opted-in Pod the providers cannot run as written: they
-// launch one container and no init containers, and expose at most one port (Modal's
-// connect URL routes to one; see modal.firstPort). Admitting more would drop the rest
-// silently.
+// launch one container and no init containers, expose at most one port (Modal's connect URL
+// routes to one; see modal.firstPort), and mount nothing from the cluster, so no volumes and
+// no service account. Admitting more would drop the rest silently.
 type PodCustomValidator struct{}
 
 var _ webhook.CustomValidator = &PodCustomValidator{}
@@ -186,6 +187,10 @@ func validatePod(pod *corev1.Pod) error {
 	}
 	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
 		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
+	}
+	// The accelerator type and the GPU count must come together; see util.AcceleratorRequest.
+	if _, _, err := util.AcceleratorRequest(pod); err != nil {
+		return err
 	}
 	return nil
 }
