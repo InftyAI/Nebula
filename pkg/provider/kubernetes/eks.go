@@ -40,6 +40,10 @@ const (
 	// a presigned STS GetCallerIdentity URL, bound to one cluster by the signed header.
 	eksTokenPrefix  = "k8s-aws-v1."
 	clusterIDHeader = "x-k8s-aws-id"
+	// expiresHeader carries presignExpiry, the value `aws eks get-token` sends. EKS bounds a
+	// token's life itself (see tokenTTL), not by this.
+	expiresHeader = "X-Amz-Expires"
+	presignExpiry = "60"
 	// tokenTTL is how long a minted token is reused. EKS accepts one for 15 minutes; the
 	// margin covers clock skew and a request in flight when it is swapped.
 	tokenTTL = 10 * time.Minute
@@ -122,10 +126,14 @@ func (s *eksTokenSource) Token(ctx context.Context) (string, error) {
 	if s.token != "" && time.Now().Before(s.expires) {
 		return s.token, nil
 	}
+	// The STS presign client sets no expiry, and EKS rejects a token without one as
+	// Unauthorized. As a header it is hoisted into the query like every X-Amz-* one.
 	req, err := s.presign.PresignGetCallerIdentity(ctx, &sts.GetCallerIdentityInput{},
 		func(o *sts.PresignOptions) {
 			o.ClientOptions = append(o.ClientOptions, func(so *sts.Options) {
-				so.APIOptions = append(so.APIOptions, smithyhttp.AddHeaderValue(clusterIDHeader, s.cluster))
+				so.APIOptions = append(so.APIOptions,
+					smithyhttp.SetHeaderValue(clusterIDHeader, s.cluster),
+					smithyhttp.SetHeaderValue(expiresHeader, presignExpiry))
 			})
 		})
 	if err != nil {
