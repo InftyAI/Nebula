@@ -19,10 +19,10 @@ limitations under the License.
 // and that cluster's Karpenter launches and packs the nodes. One NodeClaim maps to one real
 // pod, not to a node; several pods can share a Karpenter node.
 //
-// Capacity is found by trying. Provision creates the pod and watches it briefly, failing at
-// once on the node autoscaler's refusal (see waitForProvision); a pod still unbound after that
-// is settled by the poll loop, which reports no capacity past the bind timeout (see
-// toInstance). Either way the cluster is blocklisted like an AWS region.
+// Capacity is found by trying. Provision creates the pod and returns at once, accepted but
+// unreserved; the poll loop settles it, reporting no capacity on the node autoscaler's refusal
+// or once the pod stays unbound past the bind timeout (see toInstance), and the cluster is
+// then blocklisted like an AWS region.
 //
 // The real pod lives in the placeholder's namespace, named after the claim like every
 // provider's instance, which is what lets the host cluster itself be a target. Nebula reports
@@ -42,6 +42,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -53,10 +54,8 @@ import (
 const (
 	pollInterval = 5 * time.Second
 	spotNotice   = 2 * time.Minute
-	// provisionSlack is the part of a Provision that is not the wait: the namespace,
-	// pod and Secret calls, and deleting a previous incarnation. It keeps the handler's
-	// deadline from cutting the wait short, which would read as no capacity.
-	provisionSlack = 10 * time.Second
+	// cleanupTimeout bounds deleting a pod Provision could not finish setting up.
+	cleanupTimeout = 10 * time.Second
 )
 
 var _ provider.Provider = (*Provider)(nil)
@@ -168,19 +167,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		NativeTags:           true,
 		PreemptionNotice:     spotNotice,
 		PollInterval:         pollInterval,
-		ProvisionTimeout:     p.longestProvision() + provisionSlack,
 	}
-}
-
-// longestProvision is the slowest node autoscaler's provisionTimeout. Capabilities has one
-// deadline for the provider, set to this plus provisionSlack, and each cluster's wait inside
-// it is bounded by its own node autoscaler.
-func (p *Provider) longestProvision() time.Duration {
-	var d time.Duration
-	for _, cl := range p.clusters {
-		d = max(d, cl.nodeAutoscaler.provisionTimeout())
-	}
-	return d
 }
 
 // Offerings implements provider.Provider. There is no price table: see the package doc.
@@ -241,27 +228,23 @@ func (p *Provider) Provision(
 			return provider.ProvisionResult{}, err
 		}
 	}
-	bound, err := waitForProvision(ctx, cl.clients, cl.nodeAutoscaler, real.Namespace, real.Name)
-	if err != nil {
-		cleanup(ctx, cl.clients, real.Namespace, real.Name)
-		return provider.ProvisionResult{}, provider.WithTier(req.CapacityType, err)
-	}
-	// Unbound is accepted, not reserved: the node may still be booting. List settles it,
-	// reporting no capacity once the pod is unbound past its node autoscaler's bindTimeout.
+	// Unbound is accepted, not reserved: a node may still be coming. List settles it (see
+	// toInstance), so no worker waits on Karpenter here.
 	return provider.ProvisionResult{
 		InstanceID: instanceID(req.Region, real.Namespace, real.Name),
-		Reserved:   bound,
+		Reserved:   created.Spec.NodeName != "",
 	}, nil
 }
 
-// cleanup deletes a pod that got no capacity, on a context that outlives the expired one.
+// cleanup deletes a pod Provision could not finish setting up, on a context that outlives the
+// caller's.
 // A failure is only logged: the Pod fails regardless, and the NodeClaim teardown finds the
 // leftover through FindByClaim.
 func cleanup(ctx context.Context, cc clusterClients, namespace, name string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), provisionSlack)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
 	if err := deleteInstance(ctx, cc, namespace, name); err != nil {
-		logf.FromContext(ctx).Error(err, "kubernetes: could not delete pod without capacity; teardown will retry",
+		logf.FromContext(ctx).Error(err, "kubernetes: could not delete a half-set-up pod; teardown will retry",
 			"namespace", namespace, "pod", name)
 	}
 }
@@ -328,24 +311,46 @@ func (p *Provider) Get(ctx context.Context, instanceID, _ string) (*provider.Ins
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes: get pod %s: %w", instanceID, classifyAPI(err))
 	}
-	inst := p.toInstance(cl, pod)
+	inst := p.toInstance(cl, pod, false)
 	return &inst, nil
 }
 
 // List implements provider.Provider. One unreadable cluster fails the whole call: leaving
 // its pods out would make the poll loop read every one of them as terminated.
+//
+// Note: list is expensive for kubernetes compared to other providers, especially with many pods.
 func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	var out []provider.Instance
 	for _, region := range p.order {
-		pods, err := p.listPods(ctx, p.clusters[region], "")
+		cl := p.clusters[region]
+		// TODO: this may leads to performance issues if there are many pods
+		// in the cluster, informer-based listing should be considered for better performance.
+		pods, err := p.listPods(ctx, cl, "")
 		if err != nil {
 			return nil, err
 		}
+		refused := p.refusals(ctx, cl, pods)
 		for i := range pods {
-			out = append(out, p.toInstance(p.clusters[region], &pods[i]))
+			out = append(out, p.toInstance(cl, &pods[i], refused[pods[i].UID]))
 		}
 	}
 	return out, nil
+}
+
+// refusals reads cl's node autoscaler refusals, but only while some of pods is still waiting
+// for a node: nothing else needs them. A failed read is no verdict; the bind timeout remains.
+func (p *Provider) refusals(ctx context.Context, cl cluster, pods []corev1.Pod) map[types.UID]bool {
+	if !slices.ContainsFunc(pods, func(pod corev1.Pod) bool { return pod.Spec.NodeName == "" }) {
+		return nil
+	}
+	// TODO: we also have performance issue here if we have many pods.
+	// Consider using informer-based caching or batching refusals requests for better performance.
+	refused, err := cl.nodeAutoscaler.refusals(ctx, cl.clients)
+	if err != nil {
+		logf.FromContext(ctx).Info("kubernetes: could not read refusals; relying on the bind timeout",
+			"cluster", cl.cfg.Name, "error", err.Error())
+	}
+	return refused
 }
 
 // FindByClaim implements provider.Provider. region names the claim's cluster; an unknown one
@@ -363,7 +368,7 @@ func (p *Provider) FindByClaim(ctx context.Context, claimName, region string) (*
 		for i := range pods {
 			// Checked again here: the selector is the server's job, and not every client honours it.
 			if pods[i].Name == claimName {
-				inst := p.toInstance(p.clusters[r], &pods[i])
+				inst := p.toInstance(p.clusters[r], &pods[i], false)
 				return &inst, nil
 			}
 		}
@@ -546,11 +551,10 @@ func deleteInstance(ctx context.Context, cc clusterClients, namespace, name stri
 // toInstance normalizes a real pod. Region is the cluster's AWS region, the token the claim
 // carries.
 //
-// A pod still unbound past its node autoscaler's bindTimeout reports InstanceUnschedulable: it is
-// the bind wait an unreserved Provision handed over, timed from the pod's creation so a
-// manager restart does not reset it. No events are read here; the fast refusal is caught in
-// Provision (see waitForProvision).
-func (p *Provider) toInstance(cl cluster, pod *corev1.Pod) provider.Instance {
+// An unbound pod reports InstanceUnschedulable when its node autoscaler refused it, or once it
+// stays unbound past bindTimeout, timed from the pod's creation so a manager restart does not
+// reset it. That is the bind wait an unreserved Provision handed over.
+func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refused bool) provider.Instance {
 	inst := provider.Instance{
 		ID:        instanceID(cl.cfg.Region, pod.Namespace, pod.Name),
 		ClaimName: pod.Name,
@@ -560,7 +564,7 @@ func (p *Provider) toInstance(cl cluster, pod *corev1.Pod) provider.Instance {
 	}
 	timeout := cl.nodeAutoscaler.bindTimeout()
 	if pod.Spec.NodeName == "" && inst.State == provider.InstancePending &&
-		p.now().Sub(pod.CreationTimestamp.Time) > timeout {
+		(refused || p.now().Sub(pod.CreationTimestamp.Time) > timeout) {
 		inst.State = provider.InstanceUnschedulable
 	}
 	return inst

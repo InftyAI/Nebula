@@ -30,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"k8s.io/apimachinery/pkg/runtime"
 	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -88,6 +89,12 @@ func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error
 		TLSClientConfig: rest.TLSClientConfig{CAData: ca},
 		QPS:             clusterQPS,
 		Burst:           clusterBurst,
+		// Protobuf for the built-in types read every poll (pods, events): several times smaller
+		// and cheaper to decode than JSON. Custom resources only speak JSON, hence the fallback.
+		ContentConfig: rest.ContentConfig{
+			ContentType:        runtime.ContentTypeProtobuf,
+			AcceptContentTypes: runtime.ContentTypeProtobuf + "," + runtime.ContentTypeJSON,
+		},
 		WrapTransport: func(rt http.RoundTripper) http.RoundTripper {
 			return &bearerTransport{base: rt, tokens: tokens}
 		},

@@ -18,12 +18,10 @@ package kubernetes
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -47,6 +45,7 @@ func newTestCluster(t *testing.T, bind bool) testCluster {
 	kube.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		pod := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
 		pod.UID = testUID
+		pod.CreationTimestamp = metav1.Now() // as the API server does; the fake leaves it zero
 		if bind {
 			pod.Spec.NodeName = "node-1"
 		}
@@ -112,45 +111,70 @@ func TestProvisionBoundToWarmNode(t *testing.T) {
 	}
 }
 
-func TestProvisionNoCapacityDeletesPod(t *testing.T) {
+// Provision never waits for Karpenter: it accepts the pod unreserved, and List reports a
+// refusal on the next poll, whenever it arrives.
+func TestListReportsKarpenterRefusal(t *testing.T) {
 	for _, reason := range []string{reasonInsufficientCapacity, reasonFailedScheduling} {
 		t.Run(reason, func(t *testing.T) {
 			tc := newTestCluster(t, false)
+			p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+
+			res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
+			if err != nil || res.Reserved {
+				t.Fatalf("Provision = %+v, %v; want accepted, unreserved", res, err)
+			}
+			if got := listState(t, p); got != provider.InstancePending {
+				t.Fatalf("before any refusal: %s, want Pending", got)
+			}
 			if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
 				karpenterEvent(reason, "no p5 capacity"), metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
-
-			_, err := p.Provision(context.Background(), placeholder(), provisionRequest())
-			if !errors.Is(err, provider.ErrNoCapacity) {
-				t.Fatalf("err = %v, want ErrNoCapacity", err)
+			if got := listState(t, p); got != provider.InstanceUnschedulable {
+				t.Fatalf("after Karpenter's %s: %s, want Unschedulable", reason, got)
 			}
-			assertGone(t, tc)
 		})
 	}
 }
 
-func TestProvisionIgnoresSchedulerFailedScheduling(t *testing.T) {
+// listState is the one instance List reports.
+func listState(t *testing.T, p *Provider) provider.InstanceState {
+	t.Helper()
+	list, err := p.List(context.Background())
+	if err != nil || len(list) != 1 {
+		t.Fatalf("List = %+v, %v; want one instance", list, err)
+	}
+	return list[0].State
+}
+
+// The kube-scheduler's FailedScheduling, which every pod waiting for a new node gets, is no
+// refusal; nor is a Karpenter refusal about a pod that has since been bound.
+func TestListIgnoresWhatIsNotARefusal(t *testing.T) {
 	tc := newTestCluster(t, false)
+	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
+		t.Fatal(err)
+	}
 	ev := karpenterEvent(reasonFailedScheduling, "0/3 nodes are available")
 	ev.Source.Component = "default-scheduler"
 	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(), ev, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
-
-	// The scheduler's event is no verdict, so the window closes without one: the pod is
-	// accepted unreserved and kept for the poll loop to settle.
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	res, err := p.Provision(ctx, placeholder(), provisionRequest())
-	if err != nil || res.Reserved || res.InstanceID == "" {
-		t.Fatalf("Provision = %+v, %v; want accepted, unreserved", res, err)
+	if got := listState(t, p); got != provider.InstancePending {
+		t.Fatalf("with the scheduler's event: %s, want Pending", got)
 	}
-	_, err = tc.kube.CoreV1().Pods("org-1").Get(context.Background(), "org-1-work-1", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("pod was deleted: %v", err)
+
+	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
+		karpenterEvent(reasonInsufficientCapacity, "earlier attempt"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	pod, _ := tc.kube.CoreV1().Pods("org-1").Get(context.Background(), "org-1-work-1", metav1.GetOptions{})
+	pod.Spec.NodeName = "node-1"
+	if _, err := tc.kube.CoreV1().Pods("org-1").Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := listState(t, p); got == provider.InstanceUnschedulable {
+		t.Fatal("a bound pod must not be reported Unschedulable for an earlier refusal")
 	}
 }
 
@@ -226,25 +250,6 @@ func TestProvisionCreatesNamespaceInRemoteCluster(t *testing.T) {
 	}
 }
 
-func assertGone(t *testing.T, tc testCluster) {
-	t.Helper()
-	ctx := context.Background()
-	_, err := tc.kube.CoreV1().Pods("org-1").Get(ctx, "org-1-work-1", metav1.GetOptions{})
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("real pod not deleted: %v", err)
-	}
-	// The fake clientset has no garbage collector, so what is checked is that a real one would
-	// take the env Secret with the pod: it is owned by it, or was never written.
-	sec, err := tc.kube.CoreV1().Secrets("org-1").Get(ctx, "org-1-work-1-env", metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-	case err != nil:
-		t.Errorf("get env secret: %v", err)
-	case len(sec.OwnerReferences) != 1 || sec.OwnerReferences[0].UID != testUID:
-		t.Errorf("env secret is not owned by the real pod: %+v", sec.OwnerReferences)
-	}
-}
-
 func TestKarpenterVerify(t *testing.T) {
 	tc := newTestCluster(t, false)
 	if err := (karpenter{}).verify(context.Background(), tc.clients()); err == nil {
@@ -259,27 +264,13 @@ func TestKarpenterVerify(t *testing.T) {
 	}
 }
 
-// A new node: the pod binds a while after it was created.
-func TestProvisionWaitsForBinding(t *testing.T) {
+// Provision returns without waiting for a node: reserved only if the pod is already bound.
+func TestProvisionDoesNotWaitForANode(t *testing.T) {
 	tc := newTestCluster(t, false)
-	go func() {
-		ctx := context.Background()
-		for {
-			pod, err := tc.kube.CoreV1().Pods("org-1").Get(ctx, "org-1-work-1", metav1.GetOptions{})
-			if err == nil {
-				pod.Spec.NodeName = "node-1"
-				if _, err := tc.kube.CoreV1().Pods("org-1").Update(ctx, pod, metav1.UpdateOptions{}); err == nil {
-					return
-				}
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}()
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
-
 	res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
-	if err != nil || !res.Reserved {
-		t.Fatalf("Provision = %+v, %v", res, err)
+	if err != nil || res.Reserved || res.InstanceID != "us-east-1/org-1/org-1-work-1" {
+		t.Fatalf("Provision = %+v, %v; want accepted, unreserved, at once", res, err)
 	}
 }
 

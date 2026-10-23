@@ -21,6 +21,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
@@ -35,14 +36,10 @@ type nodeAutoscaler interface {
 	// selection steers the pod onto nodes with the GPU families and tier. No families is a
 	// CPU-only pod; an empty tier leaves it to the cluster.
 	selection(families []string, tier nebulav1alpha1.CapacityType) nodeSelection
-	// refused looks once at a pending, unbound pod for the node autoscaler's verdict that it
-	// will not get it a node, returning an error wrapping provider.ErrNoCapacity, or nil. It
-	// only speeds up failure: success is the pod binding, and silence ends at bindTimeout.
-	refused(ctx context.Context, cc clusterClients, pod *corev1.Pod) error
-	// provisionTimeout is how long Provision watches a new pod for a binding or refused: long
-	// enough for the node autoscaler to decide, short enough not to hold a worker through
-	// node boot. Capabilities.ProvisionTimeout adds provisionSlack for the create calls.
-	provisionTimeout() time.Duration
+	// refusals returns the pods in the cluster the node autoscaler says it will not get a node
+	// for, by UID, in one read for all of them. It only speeds up failure: success is the pod
+	// binding, silence ends at bindTimeout, and an error means no answer this time.
+	refusals(ctx context.Context, cc clusterClients) (map[types.UID]bool, error)
 	// bindTimeout is how long a healthy launch may take to bind the pod, node boot included,
 	// counted from the pod's creation. Past it, List reports no capacity.
 	bindTimeout() time.Duration

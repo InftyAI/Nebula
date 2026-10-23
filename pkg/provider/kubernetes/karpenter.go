@@ -27,9 +27,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
-	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // Karpenter v1 (sigs.k8s.io/karpenter): its well-known labels, the annotation that keeps
@@ -51,10 +51,6 @@ const (
 	// EC2 launch and node boot until the GPUs are advertised. Measured p-family boots may need
 	// more; image pull comes after binding and is the readiness deadline's.
 	karpenterBindTimeout = 5 * time.Minute
-	// karpenterProvisionTimeout covers the slow end of Karpenter's decision: its batch window
-	// (up to 10s by default), the scheduling pass and the EC2 call. A refusal arriving after
-	// it is only caught by bindTimeout, so err long.
-	karpenterProvisionTimeout = 30 * time.Second
 )
 
 // nodeClaimGV is Karpenter v1's API, only checked for presence (see verify).
@@ -62,8 +58,7 @@ var nodeClaimGV = schema.GroupVersion{Group: "karpenter.sh", Version: "v1"}
 
 type karpenter struct{}
 
-func (karpenter) bindTimeout() time.Duration      { return karpenterBindTimeout }
-func (karpenter) provisionTimeout() time.Duration { return karpenterProvisionTimeout }
+func (karpenter) bindTimeout() time.Duration { return karpenterBindTimeout }
 
 // selection pins the GPU model through the instance family (one model per NVIDIA family on
 // AWS) and the tier through the capacity type, and keeps consolidation and drift from
@@ -103,27 +98,30 @@ func karpenterCapacityType(tier nebulav1alpha1.CapacityType) string {
 	}
 }
 
-// refused returns Karpenter's verdict that it will not get the pod a node, from the pod's
-// own events, or nil. EC2 refusing a launch shows nowhere else: Karpenter deletes that
-// NodeClaim without recording why. These events are rate-limited, so a dropped one only costs
+// refusals reads Karpenter's refusals for every pod in the cluster at once: its warnings about
+// pods, InsufficientCapacityError (EC2 had none) and FailedScheduling (no NodePool fits). EC2
+// refusing a launch shows nowhere else, since Karpenter deletes that NodeClaim without
+// recording why. The selector leaves out the kube-scheduler's FailedScheduling, which every
+// pod needing a new node gets. Karpenter rate-limits these events, so a dropped one only costs
 // the bind timeout.
-func (karpenter) refused(ctx context.Context, cc clusterClients, pod *corev1.Pod) error {
-	evs, err := cc.kube.CoreV1().Events(pod.Namespace).List(ctx, metav1.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("involvedObject.uid", string(pod.UID)).String(),
+func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID]bool, error) {
+	evs, err := cc.kube.CoreV1().Events(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.Set{
+			"involvedObject.kind": "Pod", "source": karpenterComponent, "type": corev1.EventTypeWarning,
+		}.String(),
+		ResourceVersion: "0", // served from the API server's watch cache
 	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	out := map[types.UID]bool{}
 	for _, ev := range evs.Items {
-		// Filtered again here: the selector is the server's job, and not every client honours it.
-		if ev.InvolvedObject.UID != pod.UID || !fromKarpenter(ev) {
-			continue
-		}
-		if ev.Reason == reasonInsufficientCapacity || ev.Reason == reasonFailedScheduling {
-			return fmt.Errorf("kubernetes: karpenter: %s: %w", ev.Message, provider.ErrNoCapacity)
+		// Checked again here: the selector is the server's job, and not every client honours it.
+		if fromKarpenter(ev) && (ev.Reason == reasonInsufficientCapacity || ev.Reason == reasonFailedScheduling) {
+			out[ev.InvolvedObject.UID] = true
 		}
 	}
-	return nil
+	return out, nil
 }
 
 func (karpenter) verify(_ context.Context, cc clusterClients) error {
