@@ -4,24 +4,19 @@ name: Release
 # needs no prior bump commit -- the tag is stamped into the images, the binary (VERSION ->
 # pkg/version) and dist/install.yaml below. Publishing a release from the GitHub UI creates its
 # tag, which lands here through the same push trigger -- a `release: published` trigger would
-# only start a second, racing run. workflow_dispatch exists to re-publish a tag whose first run
-# failed halfway, without moving the tag.
+# only start a second, racing run. To retry a failed release, re-run its run: that keeps the
+# tag's commit, where a dispatch would check out the branch it was started from.
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Existing tag to publish
-        required: true
 
 permissions:
   contents: read
 
 env:
   CONTROLLER_IMAGE: inftyai/nebula-controller
-  VERSION: ${{ inputs.version || github.ref_name }}
+  VERSION: ${{ github.ref_name }}
 
 jobs:
   # Both images ship under the same tag. Their names are repeated here rather than taken from env
@@ -81,7 +76,7 @@ jobs:
         run: make build-installer IMG=${{ env.CONTROLLER_IMAGE }}:${{ env.VERSION }}
 
       # Runs after the images so a release this creates never points at a tag nobody can pull.
-      # One published from the UI, or being re-published, already exists: it only gets the
+      # One published from the UI, or left by a re-run, already exists: it only gets the
       # manifest, and its title, notes and pre-release flag stay as its author set them.
       # A pre-release suffix (v0.2.0-rc.1) must not become the repo's "latest" release.
       - name: Publish release
