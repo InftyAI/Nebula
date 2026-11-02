@@ -2,8 +2,10 @@ name: Release
 
 # Tag-driven: the tag IS the version. Nothing in the repo pins a release version, so a release
 # needs no prior bump commit -- the tag is stamped into the images, the binary (VERSION ->
-# pkg/version) and dist/install.yaml below. workflow_dispatch exists to re-publish a tag whose
-# first run failed halfway, without moving the tag.
+# pkg/version) and dist/install.yaml below. Publishing a release from the GitHub UI creates its
+# tag, which lands here through the same push trigger -- a `release: published` trigger would
+# only start a second, racing run. workflow_dispatch exists to re-publish a tag whose first run
+# failed halfway, without moving the tag.
 on:
   push:
     tags:
@@ -78,12 +80,18 @@ jobs:
       - name: Generate install manifest
         run: make build-installer IMG=${{ env.CONTROLLER_IMAGE }}:${{ env.VERSION }}
 
-      # Runs after the images so a published release never points at a tag nobody can pull.
+      # Runs after the images so a release this creates never points at a tag nobody can pull.
+      # One published from the UI, or being re-published, already exists: it only gets the
+      # manifest, and its title, notes and pre-release flag stay as its author set them.
       # A pre-release suffix (v0.2.0-rc.1) must not become the repo's "latest" release.
-      - name: Create release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/install.yaml --clobber
+            exit 0
+          fi
           prerelease=""
           case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$VERSION" dist/install.yaml \
