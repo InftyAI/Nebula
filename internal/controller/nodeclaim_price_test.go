@@ -75,6 +75,7 @@ func TestRecordPrice_WritesRateAndRequest(t *testing.T) {
 	pod := gpuPod("H100", 2, "4", "8Gi")
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
 	claim.Spec.CapacityType = nebulav1alpha1.CapacityOnDemand
+	claim.Spec.Region = "us-east-1"
 	pp := &pricedProvider{fakeProvider: &fakeProvider{name: "fake"}, rate: 7.9}
 	r, c := newPricedReconciler(t, []client.Object{pod, claim}, pp)
 
@@ -90,6 +91,8 @@ func TestRecordPrice_WritesRateAndRequest(t *testing.T) {
 	want := provider.PriceRequest{
 		AcceleratorType: "H100", Count: 2,
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
+		// The claim's region, for a provider whose price varies by region (AWS Spot).
+		Region: "us-east-1",
 		// The Pod's own reservation, which only a provider metering CPU/memory apart from
 		// the accelerator charges for — but the request carries it either way.
 		CPUCores: 4, MemoryMiB: 8192,

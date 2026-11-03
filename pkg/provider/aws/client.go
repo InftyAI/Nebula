@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -56,6 +57,11 @@ type ec2API interface {
 	DescribeInstanceTypeOfferings(
 		ctx context.Context, in *ec2.DescribeInstanceTypeOfferingsInput, optFns ...func(*ec2.Options),
 	) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
+	// DescribeSpotPriceHistory reads the current Spot price per AZ (see SpotPrice).
+	// Needs the ec2:DescribeSpotPriceHistory IAM permission.
+	DescribeSpotPriceHistory(
+		ctx context.Context, in *ec2.DescribeSpotPriceHistoryInput, optFns ...func(*ec2.Options),
+	) (*ec2.DescribeSpotPriceHistoryOutput, error)
 	// DescribeImages resolves the region's GPU AMI at construction (see
 	// resolveGPUAMI); DescribeSubnets discovers the default VPC's per-AZ subnets
 	// RunInstance fails over across (see discoverDefaultSubnets).
@@ -931,6 +937,52 @@ func (c *sdkClient) AvailableInstanceTypes(ctx context.Context) (map[string]bool
 		in.NextToken = page.NextToken
 	}
 	return out, nil
+}
+
+// spotProductDescription is the only Linux product Spot prices are published under since
+// EC2-Classic was retired (August 2023); the plain "Linux/UNIX" variant priced Classic.
+const spotProductDescription = "Linux/UNIX (Amazon VPC)"
+
+// errNoSpotPrice reports that the region publishes no current Spot price for a type, e.g. one
+// it does not offer on Spot. The caller falls back to the catalog's seed price.
+var errNoSpotPrice = errors.New("no spot price")
+
+// SpotPrice implements Client via DescribeSpotPriceHistory. A StartTime of now returns the
+// price in effect in each AZ; the lowest is returned, matching the fleet's lowest-price Spot
+// allocation.
+func (c *sdkClient) SpotPrice(ctx context.Context, instanceType string) (float64, error) {
+	in := &ec2.DescribeSpotPriceHistoryInput{
+		InstanceTypes:       []ec2types.InstanceType{ec2types.InstanceType(instanceType)},
+		ProductDescriptions: []string{spotProductDescription},
+		StartTime:           awssdk.Time(time.Now()),
+	}
+	lowest := -1.0
+	for {
+		page, err := c.ec2.DescribeSpotPriceHistory(ctx, in)
+		if err != nil {
+			return 0, err
+		}
+		for _, h := range page.SpotPriceHistory {
+			if h.SpotPrice == nil {
+				continue
+			}
+			price, err := strconv.ParseFloat(*h.SpotPrice, 64)
+			if err != nil || price <= 0 {
+				continue
+			}
+			if lowest < 0 || price < lowest {
+				lowest = price
+			}
+		}
+		if page.NextToken == nil || *page.NextToken == "" {
+			break
+		}
+		in.NextToken = page.NextToken
+	}
+	if lowest < 0 {
+		return 0, fmt.Errorf("aws: %s in %s: %w", instanceType, c.region, errNoSpotPrice)
+	}
+	return lowest, nil
 }
 
 // instanceTypeAZs returns, for each of the requested types, the set of AZs in this

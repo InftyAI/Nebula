@@ -134,6 +134,11 @@ type Client interface {
 	// region offers is AWS-authoritative and changes over time, so it is queried
 	// live rather than hand-maintained in the catalog.
 	AvailableInstanceTypes(ctx context.Context) (map[string]bool, error)
+	// SpotPrice returns the current Spot price (USD/hour) of one instance type in the
+	// client's region: the LOWEST across its AZs, since the launch fleet's default Spot
+	// allocation strategy is lowest-price. Spot prices move hourly and differ per region
+	// and AZ, so they are read live rather than from the catalog's seed rows.
+	SpotPrice(ctx context.Context, instanceType string) (float64, error)
 }
 
 // InstanceSpec is the resolved, EC2-shaped request the Client turns into a
@@ -236,7 +241,33 @@ type Provider struct {
 
 	mu      sync.Mutex
 	clients map[string]Client // region -> Client, populated lazily by clientFor
+
+	// spotMu guards spotPrices, the live Spot price cache PricePerHour reads (see spotRate).
+	spotMu     sync.Mutex
+	spotPrices map[spotPriceKey]spotPriceEntry
 }
+
+// spotPriceKey is one cached Spot price: an instance type in a region.
+type spotPriceKey struct{ region, instanceType string }
+
+// spotPriceEntry is a cached Spot price, or the failure to read one (so a missing IAM grant
+// or throttle is not retried on every reconcile).
+type spotPriceEntry struct {
+	price float64
+	err   error
+	at    time.Time
+}
+
+const (
+	// spotPriceTTL is how long a live Spot price is reused. Spot prices move gradually, at
+	// most every hour or so, so this bounds staleness without a call per reconcile.
+	spotPriceTTL = time.Hour
+	// spotPriceErrTTL is how long a failed lookup is remembered before retrying.
+	spotPriceErrTTL = 5 * time.Minute
+	// spotPriceTimeout caps one DescribeSpotPriceHistory lookup. PricePerHour has no context
+	// of its own, and a slow lookup only delays a cost figure.
+	spotPriceTimeout = 10 * time.Second
+)
 
 // New returns an EC2 Provider backed by a client factory and price catalog.
 // regionSource supplies the NodePool declarations the List/Offerings fan-out
@@ -254,6 +285,7 @@ func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource)
 		newClient:    newClient,
 		regionSource: regionSource,
 		clients:      make(map[string]Client),
+		spotPrices:   make(map[spotPriceKey]spotPriceEntry),
 	}
 }
 
@@ -454,7 +486,7 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 			log.Error(err, "probe instance-type availability failed; skipping region", "region", region)
 			continue
 		}
-		for _, o := range rows {
+		for _, o := range regionRows(rows, region) {
 			o.Region = region
 			o.Available = o.Available && avail[o.AcceleratorID]
 			out = append(out, o)
@@ -464,6 +496,36 @@ func (p *Provider) Offerings(ctx context.Context) ([]provider.Offering, error) {
 		return nil, fmt.Errorf("aws: offerings probe failed in all %d region(s)", failed)
 	}
 	return out, nil
+}
+
+// regionRows returns the catalog rows that price region: its own rows, plus a blank-region
+// (default) row for each offering the region has no row of its own for. Rows for other
+// regions are dropped.
+func regionRows(rows []provider.Offering, region string) []provider.Offering {
+	type offeringKey struct {
+		id    string
+		count int32
+		tier  nebulav1alpha1.CapacityType
+	}
+	key := func(o provider.Offering) offeringKey {
+		return offeringKey{id: o.AcceleratorID, count: o.GPUCount, tier: o.CapacityType}
+	}
+	own := map[offeringKey]bool{}
+	for _, o := range rows {
+		if o.Region == region {
+			own[key(o)] = true
+		}
+	}
+	out := make([]provider.Offering, 0, len(rows))
+	for _, o := range rows {
+		switch {
+		case o.Region == region:
+			out = append(out, o)
+		case o.Region == "" && !own[key(o)]:
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // Provision implements provider.Provider. The Pod is the source of truth for the
@@ -760,7 +822,60 @@ func (p *Provider) PricePerHour(req provider.PriceRequest) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if req.CapacityType == nebulav1alpha1.CapacitySpot && req.Region != "" {
+		rate = p.spotRate(req, rate)
+	}
 	return rate + data.AWSRootVolumeCostPerHour(awsAMIRootGiB+req.DiskGiB), nil
+}
+
+// spotRate is the live Spot price of the request's primary instance type in its region, or
+// seed (the catalog's Spot row) when the live price cannot be read. The catalog's Spot rows
+// are a single us-east-1 snapshot; the live price is what the region charges now.
+func (p *Provider) spotRate(req provider.PriceRequest, seed float64) float64 {
+	ids, ok := p.MapAccelerator(req.AcceleratorType, req.Count)
+	if !ok || len(ids) == 0 {
+		return seed
+	}
+	key := spotPriceKey{region: req.Region, instanceType: ids[0]}
+	log := logf.Log.WithName("aws-spot-price").WithValues("region", key.region, "instanceType", key.instanceType)
+
+	p.spotMu.Lock()
+	e, cached := p.spotPrices[key]
+	p.spotMu.Unlock()
+	if !cached || e.expired(time.Now()) {
+		e = p.fetchSpotPrice(key)
+		p.spotMu.Lock()
+		p.spotPrices[key] = e
+		p.spotMu.Unlock()
+	}
+	if e.err != nil {
+		log.V(1).Info("live spot price unavailable; using the catalog seed", "seed", seed, "error", e.err.Error())
+		return seed
+	}
+	return e.price
+}
+
+// fetchSpotPrice reads one live Spot price through the region's client.
+func (p *Provider) fetchSpotPrice(key spotPriceKey) spotPriceEntry {
+	ctx, cancel := context.WithTimeout(context.Background(), spotPriceTimeout)
+	defer cancel()
+	now := time.Now()
+	client, err := p.clientFor(ctx, key.region)
+	if err != nil {
+		return spotPriceEntry{err: err, at: now}
+	}
+	price, err := client.SpotPrice(ctx, key.instanceType)
+	return spotPriceEntry{price: price, err: err, at: now}
+}
+
+// expired reports whether the entry must be re-read: a price after spotPriceTTL, a failure
+// after the shorter spotPriceErrTTL.
+func (e spotPriceEntry) expired(now time.Time) bool {
+	ttl := spotPriceTTL
+	if e.err != nil {
+		ttl = spotPriceErrTTL
+	}
+	return now.Sub(e.at) > ttl
 }
 
 // instanceSpecFromPod reads the workload off the Pod (source of truth) and the

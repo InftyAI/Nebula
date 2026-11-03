@@ -59,6 +59,13 @@ type fakeEC2 struct {
 	// assert which instance ids were queried.
 	lastStatusIn *ec2.DescribeInstanceStatusInput
 
+	// spotPages seeds DescribeSpotPriceHistory; spotErr injects a failure; lastSpotIn
+	// records the last input so a test can assert the filters.
+	spotPages  []*ec2.DescribeSpotPriceHistoryOutput
+	spotErr    error
+	spotIdx    int
+	lastSpotIn *ec2.DescribeSpotPriceHistoryInput
+
 	offeringPages []*ec2.DescribeInstanceTypeOfferingsOutput
 	offeringErr   error
 	offeringIdx   int
@@ -232,6 +239,21 @@ func (f *fakeEC2) DescribeInstanceTypeOfferings(
 	}
 	page := f.offeringPages[f.offeringIdx]
 	f.offeringIdx++
+	return page, nil
+}
+
+func (f *fakeEC2) DescribeSpotPriceHistory(
+	_ context.Context, in *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options),
+) (*ec2.DescribeSpotPriceHistoryOutput, error) {
+	f.lastSpotIn = in
+	if f.spotErr != nil {
+		return nil, f.spotErr
+	}
+	if f.spotIdx >= len(f.spotPages) {
+		return &ec2.DescribeSpotPriceHistoryOutput{}, nil
+	}
+	page := f.spotPages[f.spotIdx]
+	f.spotIdx++
 	return page, nil
 }
 
@@ -1309,5 +1331,48 @@ func TestSDKRunInstance_SizesRootVolume(t *testing.T) {
 					awssdk.ToInt32(ebs.VolumeSize), ebs.VolumeType, awssdk.ToBool(ebs.DeleteOnTermination), tc.wantSize)
 			}
 		})
+	}
+}
+
+func TestSpotPrice_LowestAcrossAZs(t *testing.T) {
+	spot := func(az, price string) ec2types.SpotPrice {
+		return ec2types.SpotPrice{AvailabilityZone: awssdk.String(az), SpotPrice: awssdk.String(price)}
+	}
+	f := &fakeEC2{spotPages: []*ec2.DescribeSpotPriceHistoryOutput{
+		{
+			SpotPriceHistory: []ec2types.SpotPrice{spot("us-east-1a", "31.9467"), {AvailabilityZone: awssdk.String("us-east-1b")}},
+			NextToken:        awssdk.String("page-2"),
+		},
+		{SpotPriceHistory: []ec2types.SpotPrice{spot("us-east-1c", "29.168"), spot("us-east-1d", "37.378")}},
+	}}
+	c := &sdkClient{ec2: f, region: testRegion}
+
+	got, err := c.SpotPrice(context.Background(), "p5.48xlarge")
+	if err != nil || got != 29.168 {
+		t.Fatalf("SpotPrice = %v, %v; want the lowest AZ price 29.168 across both pages", got, err)
+	}
+	in := f.lastSpotIn
+	if !reflect.DeepEqual(in.InstanceTypes, []ec2types.InstanceType{"p5.48xlarge"}) {
+		t.Errorf("InstanceTypes = %v, want only p5.48xlarge", in.InstanceTypes)
+	}
+	if !reflect.DeepEqual(in.ProductDescriptions, []string{spotProductDescription}) {
+		t.Errorf("ProductDescriptions = %v, want %q", in.ProductDescriptions, spotProductDescription)
+	}
+	if in.StartTime == nil {
+		t.Error("StartTime unset: without it AWS returns the whole history, not the current price")
+	}
+}
+
+func TestSpotPrice_NoPrice(t *testing.T) {
+	c := &sdkClient{ec2: &fakeEC2{}, region: testRegion}
+	if _, err := c.SpotPrice(context.Background(), "p5.48xlarge"); !errors.Is(err, errNoSpotPrice) {
+		t.Fatalf("SpotPrice(no history) err = %v, want errNoSpotPrice", err)
+	}
+}
+
+func TestSpotPrice_APIError(t *testing.T) {
+	c := &sdkClient{ec2: &fakeEC2{spotErr: apiErr("UnauthorizedOperation")}, region: testRegion}
+	if _, err := c.SpotPrice(context.Background(), "p5.48xlarge"); err == nil {
+		t.Fatal("SpotPrice swallowed the API error")
 	}
 }
