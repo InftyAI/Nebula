@@ -63,7 +63,10 @@ type fakeProvider struct {
 	terminateErr    error
 	list            []provider.Instance
 	listErr         error
-	capabilities    provider.Capabilities
+	// listHook runs inside List, before it answers, so a test can act in the window in
+	// which the snapshot is already taken.
+	listHook     func()
+	capabilities provider.Capabilities
 	// classifyScope is what ClassifyProvisionError returns for a failure; the zero
 	// value (empty scope) means "not blocklistable". classifyAccel/classifyRegion
 	// record what the handler passed in, so a test can assert it resolved them off the
@@ -79,6 +82,7 @@ type fakeProvider struct {
 	// timeout does. It exists to prove the provision deadline does not leak into the
 	// writes that follow.
 	provisionBlocksUntilDeadline bool
+	classifyErr                  error // the error last passed to ClassifyProvisionError
 }
 
 func (f *fakeProvider) Name() string                        { return "fake" }
@@ -123,7 +127,11 @@ func (f *fakeProvider) Get(context.Context, string, string) (*provider.Instance,
 	return nil, nil
 }
 func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
-	return f.list, f.listErr
+	list, err := f.list, f.listErr
+	if f.listHook != nil {
+		f.listHook()
+	}
+	return list, err
 }
 func (f *fakeProvider) FindByClaim(_ context.Context, claim, _ string) (*provider.Instance, error) {
 	if f.listErr != nil {
@@ -139,7 +147,12 @@ func (f *fakeProvider) FindByClaim(_ context.Context, claim, _ string) (*provide
 func (f *fakeProvider) Offerings(context.Context) ([]provider.Offering, error) { return nil, nil }
 func (f *fakeProvider) MapAccelerator(c string, _ int32) ([]string, bool)      { return []string{c}, true }
 func (f *fakeProvider) ResolveRegions(declared, _ []string) []string           { return declared }
-func (f *fakeProvider) ClassifyProvisionError(_ error, accel, region string) provider.BlockScope {
+
+// denyAll is the scope a provider-wide failure (auth) classifies to.
+var denyAll = provider.BlockScope{Deny: provider.DenyAll}
+
+func (f *fakeProvider) ClassifyProvisionError(err error, accel, region string) provider.BlockScope {
+	f.classifyErr = err
 	f.classifyAccel = accel
 	f.classifyRegion = region
 	return f.classifyScope
@@ -503,11 +516,11 @@ func TestCreatePod_UnattributableErrorFailsPodWithoutBlocklisting(t *testing.T) 
 }
 
 func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
-	accel, region := "H100", "us-east-1"
 	scope := provider.BlockScope{
-		Accelerator:  &accel,
+		Deny:         provider.DenyCandidate,
+		Accelerator:  "H100",
 		CapacityType: nebulav1alpha1.CapacitySpot,
-		Region:       &region,
+		Region:       "us-east-1",
 	}
 	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: scope}
 	bl := &recordingBlocklist{}
@@ -516,8 +529,7 @@ func TestCreatePod_ProvisionFailureRecordsBlock(t *testing.T) {
 	h := NewHandler(fp, nil, bl, clusterWithTTL(7*time.Minute))
 	h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base TTL is asserted exactly
 
-	pod := testPod("default", "p1")
-	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = "H100"
+	pod := withGPU(testPod("default", "p1"), "H100")
 
 	if err := h.CreatePod(context.Background(), pod); err == nil {
 		t.Fatal("expected CreatePod to return the provision error")
@@ -575,7 +587,7 @@ func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
 		cluster: clusterWithTTL(0),
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+			fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: denyAll}
 			bl := &recordingBlocklist{}
 			h := NewHandler(fp, nil, bl, tc.cluster)
 			h.jitterFn = func() time.Duration { return 0 } // pin jitter so the base default is exact
@@ -598,7 +610,7 @@ func TestCreatePod_BlocklistTTLFallsBackToDefault(t *testing.T) {
 // is filed either. Blocking a candidate over OUR failure to read a pool would exclude
 // serviceable capacity for every tenant sharing the blocklist.
 func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
-	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: denyAll}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, &fakeCluster{err: errors.New("cache not synced")})
 
@@ -616,7 +628,7 @@ func TestCreatePod_UnreadablePoolBlocksNothing(t *testing.T) {
 // The recorded TTL is the base (the pool's, or the default) PLUS the handler's jitter, so
 // Pods failing for one scope do not re-probe the freed candidate in lockstep.
 func TestCreatePod_BlocklistTTLAddsJitter(t *testing.T) {
-	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: provider.BlockScope{DenyAll: true}}
+	fp := &fakeProvider{provisionErr: errors.New("no capacity"), classifyScope: denyAll}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
 	h.jitterFn = func() time.Duration { return 20 * time.Second } // deterministic jitter
@@ -1503,6 +1515,30 @@ func TestReconcileOnce_AbsentInstanceIsTerminated(t *testing.T) {
 	}
 }
 
+func TestReconcileOnce_PodStoredDuringListIsNotGone(t *testing.T) {
+	// The race seen live: a pod provisioned while List was in flight is missing from that
+	// snapshot, yet alive. Only a List begun after it was stored is a verdict on it.
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	fp.listHook = func() {
+		fp.listHook = nil
+		_ = h.CreatePod(context.Background(), testPod("default", "p1"))
+	}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase == corev1.PodFailed {
+		t.Fatalf("a pod stored during List was failed as gone: %q", got.Status.Reason)
+	}
+
+	h.reconcileOnce(context.Background()) // begun after the store, and still missing it
+	got, _ = h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != "Terminated" {
+		t.Fatalf("phase/reason = %q/%q, want Failed/Terminated once a later List misses it",
+			got.Status.Phase, got.Status.Reason)
+	}
+}
+
 func TestReconcileOnce_ReadinessDeadlineFailsPod(t *testing.T) {
 	// An instance the provider keeps reporting Pending forever — Modal's probe never
 	// reporting pass. Past the deadline the Pod goes terminal, which is the whole action:
@@ -1895,7 +1931,7 @@ func TestCreatePod_ReadsPlacementFromClaim(t *testing.T) {
 func TestCreatePod_BlocklistRegionComesFromTheClaim(t *testing.T) {
 	fp := &fakeProvider{
 		provisionErr:  errors.New("no capacity"),
-		classifyScope: provider.BlockScope{DenyAll: true},
+		classifyScope: provider.BlockScope{Deny: provider.DenyAll},
 	}
 	bl := &recordingBlocklist{}
 	h := NewHandler(fp, nil, bl, clusterWithPlacement(nebulav1alpha1.CapacitySpot, "us-east-1"))
@@ -1981,5 +2017,128 @@ func TestCreatePod_FailsClosedWithoutClusterState(t *testing.T) {
 				t.Error("pod is tracked; nothing was provisioned for it")
 			}
 		})
+	}
+}
+
+// An unreserved instance the provider later reports as having no capacity is the Provision
+// error path arriving late: the candidate is blocklisted with the pool's TTL, the Pod fails
+// with the provision-failed reason, and a second tick neither re-fails nor re-blocks it.
+func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
+	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
+	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
+	bl := &recordingBlocklist{}
+	cluster := clusterWithTTL(30 * time.Second)
+	cluster.claim.Spec.CapacityType = nebulav1alpha1.CapacitySpot
+	h := NewHandler(fp, nil, bl, cluster)
+	h.jitterFn = func() time.Duration { return 0 }
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", Region: "eks-use1",
+		State: provider.InstanceUnschedulable,
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != reasonProvisionFailed {
+		t.Fatalf("status = %s/%s, want Failed/%s", got.Status.Phase, got.Status.Reason, reasonProvisionFailed)
+	}
+	if bl.calls != 1 || bl.ttl != 30*time.Second || fp.classifyRegion != "eks-use1" {
+		t.Fatalf("block = %d calls, ttl %v, region %q; want one, 30s, eks-use1", bl.calls, bl.ttl, fp.classifyRegion)
+	}
+	// The claim's tier rides on the error, so the provider blocks Spot alone, not every tier.
+	if tier := provider.TierOf(fp.classifyErr); tier != nebulav1alpha1.CapacitySpot {
+		t.Fatalf("classified a late failure with tier %q, want the claim's %q", tier, nebulav1alpha1.CapacitySpot)
+	}
+
+	h.reconcileOnce(context.Background())
+	if bl.calls != 1 {
+		t.Fatalf("Record calls = %d after a second tick, want 1", bl.calls)
+	}
+}
+
+// A Failed instance fails the Pod without blocking the candidate: that is how a provider
+// reports a refusal that is not capacity (Karpenter's FailedScheduling, a missing toleration),
+// which must not exclude the candidate for every other Pod.
+func TestReconcileOnce_FailedFailsPodWithoutBlock(t *testing.T) {
+	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
+	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
+	h.jitterFn = func() time.Duration { return 0 }
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", Region: "eks-use1", State: provider.InstanceFailed,
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != reasonFailed {
+		t.Fatalf("status = %s/%s, want Failed/%s", got.Status.Phase, got.Status.Reason, reasonFailed)
+	}
+	if bl.calls != 0 {
+		t.Fatalf("Record calls = %d, want none", bl.calls)
+	}
+}
+
+// Provisioning is an instance with no capacity yet: the Pod stays at Provisioning, so its
+// claim is not Bound and nothing accrues, and the readiness clock does not start, since that
+// wait is the provider's to bound.
+func TestReconcileOnce_ProvisioningIsNotInitializing(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceProvisioning}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodPending || got.Status.Reason != reasonProvisioning {
+		t.Fatalf("status = %s/%s, want Pending/%s", got.Status.Phase, got.Status.Reason, reasonProvisioning)
+	}
+	h.mu.Lock()
+	clock := h.tracked[key("default", "p1")].initializingAt
+	h.mu.Unlock()
+	if !clock.IsZero() {
+		t.Fatal("the readiness clock must not start while the instance has no capacity")
+	}
+}
+
+// NotReady shows as it is, Running with Ready=False, and counts toward the readiness deadline
+// like Pending: unusable for the whole deadline fails the Pod, before or after it was ready.
+// Running in between resets the clock.
+func TestReconcileOnce_NotReadyIsShownAndCounted(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1"}
+	h := NewHandler(fp, nil, nil, openCluster())
+	if err := h.CreatePod(context.Background(), testPod("default", "p1")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	tick := func(state provider.InstanceState) *corev1.Pod {
+		fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: state}}
+		h.reconcileOnce(context.Background())
+		got, _ := h.GetPod(context.Background(), "default", "p1")
+		return got
+	}
+
+	got := tick(provider.InstanceNotReady)
+	if got.Status.Phase != corev1.PodRunning || isPodReadyStatus(got) {
+		t.Fatalf("not-ready instance = %s, ready=%v; want Running, not ready", got.Status.Phase, isPodReadyStatus(got))
+	}
+	if got := tick(provider.InstanceRunning); !isPodReadyStatus(got) {
+		t.Fatal("a ready instance must make the Pod ready")
+	}
+
+	tick(provider.InstanceNotReady) // the clock starts again, from zero
+	rewindInitializing(t, h, "default", "p1", 11*time.Minute)
+	got = tick(provider.InstanceNotReady)
+	if got.Status.Phase != corev1.PodFailed || got.Status.Reason != reasonReadinessTimeout {
+		t.Fatalf("unusable past the deadline = %s/%s, want Failed/%s",
+			got.Status.Phase, got.Status.Reason, reasonReadinessTimeout)
 	}
 }

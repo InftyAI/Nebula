@@ -712,7 +712,7 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 //     sentinel: a Spot shortage must block only Spot, leaving OnDemand serviceable.
 //   - EC2 capacity is per-region, so a capacity or quota block is confined to the region
 //     that actually failed — a shortage in us-east-1 must not disqualify us-west-2, and
-//     vCPU limits are regional too. Only DenyAll (auth) stays region-wide, since bad
+//     vCPU limits are regional too. Only DenyAll (auth) stays provider-wide, since bad
 //     credentials fail everywhere. The region is a parameter because the error does not
 //     carry it and there is no default region to assume.
 func (p *Provider) ClassifyProvisionError(err error, accelerator, region string) provider.BlockScope {
@@ -731,15 +731,11 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	if scope == (provider.BlockScope{}) {
 		return scope
 	}
-	// Confine an accelerator/capacity/quota block to the region that failed. A
-	// DenyAll (auth) fails in every region, so it stays region-wide (Region left nil).
-	// An empty region (should not happen — every request carries one) maps to &"" =
-	// the wildcard, which blocks the accelerator in ALL regions: the safe over-broad
-	// choice, since a stale-but-effective block beats a block pinned to a guessed
-	// region that never matches.
-	if !scope.DenyAll {
-		r := region
-		scope.Region = &r
+	// Confine a candidate block to the region that failed; DenyAll (auth) fails in every
+	// region, so it stays provider-wide. Every request carries a region; an empty one
+	// would only match region-less candidates, which AWS has none of.
+	if scope.Deny == provider.DenyCandidate {
+		scope.Region = region
 	}
 	return scope
 }
@@ -816,7 +812,7 @@ func (p *Provider) instanceSpecFromPod(
 		Image:         c.Image,
 		Command:       append([]string{}, c.Command...),
 		Args:          append([]string{}, c.Args...),
-		// The caller's resolved environment, whole (provider.ProvisionRequest.Env). The Pod's
+		// The caller's resolved environment, whole (provider.Env.All). The Pod's
 		// own env is not read: it holds references this adapter cannot follow.
 		//
 		// CAVEAT, and the reason this is called out: buildUserData renders env into cloud-init
@@ -828,7 +824,7 @@ func (p *Provider) instanceSpecFromPod(
 		// TODO: deliver Secret-derived values out-of-band — SSM Parameter Store / Secrets
 		// Manager under the claim, fetched at boot with the instance profile — and keep only
 		// non-sensitive values in user-data.
-		Env:     req.Env,
+		Env:     req.Env.All(),
 		Spot:    req.CapacityType == nebulav1alpha1.CapacitySpot,
 		Region:  req.Region,
 		Tags:    map[string]string{ClaimTagKey: req.ClaimName},

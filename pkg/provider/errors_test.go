@@ -29,16 +29,14 @@ import (
 func TestClassifyError(t *testing.T) {
 	const tier = nebulav1alpha1.CapacityOnDemand
 	const accel = "H100"
-	// capacityScope is the expected accelerator-scoped block: the accelerator id is
-	// promoted to an exact-match pointer.
-	capacityScope := BlockScope{CapacityType: tier, Accelerator: ptrStr(accel)}
+	capacityScope := BlockScope{Deny: DenyCandidate, CapacityType: tier, Accelerator: accel}
 	tests := []struct {
 		name string
 		err  error
 		want BlockScope
 	}{
 		{"nil", nil, BlockScope{}},
-		{"auth sentinel", ErrAuth, BlockScope{DenyAll: true}},
+		{"auth sentinel", ErrAuth, BlockScope{Deny: DenyAll}},
 		// Quota is scoped like capacity (per accelerator + tier), NOT DenyAll: cloud
 		// quotas are per-resource and, for a multi-region adapter, per-region, so one
 		// exhausted quota must not fence off other regions/accelerators.
@@ -80,7 +78,7 @@ func TestClassifyError(t *testing.T) {
 			"modal refusing us during a build fences the provider",
 			fmt.Errorf("modal: image build: %w", errors.New(
 				"rpc error: code = Unauthenticated desc = invalid token")),
-			BlockScope{DenyAll: true},
+			BlockScope{Deny: DenyAll},
 		},
 		{
 			"modal rate-limiting us during a build is capacity-scoped",
@@ -89,7 +87,7 @@ func TestClassifyError(t *testing.T) {
 			capacityScope,
 		},
 		{"wrapped sentinel", fmt.Errorf("provision failed: %w", ErrNoCapacity), capacityScope},
-		{"string unauthorized", fmt.Errorf("HTTP 401 unauthorized"), BlockScope{DenyAll: true}},
+		{"string unauthorized", fmt.Errorf("HTTP 401 unauthorized"), BlockScope{Deny: DenyAll}},
 		{"string quota", fmt.Errorf("account limit exceeded"), capacityScope},
 		{"string capacity", fmt.Errorf("no capacity available"), capacityScope},
 		// An error we cannot attribute blocks NOTHING: it is no evidence against the
@@ -124,7 +122,7 @@ func TestClassifyError(t *testing.T) {
 		// Pod picked the same broken provider.
 		{"mint failure on an auth refusal",
 			fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
-				errors.New("unauthorized")), BlockScope{DenyAll: true}},
+				errors.New("unauthorized")), BlockScope{Deny: DenyAll}},
 		{"mint failure on a rate limit",
 			fmt.Errorf("modal: mint connect credential for sandbox sb-1: %w",
 				errors.New("429 rate limit exceeded")), capacityScope},
@@ -155,19 +153,19 @@ func TestClassifyError(t *testing.T) {
 // does not block OnDemand on the same provider.
 func TestClassifyError_TierStamped(t *testing.T) {
 	got := ClassifyError(ErrNoCapacity, nebulav1alpha1.CapacitySpot, "H100")
-	if got.CapacityType != nebulav1alpha1.CapacitySpot || got.DenyAll {
+	if got.CapacityType != nebulav1alpha1.CapacitySpot || got.Deny != DenyCandidate {
 		t.Fatalf("expected Spot accelerator-scoped block, got %+v", got)
 	}
 }
 
-// An empty accelerator (CPU-only Pod) must leave Accelerator nil ("not
-// applicable"), never a wildcard that would widen the block across every GPU.
-func TestClassifyError_EmptyAcceleratorStaysNil(t *testing.T) {
+// A CPU-only Pod's block is a candidate block with an empty Accelerator, which matches only
+// CPU-only candidates (see BlockScope.Accelerator), never a GPU one.
+func TestClassifyError_EmptyAcceleratorStaysEmpty(t *testing.T) {
 	got := ClassifyError(ErrNoCapacity, nebulav1alpha1.CapacityOnDemand, "")
-	if got.Accelerator != nil {
-		t.Fatalf("expected nil Accelerator for a CPU-only request, got %+v", got.Accelerator)
+	if got.Deny != DenyCandidate || got.Accelerator != "" {
+		t.Fatalf("expected a CPU-only candidate block, got %+v", got)
 	}
-	if got.DenyAll || got.CapacityType != nebulav1alpha1.CapacityOnDemand {
+	if got.CapacityType != nebulav1alpha1.CapacityOnDemand {
 		t.Fatalf("expected an OnDemand capacity scope, got %+v", got)
 	}
 }
@@ -184,5 +182,3 @@ func TestClassifyError_UnattributableBlocksNothing(t *testing.T) {
 		t.Fatalf("an unattributable error must block nothing, got %+v", got)
 	}
 }
-
-func ptrStr(s string) *string { return &s }

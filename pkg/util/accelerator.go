@@ -43,13 +43,13 @@ const NvidiaGPUResource corev1.ResourceName = "nvidia.com/gpu"
 //
 // It returns:
 //   - ("", 0, nil)      no GPU type requested => a CPU-only workload.
-//   - (type, count, nil) a GPU workload; count defaults to 1 when the type is
-//     set but no nvidia.com/gpu resource is present, so authors can request a
-//     single GPU with just the label.
+//   - (type, count, nil) a GPU workload.
 //
 // The type is returned verbatim (case is normalized downstream by the provider
-// catalog's MapAccelerator). An error is returned only for a genuinely
-// contradictory request: an explicit nvidia.com/gpu count with no GPU type.
+// catalog's MapAccelerator). Type and count must come together: a count with no
+// type, or a type with no nvidia.com/gpu request, is an error. A type alone used to
+// mean one GPU, but the container itself asks for none, so a provider running it
+// would get no device.
 func AcceleratorRequest(pod *corev1.Pod) (accelerator string, count int32, err error) {
 	typ := pod.Labels[nebulav1alpha1.AcceleratorTypeLabel]
 	n := gpuCount(pod)
@@ -61,7 +61,7 @@ func AcceleratorRequest(pod *corev1.Pod) (accelerator string, count int32, err e
 		return "", 0, nil // CPU-only
 	}
 	if n == 0 {
-		n = 1 // a GPU type with no explicit count means one GPU
+		return "", 0, fmt.Errorf("%s=%s set without an nvidia.com/gpu request", nebulav1alpha1.AcceleratorTypeLabel, typ)
 	}
 	return typ, n, nil
 }

@@ -320,23 +320,21 @@ func (c *sdkClient) registrySecret(ctx context.Context, kv map[string]string) (*
 //
 // CreateConnectToken BLOCKS until Modal has assigned the sandbox a worker, and that wait is
 // load-bearing: it is what makes a returning CreateSandbox proof of a placed GPU rather than
-// of an accepted request (see Provision). Modal caps it itself, at ~3m40s, so a queue longer
-// than the cap fails a Pod whose sandbox would have been placed.
+// of an accepted request (see Provision). It is bounded by provisionTimeout, and by Modal's
+// own ~3m43s cap after the SDK's retries.
 //
 // A failure is REPORTED, never swallowed into a zero credential. Minting is one-shot with
 // no read-back, so a dropped error loses the credential of a sandbox that exists and is
 // billing — silently, since a caller handed an empty pair has nothing to log. The Pod fails
 // terminally and its owner recreates it — the only recovery, since this sandbox can never be
-// given a credential. The API error is passed through unlabelled, because it is what decides
-// the blocklist scope: an "unauthorized" here is OUR Modal credential, so it must fence the
-// provider off rather than be scoped to one request.
+// given a credential. The API error is passed through, because it is what decides the
+// blocklist scope (see mintError).
 func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port int) (Credential, error) {
 	creds, err := sb.CreateConnectToken(ctx, &modal.SandboxCreateConnectTokenParams{
 		Port: port,
 	})
 	if err != nil {
-		return Credential{}, fmt.Errorf("modal: mint connect credential for sandbox %s on port %d: %w",
-			sb.SandboxID, port, err)
+		return Credential{}, mintError(sb.SandboxID, port, err)
 	}
 	// A token-less success is the same outcome as an error — an address with nothing to
 	// authenticate against it — so it is reported as one. Nothing to wrap: Modal reported
@@ -346,6 +344,18 @@ func (c *sdkClient) mintCredential(ctx context.Context, sb *modal.Sandbox, port 
 			sb.SandboxID)
 	}
 	return Credential{URL: creds.URL, Token: creds.Token}, nil
+}
+
+// mintError wraps a failed mint. A DeadlineExceeded is the wait for a worker running out,
+// whether Modal's own cap or ours, so no GPU came free: it is labelled a shortage, which blocks the
+// candidate and lets replacement Pods fail over instead of queueing behind it again. Anything
+// else stays unlabelled: an "unauthorized" here is OUR Modal credential, and must fence the
+// provider off rather than be scoped to one request.
+func mintError(sandboxID string, port int, err error) error {
+	if status.Code(err) == codes.DeadlineExceeded {
+		err = fmt.Errorf("%w: %w", provider.ErrNoCapacity, err)
+	}
+	return fmt.Errorf("modal: mint connect credential for sandbox %s on port %d: %w", sandboxID, port, err)
 }
 
 // modalProbe maps a Pod readinessProbe onto Modal's Probe. Modal supports only

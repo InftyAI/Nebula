@@ -55,7 +55,7 @@ var (
 // checking the shared sentinels first and falling back to string heuristics for raw API
 // messages. The rule it encodes: a narrow failure must not disqualify other accelerators, or
 // other regions. Only auth widens to the whole provider via DenyAll; a capacity refusal is
-// scoped to the failing accelerator/tier/region so failover can route around it; and two cases
+// DenyCandidate, the failing accelerator/tier/region, so failover can route around it; and two cases
 // block nothing at all — a failure that belongs to the REQUEST rather than the candidate, and
 // one that could not be attributed to either.
 //
@@ -68,29 +68,22 @@ var (
 // a scope elsewhere. An adapter that decorates the result must leave the ZERO scope alone —
 // it means "block nothing", and any field added to it becomes a block.
 //
-// capacityType is stamped onto accelerator-scoped blocks so a Spot failure does not block
-// OnDemand. accelerator is the request's POOL identity (type:count, "" for a CPU-only Pod),
-// not the provider's SKU id, so the block stays truthful when a launch spans several
-// interchangeable instance types: non-empty becomes an exact match, "" leaves it nil so the
-// block does not widen across every accelerator. DenyAll ignores both.
+// capacityType is stamped onto candidate blocks so a Spot failure does not block OnDemand.
+// accelerator is the request's POOL identity (type:count, "" for a CPU-only Pod), not the
+// provider's SKU id, so the block stays truthful when a launch spans several interchangeable
+// instance types (see BlockScope.Accelerator). DenyAll ignores both.
 func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelerator string) BlockScope {
 	if err == nil {
 		return BlockScope{}
 	}
 
-	// capacityScope builds an accelerator/tier-scoped block, promoting a non-empty
-	// accelerator pool to an exact-match pointer and leaving it nil otherwise.
 	capacityScope := func() BlockScope {
-		s := BlockScope{CapacityType: capacityType}
-		if accelerator != "" {
-			s.Accelerator = &accelerator
-		}
-		return s
+		return BlockScope{Deny: DenyCandidate, Accelerator: accelerator, CapacityType: capacityType}
 	}
 
 	switch categorize(err) {
 	case catAuth:
-		return BlockScope{DenyAll: true}
+		return BlockScope{Deny: DenyAll}
 	case catCapacity:
 		return capacityScope()
 	case catRequest:
@@ -125,6 +118,31 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 		return capacityScope()
 	}
 }
+
+// WithTier records the capacity tier a provision failure happened under. ClassifyProvisionError
+// is not handed one, so an adapter whose errors do not say it themselves reads it back with
+// TierOf, and a Spot shortage does not block OnDemand. The poll loop wraps the failures it
+// finds late the same way, so they block what a synchronous Provision failure would.
+func WithTier(tier nebulav1alpha1.CapacityType, err error) error {
+	return &tierError{tier: tier, err: err}
+}
+
+// TierOf returns the tier WithTier recorded on err, or "" if none was.
+func TierOf(err error) nebulav1alpha1.CapacityType {
+	var te *tierError
+	if errors.As(err, &te) {
+		return te.tier
+	}
+	return ""
+}
+
+type tierError struct {
+	tier nebulav1alpha1.CapacityType
+	err  error
+}
+
+func (e *tierError) Error() string { return e.err.Error() }
+func (e *tierError) Unwrap() error { return e.err }
 
 // IsDeadline reports whether err is a provision deadline that fired.
 func IsDeadline(err error) bool {

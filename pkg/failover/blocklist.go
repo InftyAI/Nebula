@@ -20,10 +20,15 @@ limitations under the License.
 //
 // It follows SkyPilot's blocklist-granularity rule: record at the exact granularity
 // that failed (a provider.BlockScope), and block a candidate only if some live
-// entry's scope MATCHES it. Empty scope fields are wildcards, so "no Spot H100 in
-// us-east-1" never disqualifies an OnDemand request, another accelerator, or another
-// region — while an auth failure (DenyAll) blocks the whole provider until its TTL
-// lapses.
+// entry's scope MATCHES it. So "no Spot H100 in us-east-1" (DenyCandidate) never
+// disqualifies an OnDemand request, another accelerator, or another region — while an
+// auth failure (DenyAll) blocks the whole provider until its TTL lapses.
+//
+// A lapsed block is HALF-OPEN rather than gone: the first placement to ask is admitted as
+// a probe (see Admit), and the candidate stays blocked for everyone else for ProbeWindow.
+// A refused probe is recorded like any failure and blocks again; a ProbeWindow with no
+// failure means it was not refused, and the candidate opens. So a candidate that is still
+// out costs one attempt per expiry, not one per waiting Pod.
 //
 // In-memory and per-process on purpose: this is a hint that bounds churn, not durable
 // state. After a restart it is empty and the next attempt re-probes the provider,
@@ -41,12 +46,32 @@ import (
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
-// entry is one recorded block: the provider it applies to, the scope that failed,
-// and when the block lapses. It is compared against a query candidate by Blocked.
+// ProbeWindow is how long a half-open candidate's one probe has to be refused before the
+// candidate opens for everyone. Long enough for most refusals: a synchronous provider's
+// (AWS, Modal) fails Provision itself, and Karpenter's arrives within ~3-8s, poll included,
+// while it still remembers the shortage. One that rechecks EC2 can take ~30s; such a late
+// refusal only lets the waiting Pods in as before, never worse.
+const ProbeWindow = 15 * time.Second
+
+// entry is one recorded block: the provider it applies to, the scope that failed, when the
+// block lapses, and, once half-open, until when its admitted probe holds the others back.
 type entry struct {
-	provider  string
-	scope     provider.BlockScope
-	expiresAt time.Time
+	provider   string
+	scope      provider.BlockScope
+	expiresAt  time.Time
+	probeUntil time.Time // zero until a probe is admitted
+}
+
+// heldUntil is when e stops holding candidates back: its expiry while blocked, its probe
+// window while probing, zero once half-open with no probe admitted.
+func (e entry) heldUntil(now time.Time) time.Time {
+	switch {
+	case now.Before(e.expiresAt):
+		return e.expiresAt
+	case now.Before(e.probeUntil):
+		return e.probeUntil
+	}
+	return time.Time{}
 }
 
 // Candidate is a placement being considered — the (provider, accelerator, tier,
@@ -84,18 +109,18 @@ func newWithClock(c clock.Clock) *Blocklist {
 	return &Blocklist{clock: c}
 }
 
-// Record adds a block for prov at scope, lapsing after ttl. A DenyAll scope blocks the
-// whole provider; anything else is confined to its matching fields. A non-positive ttl
-// or empty provider is a no-op — defensive, so a misfire cannot install a permanent or
-// provider-less block. Recording also drops expired entries, bounding the slice.
+// Record adds a block for prov at scope, lapsing after ttl; scope.Deny says how much of the
+// provider it covers (see provider.DenyPolicy). A non-positive ttl, an empty provider or a
+// scope with no known policy is a no-op — defensive, so a misfire cannot install a
+// permanent, provider-less or unmatchable block. Recording also drops expired entries,
+// bounding the slice.
 //
-// Records COALESCE: an existing live entry with the same provider and an identical
-// scope has its expiry extended (never shortened) instead of gaining a duplicate. So
-// many Pods failing for the same reason produce ONE entry — the slice is bounded by
-// distinct live scopes, not failure volume. Behaviour is unchanged, since Blocked/
-// BlockedUntil already used the latest covering expiry.
+// Records COALESCE: an existing entry with the same provider and an identical scope has its
+// expiry extended (never shortened) instead of gaining a duplicate. So many Pods failing for
+// the same reason produce ONE entry — the slice is bounded by distinct live scopes, not
+// failure volume. A half-open entry, its probe refused, is blocked again for ttl.
 func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Duration) {
-	if prov == "" || ttl <= 0 {
+	if prov == "" || ttl <= 0 || !knownPolicy(scope.Deny) {
 		return
 	}
 	b.mu.Lock()
@@ -105,13 +130,12 @@ func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Dura
 	b.gcLocked(now)
 
 	expiresAt := now.Add(ttl)
-	// Coalesce into an existing live entry for the same scope. gcLocked has already
-	// dropped expired entries, so every entry scanned here is still live.
 	for i := range b.entries {
-		if b.entries[i].provider == prov && scopeEqual(b.entries[i].scope, scope) {
-			if expiresAt.After(b.entries[i].expiresAt) {
-				b.entries[i].expiresAt = expiresAt // extend; never shorten a live block
+		if e := &b.entries[i]; e.provider == prov && e.scope == scope {
+			if expiresAt.After(e.expiresAt) {
+				e.expiresAt = expiresAt // extend; never shorten a live block
 			}
+			e.probeUntil = time.Time{}
 			return
 		}
 	}
@@ -122,58 +146,69 @@ func (b *Blocklist) Record(prov string, scope provider.BlockScope, ttl time.Dura
 	})
 }
 
-// Blocked reports whether c is currently excluded by any live entry. It is the
-// query the placement loop makes before selecting a candidate: a true result means
-// "skip this (provider, accelerator, tier, region) and try the next one".
+// Blocked reports whether c is currently excluded, without admitting a probe: a half-open
+// candidate reads as not blocked. Placement asks Admit instead.
 func (b *Blocklist) Blocked(c Candidate) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	now := b.clock.Now()
-	b.gcLocked(now)
-	for i := range b.entries {
-		if b.entries[i].provider == c.Provider && scopeCovers(b.entries[i].scope, c) {
-			return true
-		}
-	}
-	return false
+	_, blocked := b.BlockedUntil(c)
+	return blocked
 }
 
-// BlockedUntil reports whether c is currently excluded and, if so, how long until
-// it could become servable — the duration until the LATEST covering entry lapses
-// (c stays blocked while ANY covering entry is live, so it frees only when the
-// last one expires). Placement uses this to requeue a gated Pod exactly when a
-// candidate frees, instead of leaving it idle until the periodic resync. A false
-// result (retryAfter 0) means c is not blocked now.
+// BlockedUntil reports whether c is currently excluded and, if so, how long until it could
+// become servable: until the LATEST covering entry stops holding it (its expiry, or its
+// probe's window). It never admits a probe, so it is safe for anything but placement.
 func (b *Blocklist) BlockedUntil(c Candidate) (retryAfter time.Duration, blocked bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	now := b.clock.Now()
 	b.gcLocked(now)
-	var latest time.Time
+	return b.heldLocked(c, now)
+}
+
+// Admit is the placement loop's query: whether c may be tried now, and if not, how long
+// until it could be. A candidate held back by any covering entry is not admitted. One that
+// is half-open is admitted as the probe: every covering half-open entry then holds the
+// others back for ProbeWindow, until a refusal (Record) blocks it again or the window ends.
+func (b *Blocklist) Admit(c Candidate) (retryAfter time.Duration, admitted bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.clock.Now()
+	b.gcLocked(now)
+	if until, held := b.heldLocked(c, now); held {
+		return until, false
+	}
 	for i := range b.entries {
-		if b.entries[i].provider == c.Provider && scopeCovers(b.entries[i].scope, c) {
-			if b.entries[i].expiresAt.After(latest) {
-				latest = b.entries[i].expiresAt
+		if e := &b.entries[i]; e.provider == c.Provider && scopeCovers(e.scope, c) {
+			e.probeUntil = now.Add(ProbeWindow)
+		}
+	}
+	return 0, true
+}
+
+func (b *Blocklist) heldLocked(c Candidate, now time.Time) (time.Duration, bool) {
+	var latest time.Time
+	for _, e := range b.entries {
+		if e.provider == c.Provider && scopeCovers(e.scope, c) {
+			if until := e.heldUntil(now); until.After(latest) {
+				latest = until
 			}
 		}
 	}
 	if latest.IsZero() {
 		return 0, false
 	}
-	// gcLocked has dropped every expired entry, so latest is strictly after now.
 	return latest.Sub(now), true
 }
 
-// gcLocked drops entries that have expired as of now. Caller holds b.mu.
+// gcLocked drops the entries whose probe window passed without a refusal: the candidate is
+// open. An unprobed half-open entry stays, so the next placement probes it; entries stay
+// bounded by distinct scopes. Caller holds b.mu.
 func (b *Blocklist) gcLocked(now time.Time) {
 	if len(b.entries) == 0 {
 		return
 	}
 	kept := b.entries[:0]
 	for _, e := range b.entries {
-		if e.expiresAt.After(now) {
+		if e.probeUntil.IsZero() || now.Before(e.probeUntil) {
 			kept = append(kept, e)
 		}
 	}
@@ -184,66 +219,28 @@ func (b *Blocklist) gcLocked(now time.Time) {
 	b.entries = kept
 }
 
-// scopeCovers reports whether scope (a recorded block) applies to candidate c. DenyAll
-// covers the whole provider; otherwise every field must match, per BlockScope's
-// three-state pointer semantics:
-//
-//   - nil   => axis not applicable: matches ONLY a candidate whose field is empty, so
-//     a CPU-only Pod or a region-simple provider blocks without widening.
-//   - &""   => wildcard: matches any value on that axis.
-//   - &"v"  => exact: matches only a candidate whose field equals "v".
-//
-// This is the match half of the granularity rule: as broad as the failure, no broader.
+// scopeCovers reports whether scope (a recorded block) applies to candidate c, per its
+// policy: the whole provider, one region, or one candidate. This is the match half of the
+// granularity rule: as broad as the failure, no broader.
 func scopeCovers(scope provider.BlockScope, c Candidate) bool {
-	if scope.DenyAll {
+	switch scope.Deny {
+	case provider.DenyAll:
+		return true
+	case provider.DenyRegion:
+		return scope.Region == c.Region
+	case provider.DenyCandidate:
+		return scope.Accelerator == c.Accelerator &&
+			(scope.CapacityType == "" || scope.CapacityType == c.CapacityType) &&
+			scope.Region == c.Region
+	default:
+		return false
+	}
+}
+
+func knownPolicy(p provider.DenyPolicy) bool {
+	switch p {
+	case provider.DenyAll, provider.DenyRegion, provider.DenyCandidate:
 		return true
 	}
-	if !ptrMatches(scope.Accelerator, c.Accelerator) {
-		return false
-	}
-	if scope.CapacityType != "" && scope.CapacityType != c.CapacityType {
-		return false
-	}
-	if !ptrMatches(scope.Region, c.Region) {
-		return false
-	}
-	return true
-}
-
-// scopeEqual reports whether two BlockScopes are the SAME block — identical along
-// every axis. It is used by Record to coalesce a repeated failure into an existing
-// entry. The *string fields are compared by VALUE, not pointer identity: two
-// independent failures for the same region allocate distinct *string pointers, so a
-// pointer-wise "==" on BlockScope would never coalesce them (and pointer fields make
-// "==" unsafe anyway). This is stricter than scopeCovers, which asks "does this block
-// COVER that candidate"; here we need exact equality so distinct scopes stay distinct
-// entries.
-func scopeEqual(a, b provider.BlockScope) bool {
-	return a.DenyAll == b.DenyAll &&
-		a.CapacityType == b.CapacityType &&
-		ptrEqual(a.Accelerator, b.Accelerator) &&
-		ptrEqual(a.Region, b.Region)
-}
-
-// ptrEqual reports whether two *string are equal by value: both nil, or both non-nil
-// pointing at equal strings. (nil and &"" are DIFFERENT — nil means "axis not
-// applicable" while &"" means "wildcard", a distinction BlockScope depends on.)
-func ptrEqual(x, y *string) bool {
-	if x == nil || y == nil {
-		return x == y // equal only if both nil
-	}
-	return *x == *y
-}
-
-// ptrMatches applies BlockScope's three-state rule to one axis: nil matches only an
-// empty candidate value (the axis is not applicable), &"" is a wildcard that matches
-// anything, and &"v" matches only the exact value.
-func ptrMatches(pattern *string, value string) bool {
-	if pattern == nil {
-		return value == ""
-	}
-	if *pattern == "" {
-		return true
-	}
-	return *pattern == value
+	return false
 }

@@ -31,6 +31,8 @@ import (
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/metrics"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/util"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // The collectors are package-level and registered once, so every test in this package
@@ -60,8 +62,14 @@ func histCount(t *testing.T, h *prometheus.HistogramVec, l prometheus.Labels) ui
 // the pool identity is derived from. Pair it with metricCluster, which supplies the other
 // half — the tier and region, which are read from the NodeClaim, not the Pod.
 func metricPod(ns, name string) *corev1.Pod {
-	pod := testPod(ns, name)
-	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = "H100"
+	return withGPU(testPod(ns, name), "H100")
+}
+
+// withGPU makes pod a one-GPU request of type accel: the type label and the nvidia.com/gpu
+// count, which util.AcceleratorRequest requires together.
+func withGPU(pod *corev1.Pod, accel string) *corev1.Pod {
+	pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = accel
+	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{util.NvidiaGPUResource: resource.MustParse("1")}
 	return pod
 }
 

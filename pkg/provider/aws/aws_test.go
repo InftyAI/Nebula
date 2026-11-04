@@ -186,7 +186,9 @@ func TestProvision_UsesResolvedEnv(t *testing.T) {
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName: "claim-env",
 		Region:    "us-west-2", // EC2 needs one; the test client is not configured with a default
-		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+		Env: provider.Env{
+			Config: map[string]string{"FOO": "bar"}, Secrets: map[string]string{"TOKEN": "t0ken"},
+		},
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -615,16 +617,15 @@ func TestSweepRegions_CoversEveryPoolsPlacement(t *testing.T) {
 func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 	const accel = "H100"
-	denyAll := provider.BlockScope{DenyAll: true}
-	// EC2 capacity/accelerator/quota blocks are confined to the adapter's region (an
-	// exact-match Region pointer) AND to the requested accelerator (passed in by the
-	// caller — the provider owns the whole scope). Only auth (DenyAll) ignores both.
-	region, wantAccel := testRegion, accel
+	denyAll := provider.BlockScope{Deny: provider.DenyAll}
+	// EC2 capacity/accelerator/quota blocks are confined to the adapter's region AND to the
+	// requested accelerator (passed in by the caller — the provider owns the whole scope).
+	// Only auth (DenyAll) ignores both.
 	onDemandRegional := provider.BlockScope{
-		Accelerator: &wantAccel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: &region,
+		Deny: provider.DenyCandidate, Accelerator: accel, CapacityType: nebulav1alpha1.CapacityOnDemand, Region: testRegion,
 	}
 	spotRegional := provider.BlockScope{
-		Accelerator: &wantAccel, CapacityType: nebulav1alpha1.CapacitySpot, Region: &region,
+		Deny: provider.DenyCandidate, Accelerator: accel, CapacityType: nebulav1alpha1.CapacitySpot, Region: testRegion,
 	}
 
 	// A Spot capacity failure the Client wraps with both sentinels: no-capacity

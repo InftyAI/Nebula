@@ -77,14 +77,15 @@ type PodPlacementReconciler struct {
 	Blocklist Blocklister
 }
 
-// Blocklister is the read side of pkg/failover.Blocklist the placement controller
-// depends on: it asks whether a candidate placement is currently excluded and,
-// when it is, how long until it frees (so a Pod stuck on failover can requeue for
-// the exact moment a block lapses rather than idling until the periodic resync).
-// The concrete type is injected from main; this narrow interface keeps the
-// controller decoupled and a nil value a no-op.
+// Blocklister is the side of pkg/failover.Blocklist the placement controller depends on:
+// whether a candidate placement may be tried now and, when not, how long until it could
+// be (so a Pod stuck on failover can requeue for the exact moment a block lapses rather
+// than idling until the periodic resync). Admitting a lapsed candidate claims its one
+// probe (see failover.Blocklist.Admit), so only a placement about to be made may ask.
+// The concrete type is injected from main; this narrow interface keeps the controller
+// decoupled and a nil value a no-op.
 type Blocklister interface {
-	BlockedUntil(c failover.Candidate) (retryAfter time.Duration, blocked bool)
+	Admit(c failover.Candidate) (retryAfter time.Duration, admitted bool)
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete

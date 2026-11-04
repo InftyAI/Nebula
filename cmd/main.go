@@ -57,6 +57,7 @@ import (
 	"github.com/InftyAI/Nebula/pkg/provider"
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
+	kubeprovider "github.com/InftyAI/Nebula/pkg/provider/kubernetes"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
 	"github.com/InftyAI/Nebula/pkg/provider/runpod"
 	"github.com/InftyAI/Nebula/pkg/vnode"
@@ -109,6 +110,7 @@ func main() {
 	var costLabels string
 	var kubeletServingTLSBootstrap bool
 	var providers string
+	var kubernetesClusters string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -151,6 +153,10 @@ func main() {
 			"x509: certificate signed by unknown authority. Off by default because it needs the "+
 			"RBAC to impersonate one virtual node identity — the signer signs for nobody else "+
 			"(see addServingCertificateBootstrap).")
+	flag.StringVar(&kubernetesClusters, "kubernetes-clusters", "",
+		"Path to the kubernetes provider's cluster table in the container, normally "+
+			"/etc/nebula/kubernetes/clusters.yaml mounted from the kubernetes-clusters ConfigMap. "+
+			"Empty leaves the kubernetes provider unregistered.")
 	flag.StringVar(&providers, "providers", strings.Join(knownProviders, ","),
 		"Comma-separated production providers to enable; all by default. A listed provider is "+
 			"skipped if it fails to initialize. Drain a provider before dropping it: nothing "+
@@ -327,7 +333,7 @@ func main() {
 	// startup already sees its provider. The manager's client backs the AWS region
 	// source (regions are read from NodePools at call time, not env), so it is
 	// threaded in; the client is only queried at runtime, after the cache has synced.
-	registerProviders(context.Background(), mgr.GetClient(), enabledProviders)
+	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, kubernetesClusters, attribution)
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
 	// Provision failure and read by the placement controller to skip a candidate
@@ -528,7 +534,7 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBoots
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames=nebula-kubelet-serving,verbs=delete;get
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames=nebula-kubelet-serving,verbs=update
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=kubernetes.io/kubelet-serving,verbs=approve
-// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-runpod","system:node:nebula-fake"},verbs=impersonate
+// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-runpod","system:node:nebula-kubernetes","system:node:nebula-fake"},verbs=impersonate
 // +kubebuilder:rbac:groups="",resources=groups,resourceNames="system:nodes",verbs=impersonate
 
 // addServingCertificateBootstrap requests a trusted serving certificate for the kubelet
@@ -608,7 +614,8 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 // crash loop.
 //
 // Only providers in enabled are attempted (see parseProviders).
-func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool) {
+func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool,
+	kubernetesClusters string, costLabels []string) {
 	register := func(name string, build func() (provider.Provider, error)) {
 		if !enabled[name] {
 			setupLog.Info("provider disabled by --providers", "provider", name)
@@ -639,6 +646,13 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 		return runpod.NewSDKClient(ctx)
 	})
 
+	register(provider.ProviderKubernetes, func() (provider.Provider, error) {
+		if kubernetesClusters == "" {
+			return nil, errors.New("no --kubernetes-clusters file")
+		}
+		return kubeprovider.NewFromFile(ctx, kubernetesClusters, costLabels)
+	})
+
 	// The fake provider is an in-memory backend used only by the e2e suite to
 	// exercise the full control-plane loop without cloud credentials. It ships in
 	// the binary but registers ONLY when explicitly enabled, so it can never place
@@ -652,7 +666,9 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 
 // knownProviders are the names --providers accepts, one per register call above. The fake
 // provider is not among them: it stays gated on its env var alone.
-var knownProviders = []string{provider.ProviderModal, provider.ProviderAWS, provider.ProviderRunPod}
+var knownProviders = []string{
+	provider.ProviderModal, provider.ProviderAWS, provider.ProviderRunPod, provider.ProviderKubernetes,
+}
 
 // parseProviders turns --providers into the enabled set. An unknown name is an error rather
 // than ignored, so a typo cannot silently leave a provider off.
