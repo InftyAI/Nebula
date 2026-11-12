@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -216,6 +217,51 @@ func TestValidateCreate_OneContainerOnePort(t *testing.T) {
 	}
 }
 
+// The accelerator type and the GPU count come together; a type alone is rejected up front,
+// rather than placed as a GPU request the container itself does not make.
+func TestValidateCreate_AcceleratorNeedsGPUCount(t *testing.T) {
+	pod := podWith(map[string]string{
+		nebulav1alpha1.EnabledLabel:         "true",
+		nebulav1alpha1.AcceleratorTypeLabel: "h100",
+	}, "")
+	pod.Spec.Containers = []corev1.Container{{Name: "main"}}
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), pod); err == nil ||
+		!strings.Contains(err.Error(), "nvidia.com/gpu") {
+		t.Fatalf("ValidateCreate err = %v, want a missing nvidia.com/gpu rejection", err)
+	}
+
+	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), pod); err != nil {
+		t.Fatalf("ValidateCreate err = %v for a type with its count, want nil", err)
+	}
+}
+
+// A host-network Pod would run outside the target's Pod NetworkPolicy, escaping namespace
+// isolation, so it is refused; one outside Nebula, or pre-bound, is not Nebula's to judge.
+func TestValidateCreate_RejectsHostNetwork(t *testing.T) {
+	v := &PodCustomValidator{}
+	for _, tc := range []struct {
+		name     string
+		labels   map[string]string
+		nodeName string
+		wantErr  bool
+	}{
+		{"opted in", map[string]string{nebulav1alpha1.EnabledLabel: "true"}, "", true},
+		{"not opted in", nil, "", false},
+		{"pre-bound", map[string]string{nebulav1alpha1.EnabledLabel: "true"}, "node-1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := podWith(tc.labels, tc.nodeName)
+			pod.Spec.Containers = []corev1.Container{{Name: "main"}}
+			pod.Spec.HostNetwork = true
+			_, err := v.ValidateCreate(context.Background(), pod)
+			if gotErr := err != nil && strings.Contains(err.Error(), "host-network"); gotErr != tc.wantErr {
+				t.Fatalf("ValidateCreate err = %v, want a host-network rejection: %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateCreate_RejectsNonPod(t *testing.T) {
 	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), &corev1.Service{}); err == nil {
 		t.Fatal("expected an error for a non-Pod object")
@@ -253,6 +299,12 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		pod.Spec.SchedulingGates = nil
 		return pod
 	}
+	// placed is what placement leaves: the gate gone and the provider chosen.
+	placed := func(pod *corev1.Pod) *corev1.Pod {
+		pod = released(pod)
+		pod.Spec.NodeSelector = map[string]string{nebulav1alpha1.ProviderLabel: "kubernetes"}
+		return pod
+	}
 	cases := []struct {
 		name     string
 		old, new *corev1.Pod
@@ -273,7 +325,10 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		// Placement ignores an unlabelled Pod, so nothing would ever release the gate it keeps.
 		{"opting out while gated", sidecarPod(optedIn), sidecarPod(nil), "gated forever"},
 		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), ""},
-		{"opting out after placement", released(sidecarPod(optedIn)), released(sidecarPod(nil)), ""},
+		// Isolation selects a placed Pod's instance by the label, so it may not go.
+		{"opting out after placement", placed(sidecarPod(optedIn)), placed(sidecarPod(nil)), "stays on a Pod Nebula has placed"},
+		// Bound elsewhere, so never placed: nothing selects it, and it may opt out.
+		{"opting out a pre-bound Pod", validPod(optedIn, "node-1"), validPod(nil, "node-1"), ""},
 	}
 	v := &PodCustomValidator{}
 	for _, tc := range cases {

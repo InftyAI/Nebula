@@ -55,7 +55,7 @@ func TestAcceleratorRequest(t *testing.T) {
 	}{
 		{name: "no label is CPU-only", typ: "", gpuLimit: 0, wantAccel: "", wantCount: 0},
 		{name: "type and count", typ: "a100-40gb", gpuLimit: 8, wantAccel: "a100-40gb", wantCount: 8},
-		{name: "type only defaults to 1", typ: "h100", gpuLimit: 0, wantAccel: "h100", wantCount: 1},
+		{name: "type without count is rejected", typ: "h100", gpuLimit: 0, wantErr: true},
 		{name: "casing preserved", typ: "A100-80GB", gpuLimit: 2, wantAccel: "A100-80GB", wantCount: 2},
 		{name: "count without type is contradictory", typ: "", gpuLimit: 4, wantErr: true},
 	}

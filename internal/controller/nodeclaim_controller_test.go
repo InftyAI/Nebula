@@ -69,7 +69,12 @@ func (f *fakeProvider) Terminate(_ context.Context, id, region string) error {
 	f.regions = append(f.regions, region)
 	return f.terminateErr
 }
-func (f *fakeProvider) Get(context.Context, string, string) (*provider.Instance, error) {
+func (f *fakeProvider) Get(_ context.Context, id, _ string) (*provider.Instance, error) {
+	for _, inst := range f.list {
+		if inst.ID == id {
+			return &inst, nil
+		}
+	}
 	return nil, nil
 }
 func (f *fakeProvider) List(context.Context) ([]provider.Instance, error) {
@@ -509,7 +514,7 @@ func TestReconcileDelete_UsesRecordedInstanceID(t *testing.T) {
 	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
 	claim.Status.InstanceID = "inst-recorded"
 	deleteClaim(t, claim)
-	prov := &fakeProvider{name: "fake"} // List would return nothing
+	prov := &fakeProvider{name: "fake", list: []provider.Instance{{ID: "inst-recorded", ClaimName: "default-p1"}}}
 	r, _ := newClaimReconciler(t, []client.Object{claim}, prov)
 
 	reconcileClaim(t, r, "c1")
@@ -519,6 +524,25 @@ func TestReconcileDelete_UsesRecordedInstanceID(t *testing.T) {
 	}
 	if len(prov.findRegions) != 0 {
 		t.Fatalf("FindByClaim called %d times with a recorded id, want 0", len(prov.findRegions))
+	}
+}
+
+// The recorded id comes from a Pod annotation the workload's owner can write, so one naming
+// another claim's instance must not be terminated: the backstop falls back to its own claim's.
+func TestReconcileDelete_IgnoresForgedInstanceID(t *testing.T) {
+	claim := newClaim("c1", "p1", "default", "uid-1", "fake")
+	claim.Status.InstanceID = "someone-elses"
+	deleteClaim(t, claim)
+	prov := &fakeProvider{name: "fake", list: []provider.Instance{
+		{ID: "someone-elses", ClaimName: "other-ns-victim"},
+		{ID: "mine", ClaimName: "default-p1"},
+	}}
+	r, _ := newClaimReconciler(t, []client.Object{claim}, prov)
+
+	reconcileClaim(t, r, "c1")
+
+	if len(prov.terminated) != 1 || prov.terminated[0] != "mine" {
+		t.Fatalf("terminated %v, want only this claim's instance", prov.terminated)
 	}
 }
 

@@ -41,7 +41,9 @@ const none = "none"
 // `sum by (accelerator)` over every H100 size would need PromQL string splitting, and
 // "all 8-GPU requests across types" is not expressible at all. The pool key is still
 // recoverable as accelerator + ":" + accelerator_count.
-var candidateLabels = []string{"provider", "region", "capacity_type", "accelerator", "accelerator_count"}
+var candidateLabels = []string{labelProvider, "region", "capacity_type", "accelerator", "accelerator_count"}
+
+const labelProvider = "provider"
 
 // withExtra returns candidateLabels plus the trailing dimensions a collector carries of
 // its own (result, reason, claim, phase). Variadic to pair with Labels.values, which takes

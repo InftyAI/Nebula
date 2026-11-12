@@ -16,14 +16,31 @@ limitations under the License.
 
 package util
 
-import corev1 "k8s.io/api/core/v1"
+import (
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
-// IsTerminalPodPhase reports whether a Pod phase is an end state that will not progress.
-//
-// Shared because the two readers must agree: the control plane reaps and un-gates on a terminal
-// Pod, while the virtual node refuses to move one (a provider still listing the instance would
-// otherwise walk a Failed Pod back to Running). A predicate that drifted between them would
-// resurrect exactly the Pods the other side had written off.
-func IsTerminalPodPhase(phase corev1.PodPhase) bool {
+// Finished reports whether a Pod phase is final (Succeeded or Failed). Shared so the control
+// plane, which reaps finished Pods, and the virtual node, which never moves one back, agree.
+func Finished(phase corev1.PodPhase) bool {
 	return phase == corev1.PodFailed || phase == corev1.PodSucceeded
+}
+
+// WorkloadKey identifies the workload a Pod belongs to, as namespace/Kind/name of its
+// controller, else of the Pod itself, so a changed template is a new workload. A Deployment's
+// gets a new ReplicaSet, named after the template's hash; a StatefulSet or DaemonSet keeps its
+// name, so the revision it stamps on its Pods is part of their key. A recreated Pod of the
+// same name and revision is the same workload.
+func WorkloadKey(pod *corev1.Pod) string {
+	kind, name := "Pod", pod.Name
+	if ref := metav1.GetControllerOf(pod); ref != nil {
+		kind, name = ref.Kind, ref.Name
+	}
+	key := pod.Namespace + "/" + kind + "/" + name
+	if rev := pod.Labels[appsv1.ControllerRevisionHashLabelKey]; rev != "" {
+		key += "/" + rev
+	}
+	return key
 }

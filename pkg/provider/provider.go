@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -166,6 +167,14 @@ type LogStreamer interface {
 	Logs(ctx context.Context, instanceID string) (io.ReadCloser, error)
 }
 
+// RegionAccelerators is OPTIONAL, for a provider whose regions do not all offer the same
+// accelerators. MapAccelerator answers for the provider as a whole; placement asks this per
+// region and skips one that cannot serve the request, rather than learning so from a failed
+// placement. A provider without it serves in every region what MapAccelerator says.
+type RegionAccelerators interface {
+	ServesAcceleratorIn(canonical, region string) bool
+}
+
 // Executor is the other OPTIONAL half: run one command inside a live instance, which is
 // what makes `kubectl exec` work. A backend with no way in (no agent, no SSH key) does
 // not implement it, and the virtual node answers NotFound.
@@ -234,19 +243,12 @@ type ProvisionRequest struct {
 	// otherwise. Resolved from the NodePool at provision time, never from the Pod, which
 	// the workload's own owner can patch (see vnode.Handler.egressFor).
 	Egress *nebulav1alpha1.EgressPolicy
-	// Env is the container's environment, fully RESOLVED: literals plus everything
-	// envFrom/valueFrom referenced, merged in kubelet precedence (envFrom in listed order,
-	// then env overriding it). A provider forwards it and never re-reads the Pod's env,
-	// which holds references it cannot follow.
+	// Env is the container's environment, fully RESOLVED (see Env). A provider forwards it and
+	// never re-reads the Pod's env, which holds references it cannot follow.
 	//
 	// Resolved by the caller (pkg/vnode): reading a Secret needs cluster access an adapter
 	// deliberately lacks, and kubelet precedence should be implemented once.
-	//
-	// SECRET-BEARING, and why this struct redacts itself — a secretKeyRef's value lands here
-	// in the clear. Never log the map, never put it on the Pod, never in an error string,
-	// the same rule as ProvisionResult.ConnectToken. Nil is normal: no env, or an
-	// unresolving caller.
-	Env map[string]string
+	Env Env
 	// RegistryAuth authenticates the pull of the container image, from the Pod's
 	// imagePullSecrets; nil is an anonymous pull. Resolved by the caller (pkg/vnode) for the
 	// same reason as Env — it names a Secret an adapter cannot read.
@@ -259,9 +261,43 @@ type ProvisionRequest struct {
 func (r ProvisionRequest) String() string {
 	return fmt.Sprintf("ProvisionRequest{ClaimName:%s CapacityType:%s Region:%s Egress:%s Env:%s "+
 		"RegistryAuth:%s}",
-		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), RedactedEnv(r.Env),
-		r.RegistryAuth)
+		r.ClaimName, r.CapacityType, r.Region, r.Egress.ModeOrOpen(), r.Env, r.RegistryAuth)
 }
+
+// Env is a container's resolved environment: literals plus everything envFrom/valueFrom
+// referenced, merged in kubelet precedence (envFrom in listed order, then env overriding it).
+// It is split by how a value must be handled, and each variable is in exactly one part,
+// decided by the source whose value won.
+//
+// SECRET-BEARING, and the reason it redacts itself: never log Secrets, never put them on a
+// Pod or in an error string, the same rule as ProvisionResult.ConnectToken. Config is
+// redacted too, since a literal can hold a secret as well. The zero value is no env.
+type Env struct {
+	// Config is literals, ConfigMap values and fieldRefs.
+	Config map[string]string
+	// Secrets is the values that came from a Secret.
+	Secrets map[string]string
+}
+
+// All is every variable, for a provider that ships the environment one way. The parts never
+// share a key, so nothing is lost. SECRET-BEARING, like Secrets.
+func (e Env) All() map[string]string {
+	if len(e.Config) == 0 && len(e.Secrets) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(e.Config)+len(e.Secrets))
+	maps.Copy(out, e.Config)
+	maps.Copy(out, e.Secrets)
+	return out
+}
+
+// String redacts both parts: key names print, values never do.
+func (e Env) String() string {
+	return fmt.Sprintf("{Config:%s Secrets:%s}", RedactedEnv(e.Config), RedactedEnv(e.Secrets))
+}
+
+// GoString implements fmt.GoStringer so %#v is redacted too.
+func (e Env) GoString() string { return e.String() }
 
 // GoString implements fmt.GoStringer so %#v is redacted too.
 func (r ProvisionRequest) GoString() string { return r.String() }
@@ -380,6 +416,10 @@ type Instance struct {
 	// secret, so unlike the connect credential it rides the level-triggered read path
 	// and is re-reported on every tick.
 	Endpoint string
+	// Err, for InstanceFailed, is why, classified like a failed Provision: a provider sentinel
+	// (ErrNoCapacity, ErrSpec) decides what is blocked, in the provider's own words. Nil is the
+	// instance's own failure, which blocks nothing.
+	Err error
 }
 
 // redacted renders a secret's presence without its value.
@@ -411,13 +451,21 @@ func RedactedEnv(m map[string]string) string {
 type InstanceState string
 
 const (
+	// InstanceProvisioning: the instance exists (it has an id and must be terminated), but no
+	// capacity is allocated to it yet, e.g. a real pod Karpenter has not given a node.
+	InstanceProvisioning InstanceState = "Provisioning"
 	// InstancePending: created but not yet reachable/ready.
 	InstancePending InstanceState = "Pending"
 	// InstanceRunning: up and reachable.
 	InstanceRunning InstanceState = "Running"
+	// InstanceNotReady: running, but not ready (a failing readiness probe, a crash loop). The
+	// Pod shows Running with Ready=False, and the readiness deadline fails it if it stays
+	// unusable that long.
+	InstanceNotReady InstanceState = "NotReady"
 	// InstanceTerminated: gone (also the mapping for "absent from List").
 	InstanceTerminated InstanceState = "Terminated"
-	// InstanceFailed: entered a terminal error state.
+	// InstanceFailed: entered a terminal error state; Instance.Err says why, if the provider
+	// knows. An unreserved instance never placed on capacity is Failed with the refusal.
 	InstanceFailed InstanceState = "Failed"
 )
 
@@ -455,38 +503,45 @@ type Offering struct {
 	GPUCount int32
 }
 
+// DenyPolicy is how much of a provider a failed placement excludes, from widest to narrowest.
+type DenyPolicy string
+
+const (
+	// DenyAll excludes every candidate of the provider: a credential that serves all of
+	// them stopped working. Still scoped to this one provider; it never spans providers.
+	DenyAll DenyPolicy = "All"
+	// DenyRegion excludes every accelerator and capacity type in BlockScope.Region: a
+	// failure of that region alone, such as one kubernetes cluster's access entry.
+	DenyRegion DenyPolicy = "Region"
+	// DenyCandidate excludes the failing candidate: BlockScope.Accelerator at its
+	// CapacityType in its Region, so failover can route around just what failed.
+	DenyCandidate DenyPolicy = "Candidate"
+	// DenyWorkload excludes the candidate, as DenyCandidate, for BlockScope.Workload only: the
+	// candidate refused that workload's spec, which says nothing about anyone else's.
+	DenyWorkload DenyPolicy = "Workload"
+)
+
 // BlockScope is how narrowly a failed placement is excluded, matched to what actually
-// failed. It is a MATCH PATTERN, not a value, so the pointer fields are three-state:
+// failed. The zero scope blocks nothing: it is the ONLY such signal, so every block names
+// its Deny policy, and the fields below are read only as that policy says.
 //
-//   - nil   => axis not applicable; matches only a candidate whose field is also empty
-//     (a CPU-only Pod has no accelerator, a region-simple provider no region).
-//   - &""   => wildcard: matches any value on that axis.
-//   - &"v"  => exact: only candidates equal to "v" (a failed H100 must not block A100).
-//
-// Pointers are needed because the scope is built in two places: the adapter classifies
-// from the error alone (which knows the region but not the accelerator, a property of the
-// request), and the vnode handler fills the accelerator in from the failing Pod. So
-// "unset" must be distinguishable from a deliberate wildcard. DenyAll ignores the pattern
-// fields entirely.
-//
-// Note this is the opposite sense to a value field like ProviderSpec.Regions, where empty
-// means "the default region". A candidate is resolved to concrete values before being
-// matched here, so the two never mix.
+// The scope is built in two places: the adapter classifies from the error alone (which
+// knows the region but not the accelerator, a property of the request), and the vnode
+// handler supplies the accelerator from the failing Pod.
 type BlockScope struct {
-	// Accelerator: nil => not applicable (CPU-only Pod, or DenyAll); &"" => every
-	// accelerator; &"H100:8" => that one pool. The value is the request's POOL identity
-	// (type:count), not the provider's SKU id, so a block stays confined to what ran out:
-	// an L4:8 shortage must not exclude L4:1. It also stays stable when a launch spans
-	// several interchangeable instance types. Filled in by the vnode handler, since the
-	// adapter classifies from the error alone and cannot know it.
-	Accelerator *string
-	// CapacityType empty => blocks all capacity types.
+	Deny DenyPolicy
+	// Accelerator, for DenyCandidate, is the request's POOL identity (type:count), not the
+	// provider's SKU id, so a block stays confined to what ran out: an L4:8 shortage must
+	// not exclude L4:1. Always an exact match: "" is a CPU-only Pod's, never every
+	// accelerator.
+	Accelerator string
+	// CapacityType, for DenyCandidate: empty => every capacity type.
 	CapacityType nebulav1alpha1.CapacityType
-	// Region: nil => the provider has no region axis (Modal, whose candidates carry an
-	// empty region too); &"us-east-1" => that region only, so a shortage there does not
-	// disqualify us-west-2.
-	Region *string
-	// DenyAll true => block everything on this provider (auth/quota errors), ignoring the
-	// fields above. Still scoped to this one provider; it never spans providers.
-	DenyAll bool
+	// Region, for DenyRegion and DenyCandidate: that region only, so a shortage there does
+	// not disqualify another. Exact like Accelerator: "" matches only candidates without a
+	// region, such as a Modal create spanning several, never the region-pinned ones.
+	Region string
+	// Workload, for DenyWorkload: the Pod's util.WorkloadKey, so replicas share one block and
+	// a changed template starts clean.
+	Workload string
 }

@@ -68,6 +68,9 @@ spec:
           # only way to turn AWS off, which registers even without credentials. Drain a
           # provider first: once dropped, nothing terminates its running instances.
           # - --providers=runpod
+          # The kubernetes provider's cluster table, from the optional ConfigMap mounted below.
+          # Absent ConfigMap = no file = the provider is skipped at registration.
+          - --kubernetes-clusters=/etc/nebula/kubernetes/clusters.yaml
         image: controller:latest
         name: manager
         imagePullPolicy: IfNotPresent
@@ -189,14 +192,22 @@ spec:
           requests:
             cpu: "1"
             memory: 1Gi
-        # Empty, not absent: config/default appends the cert mounts here with a JSON
-        # patch (`.../volumeMounts/-`), which needs the key to exist.
-        volumeMounts: []
+        volumeMounts:
+          - name: kubernetes-clusters
+            mountPath: /etc/nebula/kubernetes
+            readOnly: true
         #   # The catalog ConfigMap mount, off with NEBULA_CATALOG_DIR above.
         #   - name: catalog
         #     mountPath: /etc/nebula/catalog
         #     readOnly: true
-      volumes: []
+      volumes:
+        - name: kubernetes-clusters
+          configMap:
+            # Unprefixed on purpose: with `- ../kubernetes-provider` in config/default,
+            # namePrefix rewrites this to the generated "nebula-kubernetes-clusters".
+            # optional, so without it the provider is just skipped.
+            name: kubernetes-clusters
+            optional: true
       #   - name: catalog
       #     configMap:
       #       # Unprefixed on purpose: config/default's namePrefix rewrites this

@@ -30,14 +30,12 @@ import (
 // deterministic (package scripts forbid wall-clock reads anyway).
 var baseTime = time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)
 
-// ptr is a compact helper for the three-state BlockScope pointer fields.
-func ptr(s string) *string { return &s }
-
 func spotH100EastScope() provider.BlockScope {
 	return provider.BlockScope{
-		Accelerator:  ptr("H100"),
+		Deny:         provider.DenyCandidate,
+		Accelerator:  "H100",
 		CapacityType: nebulav1alpha1.CapacitySpot,
-		Region:       ptr("us-east-1"),
+		Region:       "us-east-1",
 	}
 }
 
@@ -97,58 +95,82 @@ func TestBlocked_ScopeMatchIsPrecise(t *testing.T) {
 	}
 }
 
-func TestBlocked_WildcardFieldsMatchAnyValue(t *testing.T) {
+func TestBlocked_DenyRegionBlocksOneRegion(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
-	// Wildcard Accelerator + wildcard Region (&"") => blocks Spot on aws
-	// everywhere, any GPU. The pointers are deliberately non-nil-empty: nil would
-	// mean "no such axis" and match only an empty candidate field.
-	bl.Record("aws", provider.BlockScope{
-		Accelerator:  ptr(""),
-		CapacityType: spot,
-		Region:       ptr(""),
-	}, 10*time.Minute)
+	bl.Record("kubernetes", provider.BlockScope{Deny: provider.DenyRegion, Region: "us-east-1"}, 10*time.Minute)
 
-	if !bl.Blocked(cand("aws", "H100", spot, "us-east-1")) {
-		t.Error("H100/us-east-1 Spot should be blocked by the wildcard Spot scope")
+	if !bl.Blocked(cand("kubernetes", "H100", spot, "us-east-1")) ||
+		!bl.Blocked(cand("kubernetes", "A100", onDemand, "us-east-1")) {
+		t.Error("DenyRegion must block every accelerator and tier in its region")
 	}
-	if !bl.Blocked(cand("aws", "A100", spot, "eu-west-1")) {
-		t.Error("A100/eu-west-1 Spot should also be blocked by the wildcard Spot scope")
-	}
-	if bl.Blocked(cand("aws", "H100", onDemand, "us-east-1")) {
-		t.Error("OnDemand must survive a Spot-only wildcard block")
+	if bl.Blocked(cand("kubernetes", "H100", spot, "us-west-1")) {
+		t.Error("DenyRegion must not block another region")
 	}
 }
 
-// A nil axis is "not applicable": it matches only a candidate whose field is empty,
-// never a populated one. This is how a region-simple provider (Modal: nil Region)
-// or a CPU-only Pod (nil Accelerator) blocks without widening across an axis it
-// never had. Contrast &"" (wildcard), which matches any value — see the test above.
-func TestBlocked_NilFieldMatchesOnlyEmptyCandidate(t *testing.T) {
+func TestBlocked_DenyWorkloadBlocksOneWorkload(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
-	// A region-simple provider's block: nil Region, nil Accelerator, Spot only.
-	bl.Record("modal", provider.BlockScope{CapacityType: spot}, 10*time.Minute)
+	bl.Record("kubernetes", provider.BlockScope{
+		Deny: provider.DenyWorkload, Accelerator: "L4:1", CapacityType: spot, Region: "us-east-1", Workload: "rs-a",
+	}, 10*time.Minute)
 
-	// A region-simple candidate carries an empty region and (CPU Pod) empty
-	// accelerator, so the nil axes match it.
-	if !bl.Blocked(cand("modal", "", spot, "")) {
-		t.Error("nil-axis Spot block should match the empty-field candidate")
+	c := cand("kubernetes", "L4:1", spot, "us-east-1")
+	c.Workload = "rs-a"
+	if !bl.Blocked(c) {
+		t.Error("DenyWorkload must block its workload's candidate")
 	}
-	// A populated candidate field is NOT matched by a nil axis: it is out of scope,
-	// not wildcarded in.
+	other := c
+	other.Workload = "rs-b"
+	elsewhere := c
+	elsewhere.Region = "us-west-1"
+	if bl.Blocked(other) || bl.Blocked(elsewhere) {
+		t.Error("DenyWorkload must not block another workload, or another candidate")
+	}
+	// An unkeyed scope blocks nothing, rather than every workload.
+	bl.Record("kubernetes", provider.BlockScope{Deny: provider.DenyWorkload, Region: "us-west-1"}, 10*time.Minute)
+	if bl.Blocked(cand("kubernetes", "", "", "us-west-1")) {
+		t.Error("DenyWorkload without a workload must block nothing")
+	}
+}
+
+func TestBlocked_EmptyCapacityTypeMatchesEveryTier(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	anyTier := provider.BlockScope{Deny: provider.DenyCandidate, Accelerator: "H100", Region: "us-east-1"}
+	bl.Record("aws", anyTier, 10*time.Minute)
+
+	if !bl.Blocked(cand("aws", "H100", spot, "us-east-1")) || !bl.Blocked(cand("aws", "H100", onDemand, "us-east-1")) {
+		t.Error("an empty CapacityType must block both tiers")
+	}
+	if bl.Blocked(cand("aws", "A100", spot, "us-east-1")) {
+		t.Error("the accelerator still matches exactly")
+	}
+}
+
+// Empty Accelerator and Region match only candidates without them: a CPU-only Pod or a
+// region-less provider (Modal) blocks without widening to a GPU or a region-pinned one.
+func TestBlocked_EmptyFieldsMatchOnlyEmptyCandidate(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	bl.Record("modal", provider.BlockScope{Deny: provider.DenyCandidate, CapacityType: spot}, 10*time.Minute)
+
+	if !bl.Blocked(cand("modal", "", spot, "")) {
+		t.Error("the block should match the empty-field candidate")
+	}
 	if bl.Blocked(cand("modal", "H100", spot, "")) {
-		t.Error("nil Accelerator must not match a populated accelerator")
+		t.Error("an empty Accelerator must not match a populated accelerator")
 	}
 	if bl.Blocked(cand("modal", "", spot, "us-east-1")) {
-		t.Error("nil Region must not match a populated region")
+		t.Error("an empty Region must not match a populated region")
 	}
 }
 
 func TestBlocked_DenyAllBlocksWholeProvider(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
-	bl.Record("aws", provider.BlockScope{DenyAll: true}, 10*time.Minute)
+	bl.Record("aws", provider.BlockScope{Deny: provider.DenyAll}, 10*time.Minute)
 
 	// Every accelerator/tier/region on aws is blocked...
 	if !bl.Blocked(cand("aws", "H100", onDemand, "us-west-2")) {
@@ -222,9 +244,9 @@ func TestRecord_NoOpOnInvalidInput(t *testing.T) {
 	bl := newWithClock(fc)
 
 	// Empty provider and non-positive TTL must not install a block.
-	bl.Record("", provider.BlockScope{DenyAll: true}, 10*time.Minute)
-	bl.Record("aws", provider.BlockScope{DenyAll: true}, 0)
-	bl.Record("aws", provider.BlockScope{DenyAll: true}, -time.Minute)
+	bl.Record("", provider.BlockScope{Deny: provider.DenyAll}, 10*time.Minute)
+	bl.Record("aws", provider.BlockScope{Deny: provider.DenyAll}, 0)
+	bl.Record("aws", provider.BlockScope{Deny: provider.DenyAll}, -time.Minute)
 
 	if bl.Blocked(Candidate{Provider: "aws", Accelerator: "H100"}) {
 		t.Error("invalid Record inputs must not block anything")
@@ -232,15 +254,21 @@ func TestRecord_NoOpOnInvalidInput(t *testing.T) {
 	if bl.Blocked(Candidate{Provider: "", Accelerator: "H100"}) {
 		t.Error("empty-provider block must not exist")
 	}
+
+	// A scope without a known policy covers nothing, so it is not recorded either.
+	bl.Record("aws", provider.BlockScope{}, 10*time.Minute)
+	bl.Record("aws", provider.BlockScope{Deny: "Everything", Region: "us-east-1"}, 10*time.Minute)
+	if n := len(bl.entries); n != 0 {
+		t.Errorf("len(entries) = %d, want 0 for scopes without a known policy", n)
+	}
 }
 
 func TestRecord_CoalescesIdenticalScope(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
 
-	// Several Pods failing for the SAME (provider, accelerator, tier, region) reason,
-	// each allocating its own scope value (distinct *string pointers), must collapse
-	// to ONE entry rather than one per failure.
+	// Several Pods failing for the SAME (provider, accelerator, tier, region) reason must
+	// collapse to ONE entry rather than one per failure.
 	for i := 0; i < 5; i++ {
 		bl.Record("aws", spotH100EastScope(), 10*time.Minute)
 	}
@@ -281,32 +309,16 @@ func TestRecord_DistinctScopesStaySeparate(t *testing.T) {
 
 	// Scopes differing on any single axis are different blocks and must NOT coalesce.
 	bl.Record("aws", spotH100EastScope(), 10*time.Minute) // H100/Spot/us-east-1
-	bl.Record("aws", provider.BlockScope{                 // different region
-		Accelerator: ptr("H100"), CapacityType: spot, Region: ptr("us-west-2"),
-	}, 10*time.Minute)
-	bl.Record("aws", provider.BlockScope{ // different tier
-		Accelerator: ptr("H100"), CapacityType: onDemand, Region: ptr("us-east-1"),
-	}, 10*time.Minute)
+	westScope, onDemandScope := spotH100EastScope(), spotH100EastScope()
+	westScope.Region, onDemandScope.CapacityType = "us-west-2", onDemand
+	regionScope := provider.BlockScope{Deny: provider.DenyRegion, Region: "us-east-1"}
+	bl.Record("aws", westScope, 10*time.Minute)             // different region
+	bl.Record("aws", onDemandScope, 10*time.Minute)         // different tier
+	bl.Record("aws", regionScope, 10*time.Minute)           // different policy
 	bl.Record("modal", spotH100EastScope(), 10*time.Minute) // different provider
 
-	if n := len(bl.entries); n != 4 {
-		t.Fatalf("len(entries) = %d, want 4 (distinct scopes must not coalesce)", n)
-	}
-}
-
-func TestRecord_NilAndWildcardScopesDoNotCoalesce(t *testing.T) {
-	fc := testclock.NewFakeClock(baseTime)
-	bl := newWithClock(fc)
-
-	// nil (axis not applicable) and &"" (wildcard) are semantically different scopes,
-	// so scopeEqual must keep them as separate entries.
-	nilAxes := provider.BlockScope{CapacityType: spot}
-	wildcardAxes := provider.BlockScope{Accelerator: ptr(""), Region: ptr(""), CapacityType: spot}
-	bl.Record("aws", nilAxes, 10*time.Minute)
-	bl.Record("aws", wildcardAxes, 10*time.Minute)
-
-	if n := len(bl.entries); n != 2 {
-		t.Fatalf("len(entries) = %d, want 2 (nil and wildcard scopes are distinct)", n)
+	if n := len(bl.entries); n != 5 {
+		t.Fatalf("len(entries) = %d, want 5 (distinct scopes must not coalesce)", n)
 	}
 }
 
@@ -315,12 +327,139 @@ func TestRecord_ExpiredEntriesAreGarbageCollected(t *testing.T) {
 	bl := newWithClock(fc)
 	bl.Record("aws", spotH100EastScope(), time.Minute)
 
-	// Let the first entry expire, then record another: the GC on Record should drop
-	// the stale one so the slice does not grow unbounded.
-	fc.Step(2 * time.Minute)
-	bl.Record("aws", provider.BlockScope{DenyAll: true}, time.Minute)
+	// Let the first entry expire and its probe pass unrefused, then record another: the GC
+	// on Record should drop the stale one so the slice stays bounded.
+	fc.Step(time.Minute)
+	bl.Admit(cand("aws", "H100", spot, "us-east-1"))
+	fc.Step(ProbeWindow)
+	bl.Record("aws", provider.BlockScope{Deny: provider.DenyAll}, time.Minute)
 
 	if n := len(bl.entries); n != 1 {
 		t.Fatalf("len(entries) = %d, want 1 (stale entry should be GC'd on Record)", n)
+	}
+}
+
+// A lapsed block admits ONE probe; every other caller is held back for ProbeWindow, so a
+// candidate still out costs one attempt per expiry instead of one per waiting Pod.
+func TestAdmit_HalfOpenAdmitsOneProbe(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+
+	if until, ok := bl.Admit(c); ok || until != 30*time.Second {
+		t.Fatalf("while blocked: Admit = (%v, %v), want (30s, false)", until, ok)
+	}
+	fc.Step(30 * time.Second)
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("the first Admit after the block lapsed must be the probe")
+	}
+	for i := 0; i < 3; i++ {
+		if until, ok := bl.Admit(c); ok || until != ProbeWindow {
+			t.Fatalf("Admit %d during the probe = (%v, %v), want (%v, false)", i, until, ok, ProbeWindow)
+		}
+	}
+	if !bl.Blocked(c) {
+		t.Error("a probing candidate must read as blocked to everyone else")
+	}
+}
+
+// A refused probe is recorded like any failure and blocks the candidate again for its TTL.
+func TestAdmit_RefusedProbeBlocksAgain(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	fc.Step(30 * time.Second)
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("want the probe admitted")
+	}
+
+	fc.Step(15 * time.Second) // the node autoscaler refuses the probe
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	if until, ok := bl.Admit(c); ok || until != 30*time.Second {
+		t.Fatalf("after the probe was refused: Admit = (%v, %v), want (30s, false)", until, ok)
+	}
+	// And the cycle repeats: one probe once that block lapses.
+	fc.Step(30 * time.Second)
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("want the next probe admitted once the renewed block lapsed")
+	}
+}
+
+// A probe not refused within ProbeWindow was let through, so the candidate opens for all.
+func TestAdmit_UnrefusedProbeOpensTheCandidate(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	fc.Step(30 * time.Second)
+	bl.Admit(c)
+
+	fc.Step(ProbeWindow)
+	for i := 0; i < 3; i++ {
+		if _, ok := bl.Admit(c); !ok {
+			t.Fatalf("Admit %d after an unrefused probe = false, want the candidate open", i)
+		}
+	}
+	if n := len(bl.entries); n != 0 {
+		t.Fatalf("len(entries) = %d, want 0 once the probe window passed", n)
+	}
+}
+
+// A half-open block nobody probed is stale past halfOpenGrace: the next burst goes out whole
+// instead of behind one probe on a shortage long gone. Within the grace it still probes.
+func TestAdmit_UnprobedHalfOpenExpiresAfterGrace(t *testing.T) {
+	c := cand("aws", "H100", spot, "us-east-1")
+	for _, tc := range []struct {
+		name      string
+		idle      time.Duration // after the block lapsed, before the burst
+		wantProbe bool
+	}{
+		// Fixed durations, not halfOpenGrace itself, so an entry that never goes stale fails.
+		{"moments after the lapse", 30 * time.Second, true},
+		{"a day after the lapse", 24 * time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := testclock.NewFakeClock(baseTime)
+			bl := newWithClock(fc)
+			bl.Record("aws", spotH100EastScope(), 30*time.Second)
+			fc.Step(30*time.Second + tc.idle)
+
+			admitted := 0
+			for i := 0; i < 3; i++ {
+				if _, ok := bl.Admit(c); ok {
+					admitted++
+				}
+			}
+			if want := map[bool]int{true: 1, false: 3}[tc.wantProbe]; admitted != want {
+				t.Fatalf("burst of 3 admitted %d, want %d", admitted, want)
+			}
+			if !tc.wantProbe && len(bl.entries) != 0 {
+				t.Fatalf("len(entries) = %d, want the stale entry dropped", len(bl.entries))
+			}
+		})
+	}
+}
+
+// Only Admit claims the probe: a read-only query of a half-open candidate sees it as not
+// blocked and leaves the probe for placement.
+func TestBlockedUntil_NeverAdmitsAProbe(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	c := cand("aws", "H100", spot, "us-east-1")
+	bl.Record("aws", spotH100EastScope(), 30*time.Second)
+	fc.Step(30 * time.Second)
+
+	for i := 0; i < 3; i++ {
+		if until, blocked := bl.BlockedUntil(c); blocked || until != 0 {
+			t.Fatalf("BlockedUntil %d of a half-open candidate = (%v, %v), want (0, false)", i, until, blocked)
+		}
+	}
+	if _, ok := bl.Admit(c); !ok {
+		t.Fatal("the probe must still be available to Admit")
+	}
+	if _, ok := bl.Admit(cand("aws", "A100", spot, "us-east-1")); !ok {
+		t.Fatal("a candidate no entry covers is always admitted")
 	}
 }

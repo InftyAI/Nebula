@@ -57,6 +57,11 @@ const defaultBlocklistTTL = 30 * time.Second
 // expires and they stampede the same just-freed candidate together.
 const blocklistJitter = 30 * time.Second
 
+// specErrorBlockTTL is how long a spec error blocks its candidate for the workload, in place
+// of the pool's TTL: the spec will not fix itself in seconds, and a fixed template is a new
+// workload anyway (see util.WorkloadKey). Still finite, as the candidate's side can change too.
+const specErrorBlockTTL = 10 * time.Minute
+
 // defaultReadyDeadline bounds how long a pod may sit Initializing before the virtual node
 // gives up on it.
 const defaultReadyDeadline = 10 * time.Minute
@@ -117,6 +122,11 @@ type Handler struct {
 	// provision is wrong and unrecoverable.
 	tracked map[string]*trackedPod
 
+	// storeSeq numbers stores into tracked, only so a poll tick can tell which pods were
+	// stored after its List began: such a pod can be missing from that List while alive,
+	// so the List is no verdict on it (see reconcileOnce).
+	storeSeq uint64
+
 	notify func(*corev1.Pod)
 
 	// nowFn, pollEvery and readyDeadline are seams for tests. readyDeadline is
@@ -137,6 +147,7 @@ type trackedPod struct {
 	pod       *corev1.Pod
 	claimName string
 	instance  string
+	storeSeq  uint64 // see Handler.storeSeq
 	// patchedMeta is what VK has already patched onto the Pod in the API server. notify
 	// fires every poll tick for the pod's whole life, and the pod it hands us is our own
 	// stamped copy — which always carries these values, so it cannot say whether they ever
@@ -360,7 +371,7 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// The env COUNT, never its content: a value here may have come from a Secret.
 	log.Info("provisioning external instance",
 		"capacityType", req.CapacityType, "region", req.Region,
-		"envVars", len(req.Env), "timeout", timeout.String())
+		"envVars", len(req.Env.Config)+len(req.Env.Secrets), "timeout", timeout.String())
 
 	// Two clocks for two different waits: provisioningAt measures the end-to-end wait a
 	// user feels (until the instance reports Running; handed to store below), callStart
@@ -666,7 +677,13 @@ func (h *Handler) pollLoop(ctx context.Context) {
 // List always fails would otherwise strand every pod in its last status with no signal.
 func (h *Handler) reconcileOnce(ctx context.Context) {
 	log := logf.FromContext(ctx).WithName("vnode-poll").WithValues("provider", h.prov.Name())
+	h.mu.Lock()
+	listSeq := h.storeSeq
+	h.mu.Unlock()
 	instances, err := h.prov.List(ctx)
+	// The tick doubles as the credential probe: it runs on a cadence through the provider's
+	// auth path, so a token that dies mid-life shows up here every tick.
+	metrics.RecordProviderAuth(h.prov.Name(), err)
 	if err != nil {
 		log.Error(err, "provider List failed; tracked pod statuses will not advance this tick")
 		return // transient; retry on the next tick
@@ -677,21 +694,40 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 
 	h.mu.Lock()
-	emit := make([]*corev1.Pod, 0, len(h.tracked))
-	tracked := len(h.tracked)
-	matched, frozen := 0, 0
+	trackedCount := len(h.tracked)
+	emit := make([]*corev1.Pod, 0, trackedCount)
+	// failed are placements to block once the lock is released: the TTL comes from the
+	// pod's NodePool, and that read does not belong under h.mu.
+	var failed []failedPlacement
+	updated, finished, gone := 0, 0, 0
 	for _, tp := range h.tracked {
 		inst, present := byClaim[tp.claimName]
 		before := statusSignature(tp.pod)
 		switch {
 		// No reverse for a terminal or deleting pod.
-		case util.IsTerminalPodPhase(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
-			frozen++
+		case util.Finished(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
+			finished++
+		case !present && tp.storeSeq > listSeq:
+			// Stored while List was in flight; the next tick decides.
 		case !present:
+			gone++
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
+		case inst.State == provider.InstanceFailed && inst.Err != nil:
+			// A failure the provider gave a reason for: the Provision error path, arriving
+			// late, so classified and blocked alike. Failing the Pod is once only, as Finished
+			// freezes it above.
+			updated++
+			err := fmt.Errorf("external instance failed: %w", inst.Err)
+			log.Info("external instance failed; failing the pod",
+				"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance, "error", err.Error())
+			applyClassifiedFailure(tp.pod, err.Error(), h.nowFn())
+			failed = append(failed, failedPlacement{
+				pod: tp.pod.DeepCopy(), claim: tp.claimName, region: inst.Region, err: err,
+			})
 		default:
-			matched++
-			if waited, over := h.readyExpired(tp, inst.State); over {
+			updated++
+			state := inst.State
+			if waited, over := h.readyExpired(tp, state); over {
 				// Failing the Pod is the whole action: teardown follows from the
 				// terminal phase, via the reap (see readyExpired).
 				log.Info("readiness deadline exceeded; failing the pod",
@@ -700,11 +736,11 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 				applyReadinessTimeout(tp.pod, waited, h.nowFn())
 				break
 			}
-			applyState(tp.pod, inst.State, inst.Endpoint, h.nowFn())
+			applyState(tp.pod, state, inst.Endpoint, h.nowFn())
 			// The observed address, for a provider that cannot know it before boot.
 			// Empty for one that published at create, which must not clear it.
 			setEndpoint(tp.pod, inst.Endpoint)
-			h.observeReady(tp, inst.State)
+			h.observeReady(tp, state)
 		}
 		// Log before -> after every tick: a differing pair is the lifecycle moving
 		// (Provisioning -> Initializing -> Running, or -> Terminated), an equal pair
@@ -717,12 +753,26 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	notify := h.notify
 	h.mu.Unlock()
 
-	// V(1) so a healthy steady state stays quiet. tracked>0 with matched==0 means the
-	// claim names don't line up with what List returns — the classic "provisioned but
-	// never Running". frozen is what keeps that reading valid: a terminal or deleting pod is
-	// deliberately not matched, so without it those would look like the same failure.
+	for _, b := range failed {
+		pool, err := h.poolFor(ctx, b.pod)
+		if err != nil {
+			pool = nil // the default TTL; a block with the wrong length beats no block
+		}
+		// The tier the instance was placed under, from the claim that recorded it, so a
+		// late Spot shortage blocks Spot alone, as a failed Provision would.
+		if nc, err := h.claimFor(ctx, b.pod, b.claim); err == nil {
+			b.err = provider.WithTier(nc.Spec.CapacityType, b.err)
+		}
+		h.recordBlock(ctx, b.pod, b.region, blocklistTTLOf(pool), b.err)
+	}
+
+	// V(1) so a healthy steady state stays quiet. updated, finished and gone split the tracked
+	// pods between them. All of them gone means the claim names don't line up with what List
+	// returns — the classic "provisioned but never Running"; finished keeps that reading valid,
+	// since a finished or deleting pod is never matched and would otherwise look the same.
 	log.V(1).Info("poll tick",
-		"listed", len(instances), "tracked", tracked, "matched", matched, "frozen", frozen)
+		"listedInstances", len(instances), "trackedCount", trackedCount,
+		"updated", updated, "finished", finished, "gone", gone)
 
 	// Re-emit EVERY tracked pod each tick, which makes status propagation
 	// level-triggered. VK dedups an emit against the last status IT received from us,
@@ -743,10 +793,14 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// readyExpired maintains the Initializing clock and reports whether it has run
-// past the deadline, with how long the pod has been there.
+// readyExpired maintains the not-usable clock and reports whether it has run past the
+// deadline, with how long the pod has been there. It counts InstancePending and
+// InstanceNotReady alike, so a workload that never comes up and one that stops being ready
+// both fail once unusable for the whole deadline; Running resets it, so a brief unready spell
+// costs nothing. InstanceProvisioning is not counted: a wait for capacity is the provider's
+// to bound (the Kubernetes provider's bindTimeout), and the budget is for booting.
 //
-// It anchors on the FIRST observation of InstancePending, not on provisioningAt: the
+// It anchors on the FIRST observation of a not-usable state, not on provisioningAt: the
 // provision call is bounded separately (see defaultProvisionTimeout), so measuring from
 // there would spend the readiness budget on a box that had barely started booting. Any
 // other state RESETS the clock rather than merely pausing it — a demoted pod gets a fresh
@@ -764,7 +818,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 //
 // Callers must hold h.mu.
 func (h *Handler) readyExpired(tp *trackedPod, state provider.InstanceState) (time.Duration, bool) {
-	if state != provider.InstancePending {
+	if state != provider.InstancePending && state != provider.InstanceNotReady {
 		tp.initializingAt = time.Time{}
 		return 0, false
 	}
@@ -873,10 +927,12 @@ func statusSignature(pod *corev1.Pod) string {
 func (h *Handler) store(pod *corev1.Pod, claim, instance string, place *placement) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.storeSeq++
 	h.tracked[key(pod.Namespace, pod.Name)] = &trackedPod{
 		pod:       pod.DeepCopy(),
 		claimName: claim,
 		instance:  instance,
+		storeSeq:  h.storeSeq,
 		placement: place,
 	}
 }
@@ -1114,6 +1170,10 @@ func (h *Handler) recordBlock(
 		// would exclude the whole provider.
 		return
 	}
+	if scope.Deny == provider.DenyWorkload {
+		scope.Workload = util.WorkloadKey(pod)
+		baseTTL = specErrorBlockTTL
+	}
 
 	// baseTTL + jitter, so Pods that failed for the SAME scope do not all re-probe the
 	// just-freed candidate at once. Coalescing keeps the latest expiry, so jittered records
@@ -1126,6 +1186,15 @@ func (h *Handler) recordBlock(
 		"recording blocklist entry for failed placement",
 		"provider", h.prov.Name(), "scope", scope, "ttl", ttl.String(), "error", err.Error())
 	h.blocklist.Record(h.prov.Name(), scope, ttl)
+}
+
+// failedPlacement is a placement the poll loop found failed, whose block it records after
+// unlocking. The provider's classification of err decides the scope.
+type failedPlacement struct {
+	pod    *corev1.Pod
+	claim  string
+	region string
+	err    error
 }
 
 func ptrNow(t metav1.Time) *metav1.Time { return &t }

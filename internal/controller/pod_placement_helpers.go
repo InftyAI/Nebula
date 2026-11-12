@@ -176,7 +176,13 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				continue
 			}
 			for _, region := range regions { // inner: region
-				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
+				if accel != "" && !servesAcceleratorIn(prov, accel, region) {
+					metrics.RecordCandidateSkip(ref.Name, tier, region, metrics.SkipAcceleratorUnsupported)
+					log.V(1).Info("skipping candidate: region does not offer the accelerator",
+						"provider", ref.Name, "accelerator", accelerator, "region", region)
+					continue
+				}
+				if until, blocked := r.blockedUntil(pod, ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
 					metrics.RecordCandidateSkip(ref.Name, tier, region, metrics.SkipBlocked)
@@ -211,6 +217,13 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			"accelerator", util.AcceleratorPool(accel, count), "skipped", skipped)
 	}
 	return placement{}, false, soonest
+}
+
+// servesAcceleratorIn reports whether prov offers the accelerator in region, which only a
+// provider.RegionAccelerators narrows below what MapAccelerator already said.
+func servesAcceleratorIn(prov provider.Provider, accel, region string) bool {
+	ra, ok := prov.(provider.RegionAccelerators)
+	return !ok || ra.ServesAcceleratorIn(accel, region)
 }
 
 // placementLabels renders the metric label set for a completed placement. It mirrors
@@ -263,22 +276,27 @@ func requestedGeographies(pod *corev1.Pod) (narrowTo []string, ok bool) {
 	return out, len(out) > 0
 }
 
-// blockedUntil reports whether the (provider, accelerator, tier, region)
-// candidate is currently excluded by the failover blocklist and, if so, how long
-// until it frees (for the requeue hint). accelerator is the request's pool
-// identity (type:count; see selectPlacement), so a capacity block matches only
-// candidates on the same pool. It is nil-safe: with no blocklist wired (tests, or
-// a blocklist-less build) nothing is ever blocked.
-func (r *PodPlacementReconciler) blockedUntil(provName, accelerator string, tier nebulav1alpha1.CapacityType, region string) (time.Duration, bool) {
+// blockedUntil reports whether the failover blocklist holds the (provider, accelerator,
+// tier, region) candidate back and, if so, how long until it frees (for the requeue hint).
+// A false result admits the candidate, as a lapsed block's probe if it is one, so call it
+// only for the candidate about to be selected. accelerator is the request's pool identity
+// (type:count; see selectPlacement), so a capacity block matches only candidates on the
+// same pool. It is nil-safe: with no blocklist wired (tests, or a blocklist-less build)
+// nothing is ever blocked.
+func (r *PodPlacementReconciler) blockedUntil(
+	pod *corev1.Pod, provName, accelerator string, tier nebulav1alpha1.CapacityType, region string,
+) (time.Duration, bool) {
 	if r.Blocklist == nil {
 		return 0, false
 	}
-	return r.Blocklist.BlockedUntil(failover.Candidate{
+	until, admitted := r.Blocklist.Admit(failover.Candidate{
 		Provider:     provName,
 		Accelerator:  accelerator,
 		CapacityType: tier,
 		Region:       region,
+		Workload:     util.WorkloadKey(pod),
 	})
+	return until, !admitted
 }
 
 // requeueJitter maps a Pod UID to a stable offset in [0, blockRequeueJitter) to
@@ -411,7 +429,7 @@ func (r *PodPlacementReconciler) reapTerminalPod(ctx context.Context, pod *corev
 	if !pod.DeletionTimestamp.IsZero() {
 		return true, nil // already being deleted; nothing more to place
 	}
-	if !util.IsTerminalPodPhase(pod.Status.Phase) {
+	if !util.Finished(pod.Status.Phase) {
 		return false, nil
 	}
 	if !isControllerOwned(pod) {

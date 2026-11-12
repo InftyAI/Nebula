@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -294,6 +296,7 @@ func TestProvision_MapsResourcesPortsAndTimeout(t *testing.T) {
 			corev1.ResourceCPU:    resource.MustParse("2500m"),
 			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
+		Limits: corev1.ResourceList{util.NvidiaGPUResource: resource.MustParse("1")},
 	}
 	c.Ports = []corev1.ContainerPort{{ContainerPort: 8000}, {ContainerPort: 9090}}
 	deadline := int64(3600)
@@ -544,8 +547,8 @@ func TestProvision_DiskAboveDefaultRefused(t *testing.T) {
 
 func TestClassifyProvisionError(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
-	denyAll := provider.BlockScope{DenyAll: true}
-	onDemand := provider.BlockScope{CapacityType: nebulav1alpha1.CapacityOnDemand}
+	denyAll := provider.BlockScope{Deny: provider.DenyAll}
+	onDemand := provider.BlockScope{Deny: provider.DenyCandidate, CapacityType: nebulav1alpha1.CapacityOnDemand}
 	tests := []struct {
 		name string
 		err  error
@@ -580,12 +583,11 @@ func TestCapabilities(t *testing.T) {
 	if caps.SupportsStop || caps.SupportsSpot || caps.PreemptionNotice != 0 || !caps.NativeTags {
 		t.Fatalf("unexpected caps: %+v", caps)
 	}
-	// Must be STATED, and above the handler's generic default: Provision blocks on the image
-	// build here, so this adapter needs more than a provider whose create just returns an id.
-	// Zero is the regression to guard — it silently reverts to that default.
+	// Must be STATED: Provision blocks on the build and the mint here, so this adapter needs
+	// more than the handler's generic default. Zero is the regression to guard — it silently
+	// reverts to that default.
 	if caps.ProvisionTimeout != provisionTimeout {
-		t.Fatalf("ProvisionTimeout = %v, want %v to cover a cold image build",
-			caps.ProvisionTimeout, provisionTimeout)
+		t.Fatalf("ProvisionTimeout = %v, want %v", caps.ProvisionTimeout, provisionTimeout)
 	}
 	if p.Name() != provider.ProviderModal {
 		t.Fatalf("name = %q", p.Name())
@@ -1150,6 +1152,29 @@ func TestResolveRegions_RoundTripsThroughProvision(t *testing.T) {
 	}
 }
 
+func TestMintTimeoutBlocksTheCandidate(t *testing.T) {
+	// Modal gives up waiting for a worker with a server-side DeadlineExceeded, not our own
+	// context deadline. Unlabelled, it read as unattributable and blocked nothing, so every
+	// replacement Pod queued behind the same full Modal again.
+	p := newTestProvider(&fakeClient{})
+	timedOut := mintError("sb-1", 8080,
+		status.Error(codes.DeadlineExceeded, "Sandbox task ID not found within timeout"))
+	want := provider.BlockScope{
+		Deny: provider.DenyCandidate, Accelerator: "A100-40GB:8", CapacityType: nebulav1alpha1.CapacityOnDemand,
+	}
+	if got := p.ClassifyProvisionError(timedOut, "A100-40GB:8", ""); got != want {
+		t.Fatalf("mint timeout: got %+v, want %+v", got, want)
+	}
+
+	denied := mintError("sb-1", 8080, status.Error(codes.PermissionDenied, "token revoked"))
+	if errors.Is(denied, provider.ErrNoCapacity) {
+		t.Fatal("a mint failure other than the worker wait was labelled a shortage")
+	}
+	if got := p.ClassifyProvisionError(denied, "A100-40GB:8", ""); got.Deny != provider.DenyAll {
+		t.Fatalf("mint auth failure: got %+v, want DenyAll", got)
+	}
+}
+
 func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
 
@@ -1157,20 +1182,20 @@ func TestClassifyProvisionError_ConfinesToFailingRegion(t *testing.T) {
 	// regions are independent pools, so without this the first regional failure would
 	// block every region the pool lists.
 	got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", "us-east")
-	if got.Region == nil || *got.Region != "us-east" {
-		t.Fatalf("expected the block confined to us-east, got Region=%v", got.Region)
+	if got.Deny != provider.DenyCandidate || got.Region != "us-east" {
+		t.Fatalf("expected a candidate block confined to us-east, got %+v", got)
 	}
 
-	// Unconstrained: no region axis was used, so Region stays nil — which per
-	// BlockScope's three-state rule matches only an empty-region candidate, and so
-	// cannot leak onto region-pinned ones.
-	if got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", ""); got.Region != nil {
-		t.Fatalf("expected nil Region for an unconstrained request, got %q", *got.Region)
+	// Unconstrained: no region axis was used, so Region stays empty — which per BlockScope
+	// matches only an empty-region candidate, and so cannot leak onto region-pinned ones.
+	if got := p.ClassifyProvisionError(provider.ErrNoCapacity, "H100:1", ""); got.Region != "" {
+		t.Fatalf("expected an empty Region for an unconstrained request, got %q", got.Region)
 	}
 
 	// Auth fails in every region, so DenyAll must not be narrowed to one.
-	if got := p.ClassifyProvisionError(provider.ErrAuth, "H100:1", "us-east"); got.Region != nil {
-		t.Fatalf("DenyAll must not be confined to a region, got %q", *got.Region)
+	got = p.ClassifyProvisionError(provider.ErrAuth, "H100:1", "us-east")
+	if got != (provider.BlockScope{Deny: provider.DenyAll}) {
+		t.Fatalf("auth must deny the whole provider, got %+v", got)
 	}
 
 	// No error, no block. recordBlock installs any non-empty scope it is handed, so
@@ -1228,7 +1253,7 @@ func TestClassifyProvisionError_ImageBuildNeverDeniesTheProvider(t *testing.T) {
 	// an expired workspace token has to fence the provider, or every replacement Pod retries it.
 	refused := fmt.Errorf("modal: image build: %w",
 		errors.New("rpc error: code = Unauthenticated desc = invalid token"))
-	if got := p.ClassifyProvisionError(refused, "H100:1", "us-east"); !got.DenyAll {
+	if got := p.ClassifyProvisionError(refused, "H100:1", "us-east"); got.Deny != provider.DenyAll {
 		t.Fatalf("Modal refusing our credentials must fence the provider, got %+v", got)
 	}
 }
@@ -1382,7 +1407,7 @@ func TestProvision_MintDeadlineBlocksTheCandidate(t *testing.T) {
 		t.Fatal("Provision succeeded; the sandbox has no credential")
 	}
 	scope := provider.ClassifyError(err, nebulav1alpha1.CapacityOnDemand, "H100:1")
-	if scope == (provider.BlockScope{}) || scope.DenyAll {
+	if scope.Deny != provider.DenyCandidate {
 		t.Fatalf("BlockScope = %+v, want an accelerator-scoped block for a spent budget", scope)
 	}
 }
@@ -1762,7 +1787,9 @@ func TestProvision_UsesResolvedEnv(t *testing.T) {
 
 	if _, err := p.Provision(context.Background(), pod, provider.ProvisionRequest{
 		ClaimName: "claim-env",
-		Env:       map[string]string{"FOO": "bar", "TOKEN": "t0ken"},
+		Env: provider.Env{
+			Config: map[string]string{"FOO": "bar"}, Secrets: map[string]string{"TOKEN": "t0ken"},
+		},
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}

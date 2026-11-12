@@ -33,6 +33,7 @@ Pod-population questions ("how many Pods are gated right now?") by kube-state-me
 - [Where they are served](#where-they-are-served)
 - [Placement](#placement)
 - [Provisioning](#provisioning)
+- [Provider auth](#provider-auth)
 - [Cost](#cost)
 - [Attribution](#attribution)
 - [Label semantics](#label-semantics)
@@ -67,7 +68,7 @@ which is the whole reason for splitting them:
 | `reason` | Means | Clears when |
 | --- | --- | --- |
 | `no_pool` | The Pod names a NodePool that does not exist, or carries no pool label. | A human fixes the Pod (or the workload generating it). |
-| `invalid_request` | The request is malformed — `nvidia.com/gpu` with no accelerator-type label (*not* treated as CPU-only), or a `nebula.inftyai.com/regions` annotation naming no known geography. | A human fixes the Pod spec. |
+| `invalid_request` | The request is malformed — `nvidia.com/gpu` with no accelerator-type label (*not* treated as CPU-only), an accelerator-type label with no `nvidia.com/gpu` request, or a `nebula.inftyai.com/regions` annotation naming no known geography. | A human fixes the Pod spec. |
 | `all_blocked` | A servable candidate exists, but failover is holding every one of them off. | By itself — the Pod is already requeued for the block's expiry. |
 | `no_candidate` | No provider in the pool can serve this request at all. | An operator adds a provider, or a provider registers. |
 | `stale_claim` | A NodeClaim from a prior same-named Pod has not been reaped yet. | By itself, in seconds. A sustained rate means the NodeClaim backstop is stuck. |
@@ -108,6 +109,26 @@ The failure `reason` is a coarse, closed set, mapped from the shared sentinels i
 Fine-grained detail is deliberately *not* here: it stays where it is already available
 (the Pod's `Failed` status message and the `vnode-handler` error log). These labels exist
 to answer "are we losing capacity, or are our credentials broken?" at a glance.
+
+## Provider auth
+
+Whether each provider's credentials still work, from the poll loop's `List` calls: they run
+every few seconds through the provider's auth path, so a token that dies mid-life shows up
+here first.
+
+| Metric | Type | What it answers |
+| --- | --- | --- |
+| `nebula_provider_auth_failures_total{provider}` | counter | How often a provider's credentials or permissions are refused. |
+| `nebula_provider_auth_failing{provider}` | gauge | Whether they are refused *now*: 1 from the first auth failure to the next success. |
+
+Only `ErrAuth` counts. Any other `List` error, a timeout or a dropped connection, leaves both
+unchanged, as it says nothing about credentials. `Provision`'s auth failures are
+`nebula_provision_failures_total{reason="auth"}`, with the candidate's region.
+
+```promql
+# A provider refused for 5 minutes straight.
+max_over_time(nebula_provider_auth_failing[5m]) == 1 and min_over_time(nebula_provider_auth_failing[5m]) == 1
+```
 
 ## Cost
 

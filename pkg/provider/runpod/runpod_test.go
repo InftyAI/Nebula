@@ -176,7 +176,7 @@ func TestProvision_GPUPod(t *testing.T) {
 		ClaimName:    "claim-a",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
 		Region:       "US-KS-2",
-		Env:          map[string]string{"HF_TOKEN": "hf_secret"},
+		Env:          provider.Env{Secrets: map[string]string{"HF_TOKEN": "hf_secret"}},
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -618,17 +618,17 @@ func TestClassifyProvisionError(t *testing.T) {
 	t.Run("capacity is scoped to this accelerator, tier and region", func(t *testing.T) {
 		err := fmt.Errorf("no instances available: %w", provider.ErrNoCapacity)
 		got := p.ClassifyProvisionError(err, accel, region)
-		if got.DenyAll {
-			t.Error("DenyAll = true for a capacity shortage; only this candidate ran out")
+		if got.Deny != provider.DenyCandidate {
+			t.Errorf("Deny = %q for a capacity shortage, want %q; only this candidate ran out", got.Deny, provider.DenyCandidate)
 		}
-		if got.Accelerator == nil || *got.Accelerator != accel {
-			t.Errorf("Accelerator = %v, want %q", got.Accelerator, accel)
+		if got.Accelerator != accel {
+			t.Errorf("Accelerator = %q, want %q", got.Accelerator, accel)
 		}
 		if got.CapacityType != nebulav1alpha1.CapacityOnDemand {
 			t.Errorf("CapacityType = %q, want OnDemand", got.CapacityType)
 		}
-		if got.Region == nil || *got.Region != region {
-			t.Errorf("Region = %v, want %q — a shortage in one DC must not disqualify another",
+		if got.Region != region {
+			t.Errorf("Region = %q, want %q — a shortage in one DC must not disqualify another",
 				got.Region, region)
 		}
 	})
@@ -638,11 +638,11 @@ func TestClassifyProvisionError(t *testing.T) {
 		// the category and keep trying the other candidates against the same dead key.
 		err := fmt.Errorf("401: %w", provider.ErrAuth)
 		got := p.ClassifyProvisionError(err, accel, region)
-		if !got.DenyAll {
-			t.Fatal("DenyAll = false for an auth failure")
+		if got.Deny != provider.DenyAll {
+			t.Fatalf("Deny = %q for an auth failure, want %q", got.Deny, provider.DenyAll)
 		}
-		if got.Region != nil {
-			t.Errorf("Region = %v on a DenyAll scope, want nil", got.Region)
+		if got.Region != "" {
+			t.Errorf("Region = %q on a DenyAll scope, want none", got.Region)
 		}
 	})
 
@@ -657,12 +657,12 @@ func TestClassifyProvisionError(t *testing.T) {
 		}
 	})
 
-	t.Run("an empty region leaves Region nil", func(t *testing.T) {
-		// nil matches only candidates that carry no region either — the unconstrained pool —
+	t.Run("an empty region stays empty", func(t *testing.T) {
+		// "" matches only candidates that carry no region either — the unconstrained pool —
 		// so the block never leaks onto region-pinned candidates.
 		err := fmt.Errorf("no capacity: %w", provider.ErrNoCapacity)
-		if got := p.ClassifyProvisionError(err, accel, ""); got.Region != nil {
-			t.Errorf("Region = %v, want nil", got.Region)
+		if got := p.ClassifyProvisionError(err, accel, ""); got.Region != "" {
+			t.Errorf("Region = %q, want none", got.Region)
 		}
 	})
 }

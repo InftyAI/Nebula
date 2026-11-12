@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -50,7 +52,12 @@ type fakeBlocklist struct {
 	until   time.Duration
 }
 
-func (b *fakeBlocklist) BlockedUntil(c failover.Candidate) (time.Duration, bool) {
+func (b *fakeBlocklist) Admit(c failover.Candidate) (time.Duration, bool) {
+	until, blocked := b.blockedUntil(c)
+	return until, !blocked
+}
+
+func (b *fakeBlocklist) blockedUntil(c failover.Candidate) (time.Duration, bool) {
 	for _, e := range b.blocked {
 		if e.Provider != "" && e.Provider != c.Provider {
 			continue
@@ -106,10 +113,9 @@ func gatedPod(name, ns, uid, pool, gpu string) *corev1.Pod {
 		},
 	}
 	if gpu != "" {
-		// The placement controller matches on the accelerator TYPE only, which
-		// rides on the accelerator-type label; the count (nvidia.com/gpu) is a
-		// provisioning detail the adapter reads, not needed here.
+		// The type and the nvidia.com/gpu count come together (see util.AcceleratorRequest).
 		pod.Labels[nebulav1alpha1.AcceleratorTypeLabel] = gpu
+		pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{util.NvidiaGPUResource: resource.MustParse("1")}
 	}
 	return pod
 }
@@ -467,6 +473,37 @@ func TestPlacement_FailsOverToNextRegionWhenBlocked(t *testing.T) {
 	}
 }
 
+// A spec error blocks the candidate for the Pod's workload, so its replicas fail over while
+// another workload still gets the region.
+func TestPlacement_WorkloadBlockFailsOverOnlyThatWorkload(t *testing.T) {
+	owned := func(name, uid, owner string) *corev1.Pod {
+		pod := gatedPod(name, "default", uid, "pool-a", "H100")
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: owner, UID: types.UID(owner), Controller: ptr.To(true),
+		}}
+		return pod
+	}
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, "us-east-1", "us-west-2")
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{owned("p1", "uid-1", "rs-a"), owned("p2", "uid-2", "rs-b"), pool}, prov)
+	bl := failover.New()
+	bl.Record(provider.ProviderModal, provider.BlockScope{
+		Deny: provider.DenyWorkload, Accelerator: "H100:1", Region: "us-east-1", Workload: "default/ReplicaSet/rs-a",
+	}, time.Hour)
+	r.Blocklist = bl
+
+	reconcilePod(t, r, "default", "p1")
+	reconcilePod(t, r, "default", "p2")
+
+	if got := getClaim(t, c, "default-p1").Spec.Region; got != "us-west-2" {
+		t.Fatalf("blocked workload placed in %q, want failover to us-west-2", got)
+	}
+	if got := getClaim(t, c, "default-p2").Spec.Region; got != "us-east-1" {
+		t.Fatalf("other workload placed in %q, want us-east-1", got)
+	}
+}
+
 func TestPlacement_CapacityIsOuterAxis(t *testing.T) {
 	// Two providers, tiers [Spot, OnDemand]. Spot is blocked on BOTH providers but
 	// OnDemand is free. Capacity is the OUTER axis, so the walk must exhaust every
@@ -527,6 +564,76 @@ func TestPlacement_ExpandsRegionGroupIntoConcreteCandidates(t *testing.T) {
 
 	if region := getClaim(t, c, "default-p1").Spec.Region; region != "us-west-2" {
 		t.Fatalf("expected the group to expand and fail over to us-west-2, got %q", region)
+	}
+}
+
+// regionalProvider offers its GPUs only in some regions, as a provider.RegionAccelerators.
+type regionalProvider struct {
+	*fakeProvider
+	servedIn map[string]bool
+}
+
+func (p regionalProvider) ServesAcceleratorIn(_, region string) bool {
+	return p.servedIn[region]
+}
+
+// A region that does not offer the accelerator is skipped up front, without a placement there
+// that fails and without a block.
+func TestPlacement_SkipsRegionWithoutTheAccelerator(t *testing.T) {
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderKubernetes, "us")
+	prov := regionalProvider{
+		fakeProvider: &fakeProvider{
+			name: provider.ProviderKubernetes, gpus: []string{"H100"},
+			expandRegions: func([]string) []string { return []string{"us-east-1", "us-west-1"} },
+		},
+		servedIn: map[string]bool{"us-west-1": true},
+	}
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool}, prov)
+
+	reconcilePod(t, r, "default", "p1")
+
+	if region := getClaim(t, c, "default-p1").Spec.Region; region != "us-west-1" {
+		t.Fatalf("placed in %q, want us-west-1, the only region offering the accelerator", region)
+	}
+}
+
+// When a block lapses, the Pods waiting on it do not all go: the first is the probe and is
+// placed, the others stay gated and requeue, so a candidate still out costs one attempt.
+func TestPlacement_LapsedBlockAdmitsOneProbe(t *testing.T) {
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, "us-east-1")
+	objs := make([]client.Object, 0, 6)
+	objs = append(objs, pool)
+	for i := range 5 {
+		objs = append(objs, gatedPod(fmt.Sprintf("p%d", i), "default", fmt.Sprintf("uid-%d", i), "pool-a", "H100"))
+	}
+	r, c := newPlacementReconciler(t, objs, &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}})
+	bl := failover.New()
+	bl.Record(provider.ProviderModal, provider.BlockScope{Deny: provider.DenyCandidate, Accelerator: "H100:1",
+		CapacityType: nebulav1alpha1.CapacityOnDemand, Region: "us-east-1"}, time.Millisecond)
+	time.Sleep(5 * time.Millisecond) // the block lapses: half-open
+	r.Blocklist = bl
+
+	placed := 0
+	for i := range 5 {
+		res, err := r.Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: "default", Name: fmt.Sprintf("p%d", i)},
+		})
+		if err != nil {
+			t.Fatalf("reconcile p%d: %v", i, err)
+		}
+		var nc nebulav1alpha1.NodeClaim
+		switch err := c.Get(context.Background(), types.NamespacedName{Name: fmt.Sprintf("default-p%d", i)}, &nc); {
+		case err == nil:
+			placed++
+		case res.RequeueAfter <= 0:
+			t.Errorf("p%d was held back without a requeue", i)
+		}
+	}
+	if placed != 1 {
+		t.Fatalf("placed %d Pods against the lapsed block, want 1, the probe", placed)
 	}
 }
 
