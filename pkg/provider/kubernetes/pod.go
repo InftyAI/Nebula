@@ -25,6 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -39,6 +40,7 @@ const (
 	envSecretSuffix = "-env"
 
 	labelTrue = "true"
+	podKind   = "Pod"
 )
 
 // ownerLabels mark what this provider created. Placeholders carry neither (placement puts the
@@ -60,6 +62,15 @@ func ownedByUs(obj metav1.Object) bool {
 	return true
 }
 
+// ownedByPod reports whether obj names the pod with uid among its owners. Labels say Nebula
+// made it, not for which pod: one left by an earlier pod of the same name carries the same
+// labels, and garbage collection removes it once that pod is gone.
+func ownedByPod(obj metav1.Object, uid types.UID) bool {
+	return slices.ContainsFunc(obj.GetOwnerReferences(), func(r metav1.OwnerReference) bool {
+		return r.Kind == podKind && r.UID == uid
+	})
+}
+
 // envSecretName is the env Secret's name for the real pod podName, with a hash of podName in
 // place of its tail when the suffix would pass maxNameLen, so two long names never meet.
 func envSecretName(podName string) string {
@@ -68,7 +79,9 @@ func envSecretName(podName string) string {
 	}
 	sum := sha256.Sum256([]byte(podName))
 	keep := maxNameLen - len(envSecretSuffix) - nameHashLen - 1
-	return podName[:keep] + "-" + hex.EncodeToString(sum[:])[:nameHashLen] + envSecretSuffix
+	// A cut at a "." would start the hash's label with "-", which no DNS-1123 label may.
+	prefix := strings.TrimRight(podName[:keep], ".-")
+	return prefix + "-" + hex.EncodeToString(sum[:])[:nameHashLen] + envSecretSuffix
 }
 
 // podSpec is everything buildPod needs that is not on the placeholder.
@@ -98,6 +111,11 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 
 	labels := map[string]string{}
 	for _, k := range s.costLabels {
+		// Nebula's own labels drive placement, not cost: the opt-in one alone would send the
+		// real pod back through Nebula when the host is the target, whatever lists it.
+		if strings.HasPrefix(k, nebulav1alpha1.GroupVersion.Group+"/") {
+			continue
+		}
 		if v, ok := local.Labels[k]; ok {
 			labels[k] = v
 		}
@@ -152,8 +170,9 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 }
 
 // withNodeRequirements adds the node autoscaler's required node affinity to the user's own.
-// Required terms are ORed, so the requirements go into every one of them; preferences and
-// pod (anti-)affinity are left as the user wrote them.
+// Required terms are ORed, so the requirements go into every one of them, except an empty
+// term, which matches no node and must stay that way; preferences and pod (anti-)affinity are
+// left as the user wrote them.
 func withNodeRequirements(user, ours *corev1.Affinity) *corev1.Affinity {
 	if ours == nil || ours.NodeAffinity == nil || ours.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
 		return user
@@ -168,12 +187,16 @@ func withNodeRequirements(user, ours *corev1.Affinity) *corev1.Affinity {
 		out.NodeAffinity = &corev1.NodeAffinity{}
 	}
 	required := out.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
-	if required == nil || len(required.NodeSelectorTerms) == 0 {
+	if required == nil {
 		out.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = ourRequired.DeepCopy()
 		return out
 	}
 	for i := range required.NodeSelectorTerms {
-		required.NodeSelectorTerms[i].MatchExpressions = append(required.NodeSelectorTerms[i].MatchExpressions, reqs...)
+		t := &required.NodeSelectorTerms[i]
+		if len(t.MatchExpressions) == 0 && len(t.MatchFields) == 0 {
+			continue
+		}
+		t.MatchExpressions = append(t.MatchExpressions, reqs...)
 	}
 	return out
 }

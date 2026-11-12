@@ -6,6 +6,11 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# Namespace isolation's default deny: uncomment once clusters.yaml sets cidrs, with its
+# networks kept equal to the non-host clusters' cidrs there.
+# resources:
+# - cluster-network-policy.yaml
+
 configMapGenerator:
 - name: kubernetes-clusters
   files:

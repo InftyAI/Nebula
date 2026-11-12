@@ -24,7 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
-	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
 // NodeAutoscalerKarpenter is the default, and today the only, node autoscaler.
@@ -38,10 +37,10 @@ type nodeAutoscaler interface {
 	// CPU-only pod; an empty tier leaves it to the cluster.
 	selection(families []string, tier nebulav1alpha1.CapacityType) nodeSelection
 	// refusals returns the pods in the cluster the node autoscaler says it will not get a node
-	// for, by UID, in one read for all of them, with the state each should report; only
-	// InstanceUnschedulable blocks the candidate. It only speeds up failure: success is the pod
-	// binding, silence ends at bindTimeout, and an error means no answer this time.
-	refusals(ctx context.Context, cc clusterClients) (map[types.UID]provider.InstanceState, error)
+	// for, by UID, in one read for all of them, each with why: ErrNoCapacity or ErrSpec, which
+	// decides the block. It only speeds up failure: success is the pod binding, silence ends at
+	// bindTimeout, and an error means no answer this time.
+	refusals(ctx context.Context, cc clusterClients) (map[types.UID]error, error)
 	// bindTimeout is how long a healthy launch may take to bind the pod, node boot included,
 	// counted from the pod's creation. Past it, List reports no capacity.
 	bindTimeout() time.Duration

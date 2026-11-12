@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -125,6 +128,21 @@ func TestConfigValidate(t *testing.T) {
 			}},
 			wantErr: "unsupported node autoscaler",
 		},
+		"cidrs": {clusters: []ClusterConfig{
+			withHost(withCIDRs(ok, "10.20.0.0/16")),
+			withCIDRs(ClusterConfig{Name: "b", Provider: "eks", Region: "us-west-1", Geography: "us"},
+				"10.21.0.0/16", "100.64.0.0/16"),
+		}},
+		"cidr malformed":   {clusters: []ClusterConfig{withCIDRs(ok, "10.20.0.0")}, wantErr: "cidr"},
+		"cidr host bits":   {clusters: []ClusterConfig{withCIDRs(ok, "10.20.0.5/16")}, wantErr: "host bits"},
+		"cidr overlap own": {clusters: []ClusterConfig{withCIDRs(ok, "10.0.0.0/8", "10.20.0.0/16")}, wantErr: "overlaps"},
+		"cidr overlap other": {
+			clusters: []ClusterConfig{
+				withCIDRs(ok, "10.20.0.0/16"),
+				withCIDRs(ClusterConfig{Name: "b", Provider: "eks", Region: "us-west-1", Geography: "us"}, "10.20.128.0/17"),
+			},
+			wantErr: "overlaps",
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -133,6 +151,45 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatalf("Validate() = %v, want error containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func withCIDRs(c ClusterConfig, cidrs ...string) ClusterConfig {
+	c.CIDRs = cidrs
+	return c
+}
+
+// The table is parsed strictly, so a field the struct lacks fails the whole provider: this is
+// the shape chart/templates/kubernetes-clusters.yaml renders, every field IaC sets included.
+func TestLoadConfigCIDRs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clusters.yaml")
+	raw := `clusters:
+- cidrs:
+  - 10.20.0.0/16
+  geography: eu
+  host: true
+  name: host
+  provider: eks
+  region: eu-north-1
+- cidrs:
+  - 10.21.0.0/16
+  geography: us
+  name: target
+  provider: eks
+  region: us-east-1
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfg.Clusters[1].CIDRs; len(got) != 1 || got[0] != "10.21.0.0/16" {
+		t.Fatalf("target cidrs = %v", got)
+	}
+	if iso := cfg.isolation(); iso == nil || iso.host.Name != "host" {
+		t.Fatalf("isolation = %+v", iso)
 	}
 }
 
@@ -147,6 +204,38 @@ func TestEnvSecretName(t *testing.T) {
 	}
 	if a == b {
 		t.Fatal("two long names collided")
+	}
+
+	// A valid name whose cut falls on a "." (or "-") still yields a valid Secret name.
+	keep := maxNameLen - len(envSecretSuffix) - nameHashLen - 1
+	for _, sep := range []string{".", "-"} {
+		name := strings.Repeat("a", keep-1) + sep + strings.Repeat("b", maxNameLen-keep)
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			t.Fatalf("test name %q is itself invalid: %v", sep, errs)
+		}
+		if got := envSecretName(name); len(validation.IsDNS1123Subdomain(got)) > 0 || len(got) > maxNameLen {
+			t.Errorf("cut at %q: envSecretName = %q, invalid: %v", sep, got, validation.IsDNS1123Subdomain(got))
+		}
+	}
+}
+
+// The id reads back into its parts, a dotted pod name included, and so does the earlier
+// "/"-separated one that instances created before the change still carry.
+func TestInstanceIDRoundTrip(t *testing.T) {
+	id := instanceID("us-east-1", "org-1", "org-1-work.1")
+	if id != "us-east-1:org-1:org-1-work.1" {
+		t.Fatalf("instanceID = %q", id)
+	}
+	for _, in := range []string{id, "us-east-1/org-1/org-1-work.1"} {
+		r, ns, name, err := parseInstanceID(in)
+		if err != nil || r != "us-east-1" || ns != "org-1" || name != "org-1-work.1" {
+			t.Errorf("parseInstanceID(%q) = %q, %q, %q, %v", in, r, ns, name, err)
+		}
+	}
+	for _, bad := range []string{"", "us-east-1", "us-east-1:org-1", "us-east-1::name", ":org-1:name"} {
+		if _, _, _, err := parseInstanceID(bad); err == nil {
+			t.Errorf("parseInstanceID(%q) accepted a malformed id", bad)
+		}
 	}
 }
 
@@ -256,14 +345,36 @@ func TestClassifyProvisionError(t *testing.T) {
 	}
 
 	// One cluster's access entry or RBAC, so the region (cluster) alone, never the provider.
-	auth := p.ClassifyProvisionError(classifyAPI(forbidden()), "H100:1", region)
-	if auth != (provider.BlockScope{Deny: provider.DenyRegion, Region: region}) {
-		t.Errorf("auth failure must block only the cluster, got %+v", auth)
+	clusterBlock := provider.BlockScope{Deny: provider.DenyRegion, Region: region}
+	for name, err := range map[string]error{
+		"rbac":         forbidden(),
+		"unauthorized": apierrors.NewUnauthorized("Unauthorized"),
+	} {
+		if s := p.ClassifyProvisionError(classifyAPI(err), "H100:1", region); s != clusterBlock {
+			t.Errorf("%s must block only the cluster, got %+v", name, s)
+		}
+	}
+
+	// Admission refusing one request also answers 403. It says nothing about the cluster, so
+	// it blocks nothing: other namespaces, with quota to spare, must still be placed there.
+	for name, reason := range map[string]string{
+		"resource quota": "exceeded quota: compute, requested: nvidia.com/gpu=1, " +
+			"used: nvidia.com/gpu=4, limited: nvidia.com/gpu=4",
+		"pod security": `violates PodSecurity "baseline:latest": privileged (container "c" must not set privileged=true)`,
+		"webhook":      `admission webhook "deny.example.com" denied the request: no`,
+	} {
+		err := apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "org-1-work-1", errors.New(reason))
+		if s := p.ClassifyProvisionError(classifyAPI(err), "H100:1", region); s != (provider.BlockScope{}) {
+			t.Errorf("%s admission rejection blocked %+v, want nothing", name, s)
+		}
 	}
 }
 
+// forbidden is a 403 as RBAC words it, the only 403 that means Nebula itself is not allowed.
 func forbidden() error {
-	return apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "x", fmt.Errorf("nope"))
+	return apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "x", errors.New(
+		`User "arn:aws:sts::1:assumed-role/nebula/s" cannot create resource "pods" `+
+			`in API group "" in the namespace "org-1"`))
 }
 
 func TestAcceleratorTolerations(t *testing.T) {
@@ -391,6 +502,43 @@ func TestBuildPodCopiesThenOverrides(t *testing.T) {
 	}
 }
 
+// An empty required term matches no node. Adding the instance family to it would make that
+// ORed branch match every such node, so it stays empty; only real terms gain the family.
+func TestWithNodeRequirementsKeepsEmptyTermsEmpty(t *testing.T) {
+	ours := karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacityOnDemand).affinity
+	arch := corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+		{Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}},
+	}}
+	user := func(terms ...corev1.NodeSelectorTerm) *corev1.Affinity {
+		return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: terms},
+		}}
+	}
+	hasFamily := func(term corev1.NodeSelectorTerm) bool {
+		return slices.ContainsFunc(term.MatchExpressions, func(r corev1.NodeSelectorRequirement) bool {
+			return r.Key == instanceFamilyLabel
+		})
+	}
+
+	only := withNodeRequirements(user(corev1.NodeSelectorTerm{}), ours).
+		NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(only) != 1 || len(only[0].MatchExpressions) != 0 || len(only[0].MatchFields) != 0 {
+		t.Errorf("a lone empty term must stay empty, got %v", only)
+	}
+
+	mixed := withNodeRequirements(user(corev1.NodeSelectorTerm{}, arch), ours).
+		NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(mixed) != 2 || hasFamily(mixed[0]) || !hasFamily(mixed[1]) {
+		t.Errorf("want the empty term untouched and the arch term with the family, got %v", mixed)
+	}
+
+	noRequired := &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{}}
+	got := withNodeRequirements(noRequired, ours).NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if got == nil || len(got.NodeSelectorTerms) != 1 || !hasFamily(got.NodeSelectorTerms[0]) {
+		t.Errorf("a pod with no required selector must get ours, got %v", got)
+	}
+}
+
 func TestIsExtendedResource(t *testing.T) {
 	for name, want := range map[corev1.ResourceName]bool{
 		"nvidia.com/gpu":          true,
@@ -448,5 +596,22 @@ func TestEnvVarsEscapeDollar(t *testing.T) {
 	want := []corev1.EnvVar{{Name: "PLAIN", Value: "x"}, {Name: "REF", Value: "$$(TOKEN)"}, {Name: "TWO", Value: "a$$$$b"}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("envVars = %+v, want %+v", got, want)
+	}
+}
+
+// Nebula's own labels never reach the real pod, even when --cost-labels names them: with the host
+// as target, the opt-in label would send the real pod back through Nebula's webhook.
+func TestBuildPodNeverCopiesNebulaLabels(t *testing.T) {
+	got := buildPod(placeholder(), podSpec{
+		claim:      "org-1-work-1",
+		costLabels: []string{"org-id", nebulav1alpha1.EnabledLabel, nebulav1alpha1.AcceleratorTypeLabel},
+	})
+	if got.Labels["org-id"] != "o1" {
+		t.Errorf("labels = %v, want the cost label org-id", got.Labels)
+	}
+	for _, k := range []string{nebulav1alpha1.EnabledLabel, nebulav1alpha1.AcceleratorTypeLabel} {
+		if _, ok := got.Labels[k]; ok {
+			t.Errorf("label %q was copied though --cost-labels named it", k)
+		}
 	}
 }

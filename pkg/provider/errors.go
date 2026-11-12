@@ -49,6 +49,15 @@ var (
 	// nothing about the same request in another. The adapter confines it to the
 	// failing region (see aws.ClassifyProvisionError). Transient until quota frees up.
 	ErrQuota = errors.New("provider: quota exceeded")
+	// ErrRequestRejected: the provider refused this request on its own terms, e.g. a
+	// Kubernetes admission rejection (a namespace's ResourceQuota, Pod Security). Blocks
+	// nothing, and outranks the string heuristics, since such messages often read
+	// "forbidden".
+	ErrRequestRejected = errors.New("provider: request rejected")
+	// ErrSpec: the candidate refused the Pod's own spec, e.g. a target cluster whose nodes
+	// carry a taint it does not tolerate. Blocks the candidate for that workload only (see
+	// DenyWorkload): another workload, or another candidate, may be fine.
+	ErrSpec = errors.New("provider: pod spec refused")
 )
 
 // ClassifyError maps a provision error to the BlockScope it should be blocklisted at,
@@ -84,6 +93,9 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 	switch categorize(err) {
 	case catAuth:
 		return BlockScope{Deny: DenyAll}
+	case catSpec:
+		// The caller adds the workload, which only the Pod knows.
+		return BlockScope{Deny: DenyWorkload, Accelerator: accelerator, CapacityType: capacityType}
 	case catCapacity:
 		return capacityScope()
 	case catRequest:
@@ -117,6 +129,14 @@ func ClassifyError(err error, capacityType nebulav1alpha1.CapacityType, accelera
 		// accelerator on the provider, far too wide a blast radius to reach by omission.
 		return capacityScope()
 	}
+}
+
+// IsAuthFailure reports whether err is a credentials/authorization failure, the one category
+// that says nothing about the request and everything about the process (see ErrAuth). Same
+// classification ClassifyError turns into DenyAll, so a failure cannot be a whole-provider block
+// there and something narrower here.
+func IsAuthFailure(err error) bool {
+	return err != nil && categorize(err) == catAuth
 }
 
 // WithTier records the capacity tier a provision failure happened under. ClassifyProvisionError
@@ -167,9 +187,12 @@ const (
 	// next Pod asking for the same candidate would fail the same way.
 	catCapacity
 	// catRequest: the provider refused this request because of something about the REQUEST
-	// itself — today an image it cannot pull or cannot build. A decision, so a rejection, but
-	// it says nothing about the candidate and must not blocklist one.
+	// itself — an image it cannot pull or cannot build, or an ErrRequestRejected. A decision,
+	// so a rejection, but it says nothing about the candidate and must not blocklist one.
 	catRequest
+	// catSpec: the candidate refused the Pod's own spec (ErrSpec). Unlike catRequest it says
+	// something about the candidate, but only for this workload.
+	catSpec
 )
 
 // categorize buckets a provision error: the deadline and cancellation checks first — they
@@ -193,6 +216,10 @@ func categorize(err error) failureCategory {
 	}
 
 	switch {
+	case errors.Is(err, ErrSpec):
+		return catSpec
+	case errors.Is(err, ErrRequestRejected):
+		return catRequest
 	case errors.Is(err, ErrAuth):
 		return catAuth
 	case errors.Is(err, ErrNoCapacity), errors.Is(err, ErrUnsupportedAccelerator),

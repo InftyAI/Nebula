@@ -18,6 +18,14 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
+  # Namespace isolation's fence (pkg/provider/kubernetes/netpol.go), on once the table has cidrs:
+  # a target's ingress NetworkPolicy, and the host's Admin-tier ClusterNetworkPolicy.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: ["networking.k8s.aws"]
+    resources: ["clusternetworkpolicies"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

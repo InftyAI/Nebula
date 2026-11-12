@@ -61,7 +61,7 @@ mapping), see [docs/status.md](status.md).
   default, which the catalog does not model.
 - Failover on Modal's queue. The blocklist has two writers: the virtual kubelet's
   `Provision` error path, and the poll loop when `List` reports an instance as
-  `InstanceUnschedulable`. A provider that reports a capacity shortfall synchronously
+  `InstanceFailed` with an `Err` (classified like a `Provision` error). A provider that reports a capacity shortfall synchronously
   (AWS `CreateFleet`) fails over through the first; the `kubernetes` provider, which
   returns unreserved and reports no capacity once its pod stays unbound past the
   bind timeout, through the second. Modal reports neither: it ACCEPTS the request and
@@ -69,7 +69,7 @@ mapping), see [docs/status.md](status.md).
   waits in Modal's queue at `Initializing` (which, per [status](status.md#modal), is
   indistinguishable from booting). Modal also collapses its regions into a single
   candidate, so it has no intra-provider region failover either. Making failover live
-  for it means reporting `InstanceUnschedulable` past a reserved-by deadline.
+  for it means reporting `InstanceFailed` with `ErrNoCapacity` past a reserved-by deadline.
 - Bin-packing multiple unrelated Pods onto one external instance. The current
   model is one workload Pod to one external instance.
 - In-place migration. Recovery from reclaim, failure, or spec changes is
@@ -145,6 +145,8 @@ Follow one GPU Pod from creation to teardown:
    `nebula.inftyai.com/accelerator-type`; GPU count is the standard
    `nvidia.com/gpu` resource. The Pod remains the source of truth for image,
    command, env, ports, CPU, memory, accelerator type, and accelerator count.
+   Env values are literal strings: unlike the kubelet, Nebula does not expand
+   `$(VAR)` in them, so `DIR=$(BASE)/cache` reaches the workload as written.
 
    A workload that cares where it runs adds `nebula.inftyai.com/regions`, a
    comma-separated list of `provider.Geographies` tokens. It only ever narrows
@@ -226,8 +228,10 @@ Follow one GPU Pod from creation to teardown:
    and region from the failed request. The shared blocklist records that scope for
    the Pod's blocklist TTL plus jitter. The Pod is marked Failed; the placement
    controller deletes terminal controller-owned Pods so their owner recreates a
-   fresh gated Pod that skips the blocked candidate. An instance accepted unreserved
-   and later listed as `InstanceUnschedulable` takes the same path from the poll loop.
+   fresh gated Pod that skips the blocked candidate. An instance later listed as
+   `InstanceFailed` with an `Err` takes the same path from the poll loop: `ErrNoCapacity`
+   blocks the candidate, `ErrSpec` (the Pod's own spec refused) blocks it for that Pod's
+   workload alone, for 10 minutes.
 
 10. **Teardown.** The happy path is edge-triggered by VK `DeletePod`, which calls
     `provider.Terminate(instanceID)`. The backstop is level-triggered by the

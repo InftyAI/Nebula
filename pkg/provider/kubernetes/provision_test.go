@@ -18,6 +18,7 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -37,7 +39,8 @@ const testUID = types.UID("real-uid")
 
 // testCluster is one fake cluster. bind makes the fake "scheduler" bind every created pod.
 type testCluster struct {
-	kube *kubefake.Clientset
+	kube    *kubefake.Clientset
+	dynamic *dynamicfake.FakeDynamicClient
 }
 
 func newTestCluster(t *testing.T, bind bool) testCluster {
@@ -52,10 +55,12 @@ func newTestCluster(t *testing.T, bind bool) testCluster {
 		}
 		return false, nil, nil // let the tracker store the mutated pod
 	})
-	return testCluster{kube: kube}
+	return testCluster{kube: kube, dynamic: newHostDynamic()}
 }
 
-func (c testCluster) clients() clusterClients { return clusterClients{kube: c.kube} }
+func (c testCluster) clients() clusterClients {
+	return clusterClients{kube: c.kube, dynamic: c.dynamic}
+}
 
 func provisionRequest() provider.ProvisionRequest {
 	return provider.ProvisionRequest{
@@ -83,7 +88,7 @@ var (
 	refusalMissingToleration = refusal(
 		"no instance type met the scheduling requirements or had enough resources, "+
 			"requirements=karpenter.sh/nodepool In [saas-on-demand], resources={\"nvidia.com/gpu\":\"1\"}",
-		"did not tolerate taint (taint=hiverge.ai/workload_class=customer:NoSchedule)",
+		"did not tolerate taint (taint=example.com/workload-class=customer:NoSchedule)",
 		"incompatible requirements, key karpenter.sh/capacity-type, "+
 			"karpenter.sh/capacity-type In [on-demand] not in karpenter.sh/capacity-type In [spot]",
 		"did not tolerate taint (taint=aws.amazon.com/neuron:NoSchedule)",
@@ -107,8 +112,15 @@ var (
 	)
 )
 
+// refusalTaintOnly is a pod every NodePool turned down for its own spec.
+var refusalTaintOnly = refusal(
+	"did not tolerate taint (taint=example.com/workload-class=customer:NoSchedule)",
+	"incompatible requirements, key karpenter.sh/capacity-type, "+
+		"karpenter.sh/capacity-type In [on-demand] not in karpenter.sh/capacity-type In [spot]",
+)
+
 func refusal(reasons ...string) string {
-	return "Failed to schedule pod, " + strings.Join(reasons, "; ")
+	return failedToSchedulePrefix + strings.Join(reasons, "; ")
 }
 
 func TestProvisionBoundToWarmNode(t *testing.T) {
@@ -119,7 +131,7 @@ func TestProvisionBoundToWarmNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Reserved || res.InstanceID != "us-east-1/org-1/org-1-work-1" {
+	if !res.Reserved || res.InstanceID != "us-east-1:org-1:org-1-work-1" {
 		t.Fatalf("result = %+v", res)
 	}
 	sec, err := tc.kube.CoreV1().Secrets("org-1").Get(context.Background(), "org-1-work-1-env", metav1.GetOptions{})
@@ -150,15 +162,19 @@ func TestProvisionBoundToWarmNode(t *testing.T) {
 }
 
 // Provision never waits for Karpenter: it accepts the pod unreserved, and List reports a
-// refusal on the next poll, whenever it arrives. Every refusal fails the pod; only one for
-// capacity reports Unschedulable, which also blocks the candidate.
+// refusal on the next poll as Failed: a spec error for the pod's own spec, no capacity for
+// anything else.
 func TestListReportsKarpenterRefusal(t *testing.T) {
 	for name, tc := range map[string]struct {
 		msg  string
-		want provider.InstanceState
+		want error
 	}{
-		"spec":     {refusalMissingToleration, provider.InstanceFailed},
-		"capacity": {refusalSoldOut, provider.InstanceUnschedulable},
+		"taint only":         {refusalTaintOnly, provider.ErrSpec},
+		"missing toleration": {refusalMissingToleration, provider.ErrNoCapacity},
+		"too many GPUs":      {refusalTooManyGPUs, provider.ErrNoCapacity},
+		"sold out":           {refusalSoldOut, provider.ErrNoCapacity},
+		"pool limit":         {refusalPoolLimit, provider.ErrNoCapacity},
+		"pool dropped":       {refusal("no instance type met all requirements"), provider.ErrNoCapacity},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cl := newTestCluster(t, false)
@@ -175,33 +191,37 @@ func TestListReportsKarpenterRefusal(t *testing.T) {
 				karpenterEvent("refusal", tc.msg), metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			if got := listState(t, p); got != tc.want {
-				t.Fatalf("after Karpenter's %s refusal: %s, want %s", name, got, tc.want)
+			got := listInstance(t, p)
+			if got.State != provider.InstanceFailed || !errors.Is(got.Err, tc.want) ||
+				!strings.Contains(got.Err.Error(), tc.msg) {
+				t.Fatalf("after Karpenter's %s refusal: %s, %v; want Failed, %v with its message",
+					name, got.State, got.Err, tc.want)
 			}
 		})
 	}
 }
 
-// A pod refused for capacity stays so: a spec refusal recorded alongside does not undo the block.
-func TestListCapacityRefusalWins(t *testing.T) {
+// A blocking refusal stays so: a spec refusal recorded alongside does not undo the block.
+func TestListSharedRefusalWins(t *testing.T) {
 	tc := newTestCluster(t, false)
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
 	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err != nil {
 		t.Fatal(err)
 	}
-	for name, msg := range map[string]string{"sold-out": refusalSoldOut, "spec": refusalMissingToleration} {
+	for name, msg := range map[string]string{"sold-out": refusalSoldOut, "spec": refusalTaintOnly} {
 		if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
 			karpenterEvent(name, msg), metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := listState(t, p); got != provider.InstanceUnschedulable {
-		t.Fatalf("with both refusals: %s, want Unschedulable", got)
+	got := listInstance(t, p)
+	if got.State != provider.InstanceFailed || !errors.Is(got.Err, provider.ErrNoCapacity) {
+		t.Fatalf("with both refusals: %s, %v; want Failed, no capacity", got.State, got.Err)
 	}
 }
 
-// A FailedScheduling outranks the bind timeout: a pod Karpenter has explained must not turn
-// into a block just by outlasting the wait.
+// A FailedScheduling outranks the bind timeout: a pod refused for its spec stays a spec error
+// rather than turning into a block for everyone by outlasting the wait.
 func TestListSpecRefusalOutranksBindTimeout(t *testing.T) {
 	tc := newTestCluster(t, false)
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
@@ -209,26 +229,29 @@ func TestListSpecRefusalOutranksBindTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := tc.kube.CoreV1().Events("org-1").Create(context.Background(),
-		karpenterEvent("refusal", refusalMissingToleration), metav1.CreateOptions{}); err != nil {
+		karpenterEvent("refusal", refusalTaintOnly), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	p.now = func() time.Time { return time.Now().Add(karpenterBindTimeout + time.Second) }
-	if got := listState(t, p); got != provider.InstanceFailed {
-		t.Fatalf("past the bind timeout after a FailedScheduling: %s, want Failed", got)
+	if got := listInstance(t, p); !errors.Is(got.Err, provider.ErrSpec) {
+		t.Fatalf("past the bind timeout after a FailedScheduling: %s, %v; want a spec error", got.State, got.Err)
 	}
 }
 
-func TestCapacityRefusal(t *testing.T) {
+func TestSpecRefusal(t *testing.T) {
 	for msg, want := range map[string]bool{
+		refusalTaintOnly: true,
+		// One clause is not the pod's spec, so the refusal blocks.
 		refusalMissingToleration: false,
 		refusalTooManyGPUs:       false,
-		refusalSoldOut:           true,
-		refusalPoolLimit:         true,
-		refusal("node limits have been exhausted for nodepool (NodePool=gpu)"): true,
-		refusal("no instance type has the required offering, requirements=…"):  true,
+		refusalSoldOut:           false,
+		refusalPoolLimit:         false,
+		refusal("node limits have been exhausted for nodepool (NodePool=gpu)"):               false,
+		refusal("no instance type met all requirements"):                                     false,
+		refusal("no instance type met all requirements", "did not tolerate taint (taint=x)"): false,
 	} {
-		if got := capacityRefusal(msg); got != want {
-			t.Errorf("capacityRefusal(%.80q…) = %v, want %v", msg, got, want)
+		if got := specRefusal(msg); got != want {
+			t.Errorf("specRefusal(%.80q…) = %v, want %v", msg, got, want)
 		}
 	}
 }
@@ -236,11 +259,16 @@ func TestCapacityRefusal(t *testing.T) {
 // listState is the one instance List reports.
 func listState(t *testing.T, p *Provider) provider.InstanceState {
 	t.Helper()
+	return listInstance(t, p).State
+}
+
+func listInstance(t *testing.T, p *Provider) provider.Instance {
+	t.Helper()
 	list, err := p.List(context.Background())
 	if err != nil || len(list) != 1 {
 		t.Fatalf("List = %+v, %v; want one instance", list, err)
 	}
-	return list[0].State
+	return list[0]
 }
 
 // The kube-scheduler's FailedScheduling, which every pod waiting for a new node gets, is no
@@ -278,7 +306,7 @@ func TestListIgnoresWhatIsNotARefusal(t *testing.T) {
 	}
 }
 
-func TestListReportsUnschedulablePastBindTimeout(t *testing.T) {
+func TestListReportsNoCapacityPastBindTimeout(t *testing.T) {
 	tc := newTestCluster(t, false)
 	ctx := context.Background()
 	unbound := placeholder()
@@ -318,11 +346,11 @@ func TestListReportsUnschedulablePastBindTimeout(t *testing.T) {
 
 	p.now = func() time.Time { return time.Now().Add(karpenterBindTimeout + time.Second) }
 	got := states()
-	if got["org-1-work-1"].State != provider.InstanceUnschedulable {
-		t.Errorf("old unbound pod = %+v, want Unschedulable", got["org-1-work-1"])
+	if old := got["org-1-work-1"]; old.State != provider.InstanceFailed || !errors.Is(old.Err, provider.ErrNoCapacity) {
+		t.Errorf("old unbound pod = %+v, want Failed, no capacity", old)
 	}
-	if got["org-1-work-2"].State == provider.InstanceUnschedulable {
-		t.Error("a bound pod must never report Unschedulable, however old")
+	if got["org-1-work-2"].State == provider.InstanceFailed {
+		t.Error("a bound pod must never report no capacity, however old")
 	}
 }
 
@@ -374,7 +402,7 @@ func TestProvisionDoesNotWaitForANode(t *testing.T) {
 	tc := newTestCluster(t, false)
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
 	res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
-	if err != nil || res.Reserved || res.InstanceID != "us-east-1/org-1/org-1-work-1" {
+	if err != nil || res.Reserved || res.InstanceID != "us-east-1:org-1:org-1-work-1" {
 		t.Fatalf("Provision = %+v, %v; want accepted, unreserved, at once", res, err)
 	}
 }
@@ -480,7 +508,39 @@ func TestProvisionAdoptsLivePod(t *testing.T) {
 	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
 
 	res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
-	if err != nil || !res.Reserved || res.InstanceID != "us-east-1/org-1/org-1-work-1" {
+	if err != nil || !res.Reserved || res.InstanceID != "us-east-1:org-1:org-1-work-1" {
 		t.Fatalf("Provision = %+v, %v; want the live pod adopted", res, err)
+	}
+}
+
+// An adopted pod takes over only its own Secret: one with Nebula's labels but another pod's
+// UID, or none, is an earlier pod's leftover that garbage collection may remove at any time.
+func TestProvisionAdoptRejectsAnotherPodsSecret(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		owners []metav1.OwnerReference
+	}{
+		{"owned by an earlier pod", []metav1.OwnerReference{
+			{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: "earlier-uid"}}},
+		{"owned by nothing", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestCluster(t, true)
+			live := buildPod(placeholder(), podSpec{claim: "org-1-work-1"})
+			live.UID, live.Spec.NodeName, live.Status.Phase = testUID, "node-1", corev1.PodRunning
+			sec := envSecret("org-1", "org-1-work-1", map[string]string{"K": "stale"})
+			sec.OwnerReferences = tc.owners
+			for _, obj := range []runtime.Object{live, sec} {
+				if err := c.kube.Tracker().Add(obj); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p := newTestProvider(map[string]clusterClients{"eks-use1": c.clients()})
+
+			if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err == nil ||
+				!strings.Contains(err.Error(), "earlier pod") {
+				t.Fatalf("Provision err = %v; want the stale Secret refused", err)
+			}
+		})
 	}
 }

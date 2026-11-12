@@ -416,6 +416,10 @@ type Instance struct {
 	// secret, so unlike the connect credential it rides the level-triggered read path
 	// and is re-reported on every tick.
 	Endpoint string
+	// Err, for InstanceFailed, is why, classified like a failed Provision: a provider sentinel
+	// (ErrNoCapacity, ErrSpec) decides what is blocked, in the provider's own words. Nil is the
+	// instance's own failure, which blocks nothing.
+	Err error
 }
 
 // redacted renders a secret's presence without its value.
@@ -460,12 +464,9 @@ const (
 	InstanceNotReady InstanceState = "NotReady"
 	// InstanceTerminated: gone (also the mapping for "absent from List").
 	InstanceTerminated InstanceState = "Terminated"
-	// InstanceFailed: entered a terminal error state.
+	// InstanceFailed: entered a terminal error state; Instance.Err says why, if the provider
+	// knows. An unreserved instance never placed on capacity is Failed with the refusal.
 	InstanceFailed InstanceState = "Failed"
-	// InstanceUnschedulable: accepted by a Provision that returned unreserved, then never
-	// placed on capacity. The poll loop treats it like a Provision capacity error: it
-	// blocklists the candidate and fails the Pod.
-	InstanceUnschedulable InstanceState = "Unschedulable"
 )
 
 // Offering is one row of the price/availability catalog. The price/availability
@@ -515,6 +516,9 @@ const (
 	// DenyCandidate excludes the failing candidate: BlockScope.Accelerator at its
 	// CapacityType in its Region, so failover can route around just what failed.
 	DenyCandidate DenyPolicy = "Candidate"
+	// DenyWorkload excludes the candidate, as DenyCandidate, for BlockScope.Workload only: the
+	// candidate refused that workload's spec, which says nothing about anyone else's.
+	DenyWorkload DenyPolicy = "Workload"
 )
 
 // BlockScope is how narrowly a failed placement is excluded, matched to what actually
@@ -537,4 +541,7 @@ type BlockScope struct {
 	// not disqualify another. Exact like Accelerator: "" matches only candidates without a
 	// region, such as a Modal create spanning several, never the region-pinned ones.
 	Region string
+	// Workload, for DenyWorkload: the Pod's util.WorkloadKey, so replicas share one block and
+	// a changed template starts clean.
+	Workload string
 }

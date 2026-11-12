@@ -57,6 +57,11 @@ const defaultBlocklistTTL = 30 * time.Second
 // expires and they stampede the same just-freed candidate together.
 const blocklistJitter = 30 * time.Second
 
+// specErrorBlockTTL is how long a spec error blocks its candidate for the workload, in place
+// of the pool's TTL: the spec will not fix itself in seconds, and a fixed template is a new
+// workload anyway (see util.WorkloadKey). Still finite, as the candidate's side can change too.
+const specErrorBlockTTL = 10 * time.Minute
+
 // defaultReadyDeadline bounds how long a pod may sit Initializing before the virtual node
 // gives up on it.
 const defaultReadyDeadline = 10 * time.Minute
@@ -676,6 +681,9 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	listSeq := h.storeSeq
 	h.mu.Unlock()
 	instances, err := h.prov.List(ctx)
+	// The tick doubles as the credential probe: it runs on a cadence through the provider's
+	// auth path, so a token that dies mid-life shows up here every tick.
+	metrics.RecordProviderAuth(h.prov.Name(), err)
 	if err != nil {
 		log.Error(err, "provider List failed; tracked pod statuses will not advance this tick")
 		return // transient; retry on the next tick
@@ -704,16 +712,17 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		case !present:
 			gone++
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())
-		case inst.State == provider.InstanceUnschedulable:
-			// An unreserved instance that never got capacity: the Provision error path,
-			// arriving late. Failing the Pod is once only, as Finished freezes it above.
+		case inst.State == provider.InstanceFailed && inst.Err != nil:
+			// A failure the provider gave a reason for: the Provision error path, arriving
+			// late, so classified and blocked alike. Failing the Pod is once only, as Finished
+			// freezes it above.
 			updated++
-			log.Info("no capacity for unreserved instance; failing the pod",
-				"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance)
-			applyNoCapacity(tp.pod, h.nowFn())
+			err := fmt.Errorf("external instance failed: %w", inst.Err)
+			log.Info("external instance failed; failing the pod",
+				"pod", key(tp.pod.Namespace, tp.pod.Name), "instanceID", tp.instance, "error", err.Error())
+			applyClassifiedFailure(tp.pod, err.Error(), h.nowFn())
 			failed = append(failed, failedPlacement{
-				pod: tp.pod.DeepCopy(), claim: tp.claimName, region: inst.Region,
-				err: fmt.Errorf("external instance got no capacity: %w", provider.ErrNoCapacity),
+				pod: tp.pod.DeepCopy(), claim: tp.claimName, region: inst.Region, err: err,
 			})
 		default:
 			updated++
@@ -1160,6 +1169,10 @@ func (h *Handler) recordBlock(
 		// An error we do not know how to blocklist. Do not install a wildcard block that
 		// would exclude the whole provider.
 		return
+	}
+	if scope.Deny == provider.DenyWorkload {
+		scope.Workload = util.WorkloadKey(pod)
+		baseTTL = specErrorBlockTTL
 	}
 
 	// baseTTL + jitter, so Pods that failed for the SAME scope do not all re-probe the

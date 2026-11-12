@@ -182,7 +182,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 						"provider", ref.Name, "accelerator", accelerator, "region", region)
 					continue
 				}
-				if until, blocked := r.blockedUntil(ref.Name, accelerator, tier, region); blocked {
+				if until, blocked := r.blockedUntil(pod, ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
 					metrics.RecordCandidateSkip(ref.Name, tier, region, metrics.SkipBlocked)
@@ -283,7 +283,9 @@ func requestedGeographies(pod *corev1.Pod) (narrowTo []string, ok bool) {
 // (type:count; see selectPlacement), so a capacity block matches only candidates on the
 // same pool. It is nil-safe: with no blocklist wired (tests, or a blocklist-less build)
 // nothing is ever blocked.
-func (r *PodPlacementReconciler) blockedUntil(provName, accelerator string, tier nebulav1alpha1.CapacityType, region string) (time.Duration, bool) {
+func (r *PodPlacementReconciler) blockedUntil(
+	pod *corev1.Pod, provName, accelerator string, tier nebulav1alpha1.CapacityType, region string,
+) (time.Duration, bool) {
 	if r.Blocklist == nil {
 		return 0, false
 	}
@@ -292,6 +294,7 @@ func (r *PodPlacementReconciler) blockedUntil(provName, accelerator string, tier
 		Accelerator:  accelerator,
 		CapacityType: tier,
 		Region:       region,
+		Workload:     util.WorkloadKey(pod),
 	})
 	return until, !admitted
 }

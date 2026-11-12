@@ -19,6 +19,7 @@ package vnode
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -2020,10 +2022,10 @@ func TestCreatePod_FailsClosedWithoutClusterState(t *testing.T) {
 	}
 }
 
-// An unreserved instance the provider later reports as having no capacity is the Provision
-// error path arriving late: the candidate is blocklisted with the pool's TTL, the Pod fails
-// with the provision-failed reason, and a second tick neither re-fails nor re-blocks it.
-func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
+// An instance the provider later reports Failed for no capacity is the Provision error path
+// arriving late: the candidate is blocklisted with the pool's TTL, the Pod fails with the
+// provision-failed reason, and a second tick neither re-fails nor re-blocks it.
+func TestReconcileOnce_FailedWithErrBlocksAndFailsPod(t *testing.T) {
 	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
 	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
 	bl := &recordingBlocklist{}
@@ -2037,7 +2039,7 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 
 	fp.list = []provider.Instance{{
 		ID: "inst-1", ClaimName: "default-p1", Region: "eks-use1",
-		State: provider.InstanceUnschedulable,
+		State: provider.InstanceFailed, Err: provider.ErrNoCapacity,
 	}}
 	h.reconcileOnce(context.Background())
 
@@ -2059,9 +2061,44 @@ func TestReconcileOnce_UnschedulableBlocksAndFailsPod(t *testing.T) {
 	}
 }
 
-// A Failed instance fails the Pod without blocking the candidate: that is how a provider
-// reports a refusal that is not capacity (Karpenter's FailedScheduling, a missing toleration),
-// which must not exclude the candidate for every other Pod.
+// A spec error blocks the candidate for the Pod's workload alone, for specErrorBlockTTL rather
+// than the pool's, and the Pod carries the provider's reason.
+func TestReconcileOnce_SpecErrorBlocksWorkload(t *testing.T) {
+	scope := provider.BlockScope{Deny: provider.DenyWorkload, Region: "eks-use1"}
+	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}
+	bl := &recordingBlocklist{}
+	h := NewHandler(fp, nil, bl, clusterWithTTL(30*time.Second))
+	h.jitterFn = func() time.Duration { return 0 }
+	pod := testPod("default", "p1")
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs", UID: "rs-uid", Controller: ptr.To(true),
+	}}
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	const taint = "did not tolerate taint (taint=team=a:NoSchedule)"
+	fp.list = []provider.Instance{{
+		ID: "inst-1", ClaimName: "default-p1", Region: "eks-use1", State: provider.InstanceFailed,
+		Err: fmt.Errorf("%w: %s", provider.ErrSpec, taint),
+	}}
+	h.reconcileOnce(context.Background())
+
+	got, _ := h.GetPod(context.Background(), "default", "p1")
+	if got.Status.Phase != corev1.PodFailed || !strings.Contains(got.Status.Message, taint) {
+		t.Fatalf("status = %s %q, want Failed with the provider's reason", got.Status.Phase, got.Status.Message)
+	}
+	if !errors.Is(fp.classifyErr, provider.ErrSpec) {
+		t.Fatalf("classified %v, want a spec error", fp.classifyErr)
+	}
+	if bl.calls != 1 || bl.ttl != specErrorBlockTTL || bl.scope.Workload != "default/ReplicaSet/rs" {
+		t.Fatalf("block = %d calls, ttl %v, workload %q; want one, %v, default/ReplicaSet/rs",
+			bl.calls, bl.ttl, bl.scope.Workload, specErrorBlockTTL)
+	}
+}
+
+// A Failed instance with no Err fails the Pod without blocking the candidate: the instance
+// itself failed, which says nothing about the candidate for any other Pod.
 func TestReconcileOnce_FailedFailsPodWithoutBlock(t *testing.T) {
 	scope := provider.BlockScope{Deny: provider.DenyCandidate, Region: "eks-use1"}
 	fp := &fakeProvider{provisionID: "inst-1", classifyScope: scope}

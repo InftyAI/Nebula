@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -469,6 +470,37 @@ func TestPlacement_FailsOverToNextRegionWhenBlocked(t *testing.T) {
 
 	if got := getClaim(t, c, "default-p1").Spec.Region; got != "us-west-2" {
 		t.Fatalf("expected failover to us-west-2, got region %q", got)
+	}
+}
+
+// A spec error blocks the candidate for the Pod's workload, so its replicas fail over while
+// another workload still gets the region.
+func TestPlacement_WorkloadBlockFailsOverOnlyThatWorkload(t *testing.T) {
+	owned := func(name, uid, owner string) *corev1.Pod {
+		pod := gatedPod(name, "default", uid, "pool-a", "H100")
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: owner, UID: types.UID(owner), Controller: ptr.To(true),
+		}}
+		return pod
+	}
+	pool := poolWithRegions("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, "us-east-1", "us-west-2")
+	prov := &fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}}
+	r, c := newPlacementReconciler(t, []client.Object{owned("p1", "uid-1", "rs-a"), owned("p2", "uid-2", "rs-b"), pool}, prov)
+	bl := failover.New()
+	bl.Record(provider.ProviderModal, provider.BlockScope{
+		Deny: provider.DenyWorkload, Accelerator: "H100:1", Region: "us-east-1", Workload: "default/ReplicaSet/rs-a",
+	}, time.Hour)
+	r.Blocklist = bl
+
+	reconcilePod(t, r, "default", "p1")
+	reconcilePod(t, r, "default", "p2")
+
+	if got := getClaim(t, c, "default-p1").Spec.Region; got != "us-west-2" {
+		t.Fatalf("blocked workload placed in %q, want failover to us-west-2", got)
+	}
+	if got := getClaim(t, c, "default-p2").Spec.Region; got != "us-east-1" {
+		t.Fatalf("other workload placed in %q, want us-east-1", got)
 	}
 }
 

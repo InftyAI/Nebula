@@ -28,7 +28,8 @@ limitations under the License.
 // a probe (see Admit), and the candidate stays blocked for everyone else for ProbeWindow.
 // A refused probe is recorded like any failure and blocks again; a ProbeWindow with no
 // failure means it was not refused, and the candidate opens. So a candidate that is still
-// out costs one attempt per expiry, not one per waiting Pod.
+// out costs one attempt per expiry, not one per waiting Pod. One nobody probes within
+// halfOpenGrace opens too: the probe throttles retries during a shortage, not after it.
 //
 // In-memory and per-process on purpose: this is a hint that bounds churn, not durable
 // state. After a restart it is empty and the next attempt re-probes the provider,
@@ -53,6 +54,11 @@ import (
 // refusal only lets the waiting Pods in as before, never worse.
 const ProbeWindow = 15 * time.Second
 
+// halfOpenGrace is how long a lapsed block waits for a probe before it is dropped as stale.
+// The blocklist has no timer, so without it an entry nobody probed would gate the next burst,
+// however much later, behind one Pod on a shortage that says nothing about now.
+const halfOpenGrace = 2 * time.Minute
+
 // entry is one recorded block: the provider it applies to, the scope that failed, when the
 // block lapses, and, once half-open, until when its admitted probe holds the others back.
 type entry struct {
@@ -74,6 +80,14 @@ func (e entry) heldUntil(now time.Time) time.Time {
 	return time.Time{}
 }
 
+// live reports whether e still says anything: blocked, probing, or half-open and recent.
+func (e entry) live(now time.Time) bool {
+	if !e.probeUntil.IsZero() {
+		return now.Before(e.probeUntil)
+	}
+	return now.Before(e.expiresAt.Add(halfOpenGrace))
+}
+
 // Candidate is a placement being considered — the (provider, accelerator, tier,
 // region) tuple the blocklist is queried against. It is the query counterpart to a
 // recorded BlockScope: Blocked reports whether any live entry's scope covers it.
@@ -86,6 +100,8 @@ type Candidate struct {
 	Accelerator  string
 	CapacityType nebulav1alpha1.CapacityType
 	Region       string
+	// Workload is the Pod's util.WorkloadKey, matched only by DenyWorkload.
+	Workload string
 }
 
 // Blocklist is a concurrency-safe, TTL-bounded set of provider blocks. The zero
@@ -199,16 +215,16 @@ func (b *Blocklist) heldLocked(c Candidate, now time.Time) (time.Duration, bool)
 	return latest.Sub(now), true
 }
 
-// gcLocked drops the entries whose probe window passed without a refusal: the candidate is
-// open. An unprobed half-open entry stays, so the next placement probes it; entries stay
-// bounded by distinct scopes. Caller holds b.mu.
+// gcLocked drops the entries whose probe window passed without a refusal, and those left
+// unprobed past halfOpenGrace: either way the candidate is open. Entries stay bounded by
+// distinct scopes. Caller holds b.mu.
 func (b *Blocklist) gcLocked(now time.Time) {
 	if len(b.entries) == 0 {
 		return
 	}
 	kept := b.entries[:0]
 	for _, e := range b.entries {
-		if e.probeUntil.IsZero() || now.Before(e.probeUntil) {
+		if e.live(now) {
 			kept = append(kept, e)
 		}
 	}
@@ -229,17 +245,23 @@ func scopeCovers(scope provider.BlockScope, c Candidate) bool {
 	case provider.DenyRegion:
 		return scope.Region == c.Region
 	case provider.DenyCandidate:
-		return scope.Accelerator == c.Accelerator &&
-			(scope.CapacityType == "" || scope.CapacityType == c.CapacityType) &&
-			scope.Region == c.Region
+		return candidateCovers(scope, c)
+	case provider.DenyWorkload:
+		return scope.Workload != "" && scope.Workload == c.Workload && candidateCovers(scope, c)
 	default:
 		return false
 	}
 }
 
+func candidateCovers(scope provider.BlockScope, c Candidate) bool {
+	return scope.Accelerator == c.Accelerator &&
+		(scope.CapacityType == "" || scope.CapacityType == c.CapacityType) &&
+		scope.Region == c.Region
+}
+
 func knownPolicy(p provider.DenyPolicy) bool {
 	switch p {
-	case provider.DenyAll, provider.DenyRegion, provider.DenyCandidate:
+	case provider.DenyAll, provider.DenyRegion, provider.DenyCandidate, provider.DenyWorkload:
 		return true
 	}
 	return false

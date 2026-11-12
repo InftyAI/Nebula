@@ -45,6 +45,7 @@ const (
 	capacityTypeOnDemand   = "on-demand"
 
 	reasonFailedScheduling = "FailedScheduling"
+	failedToSchedulePrefix = "Failed to schedule pod, "
 	karpenterComponent     = "karpenter"
 
 	// karpenterBindTimeout covers a healthy launch up to binding: Karpenter's decision, the
@@ -102,20 +103,19 @@ func karpenterCapacityType(tier nebulav1alpha1.CapacityType) string {
 // UID, so each attempt gets its own. The selector leaves out the kube-scheduler's, which every
 // pod needing a new node gets. A lost event only costs the bind timeout.
 //
-// Every refusal fails the pod; only a capacity one (see capacityRefusal) blocks the candidate.
-// EC2's InsufficientCapacityError is on the NodeClaim, which names no pod, so the pod's own
-// message is the only per-pod signal of a shortage.
-func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID]provider.InstanceState, error) {
+// Every refusal fails the pod and blocks the candidate, so failover moves on: for the pod's
+// workload alone when the refusal is about its own spec (see specRefusal), else for everyone.
+func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID]error, error) {
 	evs, err := cc.kube.CoreV1().Events(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 		FieldSelector: fields.Set{
-			"involvedObject.kind": "Pod", "source": karpenterComponent, "type": corev1.EventTypeWarning,
+			"involvedObject.kind": podKind, "source": karpenterComponent, "type": corev1.EventTypeWarning,
 		}.String(),
 		ResourceVersion: "0", // served from the API server's watch cache
 	})
 	if err != nil {
 		return nil, err
 	}
-	out := map[types.UID]provider.InstanceState{}
+	out := map[types.UID]error{}
 	for _, ev := range evs.Items {
 		// Checked again here: the selector is the server's job, and not every client honours it.
 		if !fromKarpenter(ev) {
@@ -125,29 +125,30 @@ func (karpenter) refusals(ctx context.Context, cc clusterClients) (map[types.UID
 			continue
 		}
 		uid := ev.InvolvedObject.UID
-		switch {
-		case capacityRefusal(ev.Message):
-			out[uid] = provider.InstanceUnschedulable
-		case out[uid] != provider.InstanceUnschedulable: // a later spec refusal does not undo a shortage
-			out[uid] = provider.InstanceFailed
+		switch spec := specRefusal(ev.Message); {
+		case spec && out[uid] == nil:
+			out[uid] = fmt.Errorf("%w: %s", provider.ErrSpec, ev.Message)
+		case spec:
+			// Never overrides an earlier refusal, so never a capacity one.
+		default:
+			out[uid] = fmt.Errorf("%w: %s", provider.ErrNoCapacity, ev.Message)
 		}
 	}
 	return out, nil
 }
 
-// capacityPhrases are the parts of Karpenter v1's FailedScheduling message that mean no capacity
-// rather than the pod's own spec. A sold-out offering is filtered out as unavailable, so the
-// instance-type filter reports a missing "offering"; the other two are NodePool limits.
-var capacityPhrases = []string{"offering", "exceed limits", "limits have been exhausted"}
+// specPhrases mark a clause of a refusal as the pod's own spec. The wording is Karpenter's, not
+// an API, so TestSpecRefusal pins real messages.
+var specPhrases = []string{"did not tolerate taint", "incompatible requirements"}
 
-// capacityRefusal reports whether a Karpenter refusal is about capacity. The wording is
-// Karpenter's, not an API, so TestCapacityRefusal pins real messages.
-//
-// Known gap, kept on purpose: when every family in a NodePool is unavailable at once,
-// Karpenter drops the pool before scheduling, so its clause, and the "offering", is missing.
-// Such a refusal fails the pod without a block, until Karpenter's unavailability marks lapse.
-func capacityRefusal(message string) bool {
-	return slices.ContainsFunc(capacityPhrases, func(p string) bool { return strings.Contains(message, p) })
+// specRefusal reports whether every NodePool in a Karpenter refusal turned the pod down for its
+// own spec. Karpenter writes one clause per NodePool, joined by "; ", so a single other clause,
+// including wording we do not recognize, makes it a refusal that blocks.
+func specRefusal(message string) bool {
+	clauses := strings.Split(strings.TrimPrefix(message, failedToSchedulePrefix), "; ")
+	return !slices.ContainsFunc(clauses, func(clause string) bool {
+		return !slices.ContainsFunc(specPhrases, func(p string) bool { return strings.Contains(clause, p) })
+	})
 }
 
 func (karpenter) verify(_ context.Context, cc clusterClients) error {

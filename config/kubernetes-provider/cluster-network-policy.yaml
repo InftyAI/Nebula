@@ -1,0 +1,29 @@
+# Namespace isolation's default deny on the host, the kustomize counterpart of
+# chart/templates/cluster-network-policy.yaml: no host pod may reach another cluster's cidrs. The
+# per-namespace Admin policy Provision writes (pkg/provider/kubernetes/netpol.go) opens a
+# namespace's own remote pods before it. Admin, so no namespace's NetworkPolicy can override it.
+#
+# The chart derives `networks` from the cluster table; kustomize cannot, so keep it equal to the
+# cidrs of every non-host cluster in clusters.yaml. Needs AWS VPC CNI's network policy support
+# (the networking.k8s.aws CRDs). Not a resource until clusters.yaml sets cidrs: see
+# kustomization.yaml.
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: isolation-host-cluster # nebula- prefixed by config/default, like the chart's
+spec:
+  tier: Admin
+  priority: 1000
+  subject:
+    namespaces:
+      matchExpressions:
+        # The manager's namespace must stay exempt: it reaches each target's private API
+        # endpoint, an address inside that target's cidrs.
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [nebula-system]
+  egress:
+    - name: no-target-clusters
+      action: Deny
+      to:
+        - networks: [10.21.0.0/16] # gpu-usw2's cidrs in clusters.yaml

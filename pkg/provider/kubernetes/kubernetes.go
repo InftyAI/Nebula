@@ -20,9 +20,10 @@ limitations under the License.
 // pod, not to a node; several pods can share a Karpenter node.
 //
 // Capacity is found by trying. Provision creates the pod and returns at once, accepted but
-// unreserved; the poll loop settles it. The node autoscaler's refusal fails the pod, and a
-// refusal for capacity, or a pod unbound past the bind timeout (see toInstance), is no
-// capacity: the cluster is then blocklisted like an AWS region.
+// unreserved; the poll loop settles it. The node autoscaler's refusal fails the pod: one for
+// the pod's own spec is a spec error, blocking the cluster for that workload; one for capacity,
+// or a pod unbound past the bind timeout (see toInstance), is no capacity, blocking the
+// cluster like an AWS region.
 //
 // The real pod lives in the placeholder's namespace, named after the claim like every
 // provider's instance, which is what lets the host cluster itself be a target. Nebula reports
@@ -81,15 +82,24 @@ type Provider struct {
 	offered    map[string][]string
 	costLabels []string
 	now        func() time.Time // a seam for the bind timeout in toInstance
+	// isolation fences every Provision's namespace (see netpol.go); nil when the table is off.
+	isolation *isolation
 }
 
 // NewFromFile builds the provider from the cluster table at path, connecting to every
 // cluster up front so a bad entry fails at startup rather than on the first Provision.
-// costLabels are the --cost-labels keys, copied from each Pod onto its real pod.
-func NewFromFile(ctx context.Context, path string, costLabels []string) (*Provider, error) {
+// costLabels are the --cost-labels keys, copied from each Pod onto its real pod. podIP is this
+// pod's own address, which must lie in the host cluster's cidrs when isolation is on.
+func NewFromFile(ctx context.Context, path string, costLabels []string, podIP string) (*Provider, error) {
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		return nil, err
+	}
+	iso := cfg.isolation()
+	if iso != nil {
+		if err := iso.checkHost(podIP); err != nil {
+			return nil, err
+		}
 	}
 	cat, err := catalog.Load()
 	if err != nil {
@@ -106,7 +116,12 @@ func NewFromFile(ctx context.Context, path string, costLabels []string) (*Provid
 		}
 		clients[cl.Name] = cc
 	}
-	return New(ctx, cfg.Clusters, clients, cat, costLabels), nil
+	p := New(ctx, cfg.Clusters, clients, cat, costLabels)
+	if iso != nil {
+		host := clients[iso.host.Name]
+		p.isolation = &isolation{isolationConfig: *iso, hostKube: host.kube, hostDynamic: host.dynamic}
+	}
+	return p, nil
 }
 
 // New returns a Provider over already-built clients, one per cluster in clusters, which
@@ -195,7 +210,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
 		SupportsStop:         false,
 		SupportsSpot:         true,  // Karpenter's capacity type, see nodeAffinity
-		SupportsEgressPolicy: false, // no NetworkPolicy is written yet
+		SupportsEgressPolicy: false, // a pool's egress modes; namespace isolation (netpol.go) is separate
 		SupportsCPUOnly:      true,
 		NativeTags:           true,
 		PreemptionNotice:     spotNotice,
@@ -261,6 +276,11 @@ func (p *Provider) Provision(
 
 	if err := ensureNamespace(ctx, kube, real.Namespace); err != nil {
 		return provider.ProvisionResult{}, err
+	}
+	if p.isolation != nil {
+		if err := p.isolation.fence(ctx, cl, real.Namespace); err != nil {
+			return provider.ProvisionResult{}, err
+		}
 	}
 	created, adopted, err := createOrAdopt(ctx, cl.clients, real)
 	if err != nil {
@@ -355,7 +375,7 @@ func (p *Provider) Get(ctx context.Context, instanceID, _ string) (*provider.Ins
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes: get pod %s: %w", instanceID, classifyAPI(err))
 	}
-	inst := p.toInstance(cl, pod, "")
+	inst := p.toInstance(cl, pod, nil)
 	return &inst, nil
 }
 
@@ -383,7 +403,7 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 
 // refusals reads cl's node autoscaler refusals, but only while some of pods is still waiting
 // for a node: nothing else needs them. A failed read is no verdict; the bind timeout remains.
-func (p *Provider) refusals(ctx context.Context, cl cluster, pods []corev1.Pod) map[types.UID]provider.InstanceState {
+func (p *Provider) refusals(ctx context.Context, cl cluster, pods []corev1.Pod) map[types.UID]error {
 	if !slices.ContainsFunc(pods, func(pod corev1.Pod) bool { return pod.Spec.NodeName == "" }) {
 		return nil
 	}
@@ -412,7 +432,7 @@ func (p *Provider) FindByClaim(ctx context.Context, claimName, region string) (*
 		for i := range pods {
 			// Checked again here: the selector is the server's job, and not every client honours it.
 			if pods[i].Name == claimName {
-				inst := p.toInstance(p.clusters[r], &pods[i], "")
+				inst := p.toInstance(p.clusters[r], &pods[i], nil)
 				return &inst, nil
 			}
 		}
@@ -501,14 +521,21 @@ func matches(cl ClusterConfig, token string) bool {
 	return token == "" || token == cl.Region || strings.EqualFold(token, cl.Geography)
 }
 
-// instanceID is "<region>/<namespace>/<pod>": the region names the cluster, and is part of the
-// id because Get and Terminate are handed nothing else that names it.
+// instanceID is "<region>:<namespace>:<pod>": the region names the cluster, and is part of the
+// id because Get and Terminate are handed nothing else that names it. No part can hold a ":",
+// as Kubernetes names allow only [a-z0-9.-].
 func instanceID(region, namespace, name string) string {
-	return region + "/" + namespace + "/" + name
+	return region + ":" + namespace + ":" + name
 }
 
+// parseInstanceID also reads the earlier "<region>/<namespace>/<pod>", which instances created
+// before the change still carry on their NodeClaim and placeholder.
 func parseInstanceID(id string) (region, namespace, name string, err error) {
-	parts := strings.SplitN(id, "/", 3)
+	sep := ":"
+	if !strings.Contains(id, sep) {
+		sep = "/"
+	}
+	parts := strings.SplitN(id, sep, 3)
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return "", "", "", fmt.Errorf("kubernetes: malformed instance id %q", id)
 	}
@@ -553,11 +580,11 @@ func createOrAdopt(
 }
 
 // ensureEnvSecret writes the Secret-sourced env, owned by the pod so Kubernetes deletes it with
-// it. An existing one is accepted only for an adopted pod, and only if it is Nebula's.
+// it. An existing one is accepted only for an adopted pod, and only if it is that pod's.
 func ensureEnvSecret(ctx context.Context, kube kubeClient, pod *corev1.Pod, adopted bool, env map[string]string) error {
 	want := envSecret(pod.Namespace, pod.Name, env)
 	want.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "v1", Kind: "Pod", Name: pod.Name, UID: pod.UID,
+		APIVersion: "v1", Kind: podKind, Name: pod.Name, UID: pod.UID,
 	}}
 	secrets := kube.CoreV1().Secrets(pod.Namespace)
 	_, err := secrets.Create(ctx, want, metav1.CreateOptions{})
@@ -569,6 +596,8 @@ func ensureEnvSecret(ctx context.Context, kube kubeClient, pod *corev1.Pod, adop
 			err = fmt.Errorf("secret %s/%s appeared before this pod's", want.Namespace, want.Name)
 		case !ownedByUs(got):
 			err = fmt.Errorf("secret %s/%s exists and is not Nebula's", want.Namespace, want.Name)
+		case !ownedByPod(got, pod.UID):
+			err = fmt.Errorf("secret %s/%s belongs to an earlier pod of that name", want.Namespace, want.Name)
 		}
 	}
 	if err != nil {
@@ -590,10 +619,10 @@ func deleteInstance(ctx context.Context, cc clusterClients, namespace, name stri
 // toInstance normalizes a real pod. Region is the cluster's AWS region, the token the claim
 // carries.
 //
-// A pod still provisioning reports refusal ("" for none) if set, else InstanceUnschedulable
-// once it outlasts bindTimeout, timed from creation so a restart does not reset it. The
-// refusal wins so a non-capacity reason never becomes a block by waiting.
-func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.InstanceState) provider.Instance {
+// A pod still provisioning is InstanceFailed once refused (nil for none), with the refusal as
+// its Err, or as no capacity once it outlasts bindTimeout, timed from creation so a restart
+// does not reset it.
+func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal error) provider.Instance {
 	inst := provider.Instance{
 		ID:        instanceID(cl.cfg.Region, pod.Namespace, pod.Name),
 		ClaimName: pod.Name,
@@ -605,10 +634,11 @@ func (p *Provider) toInstance(cl cluster, pod *corev1.Pod, refusal provider.Inst
 		return inst
 	}
 	switch {
-	case refusal != "":
-		inst.State = refusal
+	case refusal != nil:
+		inst.State, inst.Err = provider.InstanceFailed, refusal
 	case p.now().Sub(pod.CreationTimestamp.Time) > cl.nodeAutoscaler.bindTimeout():
-		inst.State = provider.InstanceUnschedulable
+		inst.State = provider.InstanceFailed
+		inst.Err = fmt.Errorf("%w: not bound within %s", provider.ErrNoCapacity, cl.nodeAutoscaler.bindTimeout())
 	}
 	return inst
 }
@@ -647,11 +677,23 @@ func podReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// classifyAPI marks a 401 or 403 as ErrAuth. ClassifyProvisionError narrows that to the one
-// cluster, since another cluster's credentials and RBAC are separate.
+// classifyAPI marks a 401, or a 403 from RBAC, as ErrAuth; ClassifyProvisionError narrows that
+// to the one cluster, since another cluster's credentials and RBAC are separate. Any other 403
+// is admission refusing this request (a namespace's ResourceQuota, Pod Security, a webhook),
+// so ErrRequestRejected: blocking the cluster for it would stop every other namespace too.
 func classifyAPI(err error) error {
-	if apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) {
+	switch {
+	case apierrors.IsUnauthorized(err), apierrors.IsForbidden(err) && rbacDenied(err):
 		return fmt.Errorf("%w: %w", provider.ErrAuth, err)
+	case apierrors.IsForbidden(err):
+		return fmt.Errorf("%w: %w", provider.ErrRequestRejected, err)
 	}
 	return err
+}
+
+// rbacDenied reports whether a 403 is the authorizer's: it alone words it `User "<name>" cannot
+// <verb> resource`, which admission rejections never do.
+func rbacDenied(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, `User "`) && strings.Contains(msg, `" cannot `)
 }

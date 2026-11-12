@@ -20,11 +20,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"sigs.k8s.io/yaml"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
+	"github.com/InftyAI/Nebula/pkg/provider"
 	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 )
 
@@ -166,6 +168,14 @@ func TestSampleGPUShapesAreProvisionable(t *testing.T) {
 
 		served := false
 		for _, name := range providers {
+			if name == provider.ProviderKubernetes {
+				if id, ok := packedInstanceType(cat, sh.accelerator, sh.count); ok {
+					served = true
+					t.Logf("%s: %s x%d -> %s [%s]", sh.file, sh.accelerator, sh.count, name, id)
+					break
+				}
+				continue
+			}
 			base := catalog.Base{ProviderName: name, Catalog: cat}
 			if ids, ok := base.MapAccelerator(sh.accelerator, sh.count); ok && len(ids) > 0 {
 				served = true
@@ -181,6 +191,18 @@ func TestSampleGPUShapesAreProvisionable(t *testing.T) {
 				sh.file, sh.accelerator, sh.count, sh.nodePoolRef, providers)
 		}
 	}
+}
+
+// packedInstanceType is an AWS instance type with at least count of accelerator. The kubernetes
+// provider's nodes are its EKS clusters' (see clusterCatalogs in pkg/provider/kubernetes), and
+// Karpenter packs pods onto them, so unlike on EC2 the count need not match exactly.
+func packedInstanceType(cat *catalog.Catalog, accelerator string, count int32) (string, bool) {
+	for _, o := range cat.Offerings(provider.ProviderAWS) {
+		if o.Available && strings.EqualFold(o.AcceleratorType, accelerator) && o.GPUCount >= count {
+			return o.AcceleratorID, true
+		}
+	}
+	return "", false
 }
 
 // nodePoolNameFromFile pulls metadata.name out of a NodePool sample, so a shape's

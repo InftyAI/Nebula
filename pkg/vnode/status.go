@@ -136,10 +136,9 @@ func applyReadinessTimeout(pod *corev1.Pod, waited time.Duration, now metav1.Tim
 	}, false)
 }
 
-// applyNoCapacity fails a pod whose unreserved instance was found to have no capacity, with
-// the same reason as a Provision that failed outright.
-func applyNoCapacity(pod *corev1.Pod, now metav1.Time) {
-	const msg = "external instance got no capacity"
+// applyClassifiedFailure fails a pod whose instance failed for a reason the provider gave,
+// with the same reason as a Provision that failed outright: it is classified like one.
+func applyClassifiedFailure(pod *corev1.Pod, msg string, now metav1.Time) {
 	setPhase(pod, corev1.PodFailed, reasonProvisionFailed, msg, now)
 	setReady(pod, corev1.ConditionFalse, now)
 	setContainerStatuses(pod, corev1.ContainerState{

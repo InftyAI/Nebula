@@ -33,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -49,6 +50,11 @@ const (
 	// tokenTTL is how long a minted token is reused. EKS accepts one for 15 minutes; the
 	// margin covers clock skew and a request in flight when it is swapped.
 	tokenTTL = 10 * time.Minute
+	// credentialsExpiryWindow refreshes the signing credentials this long before they expire.
+	// EKS replays a token's signature against STS, which rejects it once those credentials
+	// have expired, so it must exceed tokenTTL; the SDK's own window is 0 under IRSA and 5
+	// minutes under Pod Identity.
+	credentialsExpiryWindow = 15 * time.Minute
 
 	// clusterQPS and clusterBurst are each cluster client's own budget, separate from the
 	// home cluster's (see restConfigQPS in cmd/main.go).
@@ -60,6 +66,9 @@ const (
 // events, plus discovery to check the node autoscaler is installed.
 type clusterClients struct {
 	kube k8s.Interface
+	// dynamic writes the custom resources the typed client has no API for: the host's
+	// ClusterNetworkPolicies (see netpol.go).
+	dynamic dynamic.Interface
 	// ec2 answers which instance families the cluster's region offers (see offeredFamilies);
 	// nil keeps every family the catalog has.
 	ec2 describeOfferings
@@ -100,7 +109,8 @@ func offeredFamilies(ctx context.Context, api describeOfferings, families []stri
 // cluster's account: EKS has no resource policy to grant DescribeCluster across accounts.
 // Nothing is stored: the endpoint and CA come from DescribeCluster, the bearer token from STS.
 func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error) {
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cl.Region))
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cl.Region),
+		awsconfig.WithCredentialsCacheOptions(credentialsCacheOptions))
 	if err != nil {
 		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: load AWS config: %w", cl.Name, err)
 	}
@@ -123,6 +133,7 @@ func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error
 	restCfg := &rest.Config{
 		Host:            *c.Endpoint,
 		TLSClientConfig: rest.TLSClientConfig{CAData: ca},
+		Timeout:         30 * time.Second,
 		QPS:             clusterQPS,
 		Burst:           clusterBurst,
 		// Protobuf for the built-in types read every poll (pods, events): several times smaller
@@ -139,7 +150,16 @@ func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error
 	if err != nil {
 		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: build client: %w", cl.Name, err)
 	}
-	return clusterClients{kube: kube, ec2: ec2.NewFromConfig(awsCfg)}, nil
+	// dynamic.NewForConfig switches its own copy of the config to JSON, which custom resources need.
+	dyn, err := dynamic.NewForConfig(restCfg)
+	if err != nil {
+		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: build dynamic client: %w", cl.Name, err)
+	}
+	return clusterClients{kube: kube, dynamic: dyn, ec2: ec2.NewFromConfig(awsCfg)}, nil
+}
+
+func credentialsCacheOptions(o *awssdk.CredentialsCacheOptions) {
+	o.ExpiryWindow = credentialsExpiryWindow
 }
 
 // eksTokenSource mints and caches the bearer token for one cluster.
@@ -176,11 +196,24 @@ func (s *eksTokenSource) Token(ctx context.Context) (string, error) {
 	return s.token, nil
 }
 
-// bearerTransport adds the current EKS token to every request.
+// Invalidate drops token if it is still the cached one, so the next request mints afresh. A
+// token minted since by another request is kept.
+func (s *eksTokenSource) Invalidate(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token == token {
+		s.token = ""
+	}
+}
+
+// bearerTransport adds the current EKS token to every request. A 401 drops the token, so one
+// that went bad before tokenTTL (credentials revoked or rotated under it) costs one failed
+// request, not the rest of its life. The request is not retried: its body may not replay.
 type bearerTransport struct {
 	base   http.RoundTripper
 	tokens interface {
 		Token(context.Context) (string, error)
+		Invalidate(token string)
 	}
 }
 
@@ -191,7 +224,11 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	req = req.Clone(req.Context()) // a RoundTripper must not mutate the caller's request
 	req.Header.Set("Authorization", "Bearer "+token)
-	return t.base.RoundTrip(req)
+	resp, err := t.base.RoundTrip(req)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		t.tokens.Invalidate(token)
+	}
+	return resp, err
 }
 
 // kubeClient is the typed client; an alias so tests can pass client-go's fake.

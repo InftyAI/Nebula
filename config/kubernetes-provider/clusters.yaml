@@ -8,4 +8,67 @@ clusters:
     provider: eks
     region: us-east-1          # the EKS cluster's AWS region
     geography: us              # set explicitly; a NodePool's regions match either this or region
+    host: true                 # the cluster Nebula runs in; at most one, required once cidrs are set
     # nodeAutoscaler: karpenter   # what adds nodes; the default and only one supported today
+    # cidrs: [10.20.0.0/16]       # its pod IP ranges (VPC CNI: the VPC CIDRs); must not overlap another cluster's
+  # Another target. Setting cidrs on any cluster turns namespace isolation on, and then every
+  # cluster needs them.
+  # - name: gpu-usw2
+  #   provider: eks
+  #   region: us-west-2
+  #   geography: us
+  #   cidrs: [10.21.0.0/16]
+
+# With cidrs set, a host pod reaches only its own namespace's remote pods. For a sandbox in
+# namespace org-1 on gpu-usw2, Provision writes, before the real pod exists:
+#
+#   # host (my-cluster): org-1's traffic to its own Nebula pods, whose placeholders carry the
+#   # remote pods' IPs, is passed to org-1's own NetworkPolicies, as for its local pods. Pass,
+#   # not Accept, which is final and would override them; deleted with the namespace.
+#   kind: ClusterNetworkPolicy           # networking.k8s.aws
+#   metadata: { name: nebula-isolation-host-org-1, ownerReferences: [{ kind: Namespace, name: org-1, ... }] }
+#   spec:
+#     tier: Admin
+#     priority: 500
+#     subject: { namespaces: { matchLabels: { kubernetes.io/metadata.name: org-1 } } }
+#     egress:
+#       - name: own-nebula-pods
+#         action: Pass
+#         to: [{ pods: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: org-1 } },
+#                        podSelector: { matchLabels: { nebula.inftyai.com/enabled: "true" } } } }]
+#
+#   # target (gpu-usw2): no other namespace there may reach org-1's Nebula pods, whatever
+#   # org-1's own NetworkPolicies allow. Its peers cannot be CIDRs, hence the one below too.
+#   kind: ClusterNetworkPolicy           # networking.k8s.aws
+#   metadata: { name: nebula-isolation-target-org-1, ownerReferences: [{ kind: Namespace, name: org-1, ... }] }
+#   spec:
+#     tier: Admin
+#     priority: 500
+#     subject: { pods: { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: org-1 } },
+#                        podSelector: { matchLabels: { app.kubernetes.io/managed-by: nebula } } } }
+#     ingress:
+#       - { name: own-namespace, action: Pass, from: [{ namespaces: { matchLabels: { kubernetes.io/metadata.name: org-1 } } }] }
+#       - { name: other-namespaces, action: Deny, from: [{ namespaces: {} }] }
+#
+#   # target (gpu-usw2), org-1: from outside the cluster, Nebula's pods admit only the host.
+#   kind: NetworkPolicy
+#   metadata: { name: nebula-isolation-target, namespace: org-1 }
+#   spec:
+#     podSelector: { matchLabels: { app.kubernetes.io/managed-by: nebula } }
+#     policyTypes: [Ingress]
+#     ingress:
+#       - from: [{ podSelector: {} }]
+#       - from: [{ ipBlock: { cidr: 10.20.0.0/16 } }]
+#
+# The chart adds the host's default deny of the other clusters' ranges for every namespace, the
+# release's own exempt (chart/templates/cluster-network-policy.yaml). Admin tier after the
+# pass above (500), so org-1 reaches only its own remote pods and no namespace's own
+# NetworkPolicy can open the rest:
+#
+#   kind: ClusterNetworkPolicy           # networking.k8s.aws, AWS VPC CNI's network policy agent
+#   metadata: { name: nebula-isolation-host-cluster }
+#   spec:
+#     tier: Admin
+#     priority: 1000
+#     subject: { namespaces: { matchExpressions: [{ key: kubernetes.io/metadata.name, operator: NotIn, values: [nebula-system] }] } }
+#     egress: [{ name: no-target-clusters, action: Deny, to: [{ networks: [10.21.0.0/16] }] }]

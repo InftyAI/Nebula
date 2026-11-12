@@ -41,10 +41,9 @@ import (
 // failure is an error either way. A required miss is an error too, never a silent omission:
 // booting a GPU without its credentials bills for a workload that cannot run.
 //
-// Two divergences, both because there is no machine here: resourceFieldRef and status.*
-// fieldRefs are refused (see fieldRefValue), and $(VAR) is not expanded — values pass
-// through verbatim.
-// TODO: expand $(VAR) here if a workload needs it; the provider only sees the resolved map.
+// Two divergences. resourceFieldRef and status.* fieldRefs are refused, as there is no machine
+// here (see fieldRefValue). And an env value is a literal string: $(VAR) is not expanded, by
+// design, so every provider runs the value exactly as written.
 //
 // Reads bypass node.go's Secret/ConfigMap informers on purpose: VK waits only for the POD
 // informer to sync before CreatePod, and a cold cache reports an existing Secret as absent —

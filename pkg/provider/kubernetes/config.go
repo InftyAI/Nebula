@@ -19,7 +19,9 @@ package kubernetes
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
+	"slices"
 
 	"sigs.k8s.io/yaml"
 
@@ -56,6 +58,13 @@ type ClusterConfig struct {
 	Geography string `json:"geography"`
 	// NodeAutoscaler is what adds nodes to the cluster (see nodeAutoscalers). Empty is Karpenter.
 	NodeAutoscaler string `json:"nodeAutoscaler,omitempty"`
+	// CIDRs are the ranges the cluster's pod IPs come from (with the VPC CNI, its VPC's CIDR
+	// blocks; never the service CIDR). Namespace isolation is built from them, so ranges of
+	// different clusters must not overlap: an address in both could not be told apart.
+	CIDRs []string `json:"cidrs,omitempty"`
+	// Host marks the cluster Nebula itself runs in, whose pods reach the others' remote pods.
+	// Listed like any other entry, it may also be a placement target.
+	Host bool `json:"host,omitempty"`
 }
 
 // nodeAutoscalerName defaults an empty NodeAutoscaler to Karpenter.
@@ -91,6 +100,11 @@ func (c *Config) Validate() error {
 	}
 	seen := make(map[string]bool, len(c.Clusters))
 	regions := make(map[string]string, len(c.Clusters))
+	type owned struct {
+		prefix  netip.Prefix
+		cluster string
+	}
+	var cidrs []owned
 	for i, cl := range c.Clusters {
 		if cl.Name == "" {
 			return fmt.Errorf("kubernetes: cluster %d has no name", i)
@@ -118,6 +132,76 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("kubernetes: cluster %q: geography %q is not one of %v",
 				cl.Name, cl.Geography, provider.Geographies)
 		}
+		for _, s := range cl.CIDRs {
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				return fmt.Errorf("kubernetes: cluster %q: cidr %q: %w", cl.Name, s, err)
+			}
+			if p != p.Masked() {
+				return fmt.Errorf("kubernetes: cluster %q: cidr %q has host bits set (want %s)", cl.Name, s, p.Masked())
+			}
+			for _, o := range cidrs {
+				if o.prefix.Overlaps(p) {
+					return fmt.Errorf("kubernetes: cidr %s of cluster %q overlaps %s of cluster %q",
+						p, cl.Name, o.prefix, o.cluster)
+				}
+			}
+			cidrs = append(cidrs, owned{prefix: p, cluster: cl.Name})
+		}
+	}
+	// cidrs exist only for namespace isolation, so giving any cluster some turns it on, and a
+	// half-filled table would fence some clusters and leave the rest open.
+	hosts, ranged := 0, 0
+	for _, cl := range c.Clusters {
+		if cl.Host {
+			hosts++
+		}
+		if len(cl.CIDRs) > 0 {
+			ranged++
+		}
+	}
+	if hosts > 1 {
+		return fmt.Errorf("kubernetes: %d clusters are marked host; at most one is", hosts)
+	}
+	if ranged > 0 && ranged < len(c.Clusters) {
+		return fmt.Errorf("kubernetes: %d of %d clusters have cidrs; namespace isolation needs them on every cluster",
+			ranged, len(c.Clusters))
+	}
+	if ranged > 0 && hosts == 0 {
+		return errors.New("kubernetes: namespace isolation (cidrs are set) needs one cluster marked host")
 	}
 	return nil
+}
+
+// isolation is the namespace fence Provision builds once the table has cidrs, or nil. The
+// other clusters' ranges are the chart's to deny (templates/cluster-network-policy.yaml).
+func (c *Config) isolation() *isolationConfig {
+	if !slices.ContainsFunc(c.Clusters, func(cl ClusterConfig) bool { return len(cl.CIDRs) > 0 }) {
+		return nil
+	}
+	for _, cl := range c.Clusters {
+		if cl.Host {
+			return &isolationConfig{host: cl}
+		}
+	}
+	return nil // unreachable after Validate, which requires a host once cidrs are set
+}
+
+// checkHost fails a table whose host entry is not the cluster podIP is in, which would fence
+// the wrong ranges. An empty podIP (run outside a pod) is not checked.
+func (iso *isolationConfig) checkHost(podIP string) error {
+	if podIP == "" {
+		return nil
+	}
+	ip, err := netip.ParseAddr(podIP)
+	if err != nil {
+		return fmt.Errorf("kubernetes: POD_IP %q: %w", podIP, err)
+	}
+	for _, s := range iso.host.CIDRs {
+		if netip.MustParsePrefix(s).Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("kubernetes: this pod's IP %s is in none of host cluster %q's cidrs %v",
+		ip, iso.host.Name, iso.host.CIDRs)
 }

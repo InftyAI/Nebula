@@ -109,6 +109,32 @@ func TestBlocked_DenyRegionBlocksOneRegion(t *testing.T) {
 	}
 }
 
+func TestBlocked_DenyWorkloadBlocksOneWorkload(t *testing.T) {
+	fc := testclock.NewFakeClock(baseTime)
+	bl := newWithClock(fc)
+	bl.Record("kubernetes", provider.BlockScope{
+		Deny: provider.DenyWorkload, Accelerator: "L4:1", CapacityType: spot, Region: "us-east-1", Workload: "rs-a",
+	}, 10*time.Minute)
+
+	c := cand("kubernetes", "L4:1", spot, "us-east-1")
+	c.Workload = "rs-a"
+	if !bl.Blocked(c) {
+		t.Error("DenyWorkload must block its workload's candidate")
+	}
+	other := c
+	other.Workload = "rs-b"
+	elsewhere := c
+	elsewhere.Region = "us-west-1"
+	if bl.Blocked(other) || bl.Blocked(elsewhere) {
+		t.Error("DenyWorkload must not block another workload, or another candidate")
+	}
+	// An unkeyed scope blocks nothing, rather than every workload.
+	bl.Record("kubernetes", provider.BlockScope{Deny: provider.DenyWorkload, Region: "us-west-1"}, 10*time.Minute)
+	if bl.Blocked(cand("kubernetes", "", "", "us-west-1")) {
+		t.Error("DenyWorkload without a workload must block nothing")
+	}
+}
+
 func TestBlocked_EmptyCapacityTypeMatchesEveryTier(t *testing.T) {
 	fc := testclock.NewFakeClock(baseTime)
 	bl := newWithClock(fc)
@@ -378,6 +404,41 @@ func TestAdmit_UnrefusedProbeOpensTheCandidate(t *testing.T) {
 	}
 	if n := len(bl.entries); n != 0 {
 		t.Fatalf("len(entries) = %d, want 0 once the probe window passed", n)
+	}
+}
+
+// A half-open block nobody probed is stale past halfOpenGrace: the next burst goes out whole
+// instead of behind one probe on a shortage long gone. Within the grace it still probes.
+func TestAdmit_UnprobedHalfOpenExpiresAfterGrace(t *testing.T) {
+	c := cand("aws", "H100", spot, "us-east-1")
+	for _, tc := range []struct {
+		name      string
+		idle      time.Duration // after the block lapsed, before the burst
+		wantProbe bool
+	}{
+		// Fixed durations, not halfOpenGrace itself, so an entry that never goes stale fails.
+		{"moments after the lapse", 30 * time.Second, true},
+		{"a day after the lapse", 24 * time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := testclock.NewFakeClock(baseTime)
+			bl := newWithClock(fc)
+			bl.Record("aws", spotH100EastScope(), 30*time.Second)
+			fc.Step(30*time.Second + tc.idle)
+
+			admitted := 0
+			for i := 0; i < 3; i++ {
+				if _, ok := bl.Admit(c); ok {
+					admitted++
+				}
+			}
+			if want := map[bool]int{true: 1, false: 3}[tc.wantProbe]; admitted != want {
+				t.Fatalf("burst of 3 admitted %d, want %d", admitted, want)
+			}
+			if !tc.wantProbe && len(bl.entries) != 0 {
+				t.Fatalf("len(entries) = %d, want the stale entry dropped", len(bl.entries))
+			}
+		})
 	}
 }
 

@@ -110,7 +110,7 @@ var (
 	CandidateSkips = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nebula_placement_candidate_skips_total",
 		Help: "Placement candidates skipped, by provider, capacity type, region and reason.",
-	}, []string{"provider", "capacity_type", "region", "reason"})
+	}, []string{labelProvider, "capacity_type", "region", "reason"})
 )
 
 func init() {

@@ -41,7 +41,14 @@ func TestClassifyError(t *testing.T) {
 		// quotas are per-resource and, for a multi-region adapter, per-region, so one
 		// exhausted quota must not fence off other regions/accelerators.
 		{"quota sentinel", ErrQuota, capacityScope},
+		// Outranks the "forbidden" phrase below, which an admission rejection always carries.
+		{
+			"request-rejected sentinel blocks nothing though it reads forbidden",
+			fmt.Errorf("%w: pods \"x\" is forbidden: exceeded quota: compute", ErrRequestRejected),
+			BlockScope{},
+		},
 		{"no-capacity sentinel", ErrNoCapacity, capacityScope},
+		{"spec sentinel", ErrSpec, BlockScope{Deny: DenyWorkload, CapacityType: tier, Accelerator: accel}},
 		{"unsupported sentinel", ErrUnsupportedAccelerator, capacityScope},
 		// An image the provider cannot obtain belongs to the POD. The blocklist key carries no
 		// Pod, image or credential identity, so ANY scope here would exclude the candidate for
