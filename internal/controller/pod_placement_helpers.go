@@ -116,10 +116,18 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 		return placement{}, false, 0
 	}
 
+	refs, ok := requestedProviders(pod, pool)
+	if !ok {
+		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
+		log.Info("no requested provider is in the pool; leaving Pod gated",
+			"providers", pod.Annotations[nebulav1alpha1.ProvidersAnnotation])
+		return placement{}, false, 0
+	}
+
 	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
 	skipped := map[string]string{}             // provider -> why, for the exhausted-walk log
 	for _, tier := range capacityTiers(pool) { // outer: capacity
-		for _, ref := range pool.Spec.Providers { // provider (Ordered = listed order)
+		for _, ref := range refs { // provider (Ordered = listed order)
 			prov, ok := r.provider(ref.Name)
 			if !ok {
 				// No region on this skip and the two below: they are decided before the
@@ -256,6 +264,27 @@ func capacityTiers(pool *nebulav1alpha1.NodePool) []nebulav1alpha1.CapacityType 
 		return []nebulav1alpha1.CapacityType{""}
 	}
 	return pool.Spec.CapacityTypes
+}
+
+// requestedProviders narrows pool's providers to the Pod's ProvidersAnnotation, keeping the
+// pool's order. Absent means the whole pool. ok=false when the annotation names none of the
+// pool's providers: an empty result would otherwise read as no narrowing, and a typo would
+// place the Pod on a provider it ruled out.
+func requestedProviders(pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (refs []nebulav1alpha1.ProviderSpec, ok bool) {
+	raw := strings.TrimSpace(pod.Annotations[nebulav1alpha1.ProvidersAnnotation])
+	if raw == "" {
+		return pool.Spec.Providers, true
+	}
+	want := map[string]bool{}
+	for _, t := range strings.Split(raw, ",") {
+		want[strings.ToLower(strings.TrimSpace(t))] = true
+	}
+	for _, ref := range pool.Spec.Providers {
+		if want[strings.ToLower(ref.Name)] {
+			refs = append(refs, ref)
+		}
+	}
+	return refs, len(refs) > 0
 }
 
 // requestedGeographies reads the Pod's RegionsAnnotation into the narrowing ResolveRegions
