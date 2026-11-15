@@ -95,7 +95,7 @@ metadata:
     nebula.inftyai.com/accelerator-type: h100   # GPU type (case-insensitive)
   annotations:
     nebula.inftyai.com/regions: eu,uk           # optional: narrow within the pool
-    nebula.inftyai.com/providers: kubernetes    # optional: narrow the pool's providers
+    nebula.inftyai.com/providers: modal         # optional: narrow the pool's providers
 spec:
   containers:
   - name: workload
