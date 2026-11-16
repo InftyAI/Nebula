@@ -111,6 +111,7 @@ func main() {
 	var kubeletServingTLSBootstrap bool
 	var providers string
 	var kubernetesClusters string
+	var kubernetesPropagateLabels string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -157,6 +158,12 @@ func main() {
 		"Path to the kubernetes provider's cluster table in the container, normally "+
 			"/etc/nebula/kubernetes/clusters.yaml mounted from the kubernetes-clusters ConfigMap. "+
 			"Empty leaves the kubernetes provider unregistered.")
+	flag.StringVar(&kubernetesPropagateLabels, "kubernetes-propagate-labels", "",
+		"Comma-separated label keys copied from each placeholder Pod onto its real pod in the "+
+			"target cluster, values unchanged. A key the placeholder does not carry is skipped, and the "+
+			"--cost-labels keys always propagate. Nebula's own labels (nebula.inftyai.com/*, "+
+			"app.kubernetes.io/managed-by) are refused at startup. Empty (the default) copies only "+
+			"--cost-labels.")
 	flag.StringVar(&providers, "providers", strings.Join(knownProviders, ","),
 		"Comma-separated production providers to enable; all by default. A listed provider is "+
 			"skipped if it fails to initialize. Drain a provider before dropping it: nothing "+
@@ -174,6 +181,11 @@ func main() {
 	attribution, err := nebulametrics.ParseCostLabels(costLabels)
 	if err != nil {
 		setupLog.Error(err, "invalid --cost-labels")
+		os.Exit(1)
+	}
+	propagated, err := kubeprovider.ParsePropagateLabels(kubernetesPropagateLabels)
+	if err != nil {
+		setupLog.Error(err, "invalid --kubernetes-propagate-labels")
 		os.Exit(1)
 	}
 	enabledProviders, err := parseProviders(providers)
@@ -333,7 +345,8 @@ func main() {
 	// startup already sees its provider. The manager's client backs the AWS region
 	// source (regions are read from NodePools at call time, not env), so it is
 	// threaded in; the client is only queried at runtime, after the cache has synced.
-	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, kubernetesClusters, attribution)
+	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, kubernetesClusters,
+		append(slices.Clone(attribution), propagated...))
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
 	// Provision failure and read by the placement controller to skip a candidate
@@ -615,7 +628,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 //
 // Only providers in enabled are attempted (see parseProviders).
 func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool,
-	kubernetesClusters string, costLabels []string) {
+	kubernetesClusters string, kubernetesLabels []string) {
 	register := func(name string, build func() (provider.Provider, error)) {
 		if !enabled[name] {
 			setupLog.Info("provider disabled by --providers", "provider", name)
@@ -650,7 +663,7 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 		if kubernetesClusters == "" {
 			return nil, errors.New("no --kubernetes-clusters file")
 		}
-		return kubeprovider.NewFromFile(ctx, kubernetesClusters, costLabels, vnode.PodIPFromEnv())
+		return kubeprovider.NewFromFile(ctx, kubernetesClusters, kubernetesLabels, vnode.PodIPFromEnv())
 	})
 
 	// The fake provider is an in-memory backend used only by the e2e suite to

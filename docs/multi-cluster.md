@@ -53,6 +53,7 @@ cluster as it picks a region, from the pool's `regions` and `strategy` ([NodePoo
 | An **access entry** mapping the host's Nebula IAM role to the Kubernetes group `nebula` | How the target recognises Nebula (STS-signed token; no kubeconfig or secret). |
 | [`config/kubernetes-provider/remote-rbac.yaml`](../config/kubernetes-provider/remote-rbac.yaml) applied | What group `nebula` may do: pods, secrets, namespaces, events, network policies. |
 | Its EKS API reachable from the Nebula manager | Every poll lists the real pods there. |
+| Its log agent forwarding Nebula's pods to the host's application log group | The host's log readers query only that group. Its streams there are prefixed `<cluster>-`. |
 | *Isolation only:* AWS VPC CNI's network policy support (`networking.k8s.aws` CRDs) | Enforces the policies in [Namespace isolation](#namespace-isolation). |
 
 **The host cluster**
@@ -150,6 +151,18 @@ instance family is skipped at placement.
 The provider enforces only `egress: Open` (it has no egress policy of its own); a pool with
 `Blocked` or `Allowlist` never places on it.
 
+## Labels on the real pod
+
+The real pod carries only an allowlist of its placeholder's labels: the `--cost-labels` keys, plus
+any keys listed in `--kubernetes-propagate-labels` (empty by default), e.g. `app` for a log pipeline
+that selects workloads by it. Values are copied unchanged, and Nebula's own labels
+(`nebula.inftyai.com/*`, `app.kubernetes.io/managed-by`) cannot be listed.
+
+It is an allowlist because, in the host cluster, the real pod shares the placeholder's namespace:
+a controller label such as `pod-template-hash` would let the placeholder's owner adopt it, and
+anything selecting on labels (a Service, a PodDisruptionBudget, an operator) would count the
+sandbox twice. Add a key only if nothing in that namespace selects on it.
+
 ## Namespace isolation
 
 On whenever the table has `cidrs`. A host pod in namespace X then reaches only X's remote
@@ -186,6 +199,15 @@ kubectl get node nebula-kubernetes          # Ready once the provider is registe
 Then run a small GPU workload pinned to one cluster (a NodePool with `regions: [<region>]`):
 the placeholder should go Running with the real pod's IP, and deleting it should remove the
 real pod, after which that cluster's Karpenter removes the empty node.
+
+To check that a target forwards, look for recent events in its streams in the host's group:
+
+```bash
+aws logs filter-log-events --region <host region> \
+  --log-group-name /aws/containerinsights/<host cluster>/application \
+  --log-stream-name-prefix <target cluster>- \
+  --start-time $(( ($(date +%s) - 3600) * 1000 )) --max-items 1
+```
 
 ## Troubleshooting
 

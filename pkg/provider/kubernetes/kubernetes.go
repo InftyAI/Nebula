@@ -79,18 +79,18 @@ type Provider struct {
 	order    []string           // config order, which is the order ResolveRegions walks
 	// offered is every cluster's families merged, for MapAccelerator: placement asks the
 	// provider, not a cluster, whether it serves an accelerator.
-	offered    map[string][]string
-	costLabels []string
-	now        func() time.Time // a seam for the bind timeout in toInstance
+	offered map[string][]string
+	labels  []string         // the placeholder's label keys each real pod carries (see podSpec.labels)
+	now     func() time.Time // a seam for the bind timeout in toInstance
 	// isolation fences every Provision's namespace (see netpol.go); nil when the table is off.
 	isolation *isolation
 }
 
 // NewFromFile builds the provider from the cluster table at path, connecting to every
 // cluster up front so a bad entry fails at startup rather than on the first Provision.
-// costLabels are the --cost-labels keys, copied from each Pod onto its real pod. podIP is this
-// pod's own address, which must lie in the host cluster's cidrs when isolation is on.
-func NewFromFile(ctx context.Context, path string, costLabels []string, podIP string) (*Provider, error) {
+// labelKeys are the label keys copied from each Pod onto its real pod. podIP is this pod's own
+// address, which must lie in the host cluster's cidrs when isolation is on.
+func NewFromFile(ctx context.Context, path string, labelKeys []string, podIP string) (*Provider, error) {
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		return nil, err
@@ -116,7 +116,7 @@ func NewFromFile(ctx context.Context, path string, costLabels []string, podIP st
 		}
 		clients[cl.Name] = cc
 	}
-	p := New(ctx, cfg.Clusters, clients, cat, costLabels)
+	p := New(ctx, cfg.Clusters, clients, cat, labelKeys)
 	if iso != nil {
 		host := clients[iso.host.Name]
 		p.isolation = &isolation{isolationConfig: *iso, hostKube: host.kube, hostDynamic: host.dynamic}
@@ -129,12 +129,12 @@ func NewFromFile(ctx context.Context, path string, costLabels []string, podIP st
 // region offers, read once here: what a region offers changes in months, and a restart
 // picks a change up.
 func New(ctx context.Context, clusters []ClusterConfig, clients map[string]clusterClients, cat catalog.Lookup,
-	costLabels []string) *Provider {
+	labelKeys []string) *Provider {
 	p := &Provider{
-		clusters:   make(map[string]cluster, len(clusters)),
-		offered:    map[string][]string{},
-		costLabels: costLabels,
-		now:        time.Now,
+		clusters: make(map[string]cluster, len(clusters)),
+		offered:  map[string][]string{},
+		labels:   labelKeys,
+		now:      time.Now,
 	}
 	for _, cl := range clusters {
 		families := familiesByAccelerator(cat.Offerings(clusterCatalogs[cl.Provider]))
@@ -270,7 +270,7 @@ func (p *Provider) Provision(
 		selection:  cl.nodeAutoscaler.selection(families, req.CapacityType),
 		env:        req.Env.Config,
 		hasSecrets: len(req.Env.Secrets) > 0,
-		costLabels: p.costLabels,
+		labels:     p.labels,
 	})
 	kube := cl.clients.kube
 
