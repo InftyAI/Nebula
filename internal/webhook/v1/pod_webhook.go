@@ -218,10 +218,11 @@ func validatePod(pod *corev1.Pod) error {
 }
 
 // hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
-// placedByNebula reports whether placement chose a provider for pod, which it records in the
-// nodeSelector; a Pod bound elsewhere, or still gated, has none.
+// placedByNebula reports whether placement chose a provider for pod: it records the choice in the
+// nodeSelector as it removes the gate, so a selector on a still-gated Pod, which a user may supply
+// at creation, doesn't count.
 func placedByNebula(pod *corev1.Pod) bool {
-	return pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != ""
+	return pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "" && !hasNebulaGate(pod)
 }
 
 func hasNebulaGate(pod *corev1.Pod) bool {
