@@ -282,6 +282,58 @@ func TestValidateCreate_SkipsPreBoundPod(t *testing.T) {
 	}
 }
 
+func TestValidateUpdate_FreezesPlacementAnnotationsOncePlaced(t *testing.T) {
+	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
+	gated := func(annotations map[string]string) *corev1.Pod {
+		pod := podWith(optedIn, "", nebulav1alpha1.ProviderSelectionGate)
+		pod.Annotations = annotations
+		return pod
+	}
+	placed := func(annotations map[string]string) *corev1.Pod {
+		pod := gated(annotations)
+		pod.Spec.SchedulingGates = nil
+		pod.Spec.NodeSelector = map[string]string{nebulav1alpha1.ProviderLabel: "kubernetes"}
+		return pod
+	}
+	// A provider selector the user supplied at creation: still gated, so not placed.
+	selectedByUser := func(annotations map[string]string) *corev1.Pod {
+		pod := gated(annotations)
+		pod.Spec.NodeSelector = map[string]string{nebulav1alpha1.ProviderLabel: "kubernetes"}
+		return pod
+	}
+	providers := func(v string) map[string]string { return map[string]string{nebulav1alpha1.ProvidersAnnotation: v} }
+	regions := func(v string) map[string]string { return map[string]string{nebulav1alpha1.RegionsAnnotation: v} }
+	cases := []struct {
+		name     string
+		old, new *corev1.Pod
+		wantErr  string // substring; empty means admitted
+	}{
+		// Editing while gated is how an invalid request gets fixed.
+		{"providers edited while gated", gated(providers("aws")), gated(providers("kubernetes")), ""},
+		{"providers corrected while gated with a user's selector",
+			selectedByUser(providers("aws")), selectedByUser(providers("kubernetes")), ""},
+		{"providers set while gated", gated(nil), gated(providers("kubernetes")), ""},
+		{"providers changed once placed", placed(providers("kubernetes")), placed(providers("modal")), "can't change"},
+		{"providers removed once placed", placed(providers("kubernetes")), placed(nil), "can't change"},
+		{"providers added once placed", placed(nil), placed(providers("modal")), "can't change"},
+		{"regions changed once placed", placed(regions("eu")), placed(regions("us")), "can't change"},
+		{"other annotations change once placed", placed(providers("kubernetes")),
+			placed(map[string]string{nebulav1alpha1.ProvidersAnnotation: "kubernetes", "other": "x"}), ""},
+	}
+	v := &PodCustomValidator{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateUpdate(context.Background(), tc.old, tc.new)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("ValidateUpdate err = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("ValidateUpdate err = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
 	sidecarPod := func(labels map[string]string) *corev1.Pod {
@@ -302,6 +354,11 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 	// placed is what placement leaves: the gate gone and the provider chosen.
 	placed := func(pod *corev1.Pod) *corev1.Pod {
 		pod = released(pod)
+		pod.Spec.NodeSelector = map[string]string{nebulav1alpha1.ProviderLabel: "kubernetes"}
+		return pod
+	}
+	// selected is a Pod created with the provider selector already set: the gate is still on.
+	selected := func(pod *corev1.Pod) *corev1.Pod {
 		pod.Spec.NodeSelector = map[string]string{nebulav1alpha1.ProviderLabel: "kubernetes"}
 		return pod
 	}
@@ -327,6 +384,8 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), ""},
 		// Isolation selects a placed Pod's instance by the label, so it may not go.
 		{"opting out after placement", placed(sidecarPod(optedIn)), placed(sidecarPod(nil)), "stays on a Pod Nebula has placed"},
+		// A selector the user supplied at creation, with the gate still on: never placed, so it may opt out.
+		{"opting out while gated with a user's selector", selected(sidecarPod(optedIn)), released(selected(sidecarPod(nil))), ""},
 		// Bound elsewhere, so never placed: nothing selects it, and it may opt out.
 		{"opting out a pre-bound Pod", validPod(optedIn, "node-1"), validPod(nil, "node-1"), ""},
 	}

@@ -149,9 +149,11 @@ Follow one GPU Pod from creation to teardown:
    `$(VAR)` in them, so `DIR=$(BASE)/cache` reaches the workload as written.
 
    A workload that cares where it runs adds `nebula.inftyai.com/regions`, a
-   comma-separated list of `provider.Geographies` tokens. It only ever narrows
-   what the pool already allows — a Pod cannot reach a geography its NodePool
-   left out.
+   comma-separated list of `provider.Geographies` tokens, and
+   `nebula.inftyai.com/providers`, a comma-separated list of the pool's providers.
+   Both only ever narrow what the pool already allows — a Pod cannot reach a
+   geography or a provider its NodePool left out, and the pool's order stands, and
+   neither can change once the Pod is placed: placement read them into its NodeClaim.
 
 2. **Gate at admission.** The mutating webhook adds the scheduling gate
    `nebula.inftyai.com/provider-selection` and a key-only `Exists` toleration for
@@ -313,8 +315,9 @@ Responsibilities:
 - resolve the selected NodePool from the Pod's `nebula.inftyai.com/nodepool`
   label;
 - parse the accelerator type/count from Pod label plus `nvidia.com/gpu`;
-- parse the requested geographies from `nebula.inftyai.com/regions` and narrow
-  each provider's regions to them;
+- narrow the pool's providers to `nebula.inftyai.com/providers`, and parse the
+  requested geographies from `nebula.inftyai.com/regions` and narrow each
+  provider's regions to them;
 - select the first currently usable candidate across capacity tier, provider,
   and provider-local region;
 - consult the shared failover blocklist before selecting a candidate;

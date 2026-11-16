@@ -83,6 +83,12 @@ const (
 	// an operator carving out a NodePool per jurisdiction. Case and spacing are free.
 	RegionsAnnotation = "nebula.inftyai.com/regions"
 
+	// ProvidersAnnotation narrows ONE workload to a comma-separated list of its NodePool's
+	// providers ("kubernetes", or "kubernetes,modal"), as RegionsAnnotation narrows its
+	// geographies: the pool's order stands, and a provider the pool doesn't list is never
+	// added. Case and spacing are free.
+	ProvidersAnnotation = "nebula.inftyai.com/providers"
+
 	// EndpointAnnotation carries the reachable address of the external instance (a DNS
 	// name, an IP, or a URL, in the provider's own form). It is the only way to reach
 	// the workload, and PodIP cannot hold it — the API server validates PodIP as a

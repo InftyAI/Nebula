@@ -776,6 +776,98 @@ func TestPlacement_UnresolvableRegionAnnotationLeavesPodGated(t *testing.T) {
 	}
 }
 
+func TestRequestedProviders(t *testing.T) {
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, provider.ProviderKubernetes)
+	cases := []struct {
+		name  string
+		anno  string
+		want  []string
+		valid bool
+	}{{
+		name:  "absent is the whole pool",
+		want:  []string{provider.ProviderModal, provider.ProviderKubernetes},
+		valid: true,
+	}, {
+		name:  "one provider of the pool",
+		anno:  "kubernetes",
+		want:  []string{provider.ProviderKubernetes},
+		valid: true,
+	}, {
+		// The pool is the policy: its order stands, whatever order the Pod lists.
+		name:  "the pool's order, not the annotation's",
+		anno:  "kubernetes,modal",
+		want:  []string{provider.ProviderModal, provider.ProviderKubernetes},
+		valid: true,
+	}, {
+		name:  "case and spacing are free",
+		anno:  " Kubernetes , ",
+		want:  []string{provider.ProviderKubernetes},
+		valid: true,
+	}, {
+		// Narrowing never widens: a provider the pool doesn't list is dropped.
+		name:  "a provider outside the pool is dropped",
+		anno:  "kubernetes,aws",
+		want:  []string{provider.ProviderKubernetes},
+		valid: true,
+	}, {
+		// Must NOT come back as no narrowing, or a typo would place the Pod anywhere the pool allows.
+		name: "naming none of the pool's providers is an invalid request",
+		anno: "aws",
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+			if tc.anno != "" {
+				pod.Annotations = map[string]string{nebulav1alpha1.ProvidersAnnotation: tc.anno}
+			}
+			refs, ok := requestedProviders(pod, pool)
+			if ok != tc.valid {
+				t.Fatalf("ok = %v, want %v", ok, tc.valid)
+			}
+			got := make([]string, 0, len(refs))
+			for _, r := range refs {
+				got = append(got, r.Name)
+			}
+			if tc.valid && !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPlacement_ProvidersAnnotationSkipsTheProvidersItLeavesOut(t *testing.T) {
+	// The pool would try Modal first; the Pod asks for the kubernetes provider alone.
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pod.Annotations = map[string]string{nebulav1alpha1.ProvidersAnnotation: "kubernetes"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal, provider.ProviderKubernetes)
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool},
+		&fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}},
+		&fakeProvider{name: provider.ProviderKubernetes, gpus: []string{"H100"}})
+
+	reconcilePod(t, r, "default", "p1")
+
+	if got := getClaim(t, c, "default-p1").Spec.Provider; got != provider.ProviderKubernetes {
+		t.Fatalf("expected the kubernetes provider, got %q", got)
+	}
+}
+
+func TestPlacement_ProvidersAnnotationOutsideThePoolLeavesPodGated(t *testing.T) {
+	pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+	pod.Annotations = map[string]string{nebulav1alpha1.ProvidersAnnotation: "aws"}
+	pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand},
+		provider.ProviderModal)
+	r, c := newPlacementReconciler(t, []client.Object{pod, pool},
+		&fakeProvider{name: provider.ProviderModal, gpus: []string{"H100"}})
+
+	reconcilePod(t, r, "default", "p1")
+
+	if got := getPod(t, c, "default", "p1"); !hasGateNamed(got) {
+		t.Fatal("expected the Pod to stay gated when it names no provider in its pool")
+	}
+}
+
 func TestPlacement_SkipsSpotWhenProviderHasNoSpotTier(t *testing.T) {
 	// Modal has no user-facing preemptible capacity (SupportsSpot=false). The pool
 	// asks for Spot first, but that candidate is unservable, so the walk falls

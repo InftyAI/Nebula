@@ -145,6 +145,15 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 	if !ok {
 		return nil, fmt.Errorf("expected a Pod object but got %T", newObj)
 	}
+	if optedIn(oldPod) && placedByNebula(oldPod) {
+		// Placement read them once, into the Pod's NodeClaim; a later edit would be silently ignored.
+		for _, key := range []string{nebulav1alpha1.ProvidersAnnotation, nebulav1alpha1.RegionsAnnotation} {
+			if oldPod.Annotations[key] != newPod.Annotations[key] {
+				return nil, fmt.Errorf("annotation %s can't change once Nebula has placed the Pod: "+
+					"recreate the Pod to place it again", key)
+			}
+		}
+	}
 	if optedIn(oldPod) {
 		// Namespace isolation selects a placed Pod by this label (its IP is its instance's),
 		// so dropping it would open the instance to every other namespace.
@@ -209,10 +218,11 @@ func validatePod(pod *corev1.Pod) error {
 }
 
 // hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
-// placedByNebula reports whether placement chose a provider for pod, which it records in the
-// nodeSelector; a Pod bound elsewhere, or still gated, has none.
+// placedByNebula reports whether placement chose a provider for pod: it records the choice in the
+// nodeSelector as it removes the gate, so a selector on a still-gated Pod, which a user may supply
+// at creation, doesn't count.
 func placedByNebula(pod *corev1.Pod) bool {
-	return pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != ""
+	return pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "" && !hasNebulaGate(pod)
 }
 
 func hasNebulaGate(pod *corev1.Pod) bool {
