@@ -19,6 +19,7 @@ package kubernetes
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -51,6 +52,30 @@ func ownerLabels() map[string]string {
 		nebulav1alpha1.ManagedByLabel: nebulav1alpha1.ManagedByValue,
 		nebulav1alpha1.ProviderLabel:  provider.ProviderKubernetes,
 	}
+}
+
+// ParsePropagateLabels turns the --kubernetes-propagate-labels value into label keys. It fails
+// rather than dropping a bad entry, so nobody believes a label propagates when it does not: a key
+// Kubernetes would not accept, one listed twice, and one of Nebula's own, which buildPod would
+// overwrite or which would send the real pod back through Nebula's webhook in the host cluster.
+func ParsePropagateLabels(spec string) ([]string, error) {
+	var keys []string //nolint:prealloc // nil, not empty, when nothing is listed
+	for _, raw := range strings.Split(spec, ",") {
+		key := strings.TrimSpace(raw)
+		switch {
+		case key == "":
+			continue
+		case slices.Contains(keys, key):
+			return nil, fmt.Errorf("propagated label %q is listed twice", key)
+		case strings.HasPrefix(key, nebulav1alpha1.GroupVersion.Group+"/") || key == nebulav1alpha1.ManagedByLabel:
+			return nil, fmt.Errorf("propagated label %q is Nebula's own and cannot be copied", key)
+		}
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("propagated label %q is not a valid label key: %s", key, strings.Join(errs, "; "))
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 func ownedByUs(obj metav1.Object) bool {
@@ -92,11 +117,12 @@ type podSpec struct {
 	// non-empty, so the pod loads the env Secret holding it.
 	env        map[string]string
 	hasSecrets bool
-	// costLabels are the placeholder's --cost-labels keys, copied so cost attribution follows
-	// the sandbox to the real pod. Nothing else is: a controller label such as
-	// batch.kubernetes.io/controller-uid would let the placeholder's Job adopt the real pod,
-	// since both share a namespace.
-	costLabels []string
+	// labels are the placeholder's label keys the real pod carries: --kubernetes-propagate-labels
+	// and --cost-labels. An allowlist on purpose: in the host cluster the real pod shares the
+	// placeholder's namespace, where a controller label (pod-template-hash,
+	// batch.kubernetes.io/controller-uid) would let the placeholder's owner adopt it, and anything
+	// selecting on labels (a Service, a PDB, an operator) would count the sandbox twice.
+	labels []string
 }
 
 // buildPod renders the real pod from the placeholder: a copy of its spec, so the sandbox runs
@@ -110,9 +136,10 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 	name := s.claim
 
 	labels := map[string]string{}
-	for _, k := range s.costLabels {
-		// Nebula's own labels drive placement, not cost: the opt-in one alone would send the
-		// real pod back through Nebula when the host is the target, whatever lists it.
+	for _, k := range s.labels {
+		// Nebula's own labels drive placement: the opt-in one alone would send the real pod back
+		// through Nebula when the host is the target. ParsePropagateLabels refuses them, but
+		// --cost-labels is not checked, so they are skipped here too.
 		if strings.HasPrefix(k, nebulav1alpha1.GroupVersion.Group+"/") {
 			continue
 		}

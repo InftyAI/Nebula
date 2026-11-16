@@ -240,21 +240,27 @@ func TestInstanceIDRoundTrip(t *testing.T) {
 }
 
 func TestBuildPod(t *testing.T) {
-	got := buildPod(placeholder(), podSpec{
+	local := placeholder()
+	local.Labels["app"] = "trainer"
+	local.Labels["pod-template-hash"] = "5d9f"
+	local.Labels[nebulav1alpha1.ManagedByLabel] = "hive-operator"
+	got := buildPod(local, podSpec{
 		claim:      "org-1-work-1",
 		selection:  karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacitySpot),
-		costLabels: []string{"org-id"},
+		labels:     []string{"org-id", "app"},
 		env:        map[string]string{"B": "2", "A": "1"},
 		hasSecrets: true,
 	})
 	if got.Name != "org-1-work-1" || got.Namespace != "org-1" {
 		t.Fatalf("got %s/%s", got.Namespace, got.Name)
 	}
-	if got.Labels["org-id"] != "o1" || !ownedByUs(got) {
+	// managed-by is Nebula's whatever the placeholder says, or List would lose its own pods.
+	if got.Labels["org-id"] != "o1" || got.Labels["app"] != "trainer" || !ownedByUs(got) {
 		t.Fatalf("labels = %v", got.Labels)
 	}
 	notCopied := []string{
 		nebulav1alpha1.EnabledLabel, "batch.kubernetes.io/controller-uid", nebulav1alpha1.AcceleratorTypeLabel,
+		"pod-template-hash",
 	}
 	for _, k := range notCopied {
 		if _, ok := got.Labels[k]; ok {
@@ -603,8 +609,8 @@ func TestEnvVarsEscapeDollar(t *testing.T) {
 // as target, the opt-in label would send the real pod back through Nebula's webhook.
 func TestBuildPodNeverCopiesNebulaLabels(t *testing.T) {
 	got := buildPod(placeholder(), podSpec{
-		claim:      "org-1-work-1",
-		costLabels: []string{"org-id", nebulav1alpha1.EnabledLabel, nebulav1alpha1.AcceleratorTypeLabel},
+		claim:  "org-1-work-1",
+		labels: []string{"org-id", nebulav1alpha1.EnabledLabel, nebulav1alpha1.AcceleratorTypeLabel},
 	})
 	if got.Labels["org-id"] != "o1" {
 		t.Errorf("labels = %v, want the cost label org-id", got.Labels)
@@ -612,6 +618,26 @@ func TestBuildPodNeverCopiesNebulaLabels(t *testing.T) {
 	for _, k := range []string{nebulav1alpha1.EnabledLabel, nebulav1alpha1.AcceleratorTypeLabel} {
 		if _, ok := got.Labels[k]; ok {
 			t.Errorf("label %q was copied though --cost-labels named it", k)
+		}
+	}
+}
+
+func TestParsePropagateLabels(t *testing.T) {
+	got, err := ParsePropagateLabels(" app , app.kubernetes.io/name")
+	if err != nil || !slices.Equal(got, []string{"app", "app.kubernetes.io/name"}) {
+		t.Fatalf("got %v, %v; want both keys, trimmed", got, err)
+	}
+	if got, err := ParsePropagateLabels(" , "); err != nil || got != nil {
+		t.Errorf("empty = %v, %v; want no keys", got, err)
+	}
+	for _, bad := range []string{
+		"app,app",                     // listed twice
+		nebulav1alpha1.EnabledLabel,   // would send the real pod back through Nebula
+		nebulav1alpha1.ManagedByLabel, // Nebula's own
+		"not a key",                   // invalid
+	} {
+		if _, err := ParsePropagateLabels(bad); err == nil {
+			t.Errorf("ParsePropagateLabels(%q) accepted it", bad)
 		}
 	}
 }
