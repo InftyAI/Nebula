@@ -145,6 +145,15 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 	if !ok {
 		return nil, fmt.Errorf("expected a Pod object but got %T", newObj)
 	}
+	if optedIn(oldPod) && placedByNebula(oldPod) {
+		// Placement read them once, into the Pod's NodeClaim; a later edit would be silently ignored.
+		for _, key := range []string{nebulav1alpha1.ProvidersAnnotation, nebulav1alpha1.RegionsAnnotation} {
+			if oldPod.Annotations[key] != newPod.Annotations[key] {
+				return nil, fmt.Errorf("annotation %s can't change once Nebula has placed the Pod: "+
+					"recreate the Pod to place it again", key)
+			}
+		}
+	}
 	if optedIn(oldPod) {
 		// Namespace isolation selects a placed Pod by this label (its IP is its instance's),
 		// so dropping it would open the instance to every other namespace.

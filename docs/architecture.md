@@ -152,7 +152,8 @@ Follow one GPU Pod from creation to teardown:
    comma-separated list of `provider.Geographies` tokens, and
    `nebula.inftyai.com/providers`, a comma-separated list of the pool's providers.
    Both only ever narrow what the pool already allows — a Pod cannot reach a
-   geography or a provider its NodePool left out, and the pool's order stands.
+   geography or a provider its NodePool left out, and the pool's order stands, and
+   neither can change once the Pod is placed: placement read them into its NodeClaim.
 
 2. **Gate at admission.** The mutating webhook adds the scheduling gate
    `nebula.inftyai.com/provider-selection` and a key-only `Exists` toleration for
