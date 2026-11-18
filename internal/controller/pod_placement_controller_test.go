@@ -275,6 +275,44 @@ func TestPlacement_CPUOnlyPodMatchesAnyCPUOnlyProvider(t *testing.T) {
 	}
 }
 
+// TestPlacement_DiskPastAProvidersMaxSkipsIt pins the boundary: a Pod's ephemeral-storage at
+// Modal's 512 GiB stays on Modal, one GiB more falls through to the pool's next provider, and
+// with no other provider the Pod stays gated rather than landing short of disk.
+func TestPlacement_DiskPastAProvidersMaxSkipsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		disk      string
+		providers []string
+		want      string // "" = left gated
+	}{
+		{"at the max", "512Gi", []string{provider.ProviderModal, provider.ProviderAWS}, provider.ProviderModal},
+		{"past the max", "513Gi", []string{provider.ProviderModal, provider.ProviderAWS}, provider.ProviderAWS},
+		{"past it, decimal", "550G", []string{provider.ProviderModal, provider.ProviderAWS}, provider.ProviderAWS},
+		{"past it, nowhere else", "513Gi", []string{provider.ProviderModal}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
+			pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(tc.disk),
+			}
+			pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, tc.providers...)
+			modal := &fakeProvider{name: provider.ProviderModal, maxDiskGiB: 512}
+			aws := &fakeProvider{name: provider.ProviderAWS}
+			r, c := newPlacementReconciler(t, []client.Object{pod, pool}, modal, aws)
+
+			reconcilePod(t, r, "default", "p1")
+
+			got := getPod(t, c, "default", "p1")
+			if placed := got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel]; placed != tc.want {
+				t.Fatalf("placed on %q, want %q", placed, tc.want)
+			}
+			if gated := hasGateNamed(got); gated != (tc.want == "") {
+				t.Fatalf("gated = %v, want %v", gated, tc.want == "")
+			}
+		})
+	}
+}
+
 func TestPlacement_CPUOnlyPodSkipsGPUOnlyProvider(t *testing.T) {
 	// RunPod is listed first but runs GPU Pods only, so the CPU-only Pod lands on Modal.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")

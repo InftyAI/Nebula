@@ -359,6 +359,10 @@ type Capabilities struct {
 	SupportsEgressPolicy bool
 	// SupportsCPUOnly is true if the provider runs a Pod with no accelerator.
 	SupportsCPUOnly bool
+	// MaxDiskGiB is the most local disk one instance can have; placement skips the provider
+	// for a Pod whose ephemeral-storage asks for more. Zero means no known limit (AWS sizes the
+	// volume to the request). Modal: 512, a sandbox's fixed quota, which it cannot raise.
+	MaxDiskGiB int
 	// NativeTags is true if the provider has real instance tags/labels; when
 	// false, identity is encoded in the instance name (RunPod: false).
 	NativeTags bool
@@ -400,6 +404,13 @@ func (c Capabilities) ServesCapacityTier(tier nebulav1alpha1.CapacityType) bool 
 // unplaceable instead of silently unprotected.
 func (c Capabilities) ServesEgress(policy *nebulav1alpha1.EgressPolicy) bool {
 	return !policy.RestrictsEgress() || c.SupportsEgressPolicy
+}
+
+// ServesDisk reports whether one instance can hold diskGiB of local disk (see MaxDiskGiB).
+// Skipping, not provisioning short: a workload given less than it asked for fails when its
+// writes run out, long after placement could have chosen another provider.
+func (c Capabilities) ServesDisk(diskGiB int) bool {
+	return c.MaxDiskGiB == 0 || diskGiB <= c.MaxDiskGiB
 }
 
 // Instance is the provider-agnostic view of one external instance, as observed.

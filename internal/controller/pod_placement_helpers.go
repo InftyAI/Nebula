@@ -124,13 +124,15 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 		return placement{}, false, 0
 	}
 
+	diskGiB := util.PodEphemeralStorageGiB(pod)
+
 	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
 	skipped := map[string]string{}             // provider -> why, for the exhausted-walk log
 	for _, tier := range capacityTiers(pool) { // outer: capacity
 		for _, ref := range refs { // provider (Ordered = listed order)
 			prov, ok := r.provider(ref.Name)
 			if !ok {
-				// No region on this skip and the two below: they are decided before the
+				// No region on this skip and the three below: they are decided before the
 				// walk reaches the region axis, so they rule out every region at once.
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipProviderUnregistered)
 				skipped[ref.Name] = metrics.SkipProviderUnregistered
@@ -150,6 +152,13 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				skipped[ref.Name] = metrics.SkipEgressUnsupported
 				log.V(1).Info("skipping candidate: provider cannot enforce the pool's egress policy",
 					"provider", ref.Name, "egressMode", pool.Spec.Egress.ModeOrOpen())
+				continue
+			}
+			if !prov.Capabilities().ServesDisk(diskGiB) {
+				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipDiskUnsupported)
+				skipped[ref.Name] = metrics.SkipDiskUnsupported
+				log.V(1).Info("skipping candidate: provider cannot give one instance that much disk",
+					"provider", ref.Name, "diskGiB", diskGiB, "maxDiskGiB", prov.Capabilities().MaxDiskGiB)
 				continue
 			}
 			// A CPU-only Pod (no accelerator) matches a provider that SupportsCPUOnly; an

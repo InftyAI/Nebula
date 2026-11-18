@@ -53,13 +53,16 @@ type fakeProvider struct {
 	spot         bool                // Capabilities().SupportsSpot (placement skips Spot without it)
 	egress       bool                // Capabilities().SupportsEgressPolicy (placement skips restricted pools without it)
 	gpuOnly      bool                // !Capabilities().SupportsCPUOnly (placement skips CPU-only Pods)
+	maxDiskGiB   int                 // Capabilities().MaxDiskGiB (placement skips Pods asking more)
 	// expandRegions overrides ResolveRegions; nil = pass the declaration through.
 	expandRegions func([]string) []string
 }
 
 func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) Capabilities() provider.Capabilities {
-	return provider.Capabilities{SupportsSpot: f.spot, SupportsEgressPolicy: f.egress, SupportsCPUOnly: !f.gpuOnly}
+	return provider.Capabilities{
+		SupportsSpot: f.spot, SupportsEgressPolicy: f.egress, SupportsCPUOnly: !f.gpuOnly, MaxDiskGiB: f.maxDiskGiB,
+	}
 }
 func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (provider.ProvisionResult, error) {
 	return provider.ProvisionResult{}, nil

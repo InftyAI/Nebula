@@ -75,8 +75,9 @@ which is the whole reason for splitting them:
 
 The skip `reason` is likewise closed: `provider_unregistered`,
 `capacity_type_unsupported`, `accelerator_unsupported`, `egress_policy_unsupported`,
-`no_available_regions`, `blocked`. Only `blocked` clears on its own. One reconcile can file
-several skips — the walk visits every candidate before giving up.
+`disk_unsupported` (the Pod's `ephemeral-storage` is past what one instance of the provider
+can have, e.g. Modal's 512 GiB), `no_available_regions`, `blocked`. Only `blocked` clears on
+its own. One reconcile can file several skips — the walk visits every candidate before giving up.
 
 ## Provisioning
 
