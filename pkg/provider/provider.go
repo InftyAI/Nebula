@@ -361,7 +361,7 @@ type Capabilities struct {
 	SupportsCPUOnly bool
 	// MaxDiskGiBPerPod is the most local disk the provider can give one Pod; placement skips it
 	// for a Pod whose ephemeral-storage asks for more. Each Pod gets its own, so two Pods at the
-	// limit both fit. Zero means no known limit (AWS sizes the volume to the request). Modal:
+	// limit both fit. Zero means no known limit. AWS: gp3's 16 TiB less the AMI root. Modal:
 	// 512, a sandbox's fixed quota, which it cannot raise.
 	MaxDiskGiBPerPod int
 	// NativeTags is true if the provider has real instance tags/labels; when

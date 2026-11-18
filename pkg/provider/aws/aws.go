@@ -408,6 +408,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		// egress rules (and no NAT for the Blocked case), so it is unsupported until then.
 		SupportsEgressPolicy: false,
 		SupportsCPUOnly:      false,            // the catalog is GPU instance types only
+		MaxDiskGiBPerPod:     awsMaxDiskGiB,    // gp3's cap less the AMI root; refused past it
 		NativeTags:           true,             // EC2 tags carry identity
 		PreemptionNotice:     preemptionNotice, // Spot 2-minute warning
 		PollInterval:         spotPollInterval, // Spot reclaims are abrupt; poll faster than default
@@ -746,7 +747,8 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 const awsAMIRootGiB = 30
 
 // awsMaxDiskGiB is the most user space a Pod may ask for: gp3's 16 TiB volume cap less the OS
-// base. Refused at launch, so it never reaches rootVolume's int32.
+// base. Placement skips AWS past it (MaxDiskGiBPerPod); launch still refuses, so it never
+// reaches rootVolume's int32.
 const awsMaxDiskGiB = 16*1024 - awsAMIRootGiB
 
 // PricePerHour overrides catalog.Base to add the root volume, which EBS bills by provisioned

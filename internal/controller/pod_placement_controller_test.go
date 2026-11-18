@@ -313,6 +313,40 @@ func TestPlacement_DiskPastAProvidersMaxSkipsIt(t *testing.T) {
 	}
 }
 
+// TestPlacement_GPUPodPastAWSDiskSkipsIt: 16Ti is past AWS's 16354 GiB (gp3's 16 TiB less
+// the AMI root), so a GPU Pod asking it skips AWS for the next provider, or stays gated,
+// rather than being ungated onto AWS to fail at launch.
+func TestPlacement_GPUPodPastAWSDiskSkipsIt(t *testing.T) {
+	const awsMaxDiskGiB = 16*1024 - 30
+	for _, tc := range []struct {
+		name      string
+		providers []string
+		want      string // "" = left gated
+	}{
+		{"another provider", []string{provider.ProviderAWS, provider.ProviderRunPod}, provider.ProviderRunPod},
+		{"nowhere else", []string{provider.ProviderAWS}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := gatedPod("p1", "default", "uid-1", "pool-a", "H100")
+			pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("16Ti")
+			pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, tc.providers...)
+			aws := &fakeProvider{name: provider.ProviderAWS, maxDiskGiBPerPod: awsMaxDiskGiB}
+			runpod := &fakeProvider{name: provider.ProviderRunPod}
+			r, c := newPlacementReconciler(t, []client.Object{pod, pool}, aws, runpod)
+
+			reconcilePod(t, r, "default", "p1")
+
+			got := getPod(t, c, "default", "p1")
+			if placed := got.Spec.NodeSelector[nebulav1alpha1.ProviderLabel]; placed != tc.want {
+				t.Fatalf("placed on %q, want %q", placed, tc.want)
+			}
+			if gated := hasGateNamed(got); gated != (tc.want == "") {
+				t.Fatalf("gated = %v, want %v", gated, tc.want == "")
+			}
+		})
+	}
+}
+
 func TestPlacement_CPUOnlyPodSkipsGPUOnlyProvider(t *testing.T) {
 	// RunPod is listed first but runs GPU Pods only, so the CPU-only Pod lands on Modal.
 	pod := gatedPod("p1", "default", "uid-1", "pool-a", "")
