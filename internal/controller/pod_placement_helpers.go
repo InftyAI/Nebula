@@ -157,8 +157,8 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			if !prov.Capabilities().ServesDisk(diskGiB) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipDiskUnsupported)
 				skipped[ref.Name] = metrics.SkipDiskUnsupported
-				log.V(1).Info("skipping candidate: provider cannot give one instance that much disk",
-					"provider", ref.Name, "diskGiB", diskGiB, "maxDiskGiB", prov.Capabilities().MaxDiskGiB)
+				log.V(1).Info("skipping candidate: provider cannot give one Pod that much disk",
+					"provider", ref.Name, "diskGiB", diskGiB, "maxDiskGiBPerPod", prov.Capabilities().MaxDiskGiBPerPod)
 				continue
 			}
 			// A CPU-only Pod (no accelerator) matches a provider that SupportsCPUOnly; an

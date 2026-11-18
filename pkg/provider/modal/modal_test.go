@@ -2086,13 +2086,13 @@ func TestPricePerHour_NoPrice(t *testing.T) {
 	}
 }
 
-// TestDiskLimit_PlacementAndRefusalAgree: placement skips Modal past MaxDiskGiB, and
+// TestDiskLimit_PlacementAndRefusalAgree: placement skips Modal past MaxDiskGiBPerPod, and
 // sandboxSpecFromPod refuses at the same line, so a Pod placed by an older manager is still
 // stopped before a sandbox runs short of disk.
 func TestDiskLimit_PlacementAndRefusalAgree(t *testing.T) {
 	p := newTestProvider(&fakeClient{})
-	if got := p.Capabilities().MaxDiskGiB; got != modalFreeDiskGiB {
-		t.Fatalf("MaxDiskGiB = %d, want %d", got, modalFreeDiskGiB)
+	if got := p.Capabilities().MaxDiskGiBPerPod; got != modalFreeDiskGiB {
+		t.Fatalf("MaxDiskGiBPerPod = %d, want %d", got, modalFreeDiskGiB)
 	}
 	for _, tc := range []struct {
 		disk    string

@@ -268,10 +268,10 @@ func firstEnvtestBinaryDir() string {
 	return ""
 }
 
-// TestVirtualCapacity_DiskFollowsMaxDiskGiB: a provider with a disk limit advertises it per
+// TestVirtualCapacity_DiskFollowsMaxDiskGiBPerPod: a provider with a disk limit advertises it per
 // Pod, summed over every Pod the node takes, so 1k Pods at the limit still fit. A node capped at
 // the limit itself would refuse the second Pod, as the scheduler checks the node's total.
-func TestVirtualCapacity_DiskFollowsMaxDiskGiB(t *testing.T) {
+func TestVirtualCapacity_DiskFollowsMaxDiskGiBPerPod(t *testing.T) {
 	if got := virtualCapacity(0)[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("16Pi")) != 0 {
 		t.Errorf("no limit: ephemeral-storage = %s, want 16Pi", got.String())
 	}

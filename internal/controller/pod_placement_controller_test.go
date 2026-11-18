@@ -296,7 +296,7 @@ func TestPlacement_DiskPastAProvidersMaxSkipsIt(t *testing.T) {
 				corev1.ResourceEphemeralStorage: resource.MustParse(tc.disk),
 			}
 			pool := poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand}, tc.providers...)
-			modal := &fakeProvider{name: provider.ProviderModal, maxDiskGiB: 512}
+			modal := &fakeProvider{name: provider.ProviderModal, maxDiskGiBPerPod: 512}
 			aws := &fakeProvider{name: provider.ProviderAWS}
 			r, c := newPlacementReconciler(t, []client.Object{pod, pool}, modal, aws)
 

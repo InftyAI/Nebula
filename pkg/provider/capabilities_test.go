@@ -29,8 +29,8 @@ func TestServesDisk(t *testing.T) {
 		{max: 512, disk: 512, want: true},
 		{max: 512, disk: 513, want: false},
 	} {
-		if got := (Capabilities{MaxDiskGiB: tc.max}).ServesDisk(tc.disk); got != tc.want {
-			t.Errorf("MaxDiskGiB=%d ServesDisk(%d) = %v, want %v", tc.max, tc.disk, got, tc.want)
+		if got := (Capabilities{MaxDiskGiBPerPod: tc.max}).ServesDisk(tc.disk); got != tc.want {
+			t.Errorf("MaxDiskGiBPerPod=%d ServesDisk(%d) = %v, want %v", tc.max, tc.disk, got, tc.want)
 		}
 	}
 }

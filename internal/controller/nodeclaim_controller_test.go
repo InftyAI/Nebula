@@ -43,17 +43,17 @@ import (
 type fakeProvider struct {
 	name string
 
-	list         []provider.Instance // what List returns, and what FindByClaim searches
-	listErr      error               // if set, List and FindByClaim fail
-	findRegions  []string            // regions passed to FindByClaim, one per call
-	terminated   []string            // instance ids passed to Terminate, in order
-	regions      []string            // regions passed to Terminate, positionally paired with terminated
-	terminateErr error               // if set, Terminate fails
-	gpus         []string            // accelerators MapAccelerator offers; nil = offer any
-	spot         bool                // Capabilities().SupportsSpot (placement skips Spot without it)
-	egress       bool                // Capabilities().SupportsEgressPolicy (placement skips restricted pools without it)
-	gpuOnly      bool                // !Capabilities().SupportsCPUOnly (placement skips CPU-only Pods)
-	maxDiskGiB   int                 // Capabilities().MaxDiskGiB (placement skips Pods asking more)
+	list             []provider.Instance // what List returns, and what FindByClaim searches
+	listErr          error               // if set, List and FindByClaim fail
+	findRegions      []string            // regions passed to FindByClaim, one per call
+	terminated       []string            // instance ids passed to Terminate, in order
+	regions          []string            // regions passed to Terminate, positionally paired with terminated
+	terminateErr     error               // if set, Terminate fails
+	gpus             []string            // accelerators MapAccelerator offers; nil = offer any
+	spot             bool                // Capabilities().SupportsSpot (placement skips Spot without it)
+	egress           bool                // Capabilities().SupportsEgressPolicy (placement skips restricted pools without it)
+	gpuOnly          bool                // !Capabilities().SupportsCPUOnly (placement skips CPU-only Pods)
+	maxDiskGiBPerPod int                 // Capabilities().MaxDiskGiBPerPod (placement skips Pods asking more)
 	// expandRegions overrides ResolveRegions; nil = pass the declaration through.
 	expandRegions func([]string) []string
 }
@@ -61,7 +61,7 @@ type fakeProvider struct {
 func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsSpot: f.spot, SupportsEgressPolicy: f.egress, SupportsCPUOnly: !f.gpuOnly, MaxDiskGiB: f.maxDiskGiB,
+		SupportsSpot: f.spot, SupportsEgressPolicy: f.egress, SupportsCPUOnly: !f.gpuOnly, MaxDiskGiBPerPod: f.maxDiskGiBPerPod,
 	}
 }
 func (f *fakeProvider) Provision(context.Context, *corev1.Pod, provider.ProvisionRequest) (provider.ProvisionResult, error) {
