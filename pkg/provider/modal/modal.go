@@ -386,7 +386,9 @@ func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
 }
 
 // modalFreeDiskGiB is the per-container disk Modal grants by default, without charge, and the
-// most Nebula can get: sandboxSpecFromPod refuses a Pod asking for more.
+// most Nebula can get: a sandbox cannot request disk (the Python client drops ephemeral_disk for
+// sandboxes, and the Go SDK has no field). Placement skips Modal past it (MaxDiskGiBPerPod);
+// sandboxSpecFromPod still refuses, for a Pod placed by an older manager.
 const modalFreeDiskGiB = 512
 
 // PricePerHour overrides catalog.Base's all-in reading of the catalog, because Modal
@@ -430,6 +432,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		SupportsSpot:         false, // no user-facing preemptible tier
 		SupportsEgressPolicy: true,  // outbound allowlists on the sandbox itself
 		SupportsCPUOnly:      true,
+		MaxDiskGiBPerPod:     modalFreeDiskGiB,
 		NativeTags:           true,             // sandbox tags carry identity
 		PreemptionNotice:     0,                // no push; poll-based detection
 		PollInterval:         0,                // OnDemand-only (never preempts) → the default cadence is fine

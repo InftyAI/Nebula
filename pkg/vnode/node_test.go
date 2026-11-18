@@ -268,6 +268,25 @@ func firstEnvtestBinaryDir() string {
 	return ""
 }
 
+// TestVirtualCapacity_DiskFollowsMaxDiskGiBPerPod: a provider with a disk limit advertises it per
+// Pod, summed over every Pod the node takes, so 1k Pods at the limit still fit. A node capped at
+// the limit itself would refuse the second Pod, as the scheduler checks the node's total.
+func TestVirtualCapacity_DiskFollowsMaxDiskGiBPerPod(t *testing.T) {
+	if got := virtualCapacity(0)[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("16Pi")) != 0 {
+		t.Errorf("no limit: ephemeral-storage = %s, want 16Pi", got.String())
+	}
+	allocatable := virtualCapacity(512)
+	disk := allocatable[corev1.ResourceEphemeralStorage]
+	full := resource.MustParse("512Gi")
+	full.Mul(virtualPods)
+	if disk.Cmp(full) != 0 {
+		t.Errorf("512 GiB limit: ephemeral-storage = %s, want %d x 512Gi", disk.String(), virtualPods)
+	}
+	if pods := allocatable[corev1.ResourcePods]; pods.Value() != virtualPods {
+		t.Errorf("pods = %d, want %d", pods.Value(), virtualPods)
+	}
+}
+
 // TestVirtualCapacity_FitsTheScaleTarget replays the scheduler's resource-fit check: every
 // resource a workload may request must be allocatable, at 1k workloads of the per-workload
 // maximum, or those Pods are rejected before any provider sees them.
@@ -279,7 +298,7 @@ func TestVirtualCapacity_FitsTheScaleTarget(t *testing.T) {
 		corev1.ResourceEphemeralStorage: resource.MustParse("16Ti"),
 		nvidiaGPUResource:               resource.MustParse("8"),
 	}
-	allocatable := virtualCapacity()
+	allocatable := virtualCapacity(0)
 	for name, q := range perWorkload {
 		avail, ok := allocatable[name]
 		if !ok {

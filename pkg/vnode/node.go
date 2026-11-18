@@ -164,7 +164,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithValues("virtualNode", r.nodeName, "provider", r.prov.Name())
 
 	handler := NewHandler(r.prov, r.client, r.blocklist, r.cluster)
-	nodeSpec := nodeSpec(r.nodeName, r.prov.Name())
+	nodeSpec := nodeSpec(r.nodeName, r.prov.Name(), r.prov.Capabilities().MaxDiskGiBPerPod)
 
 	// Register on the endpoint AND advertise it, so the API server can proxy `kubectl
 	// logs` here. Both together: advertising an endpoint nobody serves makes logs hang
@@ -317,7 +317,7 @@ func noServiceLinksFactory(client kubernetes.Interface) informers.SharedInformer
 // ProviderLabel the placement controller selects on, and a NoSchedule taint so
 // only Nebula-placed Pods (which the placement controller tolerates) ever land
 // here.
-func nodeSpec(nodeName, providerName string) *corev1.Node {
+func nodeSpec(nodeName, providerName string, maxDiskGiBPerPod int) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: nodeName,
@@ -359,8 +359,8 @@ func nodeSpec(nodeName, providerName string) *corev1.Node {
 			// Advertise generous virtual capacity; the external provider, not the
 			// kubelet, enforces the real shape. Placement is driven by the
 			// nodeSelector, not by these numbers.
-			Capacity:    virtualCapacity(),
-			Allocatable: virtualCapacity(),
+			Capacity:    virtualCapacity(maxDiskGiBPerPod),
+			Allocatable: virtualCapacity(maxDiskGiBPerPod),
 			Conditions:  []corev1.NodeCondition{{Type: corev1.NodeReady}},
 		},
 	}
@@ -403,12 +403,23 @@ const nvidiaGPUResource = "nvidia.com/gpu"
 // ephemeral-storage must be listed: an unadvertised resource is zero allocatable, so every
 // Pod sizing its disk (util.PodEphemeralStorageGiB) would fail to schedule. 16 TiB is gp3's
 // largest volume.
-func virtualCapacity() corev1.ResourceList {
+//
+// A provider with a MaxDiskGiBPerPod advertises it summed over every Pod the node takes:
+// the scheduler checks a node's total, so the node cannot cap one Pod's disk. Placement does,
+// skipping the provider (Capabilities.ServesDisk); this only keeps the node truthful.
+func virtualCapacity(maxDiskGiBPerPod int) corev1.ResourceList {
+	disk := resource.MustParse("16Pi")
+	if maxDiskGiBPerPod > 0 {
+		disk = *resource.NewQuantity(int64(maxDiskGiBPerPod)<<30*virtualPods, resource.BinarySI)
+	}
 	return corev1.ResourceList{
 		corev1.ResourceCPU:              resource.MustParse("64k"),
 		corev1.ResourceMemory:           resource.MustParse("250Ti"),
-		corev1.ResourceEphemeralStorage: resource.MustParse("16Pi"),
-		corev1.ResourcePods:             resource.MustParse("1k"),
+		corev1.ResourceEphemeralStorage: disk,
+		corev1.ResourcePods:             *resource.NewQuantity(virtualPods, resource.DecimalSI),
 		nvidiaGPUResource:               resource.MustParse("8k"),
 	}
 }
+
+// virtualPods is how many Pods one virtual node advertises room for: the 1k scale target.
+const virtualPods = 1000

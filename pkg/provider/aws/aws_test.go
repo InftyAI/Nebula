@@ -1127,3 +1127,25 @@ func TestProvision_RefusesDiskAboveVolumeCap(t *testing.T) {
 		t.Fatalf("RunInstance called %d times for a refused disk", f.runCnt)
 	}
 }
+
+// TestDiskLimit_PlacementAndRefusalAgree: placement skips AWS past MaxDiskGiBPerPod, and
+// instanceSpecFromPod refuses at the same line, so a Pod placed by an older manager is still
+// stopped before EC2 is asked for a root volume past gp3's cap.
+func TestDiskLimit_PlacementAndRefusalAgree(t *testing.T) {
+	p := newTestProvider(&fakeClient{})
+	if got := p.Capabilities().MaxDiskGiBPerPod; got != awsMaxDiskGiB {
+		t.Fatalf("MaxDiskGiBPerPod = %d, want %d", got, awsMaxDiskGiB)
+	}
+	for _, tc := range []struct {
+		diskGiB int64
+		refused bool
+	}{{awsMaxDiskGiB, false}, {awsMaxDiskGiB + 1, true}} {
+		pod := gpuPod("T4", 1)
+		pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] =
+			*resource.NewQuantity(tc.diskGiB<<30, resource.BinarySI)
+		_, err := p.instanceSpecFromPod(pod, provider.ProvisionRequest{ClaimName: "c"})
+		if refused := err != nil && strings.Contains(err.Error(), "disk exceeds"); refused != tc.refused {
+			t.Errorf("%d GiB: err = %v, want refused=%v", tc.diskGiB, err, tc.refused)
+		}
+	}
+}
