@@ -635,11 +635,11 @@ func (h *Handler) GetPods(_ context.Context) ([]*corev1.Pod, error) {
 // NotifyPods registers the async status callback and starts the poll loop. VK calls it
 // once at startup; the loop runs until ctx is cancelled.
 //
-// We WRAP VK's callback: its status path writes only the /status subresource and
-// silently drops metadata changes on the same object, but the endpoint has to live on
-// metadata (PodIP cannot hold a DNS name — see applyState) and so does the instance id. So
-// the wrapper writes that metadata first, then hands the same Pod to VK. Every status push
-// therefore also reconciles how the workload is reached and which instance backs it.
+// We WRAP VK's callback: its status path writes the Pod's status and nothing else (see
+// statusOnlyPods), but the endpoint has to live on metadata (PodIP cannot hold a DNS name —
+// see applyState) and so does the instance id. So the wrapper writes that metadata first,
+// then hands the same Pod to VK. Every status push therefore also reconciles how the
+// workload is reached and which instance backs it.
 func (h *Handler) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	h.mu.Lock()
 	h.notify = func(pod *corev1.Pod) {
@@ -970,7 +970,7 @@ func (h *Handler) emit(pod *corev1.Pod) {
 // persistMetadata writes the annotations VK owns — the address and the instance id — from
 // the emitted Pod to the API server. It is the write half for whichever path stamped them
 // (see setEndpoint, setInstanceID), and runs inside the notify wrapper, just before VK's
-// status callback, which would drop these metadata changes.
+// status callback, which writes only the status (see statusOnlyPods).
 //
 // Both in ONE patch: they are usually stamped together by CreatePod, and a second write per
 // Pod would be a second round trip on the provisioning path for a value that fits beside
@@ -1020,8 +1020,8 @@ func (h *Handler) persistMetadata(ctx context.Context, pod *corev1.Pod) {
 }
 
 // patchMeta merge-patches VK's metadata onto the Pod, which needs its own write since VK's
-// status callback drops metadata. Scoped to the annotations want actually carries, so it
-// does not collide with the status write that follows.
+// status callback writes only the status. Scoped to the annotations want actually carries,
+// so it does not collide with the status write that follows.
 //
 // The ONLY write of these annotations, and persistMetadata its only caller, so every
 // address — minted at create or observed at boot — and every instance id reaches etcd
