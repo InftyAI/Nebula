@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -313,5 +314,63 @@ func TestVirtualCapacity_FitsTheScaleTarget(t *testing.T) {
 	}
 	if pods := allocatable[corev1.ResourcePods]; pods.Value() < workloads {
 		t.Errorf("pods allocatable %d < %d", pods.Value(), workloads)
+	}
+}
+
+// An annotation added after the provider took its copy of the Pod, such as a controller's
+// pod-deletion-cost, must survive the provider's next status push.
+func TestStatusOnlyPodsKeepsLaterAnnotations(t *testing.T) {
+	ctx := context.Background()
+	stale := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "u1"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending, Reason: "Provisioning"},
+	}
+	live := stale.DeepCopy()
+	live.Annotations = map[string]string{corev1.PodDeletionCost: "1000"}
+	client := fake.NewClientset(live)
+
+	stale.Status = corev1.PodStatus{Phase: corev1.PodRunning}
+	if _, err := (statusOnlyPods{client.CoreV1()}).Pods("default").UpdateStatus(
+		ctx, stale, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	got, err := client.CoreV1().Pods("default").Get(ctx, "p", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get the Pod: %v", err)
+	}
+	if got.Annotations[corev1.PodDeletionCost] != "1000" {
+		t.Errorf("annotations %v, want the deletion cost kept", got.Annotations)
+	}
+	if got.Status.Phase != corev1.PodRunning || got.Status.Reason != "" {
+		t.Errorf("status phase %q reason %q, want Running with the reason cleared",
+			got.Status.Phase, got.Status.Reason)
+	}
+}
+
+// A push still in flight when its Pod is deleted and recreated under the same name must not
+// land on the new Pod, which an update's UID check would also have refused.
+func TestStatusOnlyPodsRefusesARecreatedPod(t *testing.T) {
+	ctx := context.Background()
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "u2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	client := fake.NewClientset(live)
+
+	stale := live.DeepCopy()
+	stale.UID = "u1"
+	stale.Status = corev1.PodStatus{Phase: corev1.PodSucceeded}
+	if _, err := (statusOnlyPods{client.CoreV1()}).Pods("default").UpdateStatus(
+		ctx, stale, metav1.UpdateOptions{}); err == nil {
+		t.Error("UpdateStatus of the old Pod's status succeeded on the recreated Pod")
+	}
+
+	got, err := client.CoreV1().Pods("default").Get(ctx, "p", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get the Pod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodPending {
+		t.Errorf("the recreated Pod's phase is %q, want it left Pending", got.Status.Phase)
 	}
 }
