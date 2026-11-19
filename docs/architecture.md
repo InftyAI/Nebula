@@ -347,7 +347,7 @@ Nebula uses one static virtual Node per registered provider. The node name is
 | `DeletePod(pod)` | Call `provider.Terminate(instanceID)`, mark Pod Succeeded/Terminated, drop local tracking. |
 | `GetPod` | Return tracked Pod, or re-adopt a live provider instance by claim name after a VK restart. |
 | `GetPodStatus` / `GetPods` | Return tracked status or tracked Pods. |
-| `NotifyPods(cb)` | Start the provider `List()` poll loop and push status/endpoint changes through VK's callback. |
+| `NotifyPods(cb)` | Start the provider `List()` poll loop. Nebula writes each change itself: the endpoint and instance-id annotations by merge patch, the status by server-side apply (`pkg/vnode/statuswrite.go`). VK's callback is discarded, so VK never writes back its stale copy of the Pod. |
 
 Of the kubelet API surfaces, only **container logs** is implemented. `kubectl logs` is
 proxied by the API server to the node's kubelet endpoint, so `pkg/vnode/kubelet.go`

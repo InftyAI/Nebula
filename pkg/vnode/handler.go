@@ -158,6 +158,11 @@ type trackedPod struct {
 	// lost value, since the annotations live in etcd. Holds no credential — see
 	// persistCredential.
 	patchedMeta podMeta
+	// appliedStatus is the status this process last applied (see persistStatus), so an
+	// unchanged one is not written again; statusFinal stops all writes once it is terminal.
+	// Like patchedMeta, a cache: after a restart the first write re-reads the live Pod.
+	appliedStatus *corev1.PodStatus
+	statusFinal   bool
 
 	// initializingAt is when the instance was first observed Initializing, and arms the
 	// readiness deadline (see readyExpired). Deliberately NOT placement.provisioningAt: it
@@ -635,15 +640,15 @@ func (h *Handler) GetPods(_ context.Context) ([]*corev1.Pod, error) {
 // NotifyPods registers the async status callback and starts the poll loop. VK calls it
 // once at startup; the loop runs until ctx is cancelled.
 //
-// We WRAP VK's callback: its status path writes only the /status subresource and
-// silently drops metadata changes on the same object, but the endpoint has to live on
-// metadata (PodIP cannot hold a DNS name — see applyState) and so does the instance id. So
-// the wrapper writes that metadata first, then hands the same Pod to VK. Every status push
-// therefore also reconciles how the workload is reached and which instance backs it.
+// Every emitted Pod is written here, not by VK: its annotations (persistMetadata), which
+// must live on metadata as PodIP cannot hold a DNS name (see applyState), then its status
+// (persistStatus). cb still sees each Pod; the virtual node hands VK one that discards it
+// (see vkProvider).
 func (h *Handler) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	h.mu.Lock()
 	h.notify = func(pod *corev1.Pod) {
 		h.persistMetadata(ctx, pod)
+		h.persistStatus(ctx, pod)
 		cb(pod)
 	}
 	h.mu.Unlock()
@@ -969,8 +974,8 @@ func (h *Handler) emit(pod *corev1.Pod) {
 
 // persistMetadata writes the annotations VK owns — the address and the instance id — from
 // the emitted Pod to the API server. It is the write half for whichever path stamped them
-// (see setEndpoint, setInstanceID), and runs inside the notify wrapper, just before VK's
-// status callback, which would drop these metadata changes.
+// (see setEndpoint, setInstanceID), and runs inside the notify wrapper, just before
+// persistStatus.
 //
 // Both in ONE patch: they are usually stamped together by CreatePod, and a second write per
 // Pod would be a second round trip on the provisioning path for a value that fits beside
@@ -1019,9 +1024,9 @@ func (h *Handler) persistMetadata(ctx context.Context, pod *corev1.Pod) {
 	}
 }
 
-// patchMeta merge-patches VK's metadata onto the Pod, which needs its own write since VK's
-// status callback drops metadata. Scoped to the annotations want actually carries, so it
-// does not collide with the status write that follows.
+// patchMeta merge-patches VK's metadata onto the Pod. Not part of the status apply: an apply
+// removes what it stops sending, and these annotations must never be cleared. Scoped to the
+// annotations want actually carries.
 //
 // The ONLY write of these annotations, and persistMetadata its only caller, so every
 // address — minted at create or observed at boot — and every instance id reaches etcd

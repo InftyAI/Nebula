@@ -201,7 +201,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	pc, err := vknode.NewPodController(vknode.PodControllerConfig{
 		PodClient:         r.client.CoreV1(),
 		EventRecorder:     recorder,
-		Provider:          handler,
+		Provider:          vkProvider{handler},
 		PodInformer:       podInformer,
 		SecretInformer:    secretInformer,
 		ConfigMapInformer: configMapInformer,

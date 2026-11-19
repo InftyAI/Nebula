@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -890,6 +891,9 @@ func TestNotify_PersistsEndpointAnnotationOnce(t *testing.T) {
 
 	var patches int
 	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !isMetaPatch(action) {
+			return false, nil, nil
+		}
 		patches++
 		return false, nil, nil // fall through to the tracker so the object updates
 	})
@@ -939,7 +943,10 @@ func TestCreatePod_PersistsInstanceIDAlongsideEndpoint(t *testing.T) {
 	client := fake.NewSimpleClientset(pod)
 
 	var patches int
-	client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !isMetaPatch(action) {
+			return false, nil, nil
+		}
 		patches++
 		return false, nil, nil // fall through to the tracker so the object updates
 	})
@@ -985,7 +992,10 @@ func TestReadoptedPod_PersistsInstanceIDFromTracking(t *testing.T) {
 	client := fake.NewSimpleClientset(pod)
 
 	var patches int
-	client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !isMetaPatch(action) {
+			return false, nil, nil
+		}
 		patches++
 		return false, nil, nil // fall through to the tracker so the object updates
 	})
@@ -1303,7 +1313,10 @@ func TestCreatePod_FailedEndpointPatchIsRetriedByPollLoop(t *testing.T) {
 
 	var patches int
 	failing := true
-	client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !isMetaPatch(action) {
+			return false, nil, nil
+		}
 		patches++
 		if failing {
 			return true, nil, errors.New("boom")
@@ -2178,4 +2191,11 @@ func TestReconcileOnce_NotReadyIsShownAndCounted(t *testing.T) {
 		t.Fatalf("unusable past the deadline = %s/%s, want Failed/%s",
 			got.Status.Phase, got.Status.Reason, reasonReadinessTimeout)
 	}
+}
+
+// isMetaPatch reports whether action is patchMeta's merge patch of the Pod itself, not the
+// status apply or adoptStatus's managedFields patch, which these counts are not about.
+func isMetaPatch(action k8stesting.Action) bool {
+	pa, ok := action.(k8stesting.PatchAction)
+	return ok && pa.GetSubresource() == "" && pa.GetPatchType() == types.MergePatchType
 }
