@@ -33,7 +33,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/dynamic"
 	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -66,9 +65,6 @@ const (
 // events, plus discovery to check the node autoscaler is installed.
 type clusterClients struct {
 	kube k8s.Interface
-	// dynamic writes the custom resources the typed client has no API for: the host's
-	// ClusterNetworkPolicies (see netpol.go).
-	dynamic dynamic.Interface
 	// ec2 answers which instance families the cluster's region offers (see offeredFamilies);
 	// nil keeps every family the catalog has.
 	ec2 describeOfferings
@@ -150,12 +146,7 @@ func newEKSClients(ctx context.Context, cl ClusterConfig) (clusterClients, error
 	if err != nil {
 		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: build client: %w", cl.Name, err)
 	}
-	// dynamic.NewForConfig switches its own copy of the config to JSON, which custom resources need.
-	dyn, err := dynamic.NewForConfig(restCfg)
-	if err != nil {
-		return clusterClients{}, fmt.Errorf("kubernetes: cluster %q: build dynamic client: %w", cl.Name, err)
-	}
-	return clusterClients{kube: kube, dynamic: dyn, ec2: ec2.NewFromConfig(awsCfg)}, nil
+	return clusterClients{kube: kube, ec2: ec2.NewFromConfig(awsCfg)}, nil
 }
 
 func credentialsCacheOptions(o *awssdk.CredentialsCacheOptions) {
