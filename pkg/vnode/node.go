@@ -18,7 +18,6 @@ package vnode
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -28,11 +27,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -202,7 +199,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	recorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: r.nodeName + "/pod-controller"})
 
 	pc, err := vknode.NewPodController(vknode.PodControllerConfig{
-		PodClient:         statusOnlyPods{r.client.CoreV1()},
+		PodClient:         r.client.CoreV1(),
 		EventRecorder:     recorder,
 		Provider:          handler,
 		PodInformer:       podInformer,
@@ -314,37 +311,6 @@ func noServiceLinksFactory(client kubernetes.Interface) informers.SharedInformer
 			o.FieldSelector = fields.OneTermEqualSelector("metadata.name", noSuchServiceName).String()
 		}),
 	)
-}
-
-// statusOnlyPods is the PodClient the pod controller gets. VK's UpdateStatus sends the
-// provider's stale copy of the whole Pod, and the pods/status endpoint writes that copy's
-// annotations too, removing any added since. This UpdateStatus writes only the status.
-type statusOnlyPods struct{ corev1client.PodsGetter }
-
-func (g statusOnlyPods) Pods(namespace string) corev1client.PodInterface {
-	return statusOnlyPodInterface{g.PodsGetter.Pods(namespace)}
-}
-
-type statusOnlyPodInterface struct{ corev1client.PodInterface }
-
-// UpdateStatus replaces the Pod's status with a JSON patch, which, unlike a merge patch,
-// clears a field the new status leaves empty.
-func (p statusOnlyPodInterface) UpdateStatus(
-	ctx context.Context, pod *corev1.Pod, opts metav1.UpdateOptions,
-) (*corev1.Pod, error) {
-	ops := []map[string]any{{"op": "replace", "path": "/status", "value": pod.Status}}
-	// The UID check an update makes, so a late push never lands on a recreated Pod. GetPod's
-	// re-adoption stub has no UID, and an update would not check one either.
-	if pod.UID != "" {
-		ops = append([]map[string]any{{"op": "test", "path": "/metadata/uid", "value": pod.UID}}, ops...)
-	}
-	patch, err := json.Marshal(ops)
-	if err != nil {
-		return nil, fmt.Errorf("marshal status patch for pod %s/%s: %w", pod.Namespace, pod.Name, err)
-	}
-	return p.Patch(ctx, pod.Name, types.JSONPatchType, patch, metav1.PatchOptions{
-		DryRun: opts.DryRun, FieldManager: opts.FieldManager, FieldValidation: opts.FieldValidation,
-	}, "status")
 }
 
 // nodeSpec produces the Node object for a provider's virtual node: the
