@@ -43,7 +43,10 @@ import (
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
-const statusTerminated = "terminated"
+const (
+	statusTerminating = "terminating"
+	statusTerminated  = "terminated"
+)
 
 type settings struct {
 	workspace, region, sshKey, firewall, cluster string
@@ -384,7 +387,7 @@ func (p *Provider) Terminate(ctx context.Context, id, region string) error {
 	if vm.Status == statusTerminated {
 		return nil
 	}
-	if vm.Status != "terminating" {
+	if vm.Status != statusTerminating {
 		err := p.api.terminate(ctx, id)
 		var apiErr *apiError
 		if err != nil && (!errors.As(err, &apiErr) || apiErr.status != http.StatusNotFound) {
@@ -587,7 +590,7 @@ func (p *Provider) observe(ctx context.Context, vm instance, name string, probe 
 				result.State, result.Endpoint = provider.InstanceRunning, endpoint
 			}
 		}
-	case "unhealthy", "terminating":
+	case "unhealthy", statusTerminating:
 		result.State = provider.InstanceNotReady
 	case statusTerminated, "preempted":
 		result.State = provider.InstanceTerminated
@@ -612,7 +615,7 @@ func classify(err error) error {
 	switch apiErr.code {
 	case "global/invalid-api-key", "global/account-inactive", "global/forbidden":
 		category = provider.ErrAuth
-	case "instance-operations/launch/insufficient-capacity":
+	case codeInsufficientCapacity:
 		category = provider.ErrNoCapacity
 	case "global/quota-exceeded":
 		category = provider.ErrQuota

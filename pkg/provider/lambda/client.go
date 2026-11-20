@@ -33,9 +33,10 @@ import (
 )
 
 const (
-	apiURL            = "https://cloud.lambda.com/api/v1"
-	maxResponseSize   = 16 << 20
-	codeObjectMissing = "global/object-does-not-exist"
+	apiURL                   = "https://cloud.lambda.com/api/v1"
+	maxResponseSize          = 16 << 20
+	codeObjectMissing        = "global/object-does-not-exist"
+	codeInsufficientCapacity = "instance-operations/launch/insufficient-capacity"
 )
 
 type cloudClient struct {
@@ -281,7 +282,7 @@ func definitelyRejected(err error) bool {
 	switch apiErr.code {
 	case "global/invalid-api-key", "global/account-inactive", "global/forbidden",
 		"global/invalid-address", "global/invalid-parameters", codeObjectMissing,
-		"global/quota-exceeded", "global/rate-limited", "instance-operations/launch/insufficient-capacity":
+		"global/quota-exceeded", "global/rate-limited", codeInsufficientCapacity:
 		return true
 	default:
 		return false
