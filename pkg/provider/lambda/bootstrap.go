@@ -68,7 +68,7 @@ func bootstrap(pod *corev1.Pod, req provider.ProvisionRequest, port int) (string
 	}
 	script.WriteByte('\n')
 	if script.Len() > 1_000_000 {
-		return "", fmt.Errorf("lambda: cloud-init exceeds 1 MB: %w", provider.ErrRequestRejected)
+		return "", fmt.Errorf("lambda: cloud-init exceeds 1 MB: %w", provider.ErrSpec)
 	}
 	return script.String(), nil
 }
@@ -76,39 +76,48 @@ func bootstrap(pod *corev1.Pod, req provider.ProvisionRequest, port int) (string
 func validateWorkload(pod *corev1.Pod, req provider.ProvisionRequest, port int) error {
 	if len(req.Env.Secrets) != 0 || req.RegistryAuth != nil {
 		return fmt.Errorf("lambda: cloud-init requires a public image and non-secret environment: %w",
-			provider.ErrRequestRejected)
+			provider.ErrSpec)
 	}
-	if pod == nil || len(pod.Spec.Containers) != 1 ||
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return fmt.Errorf("lambda: Pod requires a workload container: %w", provider.ErrRequestRejected)
+	}
+	if len(pod.Spec.Containers) != 1 ||
 		len(pod.Spec.InitContainers)+len(pod.Spec.EphemeralContainers)+len(pod.Spec.Volumes) != 0 ||
 		pod.Spec.HostNetwork || pod.Spec.HostPID || pod.Spec.HostIPC ||
 		pod.Spec.SecurityContext != nil && !reflect.DeepEqual(*pod.Spec.SecurityContext, corev1.PodSecurityContext{}) {
 		return fmt.Errorf("lambda: expected one container without volumes or host namespaces: %w",
-			provider.ErrRequestRejected)
+			provider.ErrSpec)
 	}
 	if pod.Spec.RestartPolicy != "" && pod.Spec.RestartPolicy != corev1.RestartPolicyAlways {
-		return fmt.Errorf("lambda: only restartPolicy Always is supported: %w", provider.ErrRequestRejected)
+		return fmt.Errorf("lambda: only restartPolicy Always is supported: %w", provider.ErrSpec)
 	}
-	c := pod.Spec.Containers[0]
-	if c.Image == "" || c.SecurityContext != nil || c.LivenessProbe != nil || c.StartupProbe != nil ||
+	return validateContainer(pod.Spec.Containers[0], port)
+}
+
+func validateContainer(c corev1.Container, port int) error {
+	if c.Image == "" {
+		return fmt.Errorf("lambda: Pod requires a container image: %w", provider.ErrRequestRejected)
+	}
+	if c.SecurityContext != nil || c.LivenessProbe != nil || c.StartupProbe != nil ||
 		c.Lifecycle != nil || c.Stdin || c.TTY {
-		return fmt.Errorf("lambda: unsupported image, security context or process settings: %w",
-			provider.ErrRequestRejected)
+		return fmt.Errorf("lambda: unsupported security context or process settings: %w",
+			provider.ErrSpec)
 	}
 	for _, resources := range []corev1.ResourceList{c.Resources.Requests, c.Resources.Limits} {
 		for name := range resources {
 			switch name {
 			case corev1.ResourceCPU, corev1.ResourceMemory, "nvidia.com/gpu":
 			default:
-				return fmt.Errorf("lambda: unsupported resource %s: %w", name, provider.ErrRequestRejected)
+				return fmt.Errorf("lambda: unsupported resource %s: %w", name, provider.ErrSpec)
 			}
 		}
 	}
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != int32(port) || c.Ports[0].HostPort != 0 ||
 		c.Ports[0].HostIP != "" || c.Ports[0].Protocol != "" && c.Ports[0].Protocol != corev1.ProtocolTCP {
-		return fmt.Errorf("lambda: declare container TCP port %d: %w", port, provider.ErrRequestRejected)
+		return fmt.Errorf("lambda: declare container TCP port %d: %w", port, provider.ErrSpec)
 	}
 	if c.ReadinessProbe != nil {
-		return fmt.Errorf("lambda: the provider probes /healthz on port %d: %w", port, provider.ErrRequestRejected)
+		return fmt.Errorf("lambda: the provider probes /healthz on port %d: %w", port, provider.ErrSpec)
 	}
 
 	return nil

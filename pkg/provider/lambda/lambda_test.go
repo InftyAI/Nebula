@@ -194,7 +194,7 @@ func TestBootstrapRejectsSecretsAndPreservesArguments(t *testing.T) {
 	pod.Spec.Containers[0].Args = []string{"print('$(date)')"}
 	req := provider.ProvisionRequest{Env: provider.Env{Secrets: map[string]string{"SECRET": "private-value"}}}
 	_, err := bootstrap(pod, req, 8080)
-	if !errors.Is(err, provider.ErrRequestRejected) || strings.Contains(err.Error(), "private-value") {
+	if !errors.Is(err, provider.ErrSpec) || strings.Contains(err.Error(), "private-value") {
 		t.Fatalf("secret boot input = %v", err)
 	}
 	req.Env = provider.Env{Config: map[string]string{"MESSAGE": "hello world"}}

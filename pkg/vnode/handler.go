@@ -146,6 +146,11 @@ type trackedPod struct {
 	claimName string
 	instance  string
 	storeSeq  uint64 // see Handler.storeSeq
+	// A cold lookup can fail for this claim alone. VK calls UpdatePod with the
+	// real Pod after receiving a stub; keep it for retry in the poll loop.
+	lookupErr   error
+	placeholder bool
+
 	// patchedMeta is what VK has already patched onto the Pod in the API server. notify
 	// fires every poll tick for the pod's whole life, and the pod it hands us is our own
 	// stamped copy — which always carries these values, so it cannot say whether they ever
@@ -480,6 +485,12 @@ func (h *Handler) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if tp, ok := h.tracked[key(pod.Namespace, pod.Name)]; ok {
+		if tp.placeholder {
+			tp.pod = pod.DeepCopy()
+			tp.placeholder = false
+			setInstanceID(tp.pod, tp.instance)
+			return nil
+		}
 		// Preserve status and the endpoint if this API-server copy predates our writes.
 		// persistMetadata recovers the instance ID from tp.instance instead.
 		status := tp.pod.Status
@@ -499,6 +510,11 @@ func (h *Handler) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	tp, ok := h.tracked[key(pod.Namespace, pod.Name)]
 	instance, region := "", ""
 	if ok {
+		if tp.lookupErr != nil {
+			err := tp.lookupErr
+			h.mu.Unlock()
+			return fmt.Errorf("cannot delete Pod while instance ownership is unknown: %w", err)
+		}
 		instance = tp.instance
 		if tp.placement != nil {
 			region = tp.placement.region
@@ -562,11 +578,13 @@ func (h *Handler) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 // correct move while ownership is unknown.
 func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
 	h.mu.Lock()
-	tp, ok := h.tracked[key(namespace, name)]
-	h.mu.Unlock()
-	if ok {
-		return tp.pod.DeepCopy(), nil
+	podKey := key(namespace, name)
+	if tp, ok := h.tracked[podKey]; ok {
+		pod, err := tp.pod.DeepCopy(), tp.lookupErr
+		h.mu.Unlock()
+		return pod, err
 	}
+	h.mu.Unlock()
 
 	log := logf.FromContext(ctx).WithName("vnode-handler").WithValues(
 		"provider", h.prov.Name(), "pod", key(namespace, name))
@@ -581,7 +599,17 @@ func (h *Handler) GetPod(ctx context.Context, namespace, name string) (*corev1.P
 		log.Error(err, "cannot determine whether an instance exists for this Pod; "+
 			"holding off create and delete until the provider answers", "claim", claim)
 		stub := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
-		return stub, fmt.Errorf("provider %q unreachable, ownership of pod %s/%s unknown: %w",
+		if inst.State == provider.InstanceUnknown {
+			h.mu.Lock()
+			if _, tracked := h.tracked[podKey]; !tracked {
+				h.storeSeq++
+				h.tracked[podKey] = &trackedPod{
+					pod: stub.DeepCopy(), claimName: claim, storeSeq: h.storeSeq, lookupErr: err, placeholder: true,
+				}
+			}
+			h.mu.Unlock()
+		}
+		return stub, fmt.Errorf("provider %q could not determine ownership of pod %s/%s: %w",
 			h.prov.Name(), namespace, name, err)
 	}
 	if !found {
@@ -610,9 +638,16 @@ func (h *Handler) instanceByClaim(ctx context.Context, claim string) (provider.I
 		return provider.Instance{}, false, err
 	}
 	for _, inst := range instances {
-		if inst.ClaimName == claim {
-			return inst, true, nil
+		if inst.ClaimName != claim {
+			continue
 		}
+		if inst.State == provider.InstanceUnknown {
+			if inst.Err != nil {
+				return inst, false, inst.Err
+			}
+			return inst, false, fmt.Errorf("instance state is unknown for claim %s", claim)
+		}
+		return inst, true, nil
 	}
 	return provider.Instance{}, false, nil
 }
@@ -709,12 +744,19 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	updated, finished, gone := 0, 0, 0
 	for _, tp := range h.tracked {
 		inst, present := byClaim[tp.claimName]
-		before := statusSignature(tp.pod)
-		if present && inst.ID != "" && tp.placement != nil && tp.placement.awaitingInstance {
-			tp.placement.awaitingInstance = false
-			tp.instance = inst.ID
-			setInstanceID(tp.pod, inst.ID)
+		if present && inst.State == provider.InstanceUnknown {
+			log.Info("could not observe instance; retaining Pod status",
+				"claim", tp.claimName, "error", inst.Err)
+			if !tp.placeholder {
+				emit = append(emit, tp.pod.DeepCopy())
+			}
+			continue
 		}
+		tp.resolveInstanceLookup(inst, present, listSeq)
+		if tp.placeholder {
+			continue
+		}
+		before := statusSignature(tp.pod)
 		switch {
 		// No reverse for a terminal or deleting pod.
 		case util.Finished(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
@@ -805,6 +847,27 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			notify(p)
 		}
 	}
+}
+
+// resolveInstanceLookup runs with h.mu held after the poll has a confirmed
+// observation. An older list cannot settle a lookup that started after it.
+func (tp *trackedPod) resolveInstanceLookup(inst provider.Instance, present bool, listSeq uint64) {
+	if !present {
+		if tp.storeSeq <= listSeq {
+			tp.lookupErr = nil
+		}
+		return
+	}
+	awaitingLaunch := tp.placement != nil && tp.placement.awaitingInstance && inst.ID != ""
+	if tp.lookupErr == nil && !awaitingLaunch {
+		return
+	}
+	tp.lookupErr = nil
+	if awaitingLaunch {
+		tp.placement.awaitingInstance = false
+	}
+	tp.instance = inst.ID
+	setInstanceID(tp.pod, inst.ID)
 }
 
 // readyExpired maintains the not-usable clock and reports whether it has run past the

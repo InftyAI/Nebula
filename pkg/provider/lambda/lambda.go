@@ -34,6 +34,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -64,6 +65,10 @@ type Provider struct {
 	skuMu      sync.Mutex
 	skus       map[string]instanceTypeEntry
 	skuExpires time.Time
+
+	// No-launch outcomes by NodeClaim UID and timestamp, until persisted.
+	abandonedMu sync.Mutex
+	abandoned   map[types.UID]map[time.Time]struct{}
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -184,7 +189,7 @@ func (p *Provider) Provision(
 		return provider.ProvisionResult{}, err
 	}
 
-	recorded, err := readAttempt(nc)
+	recorded, err := p.currentAttempt(ctx, nc)
 	if err != nil {
 		return provider.ProvisionResult{}, err
 	}
@@ -199,7 +204,7 @@ func (p *Provider) Provision(
 		return provider.ProvisionResult{InstanceID: found.ID, Reserved: true}, nil
 	}
 	if recorded != nil {
-		return provider.ProvisionResult{}, errors.New("lambda: claimed instance has already terminated")
+		return provider.ProvisionResult{}, launchEnded(recorded)
 	}
 	accel, count, err := util.AcceleratorRequest(pod)
 	if err != nil {
@@ -220,7 +225,8 @@ func (p *Provider) Provision(
 	a := &attempt{Started: time.Now().UTC()}
 	concurrent, err := p.reserveAttempt(ctx, pod, nc, a)
 	if err != nil {
-		return provider.ProvisionResult{}, fmt.Errorf("lambda: reserve NodeClaim launch: %w", err)
+		err = fmt.Errorf("lambda: reserve NodeClaim launch: %w", err)
+		return provider.ProvisionResult{}, errors.Join(err, p.abandonAttempt(ctx, nc, a.Started))
 	}
 	if concurrent != nil {
 		other, err := p.find(ctx, nc, concurrent)
@@ -230,9 +236,12 @@ func (p *Provider) Provision(
 		if other != nil && other.State != provider.InstanceTerminated {
 			return provider.ProvisionResult{InstanceID: other.ID, Reserved: true}, nil
 		}
-		return provider.ProvisionResult{}, errors.New("lambda: claimed instance has already terminated")
+		return provider.ProvisionResult{}, launchEnded(concurrent)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return provider.ProvisionResult{}, errors.Join(err, p.abandonAttempt(ctx, nc, a.Started))
+	}
 	id, err := p.api.launch(ctx, launchRequest{
 		Region: req.Region, InstanceType: sku, Name: instanceName(nc), UserData: script,
 		Workspace: p.config.workspace, SSHKeyNames: []string{p.config.sshKey},
@@ -244,18 +253,25 @@ func (p *Provider) Provision(
 			return provider.ProvisionResult{}, errors.Join(errLaunchUnresolved, err)
 		}
 		classified := classify(err)
-		if recordErr := p.finishAttempt(ctx, nc, a.Started, nil); recordErr != nil {
+		if recordErr := p.abandonAttempt(ctx, nc, a.Started); recordErr != nil {
 			return provider.ProvisionResult{}, errors.Join(
-				classified, fmt.Errorf("lambda: clear rejected launch: %w", recordErr),
+				classified, fmt.Errorf("lambda: record rejected launch: %w", recordErr),
 			)
 		}
 		return provider.ProvisionResult{}, classified
 	}
 	a.InstanceID = id
-	if err := p.finishAttempt(ctx, nc, a.Started, a); err != nil {
+	if err := p.finishAttempt(ctx, nc, *a); err != nil {
 		return provider.ProvisionResult{}, fmt.Errorf("lambda: record accepted launch: %w: %w", errLaunchUnresolved, err)
 	}
 	return provider.ProvisionResult{InstanceID: id, Reserved: true}, nil
+}
+
+func launchEnded(recorded *attempt) error {
+	if recorded.Abandoned {
+		return errors.New("lambda: launch attempt was abandoned before an instance was created")
+	}
+	return errors.New("lambda: claimed instance has already terminated")
 }
 
 // reserveAttempt retries harmless claim updates without letting two callers send a launch.
@@ -276,7 +292,7 @@ func (p *Provider) reserveAttempt(
 		if err != nil || concurrent != nil {
 			return err
 		}
-		return p.updateAttempt(ctx, nc, a)
+		return p.updateAttempt(ctx, nc, *a)
 	})
 	return concurrent, err
 }
@@ -405,7 +421,7 @@ func (p *Provider) FindByClaim(ctx context.Context, name, region string) (*provi
 	if nc.Spec.Provider != p.Name() || nc.Spec.Region != p.config.region || region != "" && region != nc.Spec.Region {
 		return nil, errors.New("lambda: NodeClaim is outside the configured provider region")
 	}
-	recorded, err := readAttempt(nc)
+	recorded, err := p.currentAttempt(ctx, nc)
 	if err != nil {
 		return nil, err
 	}
@@ -417,40 +433,53 @@ func (p *Provider) find(ctx context.Context, nc *nebula.NodeClaim, recorded *att
 	if err != nil {
 		return nil, classify(err)
 	}
+	vm, err := p.lookupInstance(ctx, nc, recorded, vms, true)
+	if err != nil {
+		return nil, err
+	}
+	if vm == nil {
+		if recorded != nil && !recorded.Observed && !recorded.Abandoned {
+			return nil, errLaunchUnresolved
+		}
+		return nil, nil
+	}
+	out := p.observe(ctx, *vm, nc.Name, false)
+	return &out, nil
+}
+
+// lookupInstance applies the same ownership and terminal-state rules for List and cleanup.
+func (p *Provider) lookupInstance(
+	ctx context.Context, nc *nebula.NodeClaim, recorded *attempt, candidates []instance, queryByID bool,
+) (*instance, error) {
 	var vm *instance
-	for _, candidate := range vms {
-		if !p.owns(candidate, nc) || candidate.Status == statusTerminated &&
-			(recorded == nil || recorded.InstanceID != "" && recorded.InstanceID != candidate.ID) {
+	for i := range candidates {
+		candidate := &candidates[i]
+		if !p.owns(*candidate, nc) || candidate.Status == statusTerminated &&
+			(recorded == nil || recorded.Abandoned || recorded.InstanceID != "" && recorded.InstanceID != candidate.ID) {
 			continue
 		}
 		if vm != nil {
 			return nil, fmt.Errorf("lambda: multiple instances for NodeClaim %s", nc.Name)
 		}
-		vm = &candidate
+		vm = candidate
 	}
 
-	if recorded != nil && recorded.InstanceID != "" {
-		if vm == nil {
-			vm, err = p.api.get(ctx, recorded.InstanceID)
-			if err != nil {
-				return nil, classify(err)
-			}
+	if vm == nil && queryByID && recorded != nil && recorded.InstanceID != "" {
+		var err error
+		vm, err = p.api.get(ctx, recorded.InstanceID)
+		if err != nil {
+			return nil, classify(err)
 		}
-		if vm != nil && (!p.owns(*vm, nc) || vm.ID != recorded.InstanceID) {
-			return nil, fmt.Errorf("lambda: instance does not match the launch record for NodeClaim %s", nc.Name)
+		if vm != nil && !p.owns(*vm, nc) {
+			return nil, fmt.Errorf("lambda: instance does not belong to NodeClaim %s", nc.Name)
 		}
 	}
-	if vm == nil {
-		if recorded != nil && !recorded.Observed {
-			return nil, errLaunchUnresolved
+	if vm != nil {
+		if err := p.recordObservation(ctx, nc, recorded, vm.ID); err != nil {
+			return nil, err
 		}
-		return nil, nil
 	}
-	if err := p.recordObservation(ctx, nc, recorded, vm.ID); err != nil {
-		return nil, err
-	}
-	out := p.observe(ctx, *vm, nc.Name, false)
-	return &out, nil
+	return vm, nil
 }
 
 func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
@@ -459,90 +488,81 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 	if err := p.reader.List(ctx, &claims, client.MatchingLabels{nebula.ProviderLabel: p.Name()}); err != nil {
 		return nil, err
 	}
-	byName := make(map[string]*nebula.NodeClaim, len(claims.Items))
-	for i := range claims.Items {
-		byName[claims.Items[i].Name] = &claims.Items[i]
-	}
 	vms, err := p.api.list(ctx, p.config.workspace)
 	if err != nil {
 		return nil, classify(err)
 	}
-	matches := make(map[string]instance)
+	candidates := make(map[string][]instance)
 	for _, vm := range vms {
-		name, _ := scopedClaim(vm, p.config.cluster)
-		if !p.owns(vm, byName[name]) || vm.Status == statusTerminated {
-			continue
-		}
-		if _, exists := matches[name]; exists {
-			return nil, fmt.Errorf("lambda: multiple live instances for NodeClaim %s", name)
-		}
-		matches[name] = vm
-	}
-	for name, nc := range byName {
-		recorded, err := readAttempt(nc)
-		if err != nil {
-			return nil, err
-		}
-		if recorded == nil {
-			continue
-		}
-		if vm, present := matches[name]; present {
-			if err := p.recordObservation(ctx, nc, recorded, vm.ID); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if recorded.InstanceID == "" {
-			continue
-		}
-		if !nc.DeletionTimestamp.IsZero() {
-			continue
-		}
-		vm, err := p.api.get(ctx, recorded.InstanceID)
-		if err != nil {
-			return nil, classify(err)
-		}
-		if vm != nil {
-			if !p.owns(*vm, nc) {
-				return nil, errors.New("lambda: recorded instance does not belong to NodeClaim")
-			}
-			if err := p.recordObservation(ctx, nc, recorded, vm.ID); err != nil {
-				return nil, err
-			}
-			matches[name] = *vm
-		} else if !recorded.Observed {
-			matches[name] = instance{ID: recorded.InstanceID, Region: region{Name: nc.Spec.Region}, Status: "booting"}
+		if name, _ := scopedClaim(vm, p.config.cluster); name != "" {
+			candidates[name] = append(candidates[name], vm)
 		}
 	}
-	out := make([]provider.Instance, len(matches))
+
+	observations := make([]*provider.Instance, len(claims.Items))
 	var checks errgroup.Group
 	checks.SetLimit(8)
-	i := 0
-	for name, vm := range matches {
-		index := i
+	for i := range claims.Items {
+		nc := &claims.Items[i]
 		checks.Go(func() error {
-			inst := p.observe(ctx, vm, name, true)
-			if inst.State == provider.InstanceNotReady {
-				wasRunning, err := p.workloadWasRunning(ctx, byName[name])
-				if err != nil {
-					return err
-				}
-				if !wasRunning {
-					inst.State = provider.InstancePending
-				}
+			inst, err := p.observeClaim(ctx, nc, candidates[nc.Name])
+			if err != nil {
+				inst = &provider.Instance{ClaimName: nc.Name, State: provider.InstanceUnknown, Err: err}
 			}
-			out[index] = inst
+			observations[i] = inst
 			return nil
 		})
-		i++
 	}
-	if err := checks.Wait(); err != nil {
-		return nil, err
-	}
+	_ = checks.Wait()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	out := make([]provider.Instance, 0, len(observations))
+	for _, inst := range observations {
+		if inst != nil {
+			out = append(out, *inst)
+		}
+	}
 	return out, nil
+}
+
+func (p *Provider) observeClaim(
+	ctx context.Context, nc *nebula.NodeClaim, candidates []instance,
+) (*provider.Instance, error) {
+	recorded, err := p.currentAttempt(ctx, nc)
+	if err != nil {
+		return nil, err
+	}
+	vm, err := p.lookupInstance(ctx, nc, recorded, candidates, nc.DeletionTimestamp.IsZero())
+	if err != nil {
+		return nil, err
+	}
+	if vm == nil {
+		if recorded == nil || recorded.Observed || !nc.DeletionTimestamp.IsZero() {
+			return nil, nil
+		}
+		if recorded.Abandoned {
+			return &provider.Instance{ClaimName: nc.Name, State: provider.InstanceFailed}, nil
+		}
+		if recorded.InstanceID == "" {
+			return nil, errLaunchUnresolved
+		}
+		return &provider.Instance{
+			ID: recorded.InstanceID, ClaimName: nc.Name, Region: nc.Spec.Region,
+			CapacityType: nebula.CapacityOnDemand, State: provider.InstancePending,
+		}, nil
+	}
+	inst := p.observe(ctx, *vm, nc.Name, true)
+	if inst.State == provider.InstanceNotReady {
+		wasRunning, err := p.workloadWasRunning(ctx, nc)
+		if err != nil {
+			return nil, err
+		}
+		if !wasRunning {
+			inst.State = provider.InstancePending
+		}
+	}
+	return &inst, nil
 }
 
 func (p *Provider) recordObservation(ctx context.Context, nc *nebula.NodeClaim, record *attempt, id string) error {
@@ -555,8 +575,8 @@ func (p *Provider) recordObservation(ctx context.Context, nc *nebula.NodeClaim, 
 	if record.Observed {
 		return nil
 	}
-	observed := &attempt{Started: record.Started, InstanceID: id, Observed: true}
-	if err := p.finishAttempt(ctx, nc, record.Started, observed); err != nil {
+	observed := attempt{Started: record.Started, InstanceID: id, Observed: true}
+	if err := p.finishAttempt(ctx, nc, observed); err != nil {
 		return fmt.Errorf("lambda: record observed launch: %w", err)
 	}
 	return nil
