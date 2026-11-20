@@ -19,6 +19,7 @@ package vnode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -87,10 +88,9 @@ const defaultProvisionTimeout = 30 * time.Second
 // external instance, DeletePod terminates it. This is the "VK owns provisioning"
 // model — no separate controller issues Provision/Terminate.
 //
-// Leak-safety: CreatePod records the instance id before returning success, so a paid
-// instance is always reachable for teardown, and Provision is idempotent on
-// ClaimName, so a retry after a crash adopts the existing instance instead of
-// creating a second.
+// Leak-safety: CreatePod records the instance ID or tracks a create outcome
+// unresolved by the provider. Provision is idempotent on ClaimName and a retry
+// can adopt an existing instance after a restart.
 type Handler struct {
 	prov provider.Provider
 
@@ -116,10 +116,8 @@ type Handler struct {
 	// tracked is the poll loop's work list and what GetPod/GetPodStatus serve, keyed by
 	// namespace/name.
 	//
-	// INVARIANT: only pods the provider has acknowledged (Provision returned an id), or
-	// already terminal ones. Never one with Provision still in flight — reconcileOnce
-	// writes Terminated for any tracked pod missing from List(), which for a live
-	// provision is wrong and unrecoverable.
+	// Tracked pods have an instance ID, an unresolved create outcome or a terminal
+	// status. A Provision call still in flight has no entry.
 	tracked map[string]*trackedPod
 
 	// storeSeq numbers stores into tracked, only so a poll tick can tell which pods were
@@ -186,8 +184,9 @@ type trackedPod struct {
 // degrade rather than guess: no ready sample is filed, and teardown falls back to reading
 // the claim. Losing it on a restart is fine for the same reason.
 type placement struct {
-	region string
-	tier   nebulav1alpha1.CapacityType
+	region           string
+	tier             nebulav1alpha1.CapacityType
+	awaitingInstance bool
 
 	// provisioningAt is when THIS process began provisioning. It arms the one
 	// metrics.InstanceReadyDuration observation the poll loop makes on the first
@@ -395,6 +394,14 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	// An unreachable provider still counts as a failed attempt even though nothing gets
 	// blocklisted for it.
 	metrics.ObserveProvision(labels, time.Since(callStart), err)
+	if errors.Is(err, provider.ErrProvisionUnresolved) {
+		log.Info("waiting to recover unresolved provision", "reason", err.Error())
+		h.markStatus(pod, corev1.PodPending, reasonProvisioning, "waiting for the provider to confirm the instance")
+		place.awaitingInstance = true
+		h.store(pod, claim, "", place)
+		h.emit(pod)
+		return nil
+	}
 	if err != nil {
 		log.Error(err, "provision failed; Pod marked Failed")
 		h.recordBlock(ctx, pod, req.Region, blocklistTTLOf(pool), err)
@@ -703,12 +710,19 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	for _, tp := range h.tracked {
 		inst, present := byClaim[tp.claimName]
 		before := statusSignature(tp.pod)
+		if present && inst.ID != "" && tp.placement != nil && tp.placement.awaitingInstance {
+			tp.placement.awaitingInstance = false
+			tp.instance = inst.ID
+			setInstanceID(tp.pod, inst.ID)
+		}
 		switch {
 		// No reverse for a terminal or deleting pod.
 		case util.Finished(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
 			finished++
 		case !present && tp.storeSeq > listSeq:
 			// Stored while List was in flight; the next tick decides.
+		case !present && tp.placement != nil && tp.placement.awaitingInstance:
+			// The provider's durable claim still owns the unresolved create.
 		case !present:
 			gone++
 			applyState(tp.pod, provider.InstanceTerminated, "", h.nowFn())

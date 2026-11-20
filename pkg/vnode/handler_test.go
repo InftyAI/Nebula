@@ -2179,3 +2179,29 @@ func TestReconcileOnce_NotReadyIsShownAndCounted(t *testing.T) {
 			got.Status.Phase, got.Status.Reason, reasonReadinessTimeout)
 	}
 }
+
+func TestCreatePod_UnresolvedProvisionAdoptsWithoutFailingPod(t *testing.T) {
+	ctx := context.Background()
+	fp := &fakeProvider{provisionErr: fmt.Errorf("launch timeout: %w", provider.ErrProvisionUnresolved)}
+	h := NewHandler(fp, nil, nil, openCluster())
+	pod := testPod("default", "p1")
+	if err := h.CreatePod(ctx, pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	h.reconcileOnce(ctx)
+	got, err := h.GetPod(ctx, pod.Namespace, pod.Name)
+	if err != nil || got.Status.Phase != corev1.PodPending || got.Status.Reason != reasonProvisioning {
+		t.Fatalf("unresolved attempt should remain Pending without a replacement: %+v, %v", got, err)
+	}
+	fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning}}
+	h.reconcileOnce(ctx)
+	got, err = h.GetPod(ctx, pod.Namespace, pod.Name)
+	if err != nil || got.Status.Phase != corev1.PodRunning ||
+		got.Annotations[nebulav1alpha1.InstanceIDAnnotation] != "inst-1" {
+		t.Fatalf("recovered pod did not adopt the instance ID: %+v, %v", got, err)
+	}
+	if err := h.DeletePod(ctx, pod); err != nil || fp.terminateID != "inst-1" || fp.provisionCnt != 1 {
+		t.Fatalf("DeletePod used %q after %d create attempts: %v", fp.terminateID, fp.provisionCnt, err)
+	}
+}

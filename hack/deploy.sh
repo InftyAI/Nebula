@@ -108,6 +108,7 @@ PROVIDER_SECRETS=(
   # registers fine and then fails every create with an auth error, which blocklists the
   # whole provider.
   "nebula-runpod-credentials|RUNPOD_API_KEY|"
+  "nebula-lambda-credentials|LAMBDA_API_KEY|"
 )
 
 # create_provider_secret <secret-name> <required-keys> <optional-keys>

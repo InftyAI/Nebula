@@ -60,6 +60,58 @@ cluster) is passed as `make` variables.
 
 ---
 
+## Lambda Cloud
+
+Nebula runs one container per On-Demand GPU VM using the Lambda Stack 24.04
+image. The embedded catalog starts with one A10 (`gpu_1x_a10`). The service
+must bind to the configured TCP port on all interfaces and return a successful
+HTTP response from `/healthz`. The provider reports the VM endpoint in the Pod
+annotation after this check succeeds.
+
+Prepare a Lambda workspace with a registered SSH public key, a service identity
+with permission to list instance types and manage instances, and a firewall
+ruleset in your selected region. Allow the Manager's egress IPs to reach the
+TCP service port on the VM. Use the same stable `LAMBDA_CLUSTER_ID` across
+Manager restarts and a distinct ID for each Nebula deployment sharing the
+workspace.
+
+Put `LAMBDA_API_KEY` in `.env` before running `make deploy-all`, or supply
+it through the `nebula-lambda-credentials` Secret in the manager namespace.
+Create the non-secret ConfigMap in that same namespace:
+
+```bash
+kubectl -n nebula-system create configmap nebula-lambda-config \
+  --from-literal='LAMBDA_WORKSPACE_ID=<workspace-id>' \
+  --from-literal=LAMBDA_REGION=us-west-1 \
+  --from-literal='LAMBDA_SSH_KEY_NAME=<registered-public-key-name>' \
+  --from-literal='LAMBDA_FIREWALL_RULESET_ID=<regional-ruleset-id>' \
+  --from-literal='LAMBDA_CLUSTER_ID=<unique-cluster-id>' \
+  --from-literal=LAMBDA_SERVICE_PORT=8080
+```
+
+Restart an existing Manager after updating its configuration. If you use
+`--providers`, include `lambda`. Apply
+[`lambda-nodepool.yaml`](../config/samples/lambda-nodepool.yaml) and
+[`lambda-deployment.yaml`](../config/samples/lambda-deployment.yaml) to try
+one GPU workload. Change the sample's region and port to match your setup.
+The deployment disables automatic service-account-token mounts and uses a public
+image. The provider accepts plain environment variables and OnDemand GPU
+workloads with Open egress. Volumes, private image credentials, Secret-backed
+environment, custom probes, `kubectl logs` and `kubectl exec` are outside this
+backend's supported workload shape.
+
+Delete the sample Deployment when finished and verify that its Lambda instance
+has terminated. Keep the adapter, credentials, workspace and cluster ID
+available until all Lambda workloads have drained. An unresolved launch keeps the Pod Pending while the Manager looks for the
+instance. Use the NodeClaim name, UID and any API request ID to locate it in
+the configured workspace. An empty list immediately after a
+failed launch can reflect delayed visibility. For a launch that remains
+unresolved, use the Lambda audit trail or contact Lambda support to confirm
+the outcome before clearing the `nebula.inftyai.com/lambda-launch` annotation
+and replacing the affected Pod.
+
+---
+
 ## Webhook TLS (no cert-manager)
 
 Nebula runs a mutating webhook (it injects the scheduling gate into gated Pods),

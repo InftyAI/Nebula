@@ -1,0 +1,4 @@
+# Approximate USD per instance-hour.
+# https://lambda.ai/instances
+accelerator_type,accelerator_id,gpu_count,capacity_type,price_per_hour,available,region,updated
+A10,gpu_1x_a10,1,OnDemand,1.29,true,,2026-11-20

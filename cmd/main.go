@@ -58,6 +58,7 @@ import (
 	awsprovider "github.com/InftyAI/Nebula/pkg/provider/aws"
 	"github.com/InftyAI/Nebula/pkg/provider/fake"
 	kubeprovider "github.com/InftyAI/Nebula/pkg/provider/kubernetes"
+	"github.com/InftyAI/Nebula/pkg/provider/lambda"
 	"github.com/InftyAI/Nebula/pkg/provider/modal"
 	"github.com/InftyAI/Nebula/pkg/provider/runpod"
 	"github.com/InftyAI/Nebula/pkg/vnode"
@@ -345,7 +346,7 @@ func main() {
 	// startup already sees its provider. The manager's client backs the AWS region
 	// source (regions are read from NodePools at call time, not env), so it is
 	// threaded in; the client is only queried at runtime, after the cache has synced.
-	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, kubernetesClusters,
+	registerProviders(context.Background(), mgr.GetClient(), mgr.GetAPIReader(), enabledProviders, kubernetesClusters,
 		append(slices.Clone(attribution), propagated...))
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
@@ -547,7 +548,7 @@ func setupKubeletServer(mgr ctrl.Manager, addr, clientCA string, servingTLSBoots
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests,resourceNames=nebula-kubelet-serving,verbs=delete;get
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=certificatesigningrequests/approval,resourceNames=nebula-kubelet-serving,verbs=update
 // +kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=kubernetes.io/kubelet-serving,verbs=approve
-// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-runpod","system:node:nebula-kubernetes","system:node:nebula-fake"},verbs=impersonate
+// +kubebuilder:rbac:groups="",resources=users,resourceNames={"system:node:nebula-aws","system:node:nebula-modal","system:node:nebula-runpod","system:node:nebula-kubernetes","system:node:nebula-lambda","system:node:nebula-fake"},verbs=impersonate
 // +kubebuilder:rbac:groups="",resources=groups,resourceNames="system:nodes",verbs=impersonate
 
 // addServingCertificateBootstrap requests a trusted serving certificate for the kubelet
@@ -627,7 +628,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 // crash loop.
 //
 // Only providers in enabled are attempted (see parseProviders).
-func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool,
+func registerProviders(ctx context.Context, c client.Client, reader client.Reader, enabled map[string]bool,
 	kubernetesClusters string, kubernetesLabels []string) {
 	register := func(name string, build func() (provider.Provider, error)) {
 		if !enabled[name] {
@@ -666,6 +667,10 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 		return kubeprovider.NewFromFile(ctx, kubernetesClusters, kubernetesLabels, vnode.PodIPFromEnv())
 	})
 
+	register(provider.ProviderLambda, func() (provider.Provider, error) {
+		return lambda.NewFromEnv(reader, c)
+	})
+
 	// The fake provider is an in-memory backend used only by the e2e suite to
 	// exercise the full control-plane loop without cloud credentials. It ships in
 	// the binary but registers ONLY when explicitly enabled, so it can never place
@@ -680,7 +685,11 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 // knownProviders are the names --providers accepts, one per register call above. The fake
 // provider is not among them: it stays gated on its env var alone.
 var knownProviders = []string{
-	provider.ProviderModal, provider.ProviderAWS, provider.ProviderRunPod, provider.ProviderKubernetes,
+	provider.ProviderModal,
+	provider.ProviderAWS,
+	provider.ProviderRunPod,
+	provider.ProviderKubernetes,
+	provider.ProviderLambda,
 }
 
 // parseProviders turns --providers into the enabled set. An unknown name is an error rather
