@@ -663,7 +663,7 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 		if kubernetesClusters == "" {
 			return nil, errors.New("no --kubernetes-clusters file")
 		}
-		return kubeprovider.NewFromFile(ctx, kubernetesClusters, kubernetesLabels, vnode.PodIPFromEnv())
+		return kubeprovider.NewFromFile(ctx, kubernetesClusters, kubernetesLabels)
 	})
 
 	// The fake provider is an in-memory backend used only by the e2e suite to

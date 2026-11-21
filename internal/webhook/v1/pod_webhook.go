@@ -117,7 +117,7 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 // launch one container and no init containers, expose at most one port (Modal's connect URL
 // routes to one; see modal.firstPort), and mount nothing from the cluster, so no volumes and
 // no service account. Admitting more would drop the rest silently. A host-network Pod is
-// refused too, as it would run outside namespace isolation.
+// refused for the same reason (see validatePod).
 type PodCustomValidator struct{}
 
 var _ webhook.CustomValidator = &PodCustomValidator{}
@@ -133,7 +133,7 @@ func (v *PodCustomValidator) ValidateCreate(_ context.Context, obj runtime.Objec
 
 // ValidateUpdate implements webhook.CustomValidator. The shape is immutable but the opt-in
 // label is not, so only label transitions are judged: opting in is refused outright, and
-// opting out must not strand Nebula's gate, nor leave a placed Pod's instance unfenced. A Pod
+// opting out must not strand Nebula's gate, nor a placed Pod's instance. A Pod
 // staying opted in is left alone: one admitted before this check existed would otherwise have
 // every later write rejected, placement's gate release among them, and stay gated forever.
 func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
@@ -155,11 +155,11 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 		}
 	}
 	if optedIn(oldPod) {
-		// Namespace isolation selects a placed Pod by this label (its IP is its instance's),
-		// so dropping it would open the instance to every other namespace.
+		// Teardown keys on this label: the reap that deletes a timed-out placed Pod, and so
+		// terminates its instance, skips a Pod without it (see reapTerminalPod).
 		if !optedIn(newPod) && placedByNebula(oldPod) {
-			return nil, fmt.Errorf("label %s stays on a Pod Nebula has placed, as namespace isolation "+
-				"selects its instance by it: delete the Pod instead", nebulav1alpha1.EnabledLabel)
+			return nil, fmt.Errorf("label %s stays on a Pod Nebula has placed, as tearing down its "+
+				"instance depends on it: delete the Pod instead", nebulav1alpha1.EnabledLabel)
 		}
 		// Placement ignores a Pod without the label, so it would never release the gate.
 		if !optedIn(newPod) && hasNebulaGate(newPod) {
@@ -205,8 +205,8 @@ func validatePod(pod *corev1.Pod) error {
 	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
 		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
 	}
-	// The kubernetes provider copies the spec, and a host-network pod sits outside the target's
-	// Pod NetworkPolicy, so it would escape namespace isolation.
+	// No provider runs it as written: Modal, RunPod and AWS drop the field, and the kubernetes
+	// provider's copy would put the real pod on its target node's own network.
 	if pod.Spec.HostNetwork {
 		return errors.New("nebula does not run host-network Pods: set spec.hostNetwork to false")
 	}
@@ -217,7 +217,6 @@ func validatePod(pod *corev1.Pod) error {
 	return nil
 }
 
-// hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
 // placedByNebula reports whether placement chose a provider for pod: it records the choice in the
 // nodeSelector as it removes the gate, so a selector on a still-gated Pod, which a user may supply
 // at creation, doesn't count.
@@ -225,6 +224,7 @@ func placedByNebula(pod *corev1.Pod) bool {
 	return pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] != "" && !hasNebulaGate(pod)
 }
 
+// hasNebulaGate reports whether the Pod carries Nebula's provider-selection scheduling gate.
 func hasNebulaGate(pod *corev1.Pod) bool {
 	for _, g := range pod.Spec.SchedulingGates {
 		if g.Name == nebulav1alpha1.ProviderSelectionGate {

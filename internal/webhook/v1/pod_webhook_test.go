@@ -236,8 +236,8 @@ func TestValidateCreate_AcceleratorNeedsGPUCount(t *testing.T) {
 	}
 }
 
-// A host-network Pod would run outside the target's Pod NetworkPolicy, escaping namespace
-// isolation, so it is refused; one outside Nebula, or pre-bound, is not Nebula's to judge.
+// A host-network Pod would not run as written on any provider, so it is refused; one outside
+// Nebula, or pre-bound, is not Nebula's to judge.
 func TestValidateCreate_RejectsHostNetwork(t *testing.T) {
 	v := &PodCustomValidator{}
 	for _, tc := range []struct {
@@ -382,11 +382,11 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		// Placement ignores an unlabelled Pod, so nothing would ever release the gate it keeps.
 		{"opting out while gated", sidecarPod(optedIn), sidecarPod(nil), "gated forever"},
 		{"opting out and releasing the gate", sidecarPod(optedIn), released(sidecarPod(nil)), ""},
-		// Isolation selects a placed Pod's instance by the label, so it may not go.
+		// Teardown of a placed Pod's instance keys on the label, so it may not go.
 		{"opting out after placement", placed(sidecarPod(optedIn)), placed(sidecarPod(nil)), "stays on a Pod Nebula has placed"},
 		// A selector the user supplied at creation, with the gate still on: never placed, so it may opt out.
 		{"opting out while gated with a user's selector", selected(sidecarPod(optedIn)), released(selected(sidecarPod(nil))), ""},
-		// Bound elsewhere, so never placed: nothing selects it, and it may opt out.
+		// Bound elsewhere, so never placed: nothing to tear down, and it may opt out.
 		{"opting out a pre-bound Pod", validPod(optedIn, "node-1"), validPod(nil, "node-1"), ""},
 	}
 	v := &PodCustomValidator{}

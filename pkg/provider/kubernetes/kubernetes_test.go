@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -128,21 +126,6 @@ func TestConfigValidate(t *testing.T) {
 			}},
 			wantErr: "unsupported node autoscaler",
 		},
-		"cidrs": {clusters: []ClusterConfig{
-			withHost(withCIDRs(ok, "10.20.0.0/16")),
-			withCIDRs(ClusterConfig{Name: "b", Provider: "eks", Region: "us-west-1", Geography: "us"},
-				"10.21.0.0/16", "100.64.0.0/16"),
-		}},
-		"cidr malformed":   {clusters: []ClusterConfig{withCIDRs(ok, "10.20.0.0")}, wantErr: "cidr"},
-		"cidr host bits":   {clusters: []ClusterConfig{withCIDRs(ok, "10.20.0.5/16")}, wantErr: "host bits"},
-		"cidr overlap own": {clusters: []ClusterConfig{withCIDRs(ok, "10.0.0.0/8", "10.20.0.0/16")}, wantErr: "overlaps"},
-		"cidr overlap other": {
-			clusters: []ClusterConfig{
-				withCIDRs(ok, "10.20.0.0/16"),
-				withCIDRs(ClusterConfig{Name: "b", Provider: "eks", Region: "us-west-1", Geography: "us"}, "10.20.128.0/17"),
-			},
-			wantErr: "overlaps",
-		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -151,45 +134,6 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatalf("Validate() = %v, want error containing %q", err, tc.wantErr)
 			}
 		})
-	}
-}
-
-func withCIDRs(c ClusterConfig, cidrs ...string) ClusterConfig {
-	c.CIDRs = cidrs
-	return c
-}
-
-// The table is parsed strictly, so a field the struct lacks fails the whole provider: this is
-// the shape chart/templates/kubernetes-clusters.yaml renders, every field IaC sets included.
-func TestLoadConfigCIDRs(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "clusters.yaml")
-	raw := `clusters:
-- cidrs:
-  - 10.20.0.0/16
-  geography: eu
-  host: true
-  name: host
-  provider: eks
-  region: eu-north-1
-- cidrs:
-  - 10.21.0.0/16
-  geography: us
-  name: target
-  provider: eks
-  region: us-east-1
-`
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if got := cfg.Clusters[1].CIDRs; len(got) != 1 || got[0] != "10.21.0.0/16" {
-		t.Fatalf("target cidrs = %v", got)
-	}
-	if iso := cfg.isolation(); iso == nil || iso.host.Name != "host" {
-		t.Fatalf("isolation = %+v", iso)
 	}
 }
 

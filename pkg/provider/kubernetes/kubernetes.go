@@ -82,24 +82,15 @@ type Provider struct {
 	offered map[string][]string
 	labels  []string         // the placeholder's label keys each real pod carries (see podSpec.labels)
 	now     func() time.Time // a seam for the bind timeout in toInstance
-	// isolation fences every Provision's namespace (see netpol.go); nil when the table is off.
-	isolation *isolation
 }
 
 // NewFromFile builds the provider from the cluster table at path, connecting to every
 // cluster up front so a bad entry fails at startup rather than on the first Provision.
-// labelKeys are the label keys copied from each Pod onto its real pod. podIP is this pod's own
-// address, which must lie in the host cluster's cidrs when isolation is on.
-func NewFromFile(ctx context.Context, path string, labelKeys []string, podIP string) (*Provider, error) {
+// labelKeys are the label keys copied from each Pod onto its real pod.
+func NewFromFile(ctx context.Context, path string, labelKeys []string) (*Provider, error) {
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		return nil, err
-	}
-	iso := cfg.isolation()
-	if iso != nil {
-		if err := iso.checkHost(podIP); err != nil {
-			return nil, err
-		}
 	}
 	cat, err := catalog.Load()
 	if err != nil {
@@ -116,12 +107,7 @@ func NewFromFile(ctx context.Context, path string, labelKeys []string, podIP str
 		}
 		clients[cl.Name] = cc
 	}
-	p := New(ctx, cfg.Clusters, clients, cat, labelKeys)
-	if iso != nil {
-		host := clients[iso.host.Name]
-		p.isolation = &isolation{isolationConfig: *iso, hostKube: host.kube, hostDynamic: host.dynamic}
-	}
-	return p, nil
+	return New(ctx, cfg.Clusters, clients, cat, labelKeys), nil
 }
 
 // New returns a Provider over already-built clients, one per cluster in clusters, which
@@ -210,7 +196,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
 		SupportsStop:         false,
 		SupportsSpot:         true,  // Karpenter's capacity type, see nodeAffinity
-		SupportsEgressPolicy: false, // a pool's egress modes; namespace isolation (netpol.go) is separate
+		SupportsEgressPolicy: false, // no NetworkPolicy is written
 		SupportsCPUOnly:      true,
 		NativeTags:           true,
 		PreemptionNotice:     spotNotice,
@@ -276,11 +262,6 @@ func (p *Provider) Provision(
 
 	if err := ensureNamespace(ctx, kube, real.Namespace); err != nil {
 		return provider.ProvisionResult{}, err
-	}
-	if p.isolation != nil {
-		if err := p.isolation.fence(ctx, cl, real.Namespace); err != nil {
-			return provider.ProvisionResult{}, err
-		}
 	}
 	created, adopted, err := createOrAdopt(ctx, cl.clients, real)
 	if err != nil {

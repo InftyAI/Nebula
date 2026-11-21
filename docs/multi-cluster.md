@@ -22,9 +22,8 @@ Each cluster in the table is one region of the `kubernetes` provider, so placeme
 cluster as it picks a region, from the pool's `regions` and `strategy` ([NodePools](#nodepools)).
 
 1. **Provision** works in the chosen cluster, through its EKS API: it creates the Pod's
-   namespace if missing, writes the [isolation](#namespace-isolation) policies when the table
-   has `cidrs`, and creates the real pod. That is the placeholder's spec, named after the
-   claim (`<namespace>-<pod>`), with Nebula's scheduling replaced by a node selection for the
+   namespace if missing and creates the real pod. That is the placeholder's spec, named after
+   the claim (`<namespace>-<pod>`), with Nebula's scheduling replaced by a node selection for the
    GPU's instance families and the capacity type. Secret-sourced env vars go into a Secret the
    real pod owns.
 2. **That cluster's Karpenter** launches a node, and the real pod starts there.
@@ -51,10 +50,9 @@ cluster as it picks a region, from the pool's `regions` and `strategy` ([NodePoo
 | EKS, with **Karpenter v1** and a GPU NodePool | Karpenter launches the nodes; Nebula checks its NodeClaim API at startup. The NodePool must allow the instance families of the GPUs you request (multi-GPU types too, or nothing packs). |
 | The NVIDIA device plugin | Without it no node advertises `nvidia.com/gpu`. |
 | An **access entry** mapping the host's Nebula IAM role to the Kubernetes group `nebula` | How the target recognises Nebula (STS-signed token; no kubeconfig or secret). |
-| [`config/kubernetes-provider/remote-rbac.yaml`](../config/kubernetes-provider/remote-rbac.yaml) applied | What group `nebula` may do: pods, secrets, namespaces, events, network policies. |
+| [`config/kubernetes-provider/remote-rbac.yaml`](../config/kubernetes-provider/remote-rbac.yaml) applied | What group `nebula` may do: pods, secrets, namespaces, events. |
 | Its EKS API reachable from the Nebula manager | Every poll lists the real pods there. |
 | Its log agent forwarding Nebula's pods to the host's application log group | The host's log readers query only that group. Its streams there are prefixed `<cluster>-`. |
-| *Isolation only:* AWS VPC CNI's network policy support (`networking.k8s.aws` CRDs) | Enforces the policies in [Namespace isolation](#namespace-isolation). |
 
 **The host cluster**
 
@@ -74,26 +72,21 @@ Read once at manager startup from `/etc/nebula/kubernetes/clusters.yaml` (Config
 
 ```yaml
 clusters:
-  - name: hive-b18270575c-dev   # the EKS cluster's own name
+  - name: my-cluster            # the EKS cluster's own name
     provider: eks
     region: eu-north-1
     geography: eu               # a NodePool's regions match this or region
-    host: true                  # the cluster Nebula runs in
-    cidrs: [10.20.0.0/16]       # isolation only: its pod IP ranges (VPC CNI: the VPC CIDRs)
   - name: gpu-usw2
     provider: eks
     region: us-west-2
     geography: us
-    cidrs: [10.21.0.0/16]
 ```
 
 Rules, enforced at load (a bad table leaves the provider unregistered):
 
 - names are unique, `provider` is `eks`, and **one cluster per region**;
 - `geography` is one of Nebula's geographies (`us`, `eu`, `uk`, `ap`, …);
-- `cidrs` are on **every** cluster or on none, never overlap, and have no host bits set;
-- at most one cluster is `host`, and exactly one once `cidrs` are set; the manager's own pod IP
-  must fall in the host's `cidrs`.
+- no other field: the table is parsed strictly, so a misspelt key fails the load.
 
 ## Installing
 
@@ -103,7 +96,6 @@ component that `config/default` includes on request:
 | File | What it is | Applied |
 |---|---|---|
 | `clusters.yaml` | the cluster table | rendered into the `kubernetes-clusters` ConfigMap |
-| `cluster-network-policy.yaml` | the host-wide default deny, for isolation | only once enabled (step 4) |
 | `remote-rbac.yaml` | what group `nebula` may do in a target | by hand, in each target (step 3) |
 
 1. Fill in [`config/kubernetes-provider/clusters.yaml`](../config/kubernetes-provider/clusters.yaml).
@@ -116,15 +108,6 @@ component that `config/default` includes on request:
    kubectl apply -f config/kubernetes-provider/remote-rbac.yaml
    ```
    and map Nebula's IAM role to the group `nebula` with an access entry.
-4. **If the table sets `cidrs`**, enable the default deny: uncomment `resources:` and
-   `- cluster-network-policy.yaml` in `config/kubernetes-provider/kustomization.yaml`, set its
-   `networks` to every non-host cluster's `cidrs`, and deploy again. Kustomize cannot derive
-   them from the table, so update both files together whenever a cluster is added.
-
-   > **Skipping step 4 leaves isolation without its boundary**: host namespaces that have
-   > never placed a sandbox can reach every remote one, since targets admit the whole host
-   > range.
-
 After any change to `clusters.yaml`, deploy and restart the manager (it reads the table only
 at startup):
 
@@ -163,31 +146,14 @@ a controller label such as `pod-template-hash` would let the placeholder's owner
 anything selecting on labels (a Service, a PodDisruptionBudget, an operator) would count the
 sandbox twice. Add a key only if nothing in that namespace selects on it.
 
-## Namespace isolation
+## Networking
 
-On whenever the table has `cidrs`. A host pod in namespace X then reaches only X's remote
-pods, and a remote pod in X admits only X and the host.
+Nebula writes no NetworkPolicies. A real pod's traffic to and from the host and other
+namespaces is whatever each cluster's own network allows, so apply your own policies if
+tenants must not reach each other's pods.
 
-| Where | Policy | Written by | Effect |
-|---|---|---|---|
-| host | ClusterNetworkPolicy `nebula-isolation-host-<X>`, **Admin, priority 500, `Pass`** | Provision | X's traffic to its own Nebula pods (whose placeholders carry the remote IPs) is left to X's own NetworkPolicies, exactly as for its local pods |
-| host | ClusterNetworkPolicy `nebula-isolation-host-cluster`, **Admin, priority 1000** | `cluster-network-policy.yaml` (step 4) | every other namespace, and X's other traffic, is denied the targets' ranges |
-| target | ClusterNetworkPolicy `nebula-isolation-target-<X>`, **Admin, priority 500** | Provision | no other namespace in the target reaches X's Nebula pods (`Deny`), whatever X's own NetworkPolicies allow; X's own traffic is left to them (`Pass`) |
-| target | NetworkPolicy `nebula-isolation-target` in X | Provision | from outside the cluster, Nebula's pods admit only the host's range: the ClusterNetworkPolicy above cannot match CIDRs |
-
-The ClusterNetworkPolicies are Admin-tier so that no namespace's own NetworkPolicy can override
-the boundary. Keep the deny's `priority` above 500, so it runs after the per-namespace passes;
-at or below 500 it would drop each namespace's traffic to its own remote pods too.
-`nebula-system` is exempt, as the manager must reach the targets' API endpoints; add any other
-namespace that legitimately needs the targets to the deny's `values` list in
-`cluster-network-policy.yaml`.
-
-One host per set of targets: each target's `nebula-isolation-target` admits exactly one host's
-range, and two Nebula hosts placing into one target would overwrite it in turn, and put two
-tenants of the same namespace name into one target namespace.
-
-Pod NetworkPolicy does not apply to a host-network Pod, so admission refuses opted-in Pods
-with `spec.hostNetwork: true`; one would otherwise run outside the fence in its target.
+Give each target one Nebula host: a real pod keeps its placeholder's namespace, so two hosts
+placing into one target would put tenants from both into the same-named namespace there.
 
 ## Checking it works
 

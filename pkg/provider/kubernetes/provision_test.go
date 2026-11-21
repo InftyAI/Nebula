@@ -27,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -39,8 +38,7 @@ const testUID = types.UID("real-uid")
 
 // testCluster is one fake cluster. bind makes the fake "scheduler" bind every created pod.
 type testCluster struct {
-	kube    *kubefake.Clientset
-	dynamic *dynamicfake.FakeDynamicClient
+	kube *kubefake.Clientset
 }
 
 func newTestCluster(t *testing.T, bind bool) testCluster {
@@ -55,11 +53,11 @@ func newTestCluster(t *testing.T, bind bool) testCluster {
 		}
 		return false, nil, nil // let the tracker store the mutated pod
 	})
-	return testCluster{kube: kube, dynamic: newHostDynamic()}
+	return testCluster{kube: kube}
 }
 
 func (c testCluster) clients() clusterClients {
-	return clusterClients{kube: c.kube, dynamic: c.dynamic}
+	return clusterClients{kube: c.kube}
 }
 
 func provisionRequest() provider.ProvisionRequest {
