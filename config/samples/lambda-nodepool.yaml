@@ -1,0 +1,11 @@
+apiVersion: nebula.inftyai.com/v1alpha1
+kind: NodePool
+metadata:
+  name: lambda-example
+spec:
+  providers:
+  - name: lambda
+    regions:
+    - us-west-1
+  capacityTypes:
+  - OnDemand

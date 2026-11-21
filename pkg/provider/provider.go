@@ -87,7 +87,8 @@ type Provider interface {
 	// List returns every instance Nebula owns on this provider, in as few API calls as
 	// possible (ideally one). This is the engine of the poll loop: since no provider pushes
 	// events, preemption and termination are detected by an instance disappearing or
-	// changing state here.
+	// changing state here. A claim whose ownership or state could not be established
+	// can be returned as InstanceUnknown so other claims can still advance.
 	List(ctx context.Context) ([]Instance, error)
 
 	// FindByClaim returns the instance for claimName that still holds resources (a stopped
@@ -431,7 +432,8 @@ type Instance struct {
 	Endpoint string
 	// Err, for InstanceFailed, is why, classified like a failed Provision: a provider sentinel
 	// (ErrNoCapacity, ErrSpec) decides what is blocked, in the provider's own words. Nil is the
-	// instance's own failure, which blocks nothing.
+	// instance's own failure, which blocks nothing. For InstanceUnknown, Err explains
+	// why this claim could not be observed and does not affect placement.
 	Err error
 }
 
@@ -480,6 +482,9 @@ const (
 	// InstanceFailed: entered a terminal error state; Instance.Err says why, if the provider
 	// knows. An unreserved instance never placed on capacity is Failed with the refusal.
 	InstanceFailed InstanceState = "Failed"
+	// InstanceUnknown: a claim could not be observed this tick. Keep its existing status
+	// and wait for a confirmed observation before adopting, failing or reprovisioning it.
+	InstanceUnknown InstanceState = "Unknown"
 )
 
 // Offering is one row of the price/availability catalog. The price/availability

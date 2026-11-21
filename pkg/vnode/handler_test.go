@@ -2179,3 +2179,71 @@ func TestReconcileOnce_NotReadyIsShownAndCounted(t *testing.T) {
 			got.Status.Phase, got.Status.Reason, reasonReadinessTimeout)
 	}
 }
+
+func TestCreatePod_UnresolvedProvisionAdoptsWithoutFailingPod(t *testing.T) {
+	ctx := context.Background()
+	fp := &fakeProvider{provisionErr: fmt.Errorf("launch timeout: %w", provider.ErrProvisionUnresolved)}
+	h := NewHandler(fp, nil, nil, openCluster())
+	pod := testPod("default", "p1")
+	if err := h.CreatePod(ctx, pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	h.reconcileOnce(ctx)
+	got, err := h.GetPod(ctx, pod.Namespace, pod.Name)
+	if err != nil || got.Status.Phase != corev1.PodPending || got.Status.Reason != reasonProvisioning {
+		t.Fatalf("unresolved attempt should remain Pending without a replacement: %+v, %v", got, err)
+	}
+	fp.list = []provider.Instance{{ID: "inst-1", ClaimName: "default-p1", State: provider.InstanceRunning}}
+	h.reconcileOnce(ctx)
+	got, err = h.GetPod(ctx, pod.Namespace, pod.Name)
+	if err != nil || got.Status.Phase != corev1.PodRunning ||
+		got.Annotations[nebulav1alpha1.InstanceIDAnnotation] != "inst-1" {
+		t.Fatalf("recovered pod did not adopt the instance ID: %+v, %v", got, err)
+	}
+	if err := h.DeletePod(ctx, pod); err != nil || fp.terminateID != "inst-1" || fp.provisionCnt != 1 {
+		t.Fatalf("DeletePod used %q after %d create attempts: %v", fp.terminateID, fp.provisionCnt, err)
+	}
+}
+
+func TestUnknownInstanceObservationDoesNotBlockUnrelatedPods(t *testing.T) {
+	ctx := context.Background()
+	fp := &fakeProvider{}
+	h := NewHandler(fp, nil, nil, openCluster())
+	first := testPod("default", "first")
+	second := testPod("default", "second")
+	applyState(first, provider.InstanceRunning, "", h.nowFn())
+	applyState(second, provider.InstancePending, "", h.nowFn())
+	h.store(first, "default-first", "one", nil)
+	h.store(second, "default-second", "two", nil)
+	fp.list = []provider.Instance{
+		{ClaimName: "default-first", State: provider.InstanceUnknown, Err: errors.New("instance ownership uncertain")},
+		{ClaimName: "default-second", State: provider.InstanceRunning, ID: "two"},
+	}
+	h.reconcileOnce(ctx)
+	for _, name := range []string{"first", "second"} {
+		pod, err := h.GetPod(ctx, "default", name)
+		if err != nil || pod.Status.Phase != corev1.PodRunning {
+			t.Fatalf("pod %s: %+v, %v", name, pod, err)
+		}
+	}
+
+	restarted := NewHandler(fp, nil, nil, openCluster())
+	stub, err := restarted.GetPod(ctx, "default", "first")
+	if stub == nil || err == nil || errdefs.IsNotFound(err) {
+		t.Fatalf("cold lookup misclassified uncertain ownership: %+v, %v", stub, err)
+	}
+	if err := restarted.UpdatePod(ctx, first); err != nil {
+		t.Fatalf("UpdatePod while ownership is uncertain: %v", err)
+	}
+	fp.list = []provider.Instance{{
+		ClaimName: "default-first", ID: "one", State: provider.InstanceRunning,
+	}}
+	restarted.reconcileOnce(ctx)
+	pods, err := restarted.GetPods(ctx)
+	if err != nil || len(pods) != 1 || pods[0].Status.Phase != corev1.PodRunning ||
+		pods[0].Annotations[nebulav1alpha1.InstanceIDAnnotation] != "one" {
+		t.Fatalf("polling did not recover the cold Pod after UpdatePod: %+v, %v", pods, err)
+	}
+
+}

@@ -33,6 +33,9 @@ import (
 // errors.Is against these without importing any adapter, and BlockScope is
 // derived uniformly by ClassifyError below.
 var (
+	// ErrProvisionUnresolved means a create may have succeeded but has no confirmed
+	// result. Keep the Pod pending and use List to discover the recorded claim.
+	ErrProvisionUnresolved = errors.New("provider: provision outcome unresolved")
 	// ErrNoCapacity: the provider could not allocate the requested accelerator
 	// right now. Accelerator-scoped and transient.
 	ErrNoCapacity = errors.New("provider: no capacity for requested accelerator")
