@@ -155,6 +155,25 @@ tenants must not reach each other's pods.
 Give each target one Nebula host: a real pod keeps its placeholder's namespace, so two hosts
 placing into one target would put tenants from both into the same-named namespace there.
 
+### Upgrading from a build with namespace isolation
+
+Builds of `main` from #140 until this change could fence namespaces when the table set `cidrs`
+(no release shipped it). Removing the code does not remove the policies it wrote, and a
+leftover host-wide deny keeps cutting off the targets for any namespace Nebula has not placed
+into before, since nothing writes that namespace's opening any more. Install any replacement
+policies first, then delete the old ones, on the host and in every target:
+
+```bash
+kubectl delete clusternetworkpolicies.networking.k8s.aws -l app.kubernetes.io/managed-by=nebula
+kubectl delete networkpolicies -A -l app.kubernetes.io/managed-by=nebula
+```
+
+and, on the host only, the deny that `config/kubernetes-provider` applied:
+
+```bash
+kubectl delete clusternetworkpolicies.networking.k8s.aws nebula-isolation-host-cluster
+```
+
 ## Checking it works
 
 ```bash

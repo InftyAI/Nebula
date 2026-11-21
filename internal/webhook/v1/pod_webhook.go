@@ -18,6 +18,7 @@ package v1
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -115,7 +116,8 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 // PodCustomValidator rejects an opted-in Pod the providers cannot run as written: they
 // launch one container and no init containers, expose at most one port (Modal's connect URL
 // routes to one; see modal.firstPort), and mount nothing from the cluster, so no volumes and
-// no service account. Admitting more would drop the rest silently.
+// no service account. Admitting more would drop the rest silently. A host-network Pod is
+// refused for the same reason (see validatePod).
 type PodCustomValidator struct{}
 
 var _ webhook.CustomValidator = &PodCustomValidator{}
@@ -131,9 +133,9 @@ func (v *PodCustomValidator) ValidateCreate(_ context.Context, obj runtime.Objec
 
 // ValidateUpdate implements webhook.CustomValidator. The shape is immutable but the opt-in
 // label is not, so only label transitions are judged: opting in is refused outright, and
-// opting out must not strand Nebula's gate. A Pod staying opted in is left alone: one admitted
-// before this check existed would otherwise have every later write rejected, placement's gate
-// release among them, and stay gated forever.
+// opting out must not strand Nebula's gate, nor a placed Pod's instance. A Pod
+// staying opted in is left alone: one admitted before this check existed would otherwise have
+// every later write rejected, placement's gate release among them, and stay gated forever.
 func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
 	oldPod, ok := oldObj.(*corev1.Pod)
 	if !ok {
@@ -153,6 +155,12 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 		}
 	}
 	if optedIn(oldPod) {
+		// Teardown keys on this label: the reap that deletes a timed-out placed Pod, and so
+		// terminates its instance, skips a Pod without it (see reapTerminalPod).
+		if !optedIn(newPod) && placedByNebula(oldPod) {
+			return nil, fmt.Errorf("label %s stays on a Pod Nebula has placed, as tearing down its "+
+				"instance depends on it: delete the Pod instead", nebulav1alpha1.EnabledLabel)
+		}
 		// Placement ignores a Pod without the label, so it would never release the gate.
 		if !optedIn(newPod) && hasNebulaGate(newPod) {
 			return nil, fmt.Errorf("removing label %s would leave the Pod gated forever: also remove "+
@@ -196,6 +204,11 @@ func validatePod(pod *corev1.Pod) error {
 	}
 	if c := pod.Spec.Containers[0]; len(c.Ports) > 1 {
 		return fmt.Errorf("nebula exposes at most one port per Pod, container %q declares %d", c.Name, len(c.Ports))
+	}
+	// No provider runs it as written: Modal, RunPod and AWS drop the field, and the kubernetes
+	// provider's copy would put the real pod on its target node's own network.
+	if pod.Spec.HostNetwork {
+		return errors.New("nebula does not run host-network Pods: set spec.hostNetwork to false")
 	}
 	// The accelerator type and the GPU count must come together; see util.AcceleratorRequest.
 	if _, _, err := util.AcceleratorRequest(pod); err != nil {
