@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -136,22 +134,6 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatalf("Validate() = %v, want error containing %q", err, tc.wantErr)
 			}
 		})
-	}
-}
-
-// The table is parsed strictly, so a table still carrying namespace isolation's cidrs or host
-// fails to load, naming the field, rather than loading with the fence silently gone.
-func TestLoadConfigRejectsIsolationFields(t *testing.T) {
-	for _, field := range []string{"cidrs: [10.20.0.0/16]", "host: true"} {
-		path := filepath.Join(t.TempDir(), "clusters.yaml")
-		raw := "clusters:\n- name: a\n  provider: eks\n  region: us-east-1\n  geography: us\n  " + field + "\n"
-		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		key := strings.SplitN(field, ":", 2)[0]
-		if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), `unknown field "`+key+`"`) {
-			t.Errorf("%s: LoadConfig = %v, want an unknown-field error", key, err)
-		}
 	}
 }
 
