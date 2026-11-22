@@ -221,3 +221,51 @@ func (w *delayedReservationWriter) Patch(
 	w.commit = func() error { return w.Writer.Patch(context.Background(), obj, patch, opts...) }
 	return errors.New("reservation response timed out before the write")
 }
+
+func TestListReportsConfirmedAbsenceForPreviouslyObservedVM(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   provider.InstanceState
+		wantID string
+	}{
+		{name: "instance is gone", status: http.StatusNotFound, want: provider.InstanceTerminated, wantID: "observed-vm"},
+		{name: "lookup unavailable", status: http.StatusServiceUnavailable, want: provider.InstanceUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, claim := workload()
+			claim.Annotations = map[string]string{
+				attemptAnnotation: `{"started":"2026-11-20T00:00:00Z","instanceID":"observed-vm","observed":true}`,
+			}
+			p := testProvider(t, nil, testKube(t, claim))
+			queriedVM := false
+			transport := recoveryTransport(func(r *http.Request) (*http.Response, error) {
+				w := httptest.NewRecorder()
+				switch r.URL.Path {
+				case "/instances":
+					writeInstances(t, w, nil, false)
+				case "/instances/observed-vm":
+					queriedVM = true
+					w.WriteHeader(tc.status)
+					if tc.status == http.StatusNotFound {
+						_, _ = w.Write([]byte(`{"error":{"code":"global/object-does-not-exist"}}`))
+					}
+				default:
+					t.Errorf("unexpected API request: %s", r.URL.Path)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+				return w.Result(), nil
+			})
+			p.api = &cloudClient{baseURL: "http://test.invalid", http: &http.Client{Transport: transport}}
+
+			seen, err := p.List(context.Background())
+			if err != nil || !queriedVM || len(seen) != 1 || seen[0].State != tc.want || seen[0].ID != tc.wantID {
+				t.Fatalf("List = %+v, %v; queried saved ID: %v", seen, err, queriedVM)
+			}
+		})
+	}
+}
+
+type recoveryTransport func(*http.Request) (*http.Response, error)
+
+func (f recoveryTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

@@ -2247,3 +2247,52 @@ func TestUnknownInstanceObservationDoesNotBlockUnrelatedPods(t *testing.T) {
 	}
 
 }
+
+func TestReconcileOnce_StaleTerminalObservationKeepsNewTracking(t *testing.T) {
+	ctx := context.Background()
+	for _, mode := range []string{"unresolved launch", "cold lookup"} {
+		t.Run(mode, func(t *testing.T) {
+			fp := &fakeProvider{provisionErr: provider.ErrProvisionUnresolved}
+			h := NewHandler(fp, nil, nil, openCluster())
+			pod := testPod("default", "p1")
+			pod.Status.Phase = corev1.PodPending
+			fp.list = []provider.Instance{{ClaimName: "default-p1", ID: "old-vm", State: provider.InstanceTerminated}}
+			fp.listHook = func() {
+				fp.listHook = nil
+				if mode == "cold lookup" {
+					fp.list = []provider.Instance{{
+						ClaimName: "default-p1", State: provider.InstanceUnknown, Err: errors.New("uncertain ownership"),
+					}}
+					if _, err := h.GetPod(ctx, pod.Namespace, pod.Name); err == nil {
+						t.Fatal("cold lookup should report uncertain ownership")
+					}
+					if err := h.UpdatePod(ctx, pod); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := h.CreatePod(ctx, pod); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			h.reconcileOnce(ctx)
+			tracked, _ := h.GetPod(ctx, pod.Namespace, pod.Name)
+			if tracked == nil || tracked.Status.Phase != corev1.PodPending ||
+				tracked.Annotations[nebulav1alpha1.InstanceIDAnnotation] != "" {
+				t.Fatalf("older List changed the new tracked Pod: %+v", tracked)
+			}
+
+			confirmed := provider.InstanceRunning
+			wantPhase := corev1.PodRunning
+			if mode == "unresolved launch" {
+				confirmed, wantPhase = provider.InstanceTerminated, corev1.PodFailed
+			}
+			fp.list = []provider.Instance{{ClaimName: "default-p1", ID: "new-vm", State: confirmed}}
+			h.reconcileOnce(ctx)
+			tracked, err := h.GetPod(ctx, pod.Namespace, pod.Name)
+			if err != nil || tracked == nil || tracked.Status.Phase != wantPhase ||
+				tracked.Annotations[nebulav1alpha1.InstanceIDAnnotation] != "new-vm" {
+				t.Fatalf("fresh List did not settle the tracked Pod: %+v, %v", tracked, err)
+			}
+		})
+	}
+}

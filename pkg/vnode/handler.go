@@ -743,6 +743,10 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	var failed []failedPlacement
 	updated, finished, gone := 0, 0, 0
 	for _, tp := range h.tracked {
+		// An older List cannot settle ownership or report an instance's fate for this entry.
+		if tp.storeSeq > listSeq {
+			continue
+		}
 		inst, present := byClaim[tp.claimName]
 		if present && inst.State == provider.InstanceUnknown {
 			log.Info("could not observe instance; retaining Pod status",
@@ -752,7 +756,7 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 			}
 			continue
 		}
-		tp.resolveInstanceLookup(inst, present, listSeq)
+		tp.resolveInstanceLookup(inst, present)
 		if tp.placeholder {
 			continue
 		}
@@ -761,8 +765,6 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 		// No reverse for a terminal or deleting pod.
 		case util.Finished(tp.pod.Status.Phase) || !tp.pod.DeletionTimestamp.IsZero():
 			finished++
-		case !present && tp.storeSeq > listSeq:
-			// Stored while List was in flight; the next tick decides.
 		case !present && tp.placement != nil && tp.placement.awaitingInstance:
 			// The provider's durable claim still owns the unresolved create.
 		case !present:
@@ -849,13 +851,10 @@ func (h *Handler) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// resolveInstanceLookup runs with h.mu held after the poll has a confirmed
-// observation. An older list cannot settle a lookup that started after it.
-func (tp *trackedPod) resolveInstanceLookup(inst provider.Instance, present bool, listSeq uint64) {
+// resolveInstanceLookup runs under h.mu after the poll confirms ownership or absence.
+func (tp *trackedPod) resolveInstanceLookup(inst provider.Instance, present bool) {
 	if !present {
-		if tp.storeSeq <= listSeq {
-			tp.lookupErr = nil
-		}
+		tp.lookupErr = nil
 		return
 	}
 	awaitingLaunch := tp.placement != nil && tp.placement.awaitingInstance && inst.ID != ""

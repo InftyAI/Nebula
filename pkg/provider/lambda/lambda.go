@@ -538,7 +538,7 @@ func (p *Provider) observeClaim(
 		return nil, err
 	}
 	if vm == nil {
-		if recorded == nil || recorded.Observed || !nc.DeletionTimestamp.IsZero() {
+		if recorded == nil || !nc.DeletionTimestamp.IsZero() {
 			return nil, nil
 		}
 		if recorded.Abandoned {
@@ -547,9 +547,15 @@ func (p *Provider) observeClaim(
 		if recorded.InstanceID == "" {
 			return nil, errLaunchUnresolved
 		}
+		state := provider.InstancePending
+		if recorded.Observed {
+			// A confirmed absence must settle an unresolved launch even if the
+			// virtual kubelet started tracking it after we first observed the VM.
+			state = provider.InstanceTerminated
+		}
 		return &provider.Instance{
 			ID: recorded.InstanceID, ClaimName: nc.Name, Region: nc.Spec.Region,
-			CapacityType: nebula.CapacityOnDemand, State: provider.InstancePending,
+			CapacityType: nebula.CapacityOnDemand, State: state,
 		}, nil
 	}
 	inst := p.observe(ctx, *vm, nc.Name, true)
