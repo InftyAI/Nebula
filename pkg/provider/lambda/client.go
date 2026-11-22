@@ -23,10 +23,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -183,10 +186,19 @@ func (c *cloudClient) call(ctx context.Context, method, path string, body any, o
 }
 
 func (c *cloudClient) launch(ctx context.Context, req launchRequest) (string, error) {
+	var connected atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	})
 	var reply response[struct {
 		IDs []string `json:"instance_ids"`
 	}]
 	if err := c.call(ctx, http.MethodPost, "/instance-operations/launch", req, &reply); err != nil {
+		// A later dial failure cannot tell us what happened on an earlier connection.
+		var dialErr *net.OpError
+		if !connected.Load() && errors.As(err, &dialErr) && dialErr.Op == "dial" {
+			return "", fmt.Errorf("%w: %w", errRequestNotSent, err)
+		}
 		return "", err
 	}
 	if len(reply.Data.IDs) != 1 || strings.TrimSpace(reply.Data.IDs[0]) == "" {

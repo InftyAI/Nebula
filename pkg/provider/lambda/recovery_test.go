@@ -20,8 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -269,3 +271,61 @@ func TestListReportsConfirmedAbsenceForPreviouslyObservedVM(t *testing.T) {
 type recoveryTransport func(*http.Request) (*http.Response, error)
 
 func (f recoveryTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestLaunchDialFailureOnlySettlesWhenRequestWasNotSent(t *testing.T) {
+	dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	for _, tc := range []struct {
+		name       string
+		connected  bool
+		launchErr  error
+		unresolved bool
+	}{
+		{name: "dial failed before acquiring a connection", launchErr: dialErr},
+		{name: "dial failed after acquiring a connection", connected: true, launchErr: dialErr, unresolved: true},
+		{
+			name: "transport error without evidence of a dial failure", launchErr: errors.New("transport failed"),
+			unresolved: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pod, claim := workload()
+			p := testProvider(t, nil, testKube(t, claim))
+			p.api = &cloudClient{
+				baseURL: "http://test.invalid",
+				http: &http.Client{Transport: recoveryTransport(func(r *http.Request) (*http.Response, error) {
+					w := httptest.NewRecorder()
+					switch r.URL.Path {
+					case "/instances":
+						writeInstances(t, w, nil, false)
+					case "/instance-types":
+						_, _ = w.Write([]byte(testInstanceTypes))
+					case "/instance-operations/launch":
+						if tc.connected {
+							if trace := httptrace.ContextClientTrace(r.Context()); trace != nil && trace.GotConn != nil {
+								trace.GotConn(httptrace.GotConnInfo{})
+							}
+						}
+						return nil, tc.launchErr
+					default:
+						t.Errorf("unexpected API request: %s", r.URL.Path)
+						w.WriteHeader(http.StatusBadRequest)
+					}
+					return w.Result(), nil
+				})},
+			}
+			req := provider.ProvisionRequest{ClaimName: claim.Name, Region: "us-west-1"}
+			result, err := p.Provision(ctx, pod, req)
+			if result.InstanceID != "" || !errors.Is(err, tc.launchErr) ||
+				errors.Is(err, provider.ErrProvisionUnresolved) != tc.unresolved {
+				t.Fatalf("Provision = %+v, %v; want unresolved=%v", result, err, tc.unresolved)
+			}
+
+			vm, err := p.FindByClaim(ctx, req.ClaimName, req.Region)
+			if vm != nil || (tc.unresolved && !errors.Is(err, provider.ErrProvisionUnresolved)) ||
+				(!tc.unresolved && err != nil) {
+				t.Fatalf("FindByClaim = %+v, %v; want unresolved=%v", vm, err, tc.unresolved)
+			}
+		})
+	}
+}
