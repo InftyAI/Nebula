@@ -394,8 +394,8 @@ func TestBasePricePerHour_EmbeddedCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("modal H100 x2: %v", err)
 	}
-	if got != 2*3.9492 {
-		t.Fatalf("modal H100 x2 = %v, want %v (per-GPU rate x count)", got, 2*3.9492)
+	if got != 2*4.29 {
+		t.Fatalf("modal H100 x2 = %v, want %v (per-GPU rate x count)", got, 2*4.29)
 	}
 
 	aws := Base{ProviderName: "aws", Catalog: c}
