@@ -425,8 +425,7 @@ func TestOfferings_CopyIsolation(t *testing.T) {
 	}
 }
 
-// AWS serves H200 only as 8-GPU p5en or p5e, B200 as p6-b200 and B300 as p6-b300, OnDemand:
-// none is in AWS's Spot price feed.
+// AWS serves H200 only as 8-GPU p5en or p5e, OnDemand: neither is in AWS's Spot price feed.
 // p5en leads, as the primary the launch fleet and the blocklist key on.
 func TestEmbeddedCatalog_AWSHopperAndBlackwell(t *testing.T) {
 	c, err := Load()
@@ -452,29 +451,12 @@ func TestEmbeddedCatalog_AWSHopperAndBlackwell(t *testing.T) {
 		t.Fatal("MapAccelerator(H200, 1) found an instance; AWS has no single-GPU H200")
 	}
 
-	// B200 and B300 likewise: one 8-GPU type each, OnDemand only.
-	ids, ok = aws.MapAccelerator("B200", 8)
-	if !ok || !slices.Equal(ids, []string{"p6-b200.48xlarge"}) {
-		t.Fatalf("MapAccelerator(B200, 8) = %v, %v; want [p6-b200.48xlarge]", ids, ok)
-	}
-	req = provider.PriceRequest{AcceleratorType: "B200", Count: 8, CapacityType: nebulav1alpha1.CapacityOnDemand}
-	if got, err := aws.PricePerHour(req); err != nil || got != 113.930 {
-		t.Fatalf("aws B200 x8 OnDemand = %v, %v; want 113.930", got, err)
-	}
-	req.CapacityType = nebulav1alpha1.CapacitySpot
-	if _, err := aws.PricePerHour(req); err == nil {
-		t.Fatal("aws B200 x8 Spot priced, want no Spot offering")
-	}
-	ids, ok = aws.MapAccelerator("B300", 8)
-	if !ok || !slices.Equal(ids, []string{"p6-b300.48xlarge"}) {
-		t.Fatalf("MapAccelerator(B300, 8) = %v, %v; want [p6-b300.48xlarge]", ids, ok)
-	}
-	req = provider.PriceRequest{AcceleratorType: "B300", Count: 8, CapacityType: nebulav1alpha1.CapacityOnDemand}
-	if got, err := aws.PricePerHour(req); err != nil || got != 142.420 {
-		t.Fatalf("aws B300 x8 OnDemand = %v, %v; want 142.420", got, err)
-	}
-	req.CapacityType = nebulav1alpha1.CapacitySpot
-	if _, err := aws.PricePerHour(req); err == nil {
-		t.Fatal("aws B300 x8 Spot priced, want no Spot offering")
+	// B200 and B300 are listed but unavailable: the AL2 ECS GPU AMI the adapter boots ships NVIDIA
+	// driver 550, and Blackwell needs R570 or later. Until the AMI moves (AL2023 ships 580), an
+	// instance would launch and bill without running the workload.
+	for _, gpu := range []string{"B200", "B300"} {
+		if ids, ok := aws.MapAccelerator(gpu, 8); ok {
+			t.Errorf("MapAccelerator(%s, 8) = %v; want unavailable until the AMI ships an R570+ driver", gpu, ids)
+		}
 	}
 }
