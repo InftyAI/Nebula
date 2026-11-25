@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lambda-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lambda-example
+  template:
+    metadata:
+      labels:
+        app: lambda-example
+        nebula.inftyai.com/enabled: "true"
+        nebula.inftyai.com/nodepool: lambda-example
+        nebula.inftyai.com/accelerator-type: a10
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: app
+        image: python:3.12-slim
+        command: ["python3", "-c"]
+        args:
+        - |
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from subprocess import check_output
+
+          gpus = check_output(["nvidia-smi", "-L"])
+          if not gpus:
+              raise RuntimeError("No GPU detected")
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path != "/healthz":
+                      self.send_error(404)
+                      return
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(gpus)
+
+          HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+        env:
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          limits:
+            nvidia.com/gpu: "1"

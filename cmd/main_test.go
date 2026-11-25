@@ -38,6 +38,7 @@ func TestParseProviders(t *testing.T) {
 	}{
 		{name: "default enables all", in: strings.Join(knownProviders, ","), want: knownProviders},
 		{name: "subset", in: "aws", want: []string{"aws"}},
+		{name: "lambda can be selected", in: "lambda", want: []string{"lambda"}},
 		{name: "spaces and empties ignored", in: " modal , ,aws ", want: []string{"aws", "modal"}},
 		{name: "empty disables all", in: "", want: nil},
 		// A typo must not silently leave a provider off.

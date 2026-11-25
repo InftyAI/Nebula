@@ -141,7 +141,12 @@ spec:
           - secretRef:
               name: nebula-runpod-credentials
               optional: true
-          # Add one secretRef per provider as adapters land, following the pattern above.
+          - secretRef:
+              name: nebula-lambda-credentials
+              optional: true
+          - configMapRef:
+              name: nebula-lambda-config
+              optional: true
         ports:
         # The kubelet API the API server dials for `kubectl logs` (10250, like a real
         # kubelet). Declaring it is documentation and NetworkPolicy surface; the
