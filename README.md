@@ -29,10 +29,19 @@ per-cloud glue. The API follows a Karpenter-style split:
 ## Features
 
 - **Kubernetes-native experience.** Existing Deployments or Jobs opt in via labels; no new workload type and no per-cloud glue.
-- **Multi-provider support.** Modal, RunPod and AWS today, with more providers coming soon.
+- **Multi-provider support.** Modal, RunPod, AWS, and your own Kubernetes clusters, with more providers coming soon.
 - **Policy-driven placement.** Flexible NodePool spec to pick providers by cost, availability, and region, with failover and network egress policy.
 - **Cost tracking.** Out-of-the-box per-instance cost tracking.
 - **Observability.** Rich metrics and logs for placement, provisioning, and instance lifecycle.
+
+## Providers
+
+| Provider | What a Pod runs on |
+|---|---|
+| `aws` | an EC2 GPU instance |
+| `kubernetes` | a Pod in one of your other Kubernetes clusters |
+| `modal` | a Modal Sandbox |
+| `runpod` | a RunPod Pod |
 
 ## How it works
 
@@ -69,6 +78,9 @@ spec:
     regions:
     - us
     - eu-west-1            # or name one region exactly
+  - name: kubernetes       # your own Kubernetes clusters, one per region (see docs/multi-cluster.md)
+    regions:
+    - us-west-2
   capacityTypes:           # prefer cheap Spot, fall back to OnDemand
   - Spot
   - OnDemand
