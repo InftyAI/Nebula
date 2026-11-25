@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/components/logship/internal/supervise"
 )
 
@@ -38,7 +39,7 @@ func sandboxPod(name, id string) *corev1.Pod {
 			Name:      name,
 			Namespace: "org-00000000-0000-4000-8000-000000000001",
 			Labels: map[string]string{
-				EnabledLabel:                          EnabledValue,
+				nebulav1alpha1.EnabledLabel:           nebulav1alpha1.EnabledValue,
 				"nebula.inftyai.com/nodepool":         "modal",
 				"nebula.inftyai.com/accelerator-type": "l4",
 				"app":                                 "sandbox",
@@ -46,9 +47,9 @@ func sandboxPod(name, id string) *corev1.Pod {
 				"example.com/team-id":                 "t1",
 				"example.com/experiment-id":           "e1",
 			},
-			Annotations: map[string]string{InstanceIDAnnotation: id},
+			Annotations: map[string]string{nebulav1alpha1.InstanceIDAnnotation: id},
 		},
-		Spec: corev1.PodSpec{NodeSelector: map[string]string{ProviderSelector: "modal"}},
+		Spec: corev1.PodSpec{NodeSelector: map[string]string{nebulav1alpha1.ProviderLabel: "modal"}},
 	}
 }
 
@@ -71,7 +72,7 @@ func TestInstanceFor(t *testing.T) {
 	// fail every attempt and burn the restart budget doing it.
 	t.Run("the provider travels with the id", func(t *testing.T) {
 		pod := sandboxPod("exp-1-sandbox-0", "i-0abc123def456")
-		pod.Spec.NodeSelector[ProviderSelector] = "aws"
+		pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel] = "aws"
 		inst, ok := instanceFor(pod)
 		if !ok {
 			t.Fatal("expected a Pod on another provider to still be an instance")
@@ -83,11 +84,11 @@ func TestInstanceFor(t *testing.T) {
 
 	t.Run("not shippable yet or not ours", func(t *testing.T) {
 		for name, mangle := range map[string]func(*corev1.Pod){
-			"id not written back yet": func(p *corev1.Pod) { delete(p.Annotations, InstanceIDAnnotation) },
-			"empty id":                func(p *corev1.Pod) { p.Annotations[InstanceIDAnnotation] = "" },
+			"id not written back yet": func(p *corev1.Pod) { delete(p.Annotations, nebulav1alpha1.InstanceIDAnnotation) },
+			"empty id":                func(p *corev1.Pod) { p.Annotations[nebulav1alpha1.InstanceIDAnnotation] = "" },
 			"not placed yet":          func(p *corev1.Pod) { p.Spec.NodeSelector = nil },
-			"not opted into nebula":   func(p *corev1.Pod) { delete(p.Labels, EnabledLabel) },
-			"opted in with a typo":    func(p *corev1.Pod) { p.Labels[EnabledLabel] = "True" },
+			"not opted into nebula":   func(p *corev1.Pod) { delete(p.Labels, nebulav1alpha1.EnabledLabel) },
+			"opted in with a typo":    func(p *corev1.Pod) { p.Labels[nebulav1alpha1.EnabledLabel] = "True" },
 		} {
 			t.Run(name, func(t *testing.T) {
 				pod := sandboxPod("exp-1-sandbox-0", "sb-abc123")
@@ -182,7 +183,7 @@ func TestWatcherDrivesTheFleet(t *testing.T) {
 	})
 	// The ordinary path: a Pod is created before it has an id, and gains one when Provision returns.
 	pending := sandboxPod("exp-1-sandbox-1", "")
-	delete(pending.Annotations, InstanceIDAnnotation)
+	delete(pending.Annotations, nebulav1alpha1.InstanceIDAnnotation)
 	pods := client.CoreV1().Pods(pending.Namespace)
 	if _, err := pods.Create(ctx, pending, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)

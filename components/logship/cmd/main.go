@@ -38,6 +38,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/components/logship/internal/emit"
 	"github.com/InftyAI/Nebula/components/logship/internal/provider"
 	"github.com/InftyAI/Nebula/components/logship/internal/supervise"
@@ -86,7 +87,7 @@ func shipCluster(ctx context.Context, set *provider.Set) error {
 	}
 	f := newFleet(ctx, set)
 
-	logf("watching Pods", "enabled", watch.EnabledLabel, "instanceID", watch.InstanceIDAnnotation,
+	logf("watching Pods", "enabled", nebulav1alpha1.EnabledLabel, "instanceID", nebulav1alpha1.InstanceIDAnnotation,
 		"providers", set.Names())
 	w := &watch.Watcher{
 		Client: client,

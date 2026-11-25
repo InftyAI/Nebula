@@ -35,26 +35,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/components/logship/internal/supervise"
 )
 
-// The keys the watch reads a Pod's identity from. Hardcoded, and not configurable: Nebula's placement
-// controller and virtual kubelet write all three as a set, so anything that could configure them apart
-// could only configure them into disagreement.
-//
-// Nebula's own group, which is NOT the domain the tenant labels use — those belong to the consumer
-// and ride along in instanceFor's clone rather than being read by name. A Pod carries both domains at
-// once, so a rename here does not touch them and must not.
-const (
-	EnabledLabel         = "nebula.inftyai.com/enabled"
-	InstanceIDAnnotation = "nebula.inftyai.com/instance-id"
-
-	// ProviderSelector is a spec.nodeSelector key, not a label: it is what routes the Pod to a
-	// provider's virtual node, and the only thing on the object that names the provider.
-	ProviderSelector = "nebula.inftyai.com/provider"
-
-	EnabledValue = "true"
-)
+// The keys a Pod's identity is read from are Nebula's own (nebulav1alpha1): EnabledLabel and
+// InstanceIDAnnotation, and ProviderLabel, which is a spec.nodeSelector key rather than a label, as
+// it is what routes the Pod to a provider's virtual node. Taken from Nebula's API, so they cannot
+// drift from what its placement controller and virtual kubelet write. They are NOT the domain of
+// the tenant labels, which belong to the consumer and ride along in instanceFor's clone unread.
 
 // DefaultResync is how often the informer re-delivers the Pods it already has as updates. It is NOT a
 // relist: nothing is fetched, so it cannot notice a Pod that disappeared. A dropped event is repaired
@@ -67,7 +56,7 @@ const DefaultResync = 10 * time.Minute
 
 // instanceFor decides whether a Pod is one to ship, and builds its Instance.
 //
-// Reading the provider off the nodeSelector is not a formality: InstanceIDAnnotation holds *the
+// Reading the provider off the nodeSelector is not a formality: nebulav1alpha1.InstanceIDAnnotation holds *the
 // provider's* id, so it is a sandbox id on one Pod and an EC2 instance id on the next, and an id
 // handed to the wrong backend fails every attempt and spends the whole restart budget doing it. The
 // nodeSelector is also the only place to read it — nothing on the Pod's labels names the provider.
@@ -80,14 +69,14 @@ const DefaultResync = 10 * time.Minute
 // retry a stream that ended, so shipping a terminal Pod costs nothing; stopping at the terminal phase
 // would instead cut the tail of the log off, which is the part that says why the run ended.
 func instanceFor(pod *corev1.Pod) (supervise.Instance, bool) {
-	if pod.Labels[EnabledLabel] != EnabledValue {
+	if pod.Labels[nebulav1alpha1.EnabledLabel] != nebulav1alpha1.EnabledValue {
 		return supervise.Instance{}, false
 	}
-	provider := pod.Spec.NodeSelector[ProviderSelector]
+	provider := pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel]
 	if provider == "" {
 		return supervise.Instance{}, false
 	}
-	id := pod.Annotations[InstanceIDAnnotation]
+	id := pod.Annotations[nebulav1alpha1.InstanceIDAnnotation]
 	if id == "" {
 		return supervise.Instance{}, false
 	}
@@ -142,7 +131,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 	factory := informers.NewSharedInformerFactoryWithOptions(w.Client, resync,
 		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
-			o.LabelSelector = EnabledLabel + "=" + EnabledValue
+			o.LabelSelector = nebulav1alpha1.EnabledLabel + "=" + nebulav1alpha1.EnabledValue
 		}))
 	informer := factory.Core().V1().Pods().Informer()
 
@@ -210,7 +199,7 @@ func (w *Watcher) forget(obj any) {
 	started := w.drop(podKey(pod))
 	// Both halves, as instanceFor requires: an id without the provider that minted it is not a Ref this
 	// fleet could ever have tracked.
-	on := supervise.Ref{Provider: pod.Spec.NodeSelector[ProviderSelector], ID: pod.Annotations[InstanceIDAnnotation]}
+	on := supervise.Ref{Provider: pod.Spec.NodeSelector[nebulav1alpha1.ProviderLabel], ID: pod.Annotations[nebulav1alpha1.InstanceIDAnnotation]}
 	if on.Provider != "" && on.ID != "" && on != started {
 		w.Fleet.Forget(on)
 	}
