@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -421,5 +422,32 @@ func TestOfferings_CopyIsolation(t *testing.T) {
 	b := c.Offerings("modal")
 	if b[0].PricePerHour == -1 {
 		t.Fatal("Offerings returned a shared slice; caller mutation leaked into catalog")
+	}
+}
+
+// AWS serves H200 only as 8-GPU p5en or p5e, OnDemand: neither is in AWS's Spot price feed.
+// p5en leads, as the primary the launch fleet and the blocklist key on.
+func TestEmbeddedCatalog_AWSH200(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	aws := Base{ProviderName: "aws", Catalog: c}
+
+	ids, ok := aws.MapAccelerator("H200", 8)
+	if !ok || !slices.Equal(ids, []string{"p5en.48xlarge", "p5e.48xlarge"}) {
+		t.Fatalf("MapAccelerator(H200, 8) = %v, %v; want [p5en.48xlarge p5e.48xlarge]", ids, ok)
+	}
+	req := provider.PriceRequest{AcceleratorType: "H200", Count: 8, CapacityType: nebulav1alpha1.CapacityOnDemand}
+	got, err := aws.PricePerHour(req)
+	if err != nil || got != 63.300 {
+		t.Fatalf("aws H200 x8 OnDemand = %v, %v; want 63.300", got, err)
+	}
+	req.CapacityType = nebulav1alpha1.CapacitySpot
+	if _, err := aws.PricePerHour(req); err == nil {
+		t.Fatal("aws H200 x8 Spot priced, want no Spot offering")
+	}
+	if _, ok := aws.MapAccelerator("H200", 1); ok {
+		t.Fatal("MapAccelerator(H200, 1) found an instance; AWS has no single-GPU H200")
 	}
 }

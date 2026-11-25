@@ -34,6 +34,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -583,5 +584,18 @@ func TestParsePropagateLabels(t *testing.T) {
 		if _, err := ParsePropagateLabels(bad); err == nil {
 			t.Errorf("ParsePropagateLabels(%q) accepted it", bad)
 		}
+	}
+}
+
+// H200 reaches a target cluster through the AWS catalog's instance types: a Pod asking for it
+// gets a node from the p5e or p5en family, which the cluster's Karpenter NodePool must allow.
+func TestFamiliesByAccelerator_H200FromAWSCatalog(t *testing.T) {
+	cat, err := catalog.Load()
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	got := familiesByAccelerator(cat.Offerings(provider.ProviderAWS))["H200"]
+	if !slices.Equal(got, []string{"p5e", "p5en"}) {
+		t.Fatalf("H200 families = %v, want [p5e p5en]", got)
 	}
 }
