@@ -7,3 +7,4 @@
 - [kubelet-api.md](kubelet-api.md) — `kubectl logs` and `kubectl exec` against a Pod with no kubelet.
 - [metrics.md](metrics.md) — what is instrumented, and how to query it.
 - [add-a-provider.md](add-a-provider.md) — adding a provider backend.
+- [private-image.md](private-image.md) — using private container images with Nebula.
