@@ -34,6 +34,7 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
+	"github.com/InftyAI/Nebula/pkg/provider/catalog"
 	"github.com/InftyAI/Nebula/pkg/util"
 )
 
@@ -583,5 +584,24 @@ func TestParsePropagateLabels(t *testing.T) {
 		if _, err := ParsePropagateLabels(bad); err == nil {
 			t.Errorf("ParsePropagateLabels(%q) accepted it", bad)
 		}
+	}
+}
+
+// H200, B200 and B300 reach a target cluster through the AWS catalog's instance types: a Pod
+// asking for one gets a node from p5e/p5en, p6-b200 or p6-b300, which its Karpenter NodePool must allow.
+func TestFamiliesByAccelerator_HopperAndBlackwellFromAWSCatalog(t *testing.T) {
+	cat, err := catalog.Load()
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	families := familiesByAccelerator(cat.Offerings(provider.ProviderAWS))
+	if got := families["H200"]; !slices.Equal(got, []string{"p5e", "p5en"}) {
+		t.Fatalf("H200 families = %v, want [p5e p5en]", got)
+	}
+	if got := families["B200"]; !slices.Equal(got, []string{"p6-b200"}) {
+		t.Fatalf("B200 families = %v, want [p6-b200]", got)
+	}
+	if got := families["B300"]; !slices.Equal(got, []string{"p6-b300"}) {
+		t.Fatalf("B300 families = %v, want [p6-b300]", got)
 	}
 }

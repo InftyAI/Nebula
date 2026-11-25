@@ -56,3 +56,7 @@ A100-80GB,p4de.24xlarge,8,OnDemand,27.447,true,,2026-09-30
 A100-80GB,p4de.24xlarge,8,Spot,21.514,true,,2026-09-30
 H100,p5.48xlarge,8,OnDemand,55.040,true,,2026-09-30
 H100,p5.48xlarge,8,Spot,20.839,true,,2026-09-30
+H200,p5en.48xlarge,8,OnDemand,63.300,true,,2026-11-25
+H200,p5e.48xlarge,8,OnDemand,63.300,true,,2026-11-25
+B200,p6-b200.48xlarge,8,OnDemand,113.930,true,,2026-11-25
+B300,p6-b300.48xlarge,8,OnDemand,142.420,true,,2026-11-25

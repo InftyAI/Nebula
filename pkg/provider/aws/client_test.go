@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"path"
 	"reflect"
 	"strings"
 	"sync"
@@ -1309,5 +1310,22 @@ func TestSDKRunInstance_SizesRootVolume(t *testing.T) {
 					awssdk.ToInt32(ebs.VolumeSize), ebs.VolumeType, awssdk.ToBool(ebs.DeleteOnTermination), tc.wantSize)
 			}
 		})
+	}
+}
+
+// The filter must pick the AL2023 GPU AMI, whose R580 driver runs Blackwell, and never AL2's
+// (driver 550) or a non-GPU build. Names are from aws/amazon-ecs-ami release 20261119; AWS's
+// name filter treats * as any run of characters, as path.Match does in a name with no slash.
+func TestGPUAMINameFilter(t *testing.T) {
+	for name, want := range map[string]bool{
+		"al2023-ami-ecs-gpu-hvm-2023.0.20261119-kernel-6.1-x86_64-ebs": true,
+		"amzn2-ami-ecs-gpu-hvm-2.0.20261119-x86_64-ebs":                false,
+		"amzn2-ami-ecs-kernel-5.10-gpu-hvm-2.0.20261119-x86_64-ebs":    false,
+		"al2023-ami-ecs-hvm-2023.0.20261119-kernel-6.1-x86_64":         false,
+		"al2023-ami-ecs-gpu-hvm-2023.0.20261119-kernel-6.1-arm64-ebs":  false,
+	} {
+		if got, err := path.Match(gpuAMINameFilter, name); err != nil || got != want {
+			t.Errorf("%s matches %q = %v, %v; want %v", gpuAMINameFilter, name, got, err, want)
+		}
 	}
 }

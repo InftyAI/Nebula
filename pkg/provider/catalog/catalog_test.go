@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -421,5 +422,55 @@ func TestOfferings_CopyIsolation(t *testing.T) {
 	b := c.Offerings("modal")
 	if b[0].PricePerHour == -1 {
 		t.Fatal("Offerings returned a shared slice; caller mutation leaked into catalog")
+	}
+}
+
+// AWS serves H200 only as 8-GPU p5en or p5e, B200 as p6-b200 and B300 as p6-b300, OnDemand:
+// none is in AWS's Spot price feed.
+// p5en leads, as the primary the launch fleet and the blocklist key on.
+func TestEmbeddedCatalog_AWSHopperAndBlackwell(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	aws := Base{ProviderName: "aws", Catalog: c}
+
+	ids, ok := aws.MapAccelerator("H200", 8)
+	if !ok || !slices.Equal(ids, []string{"p5en.48xlarge", "p5e.48xlarge"}) {
+		t.Fatalf("MapAccelerator(H200, 8) = %v, %v; want [p5en.48xlarge p5e.48xlarge]", ids, ok)
+	}
+	req := provider.PriceRequest{AcceleratorType: "H200", Count: 8, CapacityType: nebulav1alpha1.CapacityOnDemand}
+	got, err := aws.PricePerHour(req)
+	if err != nil || got != 63.300 {
+		t.Fatalf("aws H200 x8 OnDemand = %v, %v; want 63.300", got, err)
+	}
+	req.CapacityType = nebulav1alpha1.CapacitySpot
+	if _, err := aws.PricePerHour(req); err == nil {
+		t.Fatal("aws H200 x8 Spot priced, want no Spot offering")
+	}
+	if _, ok := aws.MapAccelerator("H200", 1); ok {
+		t.Fatal("MapAccelerator(H200, 1) found an instance; AWS has no single-GPU H200")
+	}
+
+	// B200 and B300 likewise: one 8-GPU type each, OnDemand only. The AL2023 GPU AMI the adapter
+	// boots ships the R580 driver Blackwell needs (see gpuAMINameFilter).
+	for gpu, want := range map[string]struct {
+		id    string
+		price float64
+	}{
+		"B200": {"p6-b200.48xlarge", 113.930},
+		"B300": {"p6-b300.48xlarge", 142.420},
+	} {
+		if ids, ok := aws.MapAccelerator(gpu, 8); !ok || !slices.Equal(ids, []string{want.id}) {
+			t.Errorf("MapAccelerator(%s, 8) = %v, %v; want [%s]", gpu, ids, ok, want.id)
+		}
+		req := provider.PriceRequest{AcceleratorType: gpu, Count: 8, CapacityType: nebulav1alpha1.CapacityOnDemand}
+		if got, err := aws.PricePerHour(req); err != nil || got != want.price {
+			t.Errorf("aws %s x8 OnDemand = %v, %v; want %v", gpu, got, err, want.price)
+		}
+		req.CapacityType = nebulav1alpha1.CapacitySpot
+		if _, err := aws.PricePerHour(req); err == nil {
+			t.Errorf("aws %s x8 Spot priced, want no Spot offering", gpu)
+		}
 	}
 }
