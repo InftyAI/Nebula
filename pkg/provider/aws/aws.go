@@ -741,9 +741,10 @@ func (p *Provider) ClassifyProvisionError(err error, accelerator, region string)
 	return scope
 }
 
-// awsAMIRootGiB is the GPU AMI's root snapshot (30 GiB in every region checked, 2026-10-04),
-// the OS base of every root volume. A constant because pricing has no region to resolve the
-// AMI in; a larger snapshot is logged at client construction, since it under-prices.
+// awsAMIRootGiB is the GPU AMI's root snapshot (30 GiB: the AL2023 GPU AMI's build default,
+// which its release vars do not override), the OS base of every root volume. A constant because
+// pricing has no region to resolve the AMI in; a larger snapshot is logged at client
+// construction, since it under-prices.
 const awsAMIRootGiB = 30
 
 // awsMaxDiskGiB is the most user space a Pod may ask for: gp3's 16 TiB volume cap less the OS

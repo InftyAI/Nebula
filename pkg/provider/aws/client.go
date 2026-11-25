@@ -234,12 +234,16 @@ func newSDKClientForRegion(ctx context.Context, region string) (Client, error) {
 	return c, nil
 }
 
-// gpuAMINameFilter matches the Amazon-owned Amazon-Linux-2 ECS GPU-optimized AMI.
+// gpuAMINameFilter matches the Amazon-owned Amazon Linux 2023 ECS GPU-optimized AMI.
 // DescribeImages is filtered to this pattern and owner "amazon", then the newest
 // by creation date is chosen — so the AMI stays current without a hand-maintained
 // per-region id table. This AMI ships the NVIDIA driver and a Docker runtime,
 // which is all buildUserData's `docker pull && docker run --gpus all` needs.
-const gpuAMINameFilter = "amzn2-ami-ecs-gpu-hvm-*-x86_64-ebs"
+//
+// AL2023, not Amazon Linux 2: AL2's GPU AMI ships driver 550, too old for Blackwell (B200,
+// B300 need R570+), while this one pins the 580 series and loads the open kernel modules
+// Blackwell requires (aws/amazon-ecs-ami, al2023gpu.pkr.hcl).
+const gpuAMINameFilter = "al2023-ami-ecs-gpu-hvm-*-kernel-6.1-x86_64-ebs"
 
 // ErrConfig marks a missing/invalid non-secret AWS configuration (no resolvable
 // region, no GPU AMI in the region). It is a distinct sentinel so cmd/main.go can

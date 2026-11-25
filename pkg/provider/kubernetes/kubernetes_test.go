@@ -589,8 +589,6 @@ func TestParsePropagateLabels(t *testing.T) {
 
 // H200, B200 and B300 reach a target cluster through the AWS catalog's instance types: a Pod
 // asking for one gets a node from p5e/p5en, p6-b200 or p6-b300, which its Karpenter NodePool must allow.
-// Whatever the aws row's availability says: B200 and B300 are unavailable to the aws adapter for
-// its AMI's driver, but a cluster's nodes boot the image its own Karpenter config picks.
 func TestFamiliesByAccelerator_HopperAndBlackwellFromAWSCatalog(t *testing.T) {
 	cat, err := catalog.Load()
 	if err != nil {
