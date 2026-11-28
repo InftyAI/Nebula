@@ -17,6 +17,7 @@ limitations under the License.
 package kubernetes
 
 import (
+	"bytes"
 	"context"
 	"maps"
 	"os"
@@ -254,16 +255,44 @@ func TestReflectCopiesTheSourceLabels(t *testing.T) {
 	}
 }
 
+// A ConfigMap's copy holds its data and follows its labels, as a Secret's does.
 func TestReflectConfigMap(t *testing.T) {
 	f := newReflectFixture(t, trainerRule)
-	f.add(t, f.configMaps, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "conf", Namespace: "org-1", Labels: map[string]string{"app": "trainer"}},
-		Data:       map[string]string{"k": "v"}, BinaryData: map[string][]byte{"b": {1}},
-	})
-	f.handle(t, resourceConfigMaps, "conf")
-	got, err := f.targets["eks-eun1"].CoreV1().ConfigMaps("org-1").Get(context.Background(), "conf", metav1.GetOptions{})
-	if err != nil || got.Data["k"] != "v" || len(got.BinaryData["b"]) != 1 || !isReflected(got) {
-		t.Fatalf("copy = %+v, %v", got, err)
+	conf := func(labels map[string]string) *corev1.ConfigMap {
+		// The fake clientset leaves the copy's UID empty, so the source needs a UID or the copy
+		// would look like the source itself.
+		return &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "conf", Namespace: "org-1", UID: "src-uid", Labels: labels},
+			Data:       map[string]string{"k": "v"}, BinaryData: map[string][]byte{"b": {1}},
+		}
+	}
+	get := func() *corev1.ConfigMap {
+		t.Helper()
+		got, err := f.targets["eks-eun1"].CoreV1().ConfigMaps("org-1").Get(context.Background(), "conf", metav1.GetOptions{})
+		if err != nil || got.Data["k"] != "v" || len(got.Data) != 1 || !bytes.Equal(got.BinaryData["b"], []byte{1}) ||
+			len(got.BinaryData) != 1 {
+			t.Fatalf("copy = %+v, %v; want the source's data", got, err)
+		}
+		return got
+	}
+	steps := []struct {
+		name   string
+		source map[string]string
+		want   map[string]string
+	}{
+		{"created", map[string]string{"app": "trainer", "team": "research", "nebula.inftyai.com/reflected": "false"},
+			map[string]string{"app": "trainer", "team": "research", reflectedLabel: labelTrue}},
+		{"label changed", map[string]string{"app": "trainer", "team": "infra"},
+			map[string]string{"app": "trainer", "team": "infra", reflectedLabel: labelTrue}},
+		{"label removed", map[string]string{"app": "trainer"},
+			map[string]string{"app": "trainer", reflectedLabel: labelTrue}},
+	}
+	for _, step := range steps {
+		f.add(t, f.configMaps, conf(step.source))
+		f.handle(t, resourceConfigMaps, "conf")
+		if got := get(); !maps.Equal(got.Labels, step.want) {
+			t.Errorf("%s: copy labels = %v, want %v", step.name, got.Labels, step.want)
+		}
 	}
 }
 
