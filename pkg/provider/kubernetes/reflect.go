@@ -62,9 +62,10 @@ const (
 	// reflectSweep re-reflects every selected source and every copy regardless of events, to repair
 	// copies edited or deleted in a target and orphans left behind while Nebula was down.
 	reflectSweep = 10 * time.Minute
-	// reflectTimeout caps reflecting one object to one target, so a stuck cluster doesn't delay
-	// the others.
-	reflectTimeout = 30 * time.Second
+	// reflectTimeout caps reflecting one object to one target. Targets are written in turn, so a
+	// hung target delays the others by this much per queued object: short, since a healthy one
+	// answers in ~1-2s and a timeout only costs an idempotent retry.
+	reflectTimeout = 5 * time.Second
 
 	reasonReflectionRefused = "ReflectionRefused"
 )
