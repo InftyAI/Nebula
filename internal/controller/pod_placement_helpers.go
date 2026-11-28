@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"slices"
 	"strings"
@@ -78,9 +79,7 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 // accelerator, or cannot serve the tier) or blocked; the caller leaves the Pod gated for a
 // pool edit, a provider registering, or a block expiring.
 //
-// On ok=false, retryAfter is the time until the soonest servable-but-blocked candidate
-// frees, or 0 when no TTL can ever unblock anything. A positive hint requeues the Pod, since
-// a block expiring emits no event of its own.
+// On ok=false, the deferral says why, for the Pod's Event, and when to retry (see deferral).
 //
 // It owns the placement metrics for what it decides — a skip counter per candidate, and the
 // deferral reason on ok=false — because only this scope can tell an invalid request from an
@@ -89,7 +88,7 @@ func (r *PodPlacementReconciler) poolFor(ctx context.Context, pod *corev1.Pod) (
 //
 // TODO: Strategy (LowestPrice/Weighted) will replace the inner listed order; nothing in the
 // caller depends on the ordering, only on a (provider, capacityType, region) coming back.
-func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool, time.Duration) {
+func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev1.Pod, pool *nebulav1alpha1.NodePool) (placement, bool, deferral) {
 	log := logf.FromContext(ctx).WithName("placement-select").WithValues(
 		"pod", pod.Namespace+"/"+pod.Name, "pool", pool.Name)
 
@@ -103,7 +102,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 	if err != nil {
 		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
 		log.Info("invalid accelerator request; leaving Pod gated", "error", err.Error())
-		return placement{}, false, 0
+		return placement{}, false, deferral{message: "invalid accelerator request: " + err.Error()}
 	}
 
 	// The Pod's region ask, read ONCE: region expansion runs per provider ref, so parsing
@@ -111,23 +110,27 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 	narrowTo, ok := requestedGeographies(pod)
 	if !ok {
 		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
-		log.Info("no requested region is a known geography; leaving Pod gated",
-			"regions", pod.Annotations[nebulav1alpha1.RegionsAnnotation])
-		return placement{}, false, 0
+		raw := pod.Annotations[nebulav1alpha1.RegionsAnnotation]
+		log.Info("no requested region is a known geography; leaving Pod gated", "regions", raw)
+		return placement{}, false, deferral{message: fmt.Sprintf(
+			"no region in %s %q is a known geography (want one of %v)",
+			nebulav1alpha1.RegionsAnnotation, raw, provider.Geographies)}
 	}
 
 	refs, ok := requestedProviders(pod, pool)
 	if !ok {
 		metrics.RecordDeferral(pool.Name, metrics.DeferInvalidRequest)
-		log.Info("no requested provider is in the pool; leaving Pod gated",
-			"providers", pod.Annotations[nebulav1alpha1.ProvidersAnnotation])
-		return placement{}, false, 0
+		raw := pod.Annotations[nebulav1alpha1.ProvidersAnnotation]
+		log.Info("no requested provider is in the pool; leaving Pod gated", "providers", raw)
+		return placement{}, false, deferral{message: fmt.Sprintf(
+			"no provider in %s %q is in NodePool %s (it lists %s)",
+			nebulav1alpha1.ProvidersAnnotation, raw, pool.Name, providerNames(pool.Spec.Providers))}
 	}
 
 	diskGiB := util.PodEphemeralStorageGiB(pod)
 
 	var soonest time.Duration                  // 0 = no blocked-but-servable candidate seen
-	skipped := map[string]string{}             // provider -> why, for the exhausted-walk log
+	skipped := map[string]string{}             // provider -> why, for the exhausted walk's message
 	for _, tier := range capacityTiers(pool) { // outer: capacity
 		for _, ref := range refs { // provider (Ordered = listed order)
 			prov, ok := r.provider(ref.Name)
@@ -135,28 +138,32 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 				// No region on this skip and the three below: they are decided before the
 				// walk reaches the region axis, so they rule out every region at once.
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipProviderUnregistered)
-				skipped[ref.Name] = metrics.SkipProviderUnregistered
+				skipped[ref.Name] = "not registered"
 				log.V(1).Info("skipping candidate: provider not registered",
 					"provider", ref.Name, "capacityType", tier)
 				continue // unregistered; NodePool status surfaces this separately
 			}
 			if !prov.Capabilities().ServesCapacityTier(tier) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipCapacityUnsupported)
-				skipped[ref.Name] = metrics.SkipCapacityUnsupported
+				// The least specific reason: another tier may have found the real blocker.
+				if _, seen := skipped[ref.Name]; !seen {
+					skipped[ref.Name] = fmt.Sprintf("doesn't offer capacity type %s", tier)
+				}
 				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
 					"provider", ref.Name, "capacityType", tier)
 				continue
 			}
 			if !prov.Capabilities().ServesEgress(pool.Spec.Egress) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipEgressUnsupported)
-				skipped[ref.Name] = metrics.SkipEgressUnsupported
+				skipped[ref.Name] = fmt.Sprintf("can't enforce egress mode %s", pool.Spec.Egress.ModeOrOpen())
 				log.V(1).Info("skipping candidate: provider cannot enforce the pool's egress policy",
 					"provider", ref.Name, "egressMode", pool.Spec.Egress.ModeOrOpen())
 				continue
 			}
 			if !prov.Capabilities().ServesDisk(diskGiB) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipDiskUnsupported)
-				skipped[ref.Name] = metrics.SkipDiskUnsupported
+				skipped[ref.Name] = fmt.Sprintf("can't give one Pod %d GiB of disk (max %d)",
+					diskGiB, prov.Capabilities().MaxDiskGiBPerPod)
 				log.V(1).Info("skipping candidate: provider cannot give one Pod that much disk",
 					"provider", ref.Name, "diskGiB", diskGiB, "maxDiskGiBPerPod", prov.Capabilities().MaxDiskGiBPerPod)
 				continue
@@ -171,14 +178,14 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			if accel != "" {
 				if _, offered := prov.MapAccelerator(accel, count); !offered {
 					metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipAcceleratorUnsupported)
-					skipped[ref.Name] = metrics.SkipAcceleratorUnsupported
+					skipped[ref.Name] = "doesn't offer " + accelerator
 					log.V(1).Info("skipping candidate: provider does not offer the accelerator",
 						"provider", ref.Name, "accelerator", accel, "count", count)
 					continue
 				}
 			} else if !prov.Capabilities().SupportsCPUOnly {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipAcceleratorUnsupported)
-				skipped[ref.Name] = metrics.SkipAcceleratorUnsupported
+				skipped[ref.Name] = "doesn't run CPU-only Pods"
 				log.V(1).Info("skipping candidate: provider does not run CPU-only Pods", "provider", ref.Name)
 				continue
 			}
@@ -187,11 +194,13 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			regions := prov.ResolveRegions(ref.Regions, narrowTo)
 			if len(regions) == 0 {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipNoAvailableRegions)
-				skipped[ref.Name] = metrics.SkipNoAvailableRegions
+				skipped[ref.Name] = noRegionReason(ref.Regions, narrowTo)
 				log.V(1).Info("skipping candidate: no available region serves the requested geographies",
 					"provider", ref.Name, "capacityType", tier, "regions", narrowTo)
 				continue
 			}
+			// served: some region offers the accelerator, whether or not it is blocked.
+			served := false
 			for _, region := range regions { // inner: region
 				if accel != "" && !servesAcceleratorIn(prov, accel, region) {
 					metrics.RecordCandidateSkip(ref.Name, tier, region, metrics.SkipAcceleratorUnsupported)
@@ -199,6 +208,7 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 						"provider", ref.Name, "accelerator", accelerator, "region", region)
 					continue
 				}
+				served = true
 				if until, blocked := r.blockedUntil(pod, ref.Name, accelerator, tier, region); blocked {
 					// Servable but failed recently; try the next region, then the next
 					// tier, and remember when this one frees so we can requeue for it.
@@ -218,7 +228,10 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 					capacityType: tier,
 					region:       region,
 					accelerator:  accelerator,
-				}, true, 0
+				}, true, deferral{}
+			}
+			if !served {
+				skipped[ref.Name] = fmt.Sprintf("none of regions %v offers %s", regions, accelerator)
 			}
 		}
 	}
@@ -226,14 +239,61 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 	// merely blocked: a positive soonest means a servable candidate exists and failover
 	// is holding it off (self-clearing, and the caller requeues for it), while zero
 	// means nothing in the pool can serve this request at all.
+	request := util.AcceleratorPool(accel, count)
+	if request == "" {
+		request = "a CPU-only Pod"
+	}
 	if soonest > 0 {
 		metrics.RecordDeferral(pool.Name, metrics.DeferAllBlocked)
-	} else {
-		metrics.RecordDeferral(pool.Name, metrics.DeferNoCandidate)
-		log.Info("no provider in pool can serve the Pod; leaving it gated",
-			"accelerator", util.AcceleratorPool(accel, count), "skipped", skipped)
+		return placement{}, false, deferral{retryAfter: soonest, message: fmt.Sprintf(
+			"every candidate in NodePool %s that can serve %s failed recently and is held off by failover",
+			pool.Name, request)}
 	}
-	return placement{}, false, soonest
+	metrics.RecordDeferral(pool.Name, metrics.DeferNoCandidate)
+	log.Info("no provider in pool can serve the Pod; leaving it gated", "accelerator", request, "skipped", skipped)
+	return placement{}, false, deferral{message: fmt.Sprintf(
+		"no provider in NodePool %s can serve %s: %s", pool.Name, request, skipReasons(refs, skipped))}
+}
+
+// deferral is why selectPlacement left a Pod gated. retryAfter is the time until the soonest
+// servable-but-blocked candidate frees, or 0 when no TTL can unblock anything; a positive one
+// requeues the Pod, since a block expiring emits no event of its own.
+type deferral struct {
+	retryAfter time.Duration
+	message    string
+}
+
+// skipReasons renders skipped in the pool's provider order, so the message is stable.
+func skipReasons(refs []nebulav1alpha1.ProviderSpec, skipped map[string]string) string {
+	parts := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if why, ok := skipped[ref.Name]; ok {
+			parts = append(parts, ref.Name+" "+why)
+		}
+	}
+	if len(parts) == 0 {
+		return "every candidate is held off by failover with no expiry"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// noRegionReason is why a provider resolved no region, naming the side that narrowed it away.
+func noRegionReason(declared, narrowTo []string) string {
+	if len(narrowTo) > 0 {
+		return fmt.Sprintf("has no available region in %v", narrowTo)
+	}
+	if len(declared) > 0 {
+		return fmt.Sprintf("has no available region among %v", declared)
+	}
+	return "has no available region"
+}
+
+func providerNames(refs []nebulav1alpha1.ProviderSpec) string {
+	names := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		names = append(names, ref.Name)
+	}
+	return strings.Join(names, ", ")
 }
 
 // servesAcceleratorIn reports whether prov offers the accelerator in region, which only a

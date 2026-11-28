@@ -85,7 +85,7 @@ func newPlacementReconciler(t *testing.T, objs []client.Object, provs ...provide
 	t.Helper()
 	s := testScheme(t)
 	_ = clientgoscheme.AddToScheme(s)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).WithStatusSubresource(&corev1.Pod{}).Build()
 	r := &PodPlacementReconciler{Client: c, Scheme: s}
 	if len(provs) > 0 {
 		r.Providers = resolver(provs...)

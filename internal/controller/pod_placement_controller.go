@@ -18,10 +18,13 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -91,6 +94,7 @@ type Blocklister interface {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodeclaims,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=patch
 
 // Reconcile places one gated Pod. It is a no-op for any Pod that is not an
 // opted-in, still-gated, not-yet-scheduled workload.
@@ -131,12 +135,12 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// label is deliberately NOT filed on the metric — see metrics.RecordDeferral.
 		metrics.RecordDeferral("", metrics.DeferNoPool)
 		log.Info("no NodePool resolved for Pod; leaving it gated", "pod", pod.Name)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.setGatedReason(ctx, &pod, noPoolMessage(&pod))
 	}
 
 	// selectPlacement files its own deferral reason on the !ok paths — it is the only
 	// place that knows which of the three applies (see its doc).
-	placement, ok, retryAfter := r.selectPlacement(ctx, &pod, pool)
+	placement, ok, deferred := r.selectPlacement(ctx, &pod, pool)
 	if !ok {
 		// No provider in the pool can serve this Pod's GPU type right now. Leave it
 		// gated; a later reconcile (pool edit, provider registered) can place it.
@@ -144,16 +148,16 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// the moment it lapses — blocklist TTL expiry emits no event, so without this
 		// the Pod would idle until the periodic resync (hours) even though a servable
 		// candidate frees in minutes.
-		if retryAfter > 0 {
+		if retryAfter := deferred.retryAfter; retryAfter > 0 {
 			// Spread the requeue past the shared expiry by a stable per-Pod offset so
 			// Pods contending for the same (scope-keyed) block don't all wake and retry
 			// in lockstep, thundering the same tight pool the instant it frees.
 			retryAfter += requeueJitter(pod.UID)
 			log.Info("all servable candidates are blocked; requeuing for the soonest to free",
 				"pod", pod.Name, "pool", pool.Name, "retryAfter", retryAfter.String())
-			return ctrl.Result{RequeueAfter: retryAfter}, nil
+			return ctrl.Result{RequeueAfter: retryAfter}, r.setGatedReason(ctx, &pod, deferred.message)
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.setGatedReason(ctx, &pod, deferred.message)
 	}
 
 	// Create the NodeClaim BEFORE ungating: the claim is the durable teardown
@@ -235,4 +239,41 @@ func (r *PodPlacementReconciler) provider(name string) (provider.Provider, bool)
 		return r.Providers(name)
 	}
 	return provider.Get(name)
+}
+
+// setGatedReason writes why the Pod is still gated into the message of its PodScheduled
+// condition, which the API server sets to reason SchedulingGated for a gated Pod. Nothing else
+// writes it while the gate is on; the scheduler replaces it at bind. The reason stays
+// SchedulingGated, which kubectl's STATUS column keys on. A strategic-merge patch keyed on the
+// condition type leaves the other conditions alone, and an unchanged message is not rewritten.
+func (r *PodPlacementReconciler) setGatedReason(ctx context.Context, pod *corev1.Pod, message string) error {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Message == message {
+			return nil
+		}
+	}
+	// A map, not a PodCondition: the status is unchanged, so lastTransitionTime must not be
+	// sent, and a zero metav1.Time would marshal as null and clear it.
+	patch, err := json.Marshal(map[string]any{"status": map[string]any{"conditions": []map[string]any{{
+		"type":    corev1.PodScheduled,
+		"status":  corev1.ConditionFalse,
+		"reason":  corev1.PodReasonSchedulingGated,
+		"message": message,
+	}}}})
+	if err != nil {
+		return err
+	}
+	if err := r.Status().Patch(ctx, pod, client.RawPatch(types.StrategicMergePatchType, patch)); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return nil
+}
+
+// noPoolMessage is why poolFor found no NodePool: the Pod names none, or one that doesn't exist.
+func noPoolMessage(pod *corev1.Pod) string {
+	name := pod.Labels[nebulav1alpha1.PoolLabel]
+	if name == "" {
+		return fmt.Sprintf("the Pod has no %s label naming its NodePool", nebulav1alpha1.PoolLabel)
+	}
+	return fmt.Sprintf("NodePool %q named by the Pod's %s label does not exist", name, nebulav1alpha1.PoolLabel)
 }
