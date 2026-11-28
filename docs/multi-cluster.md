@@ -172,9 +172,10 @@ doesn't read them yet: it holds the values resolved at placement.
 A copy follows its source within seconds, so a container restarted there pulls with a registry
 token that hasn't expired. It is deleted when its source is deleted or no rule selects
 it any more, and every 10 minutes Nebula re-checks every selected object and every copy, for a
-change it missed or a copy left while it was down. Copies carry `nebula.inftyai.com/reflected`;
-an object of the same name that isn't one is never changed, and the source gets a
-`ReflectionRefused` Warning Event instead.
+change it missed or a copy left while it was down. Copies carry their source's labels, except
+any under `nebula.inftyai.com/`, plus `nebula.inftyai.com/reflected`; an object of the same name
+that isn't a copy is never changed, and the source gets a `ReflectionRefused` Warning Event
+instead.
 
 A copy holds every key of its source, so select only what every target may hold. Kubernetes'
 own objects (service-account tokens, `kube-root-ca.crt`) carry no labels a rule would select;

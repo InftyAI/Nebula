@@ -125,11 +125,28 @@ func nebulaKey(sel *metav1.LabelSelector) (string, bool) {
 		keys = append(keys, e.Key)
 	}
 	for _, k := range keys {
-		if strings.HasPrefix(k, nebulav1alpha1.GroupVersion.Group+"/") {
+		if isNebulaKey(k) {
 			return k, true
 		}
 	}
 	return "", false
+}
+
+func isNebulaKey(k string) bool {
+	return strings.HasPrefix(k, nebulav1alpha1.GroupVersion.Group+"/")
+}
+
+// copyLabels returns the labels for src's copies: src's own labels, so a copy can be identified
+// and selected in its target, plus reflectedLabel. Keys under Nebula's prefix are dropped, since
+// only Nebula sets those.
+func copyLabels(src metav1.Object) map[string]string {
+	out := reflectedLabels()
+	for k, v := range src.GetLabels() {
+		if !isNebulaKey(k) {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // objectKey identifies a source. Its copies have the same namespace and name in every target.
@@ -433,7 +450,7 @@ func deleteCopy[T metav1.Object](
 // namespace first if it is missing.
 func applySecret(ctx context.Context, kube kubeClient, src *corev1.Secret) (refused bool, err error) {
 	secrets := kube.CoreV1().Secrets(src.Namespace)
-	data := secretData(src)
+	data, lbls := secretData(src), copyLabels(src)
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		got, err := secrets.Get(ctx, src.Name, metav1.GetOptions{})
 		switch {
@@ -442,7 +459,7 @@ func applySecret(ctx context.Context, kube kubeClient, src *corev1.Secret) (refu
 				return err
 			}
 			_, err = secrets.Create(ctx, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: src.Namespace, Labels: reflectedLabels()},
+				ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: src.Namespace, Labels: lbls},
 				Type:       src.Type,
 				Data:       data,
 			}, metav1.CreateOptions{})
@@ -464,10 +481,10 @@ func applySecret(ctx context.Context, kube kubeClient, src *corev1.Secret) (refu
 				return err
 			}
 			return apierrors.NewConflict(corev1.Resource(resourceSecrets), src.Name, errors.New("type changed"))
-		case maps.EqualFunc(got.Data, data, bytes.Equal):
+		case maps.EqualFunc(got.Data, data, bytes.Equal) && maps.Equal(got.Labels, lbls):
 			return nil
 		}
-		got.Data, got.StringData = data, nil
+		got.Data, got.StringData, got.Labels = data, nil, lbls
 		_, err = secrets.Update(ctx, got, metav1.UpdateOptions{})
 		return err
 	})
@@ -480,6 +497,7 @@ func applySecret(ctx context.Context, kube kubeClient, src *corev1.Secret) (refu
 // applyConfigMap is applySecret for a ConfigMap.
 func applyConfigMap(ctx context.Context, kube kubeClient, src *corev1.ConfigMap) (refused bool, err error) {
 	configMaps := kube.CoreV1().ConfigMaps(src.Namespace)
+	lbls := copyLabels(src)
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		got, err := configMaps.Get(ctx, src.Name, metav1.GetOptions{})
 		switch {
@@ -488,7 +506,7 @@ func applyConfigMap(ctx context.Context, kube kubeClient, src *corev1.ConfigMap)
 				return err
 			}
 			_, err = configMaps.Create(ctx, &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: src.Namespace, Labels: reflectedLabels()},
+				ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: src.Namespace, Labels: lbls},
 				Data:       maps.Clone(src.Data),
 				BinaryData: maps.Clone(src.BinaryData),
 			}, metav1.CreateOptions{})
@@ -503,10 +521,11 @@ func applyConfigMap(ctx context.Context, kube kubeClient, src *corev1.ConfigMap)
 		case !isReflected(got):
 			refused = true
 			return nil
-		case maps.Equal(got.Data, src.Data) && maps.EqualFunc(got.BinaryData, src.BinaryData, bytes.Equal):
+		case maps.Equal(got.Data, src.Data) && maps.EqualFunc(got.BinaryData, src.BinaryData, bytes.Equal) &&
+			maps.Equal(got.Labels, lbls):
 			return nil
 		}
-		got.Data, got.BinaryData = maps.Clone(src.Data), maps.Clone(src.BinaryData)
+		got.Data, got.BinaryData, got.Labels = maps.Clone(src.Data), maps.Clone(src.BinaryData), lbls
 		_, err = configMaps.Update(ctx, got, metav1.UpdateOptions{})
 		return err
 	})

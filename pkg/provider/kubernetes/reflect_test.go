@@ -18,6 +18,7 @@ package kubernetes
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,8 +212,8 @@ func TestReflectCopiesToEveryTarget(t *testing.T) {
 
 	for _, cl := range []string{"eks-use1", "eks-eun1"} {
 		got, err := f.targetSecret(cl, "hf")
-		if err != nil || string(got.Data["token"]) != "one" || !isReflected(got) || got.Labels["app"] != "" {
-			t.Fatalf("%s: copy = %+v, %v; want the data under Nebula's labels only", cl, got, err)
+		if err != nil || string(got.Data["token"]) != "one" || !isReflected(got) || got.Labels["app"] != "trainer" {
+			t.Fatalf("%s: copy = %+v, %v; want the data, the source's labels and Nebula's", cl, got, err)
 		}
 		if _, err := f.targets[cl].CoreV1().Namespaces().Get(context.Background(), "org-1", metav1.GetOptions{}); err != nil {
 			t.Errorf("%s: namespace not created: %v", cl, err)
@@ -226,6 +227,30 @@ func TestReflectCopiesToEveryTarget(t *testing.T) {
 	f.handle(t, resourceSecrets, "hf")
 	if got, _ := f.targetSecret("eks-use1", "hf"); string(got.Data["token"]) != "two" {
 		t.Errorf("copy = %q, want it updated", got.Data["token"])
+	}
+}
+
+// A copy's labels follow its source's, except a key under Nebula's prefix, which Nebula sets alone.
+func TestReflectCopiesTheSourceLabels(t *testing.T) {
+	f := newReflectFixture(t, trainerRule)
+	s := trainerSecret("one")
+	s.Labels["example.com/experiment-id"] = "exp-1"
+	s.Labels["nebula.inftyai.com/reflected"] = "false"
+	f.add(t, f.secrets, s)
+	f.handle(t, resourceSecrets, "hf")
+	got, err := f.targetSecret("eks-use1", "hf")
+	if err != nil || !isReflected(got) || got.Labels["example.com/experiment-id"] != "exp-1" {
+		t.Fatalf("copy labels = %v, %v", got.Labels, err)
+	}
+
+	s = trainerSecret("one")
+	s.Labels["example.com/experiment-id"] = "exp-2"
+	f.add(t, f.secrets, s)
+	f.handle(t, resourceSecrets, "hf")
+	got, _ = f.targetSecret("eks-use1", "hf")
+	want := map[string]string{"app": "trainer", "example.com/experiment-id": "exp-2", reflectedLabel: labelTrue}
+	if !maps.Equal(got.Labels, want) {
+		t.Errorf("copy labels = %v, want %v", got.Labels, want)
 	}
 }
 
