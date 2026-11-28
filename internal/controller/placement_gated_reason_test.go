@@ -96,6 +96,15 @@ func TestPlacement_GatedPodCarriesTheReason(t *testing.T) {
 		want: "no provider in NodePool pool-a can serve H100:1: " +
 			"modal not registered; runpod doesn't offer H100:1",
 	}, {
+		// OnDemand finds the accelerator missing; the Spot pass must not replace that with
+		// the tier the provider lacks.
+		name: "a later tier keeps the earlier, specific reason",
+		pod:  h100,
+		pool: poolWith("pool-a", []nebulav1alpha1.CapacityType{nebulav1alpha1.CapacityOnDemand, nebulav1alpha1.CapacitySpot},
+			provider.ProviderModal),
+		provs: []provider.Provider{&fakeProvider{name: provider.ProviderModal, gpus: []string{"A100"}}},
+		want:  "no provider in NodePool pool-a can serve H100:1: modal doesn't offer H100:1",
+	}, {
 		name: "no region offers the accelerator",
 		pod:  h100,
 		pool: poolWithRegions("pool-a", onDemand, provider.ProviderKubernetes, "us"),

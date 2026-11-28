@@ -145,7 +145,10 @@ func (r *PodPlacementReconciler) selectPlacement(ctx context.Context, pod *corev
 			}
 			if !prov.Capabilities().ServesCapacityTier(tier) {
 				metrics.RecordCandidateSkip(ref.Name, tier, "", metrics.SkipCapacityUnsupported)
-				skipped[ref.Name] = fmt.Sprintf("doesn't offer capacity type %s", tier)
+				// The least specific reason: another tier may have found the real blocker.
+				if _, seen := skipped[ref.Name]; !seen {
+					skipped[ref.Name] = fmt.Sprintf("doesn't offer capacity type %s", tier)
+				}
 				log.V(1).Info("skipping candidate: provider does not offer the capacity tier",
 					"provider", ref.Name, "capacityType", tier)
 				continue
