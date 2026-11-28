@@ -209,7 +209,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	recorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: r.nodeName + "/pod-controller"})
 
 	pc, err := vknode.NewPodController(vknode.PodControllerConfig{
-		PodClient:         r.client.CoreV1(),
+		PodClient:         statusPods{r.client.CoreV1()},
 		EventRecorder:     recorder,
 		Provider:          handler,
 		PodInformer:       podInformer,
