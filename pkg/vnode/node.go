@@ -216,6 +216,9 @@ func (r *Runner) Start(ctx context.Context) error {
 		SecretInformer:    secretInformer,
 		ConfigMapInformer: configMapInformer,
 		ServiceInformer:   serviceInformer,
+		// The provider's kubelet resolves references itself, service links included, so they
+		// must reach CreatePod as written.
+		SkipDownwardAPIResolution: r.prov.Capabilities().KeepsEnvReferences,
 		// All three set EXPLICITLY, because a nil one silently gets a 10 items/s bucket
 		// (see podQueueRateLimiter). Each gets its own limiter so the three cannot starve
 		// each other: work arrives here from Kubernetes, status arrives from the provider,

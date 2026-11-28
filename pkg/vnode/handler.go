@@ -321,18 +321,21 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	req.CapacityType = nc.Spec.CapacityType
 	req.Region = nc.Spec.Region
 
-	// virtual-kubelet resolves every env reference before CreatePod, like a kubelet, and fails on
-	// a missing required one. Any reference still here would be silently dropped, so it is a
-	// non-terminal ConfigError (like the kubelet's CreateContainerConfigError) and the pod is NOT
-	// stored: tracking it would suppress the retry (see the provision-failure branch below).
-	env, err := literalEnv(pod)
-	if err != nil {
-		log.Error(err, "the Pod's environment isn't resolved; nothing provisioned, retrying")
-		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
-		h.emit(pod)
-		return err
+	// Unless the provider keeps references (see Capabilities.KeepsEnvReferences), virtual-kubelet
+	// resolves every one before CreatePod, like a kubelet, and fails on a missing required one.
+	// Any reference still here would be silently dropped, so it is a non-terminal ConfigError
+	// (like the kubelet's CreateContainerConfigError) and the pod is NOT stored: tracking it
+	// would suppress the retry (see the provision-failure branch below).
+	if !h.prov.Capabilities().KeepsEnvReferences {
+		env, err := literalEnv(pod)
+		if err != nil {
+			log.Error(err, "the Pod's environment isn't resolved; nothing provisioned, retrying")
+			h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
+			h.emit(pod)
+			return err
+		}
+		req.Env = provider.Env{Config: env}
 	}
-	req.Env = provider.Env{Config: env}
 
 	// Same resolve-before-requesting rule, and the same non-terminal treatment, for the
 	// image pull credential: an imagePullSecret names a Secret in the Pod's namespace that

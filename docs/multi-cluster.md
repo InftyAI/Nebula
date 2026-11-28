@@ -24,10 +24,10 @@ cluster as it picks a region, from the pool's `regions` and `strategy` ([NodePoo
 1. **Provision** works in the chosen cluster, through its EKS API: it creates the Pod's
    namespace if missing and creates the real pod. That is the placeholder's spec, named after
    the claim (`<namespace>-<pod>`), with Nebula's scheduling replaced by a node selection for the
-   GPU's instance families and the capacity type. Its env holds the values resolved from the
-   placeholder's references at placement. Its imagePullSecrets stay as written: that cluster's
-   kubelet pulls with the [reflected](#pull-secrets) copies, and one that isn't reflected fails
-   the pod there, as on any node.
+   GPU's instance families and the capacity type. Its env, envFrom and imagePullSecrets stay as
+   written: that cluster's kubelet resolves them from the [reflected](#pull-secrets) copies, so
+   no Secret value is written into the pod spec, and a reference that isn't reflected fails the
+   pod there, as on any node.
 2. **That cluster's Karpenter** launches a node, and the real pod starts there.
 3. **Status flows back.** Every 5 seconds Nebula lists the real pods in each cluster; the
    placeholder mirrors the real pod's phase and readiness, and carries its IP.
@@ -166,8 +166,8 @@ A rule selects objects of its `resources` (`secrets`, `configmaps`), in a namesp
 `namespaceSelector` (omitted: any; a namespace's name is its `kubernetes.io/metadata.name`
 label), whose labels match `objectSelector`, which is required and may not be empty. Select by
 your own labels: `nebula.inftyai.com/` keys are Nebula's, and refused. `mode` is optional and only
-`AllowList` today. A rule can select other Secrets and ConfigMaps too, but a real pod's env
-doesn't read them yet: it holds the values resolved at placement.
+`AllowList` today. A rule can select any Secret or ConfigMap, not only pull Secrets: a real
+pod's `secretKeyRef`, `configMapKeyRef` and `envFrom` read the copies too.
 
 A copy follows its source within seconds, so a container restarted there pulls with a registry
 token that hasn't expired. It is deleted when its source is deleted or no rule selects

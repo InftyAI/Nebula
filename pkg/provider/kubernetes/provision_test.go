@@ -65,7 +65,6 @@ func provisionRequest() provider.ProvisionRequest {
 	return provider.ProvisionRequest{
 		ClaimName: "org-1-work-1", Region: "us-east-1",
 		CapacityType: nebulav1alpha1.CapacityOnDemand,
-		Env:          provider.Env{Config: map[string]string{"PLAIN": "p"}, Secrets: map[string]string{"K": "v"}},
 	}
 }
 

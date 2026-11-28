@@ -86,8 +86,6 @@ func ownedByUs(obj metav1.Object) bool {
 type podSpec struct {
 	claim     string
 	selection nodeSelection
-	// env is ProvisionRequest.Env, with every value set inline (see envVars).
-	env map[string]string
 	// labels are the placeholder's label keys the real pod carries: --kubernetes-propagate-labels
 	// and --cost-labels. An allowlist on purpose: in the host cluster the real pod shares the
 	// placeholder's namespace, where a controller label (pod-template-hash,
@@ -145,9 +143,9 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 
 	c := &spec.Containers[0]
 	c.VolumeMounts = nil
-	// virtual-kubelet has already resolved every reference, so nothing here points back at the
-	// home cluster.
-	c.Env = envVars(s.env)
+	// env and envFrom stay as written (see Capabilities.KeepsEnvReferences): the target's kubelet
+	// resolves them from the reflected copies, and a reference that was never reflected fails
+	// the pod there with CreateContainerConfigError, as on any node.
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -223,20 +221,6 @@ func isExtendedResource(name corev1.ResourceName) bool {
 		return false
 	}
 	return len(validation.IsQualifiedName(corev1.DefaultResourceRequestsPrefix+n)) == 0
-}
-
-// envVars renders env sorted by name, so the same request always yields the same spec. Each "$"
-// is doubled because the kubelet expands $(VAR) in env values and turns "$$" into "$"; the values
-// are already resolved and must reach the container unchanged.
-func envVars(env map[string]string) []corev1.EnvVar {
-	if len(env) == 0 {
-		return nil
-	}
-	out := make([]corev1.EnvVar, 0, len(env))
-	for _, k := range slices.Sorted(maps.Keys(env)) {
-		out = append(out, corev1.EnvVar{Name: k, Value: strings.ReplaceAll(env[k], "$", "$$")})
-	}
-	return out
 }
 
 // reflectedLabels mark a copy (see reflect.go). Copies have no owner reference, so this label is

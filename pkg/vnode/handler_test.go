@@ -2206,3 +2206,23 @@ func TestLiteralEnv(t *testing.T) {
 		}
 	}
 }
+
+// A provider that keeps env references gets the Pod as written and an empty Env: literalEnv,
+// which would refuse the reference, is not consulted.
+func TestCreatePod_KeepsEnvReferencesForAProviderThatResolvesThem(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1", capabilities: provider.Capabilities{KeepsEnvReferences: true}}
+	h := NewHandler(fp, nil, nil, openCluster())
+	pod := testPod("default", "p1")
+	pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "TOKEN", ValueFrom: &corev1.EnvVarSource{
+		SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "creds"}, Key: "t"}}}}
+
+	if err := h.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if fp.provisionCnt != 1 {
+		t.Fatalf("provision calls = %d, want 1", fp.provisionCnt)
+	}
+	if env := fp.lastReq.Env; len(env.Config) != 0 || len(env.Secrets) != 0 {
+		t.Errorf("req.Env = %v, want empty: the provider resolves the references itself", env.All())
+	}
+}

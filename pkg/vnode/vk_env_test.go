@@ -69,8 +69,36 @@ func (p *recordingProvider) first() *corev1.Pod {
 
 // CreatePod relies on virtual-kubelet resolving every env reference first (see literalEnv). This
 // runs a Pod through its pod controller, wired as Runner.Start wires it, and fails the day an
-// upgrade or SkipDownwardAPIResolution hands CreatePod a reference instead.
+// upgrade hands CreatePod a reference instead.
 func TestVirtualKubeletResolvesEnvBeforeCreatePod(t *testing.T) {
+	got, err := literalEnv(createdThroughPodController(t, false))
+	if err != nil {
+		t.Fatalf("CreatePod got an unresolved env, which literalEnv refuses: %v", err)
+	}
+	want := map[string]string{"MODE": "fast", "URL": "https://x", "TOKEN": "s3cr3t", "POD": "work", "PLAIN": "p"}
+	if len(got) != len(want) {
+		t.Fatalf("env = %v, want exactly %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("env[%s] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// With KeepsEnvReferences the references must reach CreatePod as written, since the Kubernetes
+// provider copies them to the target. Fails the day SkipDownwardAPIResolution stops skipping.
+func TestVirtualKubeletKeepsEnvReferences(t *testing.T) {
+	c := createdThroughPodController(t, true).Spec.Containers[0]
+	if len(c.EnvFrom) != 1 || len(c.Env) != 3 || c.Env[0].ValueFrom == nil || c.Env[1].ValueFrom == nil {
+		t.Fatalf("env = %+v, envFrom = %+v; want the references as written", c.Env, c.EnvFrom)
+	}
+}
+
+// createdThroughPodController returns the Pod virtual-kubelet's pod controller hands CreatePod
+// for a Pod with a Secret, a ConfigMap and a fieldRef reference.
+func createdThroughPodController(t *testing.T, skipResolution bool) *corev1.Pod {
+	t.Helper()
 	const ns = "default"
 	kube := fake.NewClientset(
 		&corev1.Secret{
@@ -106,19 +134,20 @@ func TestVirtualKubeletResolvesEnvBeforeCreatePod(t *testing.T) {
 	svcFactory := noServiceLinksFactory(kube)
 	prov := &recordingProvider{}
 	pc, err := vknode.NewPodController(vknode.PodControllerConfig{
-		PodClient:         kube.CoreV1(),
-		EventRecorder:     record.NewFakeRecorder(100),
-		Provider:          prov,
-		PodInformer:       podFactory.Core().V1().Pods(),
-		SecretInformer:    scmFactory.Core().V1().Secrets(),
-		ConfigMapInformer: scmFactory.Core().V1().ConfigMaps(),
-		ServiceInformer:   svcFactory.Core().V1().Services(),
+		PodClient:                 kube.CoreV1(),
+		EventRecorder:             record.NewFakeRecorder(100),
+		Provider:                  prov,
+		PodInformer:               podFactory.Core().V1().Pods(),
+		SecretInformer:            scmFactory.Core().V1().Secrets(),
+		ConfigMapInformer:         scmFactory.Core().V1().ConfigMaps(),
+		ServiceInformer:           svcFactory.Core().V1().Services(),
+		SkipDownwardAPIResolution: skipResolution,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 	podFactory.Start(ctx.Done())
 	scmFactory.Start(ctx.Done())
 	svcFactory.Start(ctx.Done())
@@ -129,17 +158,5 @@ func TestVirtualKubeletResolvesEnvBeforeCreatePod(t *testing.T) {
 		// Its reason is in virtual-kubelet's log: set its log.L to see it.
 		t.Fatalf("virtual-kubelet never called CreatePod: %v", err)
 	}
-	got, err := literalEnv(prov.first())
-	if err != nil {
-		t.Fatalf("CreatePod got an unresolved env, which literalEnv refuses: %v", err)
-	}
-	want := map[string]string{"MODE": "fast", "URL": "https://x", "TOKEN": "s3cr3t", "POD": "work", "PLAIN": "p"}
-	if len(got) != len(want) {
-		t.Fatalf("env = %v, want exactly %v", got, want)
-	}
-	for k, v := range want {
-		if got[k] != v {
-			t.Errorf("env[%s] = %q, want %q", k, got[k], v)
-		}
-	}
+	return prov.first()
 }

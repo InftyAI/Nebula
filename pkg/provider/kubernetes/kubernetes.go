@@ -203,6 +203,7 @@ func (p *Provider) Capabilities() provider.Capabilities {
 		SupportsEgressPolicy: false, // no NetworkPolicy is written
 		SupportsCPUOnly:      true,
 		NativeTags:           true,
+		KeepsEnvReferences:   true, // the target's kubelet reads the reflected copies
 		PreemptionNotice:     spotNotice,
 		PollInterval:         pollInterval,
 	}
@@ -254,7 +255,6 @@ func (p *Provider) Provision(
 	real := buildPod(pod, podSpec{
 		claim:     req.ClaimName,
 		selection: cl.nodeAutoscaler.selection(families, req.CapacityType),
-		env:       req.Env.All(),
 		labels:    p.labels,
 	})
 	kube := cl.clients.kube

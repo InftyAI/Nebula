@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -162,14 +163,20 @@ func TestBuildPod(t *testing.T) {
 	local.Labels["app"] = "trainer"
 	local.Labels["pod-template-hash"] = "5d9f"
 	local.Labels[nebulav1alpha1.ManagedByLabel] = "hive-operator"
-	// As virtual-kubelet hands it over: every reference already resolved to a literal.
-	local.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "STALE", Value: "from-the-placeholder"}}
+	// As virtual-kubelet hands it over with KeepsEnvReferences: nothing resolved.
+	env := []corev1.EnvVar{
+		{Name: "TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "creds"}, Key: "token"}}},
+		{Name: "URL", Value: "https://$(HOST)/v1"},
+	}
+	envFrom := []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}}}}
+	local.Spec.Containers[0].Env, local.Spec.Containers[0].EnvFrom = env, envFrom
 	local.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "aws-role"}, {Name: "tok"}}
 	got := buildPod(local, podSpec{
 		claim:     "org-1-work-1",
 		selection: karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacitySpot),
 		labels:    []string{"org-id", "app"},
-		env:       map[string]string{"B": "2", "A": "1"},
 	})
 	if got.Name != "org-1-work-1" || got.Namespace != "org-1" {
 		t.Fatalf("got %s/%s", got.Namespace, got.Name)
@@ -193,10 +200,10 @@ func TestBuildPod(t *testing.T) {
 	if got.Annotations[doNotDisruptAnnotation] != "true" {
 		t.Errorf("annotations = %v", got.Annotations)
 	}
-	// The real pod's env is the request's, inline and sorted, not the placeholder's own.
+	// The target's kubelet resolves the references, so they and $(VAR) reach it untouched.
 	c := got.Spec.Containers[0]
-	if want := []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "2"}}; !slices.Equal(c.Env, want) {
-		t.Errorf("env = %+v, want the resolved values inline and sorted", c.Env)
+	if !reflect.DeepEqual(c.Env, env) || !reflect.DeepEqual(c.EnvFrom, envFrom) {
+		t.Errorf("env = %+v, envFrom = %+v; want the placeholder's as written", c.Env, c.EnvFrom)
 	}
 	if want := local.Spec.ImagePullSecrets; !slices.Equal(got.Spec.ImagePullSecrets, want) {
 		t.Errorf("imagePullSecrets = %v, want them as written %v", got.Spec.ImagePullSecrets, want)
@@ -391,10 +398,11 @@ func TestBuildPodCopiesThenOverrides(t *testing.T) {
 	if c.ReadinessProbe == nil || spec.SecurityContext == nil {
 		t.Error("the user's probe and security context must carry over")
 	}
-	// The placeholder's env holds a reference into the home cluster; only the resolved env may
-	// appear, and this test passes none.
-	if c.Env != nil || len(c.EnvFrom) != 0 || len(c.VolumeMounts) != 0 || len(spec.Volumes) != 0 {
-		t.Errorf("env/volumes leaked: env=%v envFrom=%v mounts=%v volumes=%v", c.Env, c.EnvFrom, c.VolumeMounts, spec.Volumes)
+	if len(c.Env) != 1 || c.Env[0].ValueFrom == nil {
+		t.Errorf("env = %v, want the placeholder's reference kept", c.Env)
+	}
+	if len(c.VolumeMounts) != 0 || len(spec.Volumes) != 0 {
+		t.Errorf("volumes leaked: mounts=%v volumes=%v", c.VolumeMounts, spec.Volumes)
 	}
 	if spec.NodeName != "" || len(spec.SchedulingGates) != 0 || len(spec.NodeSelector) != 0 {
 		t.Errorf("Nebula's scheduling leaked: node=%q gates=%v selector=%v",
@@ -509,16 +517,6 @@ func TestToStateNeedsReady(t *testing.T) {
 		if got := toState(tc.pod); got != tc.want {
 			t.Errorf("%s: toState = %s, want %s", name, got, tc.want)
 		}
-	}
-}
-
-// The kubelet expands $(VAR) and folds $$ in env values; resolved values must come out as
-// they went in, so every $ is escaped.
-func TestEnvVarsEscapeDollar(t *testing.T) {
-	got := envVars(map[string]string{"REF": "$(TOKEN)", "TWO": "a$$b", "PLAIN": "x"})
-	want := []corev1.EnvVar{{Name: "PLAIN", Value: "x"}, {Name: "REF", Value: "$$(TOKEN)"}, {Name: "TWO", Value: "a$$$$b"}}
-	if !slices.Equal(got, want) {
-		t.Fatalf("envVars = %+v, want %+v", got, want)
 	}
 }
 
