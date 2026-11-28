@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,7 +28,6 @@ import (
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/util"
-	"github.com/InftyAI/Nebula/pkg/vnode"
 )
 
 var podlog = logf.Log.WithName("pod-webhook")
@@ -204,44 +202,19 @@ func validatePod(pod *corev1.Pod) error {
 	return nil
 }
 
-// validateAffinity refuses the required affinity terms that can never schedule. The host
-// scheduler checks them against the provider's virtual node, which every Pod on that provider
-// shares and which carries only vnode.NodeLabelKeys: no region, zone or instance labels. So a
-// required node affinity never matches it; a required pod affinity fails on a topology key the
-// node lacks, since the scheduler requires the key before its first-Pod exception; and a
-// required anti-affinity on a key the node carries puts every replica in one domain, so only
-// one binds. Anything else schedules, even where its meaning is not kept (anti-affinity on a
-// zone never fires), so it passes, as do preferred terms, which only score.
+// validateAffinity refuses a required node affinity. The host scheduler checks it against the
+// provider's virtual node, which stands for instances in many regions and so carries no
+// region, zone or instance labels: the term never matches and the Pod stays Pending, where
+// the regions annotation is what chooses where it runs. Pod (anti-)affinity is left to the
+// scheduler, which marks a Pod it cannot place as unschedulable like anywhere else.
 func validateAffinity(a *corev1.Affinity) error {
-	if a == nil {
+	if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
 		return nil
 	}
-	if a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
-		return fmt.Errorf("nebula does not honor required nodeAffinity: placement chooses the provider and "+
-			"region, so constrain the region with the %s annotation and remove "+
-			"spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution, or make it preferred",
-			nebulav1alpha1.RegionsAnnotation)
-	}
-	nodeKeys := vnode.NodeLabelKeys()
-	if a.PodAffinity != nil {
-		for _, term := range a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-			if !slices.Contains(nodeKeys, term.TopologyKey) {
-				return fmt.Errorf("nebula does not honor required podAffinity on %s: Nebula's virtual node does not "+
-					"carry that label, so the Pod could never schedule; use one of %v, or make the term preferred",
-					term.TopologyKey, nodeKeys)
-			}
-		}
-	}
-	if a.PodAntiAffinity != nil {
-		for _, term := range a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-			if slices.Contains(nodeKeys, term.TopologyKey) {
-				return fmt.Errorf("nebula does not honor required podAntiAffinity on %s: every Pod already gets its "+
-					"own instance, but its replicas share one virtual node, so only one would schedule; remove the "+
-					"term or make it preferred", term.TopologyKey)
-			}
-		}
-	}
-	return nil
+	return fmt.Errorf("nebula does not honor required nodeAffinity: placement chooses the provider and "+
+		"region, so constrain the region with the %s annotation and remove "+
+		"spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution, or make it preferred",
+		nebulav1alpha1.RegionsAnnotation)
 }
 
 // placedByNebula reports whether placement chose a provider for pod: it records the choice in the

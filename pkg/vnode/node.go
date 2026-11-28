@@ -19,8 +19,6 @@ package vnode
 import (
 	"context"
 	"fmt"
-	"maps"
-	"slices"
 	"time"
 
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
@@ -329,12 +327,6 @@ func noServiceLinksFactory(client kubernetes.Interface) informers.SharedInformer
 // ProviderLabel the placement controller selects on, and a NoSchedule taint so
 // only Nebula-placed Pods (which the placement controller tolerates) ever land
 // here.
-// NodeLabelKeys are the label keys every virtual node carries, and the only ones: the webhook
-// reads them to refuse pod (anti-)affinity whose topology key could never schedule here.
-func NodeLabelKeys() []string {
-	return slices.Sorted(maps.Keys(nodeSpec("", "", 0).Labels))
-}
-
 func nodeSpec(nodeName, providerName string, maxDiskGiBPerPod int) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{

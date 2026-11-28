@@ -390,9 +390,10 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 	}
 }
 
-// Only the required terms that can never schedule on a provider's virtual node are refused;
-// the rest schedule, preferred terms only score, and a Pod Nebula will not place is not judged.
-func TestValidateCreate_RejectsUnschedulableAffinity(t *testing.T) {
+// Only a required node affinity is refused: it can never match a provider's virtual node. Pod
+// (anti-)affinity is left to the scheduler, preferred terms only score, and a Pod Nebula will not
+// place is not judged.
+func TestValidateCreate_RejectsRequiredNodeAffinity(t *testing.T) {
 	zone := corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
 		{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"us-east-1a"}},
 	}}
@@ -423,33 +424,26 @@ func TestValidateCreate_RejectsUnschedulableAffinity(t *testing.T) {
 		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossZones, peers},
 		}},
-		want: "required podAntiAffinity on kubernetes.io/hostname",
 	}, {
-		// The virtual node carries no zone, so the term never fires and the Pod schedules.
 		name: "required podAntiAffinity on a zone", labels: optedIn,
 		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossZones},
 		}},
 	}, {
-		// Every replica on a provider shares the node's provider label too.
 		name: "required podAntiAffinity on the provider label", labels: optedIn,
 		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossProviders},
 		}},
-		want: "required podAntiAffinity on " + nebulav1alpha1.ProviderLabel,
 	}, {
-		// The node carries a hostname, so peers already on it satisfy the term.
 		name: "required podAffinity on the hostname", labels: optedIn,
 		affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers},
 		}},
 	}, {
-		// The scheduler requires the topology key on the node before anything else.
 		name: "required podAffinity on a zone", labels: optedIn,
 		affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers, acrossZones},
 		}},
-		want: "required podAffinity on " + corev1.LabelTopologyZone,
 	}, {
 		name: "preferred terms pass", labels: optedIn,
 		affinity: &corev1.Affinity{
@@ -461,13 +455,13 @@ func TestValidateCreate_RejectsUnschedulableAffinity(t *testing.T) {
 			}},
 		},
 	}, {
-		name: "not opted in", affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers},
+		name: "not opted in", affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{zone}},
 		}},
 	}, {
 		name: "pre-bound", labels: optedIn, nodeName: "node-1",
-		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers},
+		affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{zone}},
 		}},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
