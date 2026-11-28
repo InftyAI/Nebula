@@ -20,9 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -31,7 +29,7 @@ import (
 
 // SetupNodePoolWebhookWithManager registers the webhook for NodePool in the manager.
 func SetupNodePoolWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&nebulav1alpha1.NodePool{}).
+	return ctrl.NewWebhookManagedBy(mgr, &nebulav1alpha1.NodePool{}).
 		WithValidator(&NodePoolCustomValidator{}).
 		Complete()
 }
@@ -50,29 +48,21 @@ type NodePoolCustomValidator struct {
 	Providers func(name string) (provider.Provider, bool)
 }
 
-var _ webhook.CustomValidator = &NodePoolCustomValidator{}
+var _ admission.Validator[*nebulav1alpha1.NodePool] = &NodePoolCustomValidator{}
 
-// ValidateCreate implements webhook.CustomValidator.
-func (v *NodePoolCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	return v.validate(obj)
-}
-
-// ValidateUpdate implements webhook.CustomValidator.
-func (v *NodePoolCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	return v.validate(newObj)
-}
-
-// ValidateDelete implements webhook.CustomValidator. Deletes are always allowed.
-func (v *NodePoolCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
-	return nil, nil
-}
-
-func (v *NodePoolCustomValidator) validate(obj runtime.Object) (admission.Warnings, error) {
-	np, ok := obj.(*nebulav1alpha1.NodePool)
-	if !ok {
-		return nil, fmt.Errorf("expected a NodePool object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator.
+func (v *NodePoolCustomValidator) ValidateCreate(_ context.Context, np *nebulav1alpha1.NodePool) (admission.Warnings, error) {
 	return v.warnings(np), nil
+}
+
+// ValidateUpdate implements admission.Validator.
+func (v *NodePoolCustomValidator) ValidateUpdate(_ context.Context, _, np *nebulav1alpha1.NodePool) (admission.Warnings, error) {
+	return v.warnings(np), nil
+}
+
+// ValidateDelete implements admission.Validator. Deletes are always allowed.
+func (v *NodePoolCustomValidator) ValidateDelete(_ context.Context, _ *nebulav1alpha1.NodePool) (admission.Warnings, error) {
+	return nil, nil
 }
 
 // warnings names every listed provider placement will never use, and says so once more when

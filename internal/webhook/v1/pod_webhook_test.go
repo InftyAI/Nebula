@@ -168,13 +168,6 @@ func TestDefault_NoTolerationForNonOptedInPod(t *testing.T) {
 	}
 }
 
-func TestDefault_RejectsNonPod(t *testing.T) {
-	d := &PodCustomDefaulter{}
-	if err := d.Default(context.Background(), &corev1.Service{}); err == nil {
-		t.Fatal("expected an error for a non-Pod object")
-	}
-}
-
 func TestValidateCreate_OneContainerOnePort(t *testing.T) {
 	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
 	container := func(name string, ports ...int32) corev1.Container {
@@ -259,12 +252,6 @@ func TestValidateCreate_RejectsHostNetwork(t *testing.T) {
 				t.Fatalf("ValidateCreate err = %v, want a host-network rejection: %v", err, tc.wantErr)
 			}
 		})
-	}
-}
-
-func TestValidateCreate_RejectsNonPod(t *testing.T) {
-	if _, err := (&PodCustomValidator{}).ValidateCreate(context.Background(), &corev1.Service{}); err == nil {
-		t.Fatal("expected an error for a non-Pod object")
 	}
 }
 
