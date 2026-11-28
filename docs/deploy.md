@@ -207,7 +207,7 @@ one; only `aws` does today, and any other key is refused rather than ignored.
 
 The file **replaces** the built-in table, so list every geography AWS should serve; one left
 out serves nothing. Each list is the order placement tries, and a region may sit under one
-geography only. A bad file leaves AWS unregistered, with the reason in the manager's log. It
+geography only. A bad file stops the manager at startup, with the reason in its log. It
 is read at startup: restart the manager after a change. List only regions your account has
 enabled: a disabled one fails to build its client and is retried on every poll.
 

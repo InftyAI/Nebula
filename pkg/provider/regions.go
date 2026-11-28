@@ -70,6 +70,11 @@ func LoadRegionTables(path string) (RegionTables, error) {
 			return nil, fmt.Errorf("region tables: provider %q has no region table to replace (want one of %v)",
 				name, regionTableProviders)
 		}
+		// A key with no value parses as nil, which the provider reads as "keep the built-in
+		// table": the opposite of what listing it means.
+		if table == nil {
+			return nil, fmt.Errorf("region tables: %s has no table; remove the key to keep the built-in one", name)
+		}
 		if err := validateRegionTable(table); err != nil {
 			return nil, fmt.Errorf("region tables: %s: %w", name, err)
 		}

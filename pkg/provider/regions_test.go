@@ -90,6 +90,14 @@ func TestLoadRegionTables(t *testing.T) {
 		}
 	})
 
+	// An empty table is a choice, unlike a missing one: AWS serves no geography.
+	t.Run("an empty table is kept", func(t *testing.T) {
+		got, err := LoadRegionTables(write(t, "aws: {}\n"))
+		if err != nil || got[ProviderAWS] == nil || len(got[ProviderAWS]) != 0 {
+			t.Fatalf("got %v, %v; want an empty, non-nil aws table", got, err)
+		}
+	})
+
 	// The ConfigMap is optional, so neither is an error: every provider keeps its built-in table.
 	for name, path := range map[string]string{"no flag": "", "no file": filepath.Join(t.TempDir(), "absent.yaml")} {
 		t.Run(name, func(t *testing.T) {
@@ -101,6 +109,8 @@ func TestLoadRegionTables(t *testing.T) {
 
 	for name, tc := range map[string]struct{ body, want string }{
 		"provider with no table": {"modal:\n  us: [us-east]\n", `provider "modal" has no region table`},
+		"key with no value":      {"aws:\n", "aws has no table"},
+		"key set to null":        {"aws: null\n", "aws has no table"},
 		"unknown geography":      {"aws:\n  jp: [ap-northeast-1]\n", `"jp" is not a geography`},
 		"region under two":       {"aws:\n  eu: [eu-west-2]\n  uk: [eu-west-2]\n", `"eu-west-2" is under both`},
 		"empty region":           {"aws:\n  us: [\"\"]\n", "empty or padded"},

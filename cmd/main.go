@@ -198,6 +198,13 @@ func main() {
 		setupLog.Error(err, "invalid --providers")
 		os.Exit(1)
 	}
+	// Fatal rather than skipping the providers it names: an unregistered provider's NodeClaims
+	// release their finalizers on delete without terminating anything (see reconcileDelete).
+	tables, err := provider.LoadRegionTables(regionTables)
+	if err != nil {
+		setupLog.Error(err, "invalid --regions")
+		os.Exit(1)
+	}
 	if err := nebulametrics.InitCost(attribution); err != nil {
 		setupLog.Error(err, "configuring the cost metric")
 		os.Exit(1)
@@ -350,7 +357,7 @@ func main() {
 	// startup already sees its provider. The manager's client backs the AWS region
 	// source (regions are read from NodePools at call time, not env), so it is
 	// threaded in; the client is only queried at runtime, after the cache has synced.
-	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, regionTables, kubernetesClusters,
+	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, tables, kubernetesClusters,
 		append(slices.Clone(attribution), propagated...))
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
@@ -633,7 +640,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 //
 // Only providers in enabled are attempted (see parseProviders).
 func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool,
-	regionTables, kubernetesClusters string, kubernetesLabels []string) {
+	tables provider.RegionTables, kubernetesClusters string, kubernetesLabels []string) {
 	register := func(name string, build func() (provider.Provider, error)) {
 		if !enabled[name] {
 			setupLog.Info("provider disabled by --providers", "provider", name)
@@ -657,10 +664,6 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 	})
 
 	register(provider.ProviderAWS, func() (provider.Provider, error) {
-		tables, err := provider.LoadRegionTables(regionTables)
-		if err != nil {
-			return nil, err
-		}
 		return awsprovider.NewSDKClient(ctx, awsRegionSource(c), tables[provider.ProviderAWS])
 	})
 
