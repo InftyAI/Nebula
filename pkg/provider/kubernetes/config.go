@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
 	"github.com/InftyAI/Nebula/pkg/provider"
@@ -41,6 +42,34 @@ var clusterCatalogs = map[string]string{
 // credentials: an EKS cluster is reached with Nebula's own AWS identity (see newEKSClients).
 type Config struct {
 	Clusters []ClusterConfig `json:"clusters"`
+	// Reflection selects which of the home cluster's Secrets and ConfigMaps are copied to the
+	// other clusters.
+	Reflection ReflectionConfig `json:"reflection,omitempty"`
+}
+
+// ReflectionConfig lists the rules for copying home-cluster objects (see reflect.go). Only objects
+// a rule selects are copied.
+type ReflectionConfig struct {
+	Rules []ReflectionRule `json:"rules,omitempty"`
+}
+
+// ReflectionMode is how a rule's objectSelector is read. Only AllowList exists today; the field
+// exists so that tables written now stay valid once DenyList is added.
+//
+// TODO: add ReflectionDenyList, copying every object in the matched namespaces except those
+// objectSelector matches. Decide first whether an empty selector is allowed there.
+type ReflectionMode string
+
+// ReflectionAllowList copies the objects the rule's selectors match.
+const ReflectionAllowList ReflectionMode = "AllowList"
+
+// ReflectionRule selects objects of its resources whose labels match objectSelector, in namespaces
+// matching namespaceSelector (nil means all). An object is copied if any rule selects it.
+type ReflectionRule struct {
+	Resources         []string              `json:"resources"`
+	NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
+	ObjectSelector    *metav1.LabelSelector `json:"objectSelector"`
+	Mode              ReflectionMode        `json:"mode,omitempty"`
 }
 
 // ClusterConfig is one placement target. A NodePool selects clusters by Region or Geography,
@@ -56,6 +85,9 @@ type ClusterConfig struct {
 	Geography string `json:"geography"`
 	// NodeAutoscaler is what adds nodes to the cluster (see nodeAutoscalers). Empty is Karpenter.
 	NodeAutoscaler string `json:"nodeAutoscaler,omitempty"`
+	// Host marks the cluster Nebula runs in, the source reflection copies from. It is listed like
+	// any other entry and may also be a placement target.
+	Host bool `json:"host,omitempty"`
 }
 
 // nodeAutoscalerName defaults an empty NodeAutoscaler to Karpenter.
@@ -119,5 +151,15 @@ func (c *Config) Validate() error {
 				cl.Name, cl.Geography, provider.Geographies)
 		}
 	}
-	return nil
+	hosts := 0
+	for _, cl := range c.Clusters {
+		if cl.Host {
+			hosts++
+		}
+	}
+	if hosts > 1 {
+		return fmt.Errorf("kubernetes: %d clusters are marked host; at most one is", hosts)
+	}
+	_, err := c.Reflection.compile()
+	return err
 }

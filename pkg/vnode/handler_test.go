@@ -2179,3 +2179,30 @@ func TestReconcileOnce_NotReadyIsShownAndCounted(t *testing.T) {
 			got.Status.Phase, got.Status.Reason, reasonReadinessTimeout)
 	}
 }
+
+// The env virtual-kubelet hands CreatePod is literals, later entries winning; one it left
+// unresolved is refused rather than dropped.
+func TestLiteralEnv(t *testing.T) {
+	pod := func(c corev1.Container) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{c}}}
+	}
+	got, err := literalEnv(pod(corev1.Container{Env: []corev1.EnvVar{
+		{Name: "A", Value: "1"}, {Name: "B", Value: "$(A)"}, {Name: "A", Value: "2"},
+	}}))
+	if err != nil || len(got) != 2 || got["A"] != "2" || got["B"] != "$(A)" {
+		t.Fatalf("literalEnv = %v, %v; want A=2 and B verbatim", got, err)
+	}
+	if got, err := literalEnv(&corev1.Pod{}); err != nil || got != nil {
+		t.Errorf("no container: %v, %v", got, err)
+	}
+	unresolved := map[string]corev1.Container{
+		"valueFrom": {Env: []corev1.EnvVar{{Name: "S", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}}}},
+		"envFrom": {EnvFrom: []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{}}}},
+	}
+	for name, c := range unresolved {
+		if _, err := literalEnv(pod(c)); err == nil {
+			t.Errorf("%s: an unresolved reference was accepted", name)
+		}
+	}
+}

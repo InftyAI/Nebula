@@ -8,9 +8,27 @@ clusters:
     provider: eks
     region: us-east-1          # the EKS cluster's AWS region
     geography: us              # set explicitly; a NodePool's regions match either this or region
+    host: true                 # the cluster Nebula runs in; reflection copies from here
     # nodeAutoscaler: karpenter   # what adds nodes; the default and only one supported today
   # Another target.
   # - name: gpu-usw2
   #   provider: eks
   #   region: us-west-2
   #   geography: us
+
+# Which of the home cluster's image pull Secrets are copied, into the same namespace, to every
+# cluster but the host, so a real pod there pulls a private image with them. Nothing is copied
+# but what a rule selects: an object of a rule's resources, in a namespace namespaceSelector
+# matches (omitted: any), whose labels match objectSelector (required, non-empty). A copy follows
+# its source and is deleted with it, or once no rule selects it. A target's own object of that
+# name is never touched. Every key of a copied Secret goes, so select only what targets may hold.
+# Select by your own labels: nebula.inftyai.com/ keys are Nebula's, and refused.
+# reflection:
+#   rules:
+#     - resources: [secrets]
+#       objectSelector: { matchLabels: { app: trainer } }
+#     - resources: [secrets]
+#       namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: org-1 } }
+#       objectSelector: { matchExpressions: [{ key: tier, operator: In, values: [shared] }] }
+#       # mode: AllowList   # what objectSelector means; the default and only one today
+

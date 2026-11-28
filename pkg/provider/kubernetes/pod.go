@@ -17,8 +17,6 @@ limitations under the License.
 package kubernetes
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"maps"
 	"slices"
@@ -26,7 +24,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -34,11 +31,9 @@ import (
 )
 
 const (
-	// maxNameLen is the object-name cap. The real pod is named after the claim, which
-	// util.ClaimName keeps within it; only the Secret's suffix can push past it.
-	maxNameLen      = 253
-	nameHashLen     = 10
-	envSecretSuffix = "-env"
+	// reflectedLabel marks a copy of a home-cluster Secret or ConfigMap (see reflect.go). Reflection
+	// only ever updates or deletes objects that carry it.
+	reflectedLabel = "nebula.inftyai.com/reflected"
 
 	labelTrue = "true"
 	podKind   = "Pod"
@@ -87,36 +82,12 @@ func ownedByUs(obj metav1.Object) bool {
 	return true
 }
 
-// ownedByPod reports whether obj names the pod with uid among its owners. Labels say Nebula
-// made it, not for which pod: one left by an earlier pod of the same name carries the same
-// labels, and garbage collection removes it once that pod is gone.
-func ownedByPod(obj metav1.Object, uid types.UID) bool {
-	return slices.ContainsFunc(obj.GetOwnerReferences(), func(r metav1.OwnerReference) bool {
-		return r.Kind == podKind && r.UID == uid
-	})
-}
-
-// envSecretName is the env Secret's name for the real pod podName, with a hash of podName in
-// place of its tail when the suffix would pass maxNameLen, so two long names never meet.
-func envSecretName(podName string) string {
-	if len(podName)+len(envSecretSuffix) <= maxNameLen {
-		return podName + envSecretSuffix
-	}
-	sum := sha256.Sum256([]byte(podName))
-	keep := maxNameLen - len(envSecretSuffix) - nameHashLen - 1
-	// A cut at a "." would start the hash's label with "-", which no DNS-1123 label may.
-	prefix := strings.TrimRight(podName[:keep], ".-")
-	return prefix + "-" + hex.EncodeToString(sum[:])[:nameHashLen] + envSecretSuffix
-}
-
 // podSpec is everything buildPod needs that is not on the placeholder.
 type podSpec struct {
 	claim     string
 	selection nodeSelection
-	// env is ProvisionRequest.Env.Config, set inline; hasSecrets says Env.Secrets is
-	// non-empty, so the pod loads the env Secret holding it.
-	env        map[string]string
-	hasSecrets bool
+	// env is ProvisionRequest.Env, with every value set inline (see envVars).
+	env map[string]string
 	// labels are the placeholder's label keys the real pod carries: --kubernetes-propagate-labels
 	// and --cost-labels. An allowlist on purpose: in the host cluster the real pod shares the
 	// placeholder's namespace, where a controller label (pod-template-hash,
@@ -162,28 +133,21 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 	spec.Tolerations = append(spec.Tolerations, s.selection.tolerations...)
 	spec.Affinity = withNodeRequirements(spec.Affinity, s.selection.affinity)
 
-	// References to objects that live in the home cluster. The webhook admits no volume
-	// but the service-account token, which is simply not mounted here.
+	// The webhook admits no volume except the service-account token, which is not mounted here.
+	// imagePullSecrets are kept as written: reflected ones are usable in the target, and the
+	// kubelet skips any that are missing or aren't registry credentials.
 	spec.ServiceAccountName, spec.DeprecatedServiceAccount = "", ""
 	spec.AutomountServiceAccountToken = ptrTo(false)
 	spec.Volumes = nil
-	spec.ImagePullSecrets = nil
 	spec.ResourceClaims = nil
 	spec.SchedulerName = ""
 	spec.Overhead = nil
 
 	c := &spec.Containers[0]
 	c.VolumeMounts = nil
-	// The caller resolved every reference, so nothing here points back at the home cluster.
-	// Plain values go inline; Secret-sourced ones go in a Secret, since a pod spec is
-	// readable with `get pod`. The two never share a key, so precedence is moot.
+	// virtual-kubelet has already resolved every reference, so nothing here points back at the
+	// home cluster.
 	c.Env = envVars(s.env)
-	c.EnvFrom = nil
-	if s.hasSecrets {
-		c.EnvFrom = []corev1.EnvFromSource{{
-			SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: envSecretName(name)}},
-		}}
-	}
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -261,10 +225,9 @@ func isExtendedResource(name corev1.ResourceName) bool {
 	return len(validation.IsQualifiedName(corev1.DefaultResourceRequestsPrefix+n)) == 0
 }
 
-// envVars renders env in sorted order, so the same request always yields the same spec. Each
-// "$" is doubled because the kubelet expands $(VAR) in env values (and folds "$$" to "$"):
-// the values are already resolved and must reach the container verbatim, as resolveEnv
-// promises, not pick up another variable such as one from the env Secret.
+// envVars renders env sorted by name, so the same request always yields the same spec. Each "$"
+// is doubled because the kubelet expands $(VAR) in env values and turns "$$" into "$"; the values
+// are already resolved and must reach the container unchanged.
 func envVars(env map[string]string) []corev1.EnvVar {
 	if len(env) == 0 {
 		return nil
@@ -276,17 +239,16 @@ func envVars(env map[string]string) []corev1.EnvVar {
 	return out
 }
 
-// envSecret holds the Secret-sourced env (provider.Env.Secrets) for the real pod named podName.
-func envSecret(namespace, podName string, env map[string]string) *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      envSecretName(podName),
-			Namespace: namespace,
-			Labels:    ownerLabels(),
-		},
-		Type:       corev1.SecretTypeOpaque,
-		StringData: env,
-	}
+// reflectedLabels mark a copy (see reflect.go). Copies have no owner reference, so this label is
+// what tells a copy from a target's own object of the same name, and what the sweep lists by.
+// It is Nebula's own key on purpose: a shared one like app.kubernetes.io/managed-by could be set
+// by something else.
+func reflectedLabels() map[string]string {
+	return map[string]string{reflectedLabel: labelTrue}
+}
+
+func isReflected(obj metav1.Object) bool {
+	return obj.GetLabels()[reflectedLabel] == labelTrue
 }
 
 func ptrTo[T any](v T) *T { return &v }

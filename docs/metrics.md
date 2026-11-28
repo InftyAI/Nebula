@@ -131,6 +131,23 @@ unchanged, as it says nothing about credentials. `Provision`'s auth failures are
 max_over_time(nebula_provider_auth_failing[5m]) == 1 and min_over_time(nebula_provider_auth_failing[5m]) == 1
 ```
 
+## Reflection
+
+The `kubernetes` provider copies the pull Secrets its rules select to its other clusters
+([Pull Secrets](multi-cluster.md#pull-secrets)), once per change and every 10 minutes.
+
+| Metric | Type | What it answers |
+| --- | --- | --- |
+| `nebula_reflections_total{cluster,result}` | counter | Whether each cluster's copies follow their sources. `refused`: the cluster has an object of a source's name that isn't a copy, left alone; `failed`: the write failed and is retried with backoff. |
+
+Sustained failures leave copies stale: a container restarted there can't pull with an expired
+registry token.
+
+```promql
+# Reflections failing for 15 minutes, by cluster.
+sum by (cluster) (increase(nebula_reflections_total{result="failed"}[15m])) > 0
+```
+
 ## Cost
 
 What the fleet has actually spent.

@@ -31,12 +31,12 @@ import (
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
-// SecretTypeAWSRole identifies Nebula’s delegated ECR image pull Secret.
+// SecretTypeAWSRole is the Secret type naming an AWS role to pull private ECR images with.
 const SecretTypeAWSRole = nebulav1alpha1.SecretTypeAWSRole
 
 // resolveRegistryAuth builds ProvisionRequest.RegistryAuth from the Pod's imagePullSecrets,
-// which name Secrets in the Pod's namespace that an adapter cannot read — the same reason
-// resolveEnv lives here. (nil, nil) is an anonymous pull.
+// which name Secrets in the Pod's namespace that an adapter cannot read. (nil, nil) is an
+// anonymous pull.
 //
 // The first USABLE entry wins, never a merge: a provider attaches ONE credential to one image.
 // Every earlier entry that did not work out — unreadable, mistyped, malformed, or holding
@@ -56,7 +56,7 @@ func resolveRegistryAuth(
 		return nil, nil
 	}
 	if client == nil {
-		// No literals-only path to degrade to, unlike resolveEnv: this is a read or nothing.
+		// No literals-only path to degrade to: this is a read or nothing.
 		return nil, fmt.Errorf("imagePullSecrets are set but this node has no cluster client")
 	}
 	// One container per Nebula Pod, as everywhere else that reads the workload.

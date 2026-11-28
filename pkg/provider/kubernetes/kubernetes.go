@@ -55,8 +55,6 @@ import (
 const (
 	pollInterval = 5 * time.Second
 	spotNotice   = 2 * time.Minute
-	// cleanupTimeout bounds deleting a pod Provision could not finish setting up.
-	cleanupTimeout = 10 * time.Second
 )
 
 var (
@@ -82,6 +80,8 @@ type Provider struct {
 	offered map[string][]string
 	labels  []string         // the placeholder's label keys each real pod carries (see podSpec.labels)
 	now     func() time.Time // a seam for the bind timeout in toInstance
+	// reflection selects what Reflect copies to the other clusters; empty copies nothing.
+	reflection []reflectRule
 }
 
 // NewFromFile builds the provider from the cluster table at path, connecting to every
@@ -107,7 +107,11 @@ func NewFromFile(ctx context.Context, path string, labelKeys []string) (*Provide
 		}
 		clients[cl.Name] = cc
 	}
-	return New(ctx, cfg.Clusters, clients, cat, labelKeys), nil
+	p := New(ctx, cfg.Clusters, clients, cat, labelKeys)
+	if p.reflection, err = cfg.Reflection.compile(); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // New returns a Provider over already-built clients, one per cluster in clusters, which
@@ -239,10 +243,6 @@ func (p *Provider) Provision(
 	if mode := req.Egress.ModeOrOpen(); mode != nebulav1alpha1.EgressOpen {
 		return provider.ProvisionResult{}, fmt.Errorf("kubernetes: cannot enforce egress mode %q yet", mode)
 	}
-	if req.RegistryAuth != nil {
-		// ECR pulls go through the node role; other registries need a pull Secret, not built yet.
-		return provider.ProvisionResult{}, req.RegistryAuth.Unsupported(provider.ProviderKubernetes)
-	}
 	cl, ok := p.clusters[req.Region]
 	if !ok {
 		return provider.ProvisionResult{}, fmt.Errorf("kubernetes: no cluster in region %q", req.Region)
@@ -252,26 +252,19 @@ func (p *Provider) Provision(
 		return provider.ProvisionResult{}, err
 	}
 	real := buildPod(pod, podSpec{
-		claim:      req.ClaimName,
-		selection:  cl.nodeAutoscaler.selection(families, req.CapacityType),
-		env:        req.Env.Config,
-		hasSecrets: len(req.Env.Secrets) > 0,
-		labels:     p.labels,
+		claim:     req.ClaimName,
+		selection: cl.nodeAutoscaler.selection(families, req.CapacityType),
+		env:       req.Env.All(),
+		labels:    p.labels,
 	})
 	kube := cl.clients.kube
 
 	if err := ensureNamespace(ctx, kube, real.Namespace); err != nil {
 		return provider.ProvisionResult{}, err
 	}
-	created, adopted, err := createOrAdopt(ctx, cl.clients, real)
+	created, _, err := createOrAdopt(ctx, cl.clients, real)
 	if err != nil {
 		return provider.ProvisionResult{}, err
-	}
-	if len(req.Env.Secrets) > 0 {
-		if err := ensureEnvSecret(ctx, kube, created, adopted, req.Env.Secrets); err != nil {
-			cleanup(ctx, cl.clients, real.Namespace, real.Name)
-			return provider.ProvisionResult{}, err
-		}
 	}
 	// Unbound is accepted, not reserved: a node may still be coming. List settles it (see
 	// toInstance), so no worker waits on Karpenter here.
@@ -279,19 +272,6 @@ func (p *Provider) Provision(
 		InstanceID: instanceID(req.Region, real.Namespace, real.Name),
 		Reserved:   created.Spec.NodeName != "",
 	}, nil
-}
-
-// cleanup deletes a pod Provision could not finish setting up, on a context that outlives the
-// caller's.
-// A failure is only logged: the Pod fails regardless, and the NodeClaim teardown finds the
-// leftover through FindByClaim.
-func cleanup(ctx context.Context, cc clusterClients, namespace, name string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-	defer cancel()
-	if err := deleteInstance(ctx, cc, namespace, name); err != nil {
-		logf.FromContext(ctx).Error(err, "kubernetes: could not delete a half-set-up pod; teardown will retry",
-			"namespace", namespace, "pod", name)
-	}
 }
 
 // familiesFor resolves the Pod's accelerator to cl's instance families; a CPU-only Pod gets none.
@@ -524,8 +504,7 @@ func parseInstanceID(id string) (region, namespace, name string, err error) {
 }
 
 // createOrAdopt creates the real pod, or adopts the live one an interrupted Provision left
-// (adopted=true). Anything else holding the pod's or env Secret's name is refused, not
-// replaced: a new pod could start on a warm node with whatever Secret of that name exists.
+// (adopted=true). Anything else holding the pod's name is refused, not replaced.
 func createOrAdopt(
 	ctx context.Context, cc clusterClients, want *corev1.Pod,
 ) (pod *corev1.Pod, adopted bool, err error) {
@@ -544,15 +523,6 @@ func createOrAdopt(
 			want.Namespace, want.Name)
 	}
 
-	secret := envSecretName(want.Name)
-	_, err = cc.kube.CoreV1().Secrets(want.Namespace).Get(ctx, secret, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		return nil, false, fmt.Errorf("kubernetes: secret %s/%s already exists", want.Namespace, secret)
-	case !apierrors.IsNotFound(err):
-		return nil, false, fmt.Errorf("kubernetes: get secret %s/%s: %w", want.Namespace, secret, classifyAPI(err))
-	}
-
 	created, err := pods.Create(ctx, want, metav1.CreateOptions{})
 	if err != nil {
 		return nil, false, fmt.Errorf("kubernetes: create pod %s/%s: %w", want.Namespace, want.Name, classifyAPI(err))
@@ -560,35 +530,7 @@ func createOrAdopt(
 	return created, false, nil
 }
 
-// ensureEnvSecret writes the Secret-sourced env, owned by the pod so Kubernetes deletes it with
-// it. An existing one is accepted only for an adopted pod, and only if it is that pod's.
-func ensureEnvSecret(ctx context.Context, kube kubeClient, pod *corev1.Pod, adopted bool, env map[string]string) error {
-	want := envSecret(pod.Namespace, pod.Name, env)
-	want.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "v1", Kind: podKind, Name: pod.Name, UID: pod.UID,
-	}}
-	secrets := kube.CoreV1().Secrets(pod.Namespace)
-	_, err := secrets.Create(ctx, want, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		var got *corev1.Secret
-		switch got, err = secrets.Get(ctx, want.Name, metav1.GetOptions{}); {
-		case err != nil:
-		case !adopted:
-			err = fmt.Errorf("secret %s/%s appeared before this pod's", want.Namespace, want.Name)
-		case !ownedByUs(got):
-			err = fmt.Errorf("secret %s/%s exists and is not Nebula's", want.Namespace, want.Name)
-		case !ownedByPod(got, pod.UID):
-			err = fmt.Errorf("secret %s/%s belongs to an earlier pod of that name", want.Namespace, want.Name)
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("kubernetes: write env secret for %s/%s: %w", pod.Namespace, pod.Name, classifyAPI(err))
-	}
-	return nil
-}
-
-// deleteInstance removes the real pod; already gone is success. Its env Secret follows
-// through the ownerReference (see ensureEnvSecret).
+// deleteInstance removes the real pod; already gone is success.
 func deleteInstance(ctx context.Context, cc clusterClients, namespace, name string) error {
 	err := cc.kube.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {

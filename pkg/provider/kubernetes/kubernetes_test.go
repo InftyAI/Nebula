@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -138,32 +137,6 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
-func TestEnvSecretName(t *testing.T) {
-	if got := envSecretName("org-1-work-1"); got != "org-1-work-1-env" {
-		t.Fatalf("envSecretName = %q", got)
-	}
-	long := strings.Repeat("a", maxNameLen)
-	a, b := envSecretName(long), envSecretName(long[:maxNameLen-1]+"b")
-	if len(a) > maxNameLen || !strings.HasSuffix(a, envSecretSuffix) {
-		t.Fatalf("envSecretName = %q (%d chars)", a, len(a))
-	}
-	if a == b {
-		t.Fatal("two long names collided")
-	}
-
-	// A valid name whose cut falls on a "." (or "-") still yields a valid Secret name.
-	keep := maxNameLen - len(envSecretSuffix) - nameHashLen - 1
-	for _, sep := range []string{".", "-"} {
-		name := strings.Repeat("a", keep-1) + sep + strings.Repeat("b", maxNameLen-keep)
-		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
-			t.Fatalf("test name %q is itself invalid: %v", sep, errs)
-		}
-		if got := envSecretName(name); len(validation.IsDNS1123Subdomain(got)) > 0 || len(got) > maxNameLen {
-			t.Errorf("cut at %q: envSecretName = %q, invalid: %v", sep, got, validation.IsDNS1123Subdomain(got))
-		}
-	}
-}
-
 // The id reads back into its parts, a dotted pod name included, and so does the earlier
 // "/"-separated one that instances created before the change still carry.
 func TestInstanceIDRoundTrip(t *testing.T) {
@@ -189,12 +162,14 @@ func TestBuildPod(t *testing.T) {
 	local.Labels["app"] = "trainer"
 	local.Labels["pod-template-hash"] = "5d9f"
 	local.Labels[nebulav1alpha1.ManagedByLabel] = "hive-operator"
+	// As virtual-kubelet hands it over: every reference already resolved to a literal.
+	local.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "STALE", Value: "from-the-placeholder"}}
+	local.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "aws-role"}, {Name: "tok"}}
 	got := buildPod(local, podSpec{
-		claim:      "org-1-work-1",
-		selection:  karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacitySpot),
-		labels:     []string{"org-id", "app"},
-		env:        map[string]string{"B": "2", "A": "1"},
-		hasSecrets: true,
+		claim:     "org-1-work-1",
+		selection: karpenter{}.selection([]string{"p5"}, nebulav1alpha1.CapacitySpot),
+		labels:    []string{"org-id", "app"},
+		env:       map[string]string{"B": "2", "A": "1"},
 	})
 	if got.Name != "org-1-work-1" || got.Namespace != "org-1" {
 		t.Fatalf("got %s/%s", got.Namespace, got.Name)
@@ -218,16 +193,13 @@ func TestBuildPod(t *testing.T) {
 	if got.Annotations[doNotDisruptAnnotation] != "true" {
 		t.Errorf("annotations = %v", got.Annotations)
 	}
+	// The real pod's env is the request's, inline and sorted, not the placeholder's own.
 	c := got.Spec.Containers[0]
-	if len(c.EnvFrom) != 1 || c.EnvFrom[0].SecretRef.Name != "org-1-work-1-env" {
-		t.Errorf("envFrom = %+v, want the env Secret", c.EnvFrom)
-	}
 	if want := []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "2"}}; !slices.Equal(c.Env, want) {
-		t.Errorf("env = %+v, want plain values inline and sorted", c.Env)
+		t.Errorf("env = %+v, want the resolved values inline and sorted", c.Env)
 	}
-	noSecrets := buildPod(placeholder(), podSpec{claim: "org-1-work-1"})
-	if len(noSecrets.Spec.Containers[0].EnvFrom) != 0 {
-		t.Error("with no Secrets there is no env Secret to load")
+	if want := local.Spec.ImagePullSecrets; !slices.Equal(got.Spec.ImagePullSecrets, want) {
+		t.Errorf("imagePullSecrets = %v, want them as written %v", got.Spec.ImagePullSecrets, want)
 	}
 	terms := got.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 	reqs := terms[0].MatchExpressions
