@@ -402,6 +402,8 @@ func TestValidateCreate_RejectsUnschedulableAffinity(t *testing.T) {
 	}
 	acrossZones := peers
 	acrossZones.TopologyKey = corev1.LabelTopologyZone
+	acrossProviders := peers
+	acrossProviders.TopologyKey = nebulav1alpha1.ProviderLabel
 	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
 	v := &PodCustomValidator{}
 	for _, tc := range []struct {
@@ -429,10 +431,25 @@ func TestValidateCreate_RejectsUnschedulableAffinity(t *testing.T) {
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossZones},
 		}},
 	}, {
-		name: "required podAffinity", labels: optedIn,
+		// Every replica on a provider shares the node's provider label too.
+		name: "required podAntiAffinity on the provider label", labels: optedIn,
+		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossProviders},
+		}},
+		want: "required podAntiAffinity on " + nebulav1alpha1.ProviderLabel,
+	}, {
+		// The node carries a hostname, so peers already on it satisfy the term.
+		name: "required podAffinity on the hostname", labels: optedIn,
 		affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers},
 		}},
+	}, {
+		// The scheduler requires the topology key on the node before anything else.
+		name: "required podAffinity on a zone", labels: optedIn,
+		affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers, acrossZones},
+		}},
+		want: "required podAffinity on " + corev1.LabelTopologyZone,
 	}, {
 		name: "preferred terms pass", labels: optedIn,
 		affinity: &corev1.Affinity{

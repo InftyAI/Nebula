@@ -18,8 +18,10 @@ package vnode
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -313,5 +315,17 @@ func TestVirtualCapacity_FitsTheScaleTarget(t *testing.T) {
 	}
 	if pods := allocatable[corev1.ResourcePods]; pods.Value() < workloads {
 		t.Errorf("pods allocatable %d < %d", pods.Value(), workloads)
+	}
+}
+
+// The webhook judges pod (anti-)affinity by these keys, so they must be exactly the labels a
+// virtual node is created with.
+func TestNodeLabelKeysAreTheNodesLabels(t *testing.T) {
+	got := NodeLabelKeys()
+	if want := slices.Sorted(maps.Keys(nodeSpec("nebula-aws", "aws", 0).Labels)); !slices.Equal(got, want) {
+		t.Fatalf("NodeLabelKeys = %v, want %v", got, want)
+	}
+	if !slices.Contains(got, corev1.LabelHostname) || slices.Contains(got, corev1.LabelTopologyZone) {
+		t.Fatalf("NodeLabelKeys = %v: want the hostname and no zone", got)
 	}
 }
