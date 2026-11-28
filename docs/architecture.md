@@ -158,9 +158,12 @@ Follow one GPU Pod from creation to teardown:
    A required `nodeAffinity` is refused by the validating webhook: it is checked against
    the provider's virtual node, which carries no region, zone or instance labels, so it
    could never match. Use `nebula.inftyai.com/regions` to choose where the Pod runs.
-   Pod (anti-)affinity is admitted and left to the scheduler, which binds the Pod or
-   marks it unschedulable as on any node; placement does not act on it, so a zone
-   anti-affinity does not spread and a pod affinity does not co-locate.
+   Pod (anti-)affinity is admitted and left to the host scheduler, which binds the Pod
+   to the virtual node or marks it unschedulable, as for any Pod. Nebula's placement
+   ignores it, so for Modal, RunPod and AWS it changes nothing about where instances
+   run. The Kubernetes provider keeps it on the real pod, so the target cluster's
+   scheduler applies it there, matching on the labels real pods carry (see
+   `--kubernetes-propagate-labels`).
 
 2. **Gate at admission.** The mutating webhook adds the scheduling gate
    `nebula.inftyai.com/provider-selection` and a key-only `Exists` toleration for
