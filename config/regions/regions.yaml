@@ -1,0 +1,21 @@
+# Region tables (--regions), read once at startup: restart the manager after a change.
+#
+# A provider listed here uses this table IN PLACE OF its built-in one, so list every
+# geography it should serve; one left out serves nothing. Each geography maps to the
+# provider's regions in the order placement tries them, and a region sits under one
+# geography only. Only aws today.
+#
+# AWS: the built-in table holds the regions every account has enabled. List an opt-in
+# region only once your account has it enabled: a disabled one fails its client and is
+# retried on every poll.
+aws:
+  us: [us-east-1, us-east-2, us-west-1, us-west-2]
+  ca: [ca-central-1]
+  sa: [sa-east-1]
+  eu: [eu-central-1, eu-north-1, eu-west-1, eu-west-3]
+  uk: [eu-west-2]
+  ap: [ap-northeast-1, ap-northeast-2, ap-northeast-3, ap-south-1, ap-southeast-1, ap-southeast-2]
+  # Opt-in, e.g.:
+  # af: [af-south-1]
+  # me: [me-central-1, me-south-1]
+  # mx: [mx-central-1]

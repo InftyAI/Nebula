@@ -135,6 +135,7 @@ Manager flags worth knowing (edit `config/manager/manager.yaml` `args`):
 |---|---|---|
 | `--kubelet-bind-address` | `:10250` | Where the kubelet log endpoint listens — the address the API server proxies `kubectl logs` to. Set it empty to disable the endpoint, which disables logs and nothing else. |
 | `--kubelet-serving-tls-bootstrap` | `false`, but `manager.yaml` ships `true` | Request a certificate for the advertised Pod IP from the `kubernetes.io/kubelet-serving` signer, and approve it. **Required on EKS and any control plane that sets `--kubelet-certificate-authority`**, where the self-signed fallback makes `kubectl exec` fail with `x509: certificate signed by unknown authority`. The flag's own default is off because the feature needs the `impersonate` grant on `users`/`groups` in `config/rbac/role.yaml`; the shipped manifest turns it on. |
+| `--regions` | *(empty)*, but `manager.yaml` ships `/etc/nebula/regions/regions.yaml` | Region tables replacing a provider's built-in one, from the optional `regions` ConfigMap. No file keeps the built-in tables. See [AWS opt-in regions](#aws-opt-in-regions). |
 | `--kubelet-client-ca` | *(empty)* | PEM bundle of CAs whose client certificates are accepted on that port. **Empty means client certificates are not verified**, so anything able to reach port 10250 can read the logs of any Pod on Nebula's virtual nodes. Set it to your API server's kubelet client CA to require mTLS, or keep the port closed with a NetworkPolicy. The default is open because which CA signs that client cert is not portable — kubeadm uses the cluster CA, EKS/GKE their own — so requiring it by default would break logs on managed control planes. |
 
 The endpoint needs `POD_IP` (projected via `fieldRef` in `config/manager/manager.yaml`)
@@ -184,6 +185,32 @@ modal environment create dev
 # then, in .env
 MODAL_ENVIRONMENT=dev
 ```
+
+## AWS opt-in regions
+
+Off unless you set it. Nebula's built-in AWS table holds only the regions every account has
+enabled, so `af`, `me` and `mx` resolve to nothing and opt-in regions such as `ap-east-1` or
+`eu-south-1` are never picked for a geography. Once your account has enabled some, list them
+in `config/regions/regions.yaml` and uncomment `- ../regions` in
+`config/default/kustomization.yaml`:
+
+```yaml
+aws:
+  us: [us-east-1, us-east-2, us-west-1, us-west-2]
+  eu: [eu-central-1, eu-north-1, eu-south-1, eu-west-1, eu-west-3]
+  af: [af-south-1]
+  # ...every other geography you want served
+```
+
+The file is keyed by provider, so other providers' tables can sit beside `aws` once they read
+one; only `aws` does today, and any other key is refused rather than ignored.
+
+The file **replaces** the built-in table, so list every geography AWS should serve; one left
+out serves nothing. Each list is the order placement tries, and a region may sit under one
+geography only. A bad file stops the manager at startup, with the reason in its log. It
+is read at startup: restart the manager after a change. List only regions your account has
+enabled: a disabled one fails to build its client and is retried on every poll.
+
 ---
 
 ## Manual deployment
