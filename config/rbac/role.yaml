@@ -16,6 +16,13 @@ rules:
   - watch
 - apiGroups:
   - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
   resourceNames:
   - system:nodes
   resources:
@@ -76,14 +83,6 @@ rules:
   - users
   verbs:
   - impersonate
-- apiGroups:
-  - ""
-  - events.k8s.io
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
 - apiGroups:
   - admissionregistration.k8s.io
   resources:

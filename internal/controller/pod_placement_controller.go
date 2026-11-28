@@ -18,12 +18,13 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/events"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -77,18 +78,7 @@ type PodPlacementReconciler struct {
 	// failed. May be nil (no candidate is ever considered blocked), keeping tests
 	// and blocklist-less wiring simple.
 	Blocklist Blocklister
-
-	// Recorder reports on the Pod why it is still gated, which otherwise only the controller's
-	// log knows. Nil records nothing.
-	Recorder events.EventRecorder
 }
-
-// Event reasons for a Pod left gated. PlacementFailed needs someone to change the Pod, its
-// NodePool or the providers; PlacementDeferred clears on its own once a failover block lapses.
-const (
-	reasonPlacementFailed   = "PlacementFailed"
-	reasonPlacementDeferred = "PlacementDeferred"
-)
 
 // Blocklister is the side of pkg/failover.Blocklist the placement controller depends on:
 // whether a candidate placement may be tried now and, when not, how long until it could
@@ -104,7 +94,7 @@ type Blocklister interface {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodepools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=nebula.inftyai.com,resources=nodeclaims,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=patch
 
 // Reconcile places one gated Pod. It is a no-op for any Pod that is not an
 // opted-in, still-gated, not-yet-scheduled workload.
@@ -145,8 +135,7 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// label is deliberately NOT filed on the metric — see metrics.RecordDeferral.
 		metrics.RecordDeferral("", metrics.DeferNoPool)
 		log.Info("no NodePool resolved for Pod; leaving it gated", "pod", pod.Name)
-		r.event(&pod, corev1.EventTypeWarning, reasonPlacementFailed, noPoolMessage(&pod))
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.setGatedReason(ctx, &pod, noPoolMessage(&pod))
 	}
 
 	// selectPlacement files its own deferral reason on the !ok paths — it is the only
@@ -166,12 +155,9 @@ func (r *PodPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			retryAfter += requeueJitter(pod.UID)
 			log.Info("all servable candidates are blocked; requeuing for the soonest to free",
 				"pod", pod.Name, "pool", pool.Name, "retryAfter", retryAfter.String())
-			r.event(&pod, corev1.EventTypeNormal, reasonPlacementDeferred,
-				fmt.Sprintf("%s; retrying in %s", deferred.message, retryAfter.Round(time.Second)))
-			return ctrl.Result{RequeueAfter: retryAfter}, nil
+			return ctrl.Result{RequeueAfter: retryAfter}, r.setGatedReason(ctx, &pod, deferred.message)
 		}
-		r.event(&pod, corev1.EventTypeWarning, reasonPlacementFailed, deferred.message)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.setGatedReason(ctx, &pod, deferred.message)
 	}
 
 	// Create the NodeClaim BEFORE ungating: the claim is the durable teardown
@@ -255,12 +241,32 @@ func (r *PodPlacementReconciler) provider(name string) (provider.Provider, bool)
 	return provider.Get(name)
 }
 
-// event records a gated Pod's reason. The message is formatted by the caller, so a "%" in it
-// (a NodePool or annotation value) is never read as a verb.
-func (r *PodPlacementReconciler) event(pod *corev1.Pod, eventType, reason, message string) {
-	if r.Recorder != nil {
-		r.Recorder.Eventf(pod, nil, eventType, reason, "Place", "%s", message)
+// setGatedReason writes why the Pod is still gated into the message of its PodScheduled
+// condition, which the API server sets to reason SchedulingGated for a gated Pod. Nothing else
+// writes it while the gate is on; the scheduler replaces it at bind. The reason stays
+// SchedulingGated, which kubectl's STATUS column keys on. A strategic-merge patch keyed on the
+// condition type leaves the other conditions alone, and an unchanged message is not rewritten.
+func (r *PodPlacementReconciler) setGatedReason(ctx context.Context, pod *corev1.Pod, message string) error {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Message == message {
+			return nil
+		}
 	}
+	// A map, not a PodCondition: the status is unchanged, so lastTransitionTime must not be
+	// sent, and a zero metav1.Time would marshal as null and clear it.
+	patch, err := json.Marshal(map[string]any{"status": map[string]any{"conditions": []map[string]any{{
+		"type":    corev1.PodScheduled,
+		"status":  corev1.ConditionFalse,
+		"reason":  corev1.PodReasonSchedulingGated,
+		"message": message,
+	}}}})
+	if err != nil {
+		return err
+	}
+	if err := r.Status().Patch(ctx, pod, client.RawPatch(types.StrategicMergePatchType, patch)); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return nil
 }
 
 // noPoolMessage is why poolFor found no NodePool: the Pod names none, or one that doesn't exist.

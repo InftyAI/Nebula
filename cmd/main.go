@@ -459,7 +459,6 @@ func setupControllers(mgr ctrl.Manager, blocklist *failover.Blocklist, kubeletSr
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Blocklist: blocklist,
-		Recorder:  mgr.GetEventRecorder("nebula-placement"),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create PodPlacement controller: %w", err)
 	}
