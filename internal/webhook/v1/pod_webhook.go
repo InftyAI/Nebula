@@ -22,10 +22,8 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
@@ -36,7 +34,7 @@ var podlog = logf.Log.WithName("pod-webhook")
 
 // SetupPodWebhookWithManager registers the webhook for Pod in the manager.
 func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&corev1.Pod{}).
+	return ctrl.NewWebhookManagedBy(mgr, &corev1.Pod{}).
 		WithDefaulter(&PodCustomDefaulter{}).
 		WithValidator(&PodCustomValidator{}).
 		Complete()
@@ -61,9 +59,9 @@ func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 // check here is defence-in-depth for the case the selector is misconfigured.
 type PodCustomDefaulter struct{}
 
-var _ webhook.CustomDefaulter = &PodCustomDefaulter{}
+var _ admission.Defaulter[*corev1.Pod] = &PodCustomDefaulter{}
 
-// Default implements webhook.CustomDefaulter. For an opted-in Pod at CREATE it
+// Default implements admission.Defaulter. For an opted-in Pod at CREATE it
 // (a) adds the provider-selection scheduling gate and (b) adds a toleration for
 // the per-provider virtual-node taint, but only when it is safe and meaningful:
 //   - the Pod carries the opt-in label (EnabledLabel=="true");
@@ -72,11 +70,7 @@ var _ webhook.CustomDefaulter = &PodCustomDefaulter{}
 //     is already scheduled has bypassed placement anyway;
 //   - each mutation is idempotent (safe under retries and the
 //     create;update-vs-create verb narrowing).
-func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) error {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		return fmt.Errorf("expected a Pod object but got %T", obj)
-	}
+func (d *PodCustomDefaulter) Default(_ context.Context, pod *corev1.Pod) error {
 
 	if pod.Labels[nebulav1alpha1.EnabledLabel] != nebulav1alpha1.EnabledValue {
 		return nil // not opted in; leave the Pod untouched
@@ -120,31 +114,19 @@ func (d *PodCustomDefaulter) Default(_ context.Context, obj runtime.Object) erro
 // refused for the same reason (see validatePod).
 type PodCustomValidator struct{}
 
-var _ webhook.CustomValidator = &PodCustomValidator{}
+var _ admission.Validator[*corev1.Pod] = &PodCustomValidator{}
 
-// ValidateCreate implements webhook.CustomValidator.
-func (v *PodCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		return nil, fmt.Errorf("expected a Pod object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator.
+func (v *PodCustomValidator) ValidateCreate(_ context.Context, pod *corev1.Pod) (admission.Warnings, error) {
 	return nil, validatePod(pod)
 }
 
-// ValidateUpdate implements webhook.CustomValidator. The shape is immutable but the opt-in
+// ValidateUpdate implements admission.Validator. The shape is immutable but the opt-in
 // label is not, so only label transitions are judged: opting in is refused outright, and
 // opting out must not strand Nebula's gate, nor a placed Pod's instance. A Pod
 // staying opted in is left alone: one admitted before this check existed would otherwise have
 // every later write rejected, placement's gate release among them, and stay gated forever.
-func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	oldPod, ok := oldObj.(*corev1.Pod)
-	if !ok {
-		return nil, fmt.Errorf("expected a Pod object but got %T", oldObj)
-	}
-	newPod, ok := newObj.(*corev1.Pod)
-	if !ok {
-		return nil, fmt.Errorf("expected a Pod object but got %T", newObj)
-	}
+func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldPod, newPod *corev1.Pod) (admission.Warnings, error) {
 	if optedIn(oldPod) && placedByNebula(oldPod) {
 		// Placement read them once, into the Pod's NodeClaim; a later edit would be silently ignored.
 		for _, key := range []string{nebulav1alpha1.ProvidersAnnotation, nebulav1alpha1.RegionsAnnotation} {
@@ -178,8 +160,8 @@ func (v *PodCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj ru
 	return nil, nil
 }
 
-// ValidateDelete implements webhook.CustomValidator. Not registered for deletes.
-func (v *PodCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+// ValidateDelete implements admission.Validator. Not registered for deletes.
+func (v *PodCustomValidator) ValidateDelete(_ context.Context, _ *corev1.Pod) (admission.Warnings, error) {
 	return nil, nil
 }
 

@@ -104,10 +104,3 @@ func TestNodePoolValidatorWarnings(t *testing.T) {
 		})
 	}
 }
-
-func TestNodePoolValidatorRejectsWrongType(t *testing.T) {
-	v := &NodePoolCustomValidator{Providers: lookup}
-	if _, err := v.ValidateCreate(context.Background(), &nebulav1alpha1.NodePoolList{}); err == nil {
-		t.Fatal("expected an error for a non-NodePool object")
-	}
-}
