@@ -60,6 +60,10 @@ func TestStatusPods_WritesOnlyTheStatus(t *testing.T) {
 			if _, err := pods.UpdateStatus(context.Background(), providerCopy(uid), metav1.UpdateOptions{}); err != nil {
 				t.Fatalf("UpdateStatus: %v", err)
 			}
+			actions := kube.Actions()
+			if len(actions) != 1 || actions[0].GetVerb() != "patch" || actions[0].GetSubresource() != "status" {
+				t.Fatalf("UpdateStatus actions = %v, want one patch to pods/status", actions)
+			}
 			got, err := kube.CoreV1().Pods("default").Get(context.Background(), "p1", metav1.GetOptions{})
 			if err != nil {
 				t.Fatal(err)
