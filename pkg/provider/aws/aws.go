@@ -71,10 +71,15 @@ const spotPollInterval = 10 * time.Second
 // container became healthy" — that is the poll loop's job.
 const provisionTimeout = 2 * time.Minute
 
-// regionsByGeography maps a geography token to the AWS regions it encompasses.
-//
-// The empty entries are the opt-in regions, disabled by default in AWS accounts.
-var regionsByGeography = map[string][]string{
+// RegionTable maps a geography token to the AWS regions it holds, in the order placement
+// walks them. A geography missing from it holds no region.
+type RegionTable map[string][]string
+
+// defaultRegions is the table used without a --regions file: the regions every AWS account
+// has enabled. Opt-in ones are left out, since an expansion reaching a disabled region would
+// fail to build its client and retry on every poll (clientFor does not cache failures); an
+// account that enabled some lists them in the --regions file, which replaces this table.
+var defaultRegions = RegionTable{
 	"us": {"us-east-1", "us-east-2", "us-west-1", "us-west-2"},
 	"ca": {"ca-central-1"},
 	"sa": {"sa-east-1"},
@@ -87,11 +92,6 @@ var regionsByGeography = map[string][]string{
 	"af": {},
 	"me": {},
 	"mx": {},
-}
-
-// regionsIn returns the list of AWS regions within a given geography token.
-func regionsIn(geography string) []string {
-	return regionsByGeography[geography]
 }
 
 // ErrSpotCapacity is a marker the Client wraps onto a Spot-tier capacity failure
@@ -233,6 +233,8 @@ type Provider struct {
 	// regionSource reports the NodePool declarations to sweep in List/Offerings.
 	// May be nil in tests, in which case sweepRegions uses only the cache keys.
 	regionSource RegionSource
+	// regions resolves geographies to EC2 regions: defaultRegions, or the --regions file's.
+	regions RegionTable
 
 	mu      sync.Mutex
 	clients map[string]Client // region -> Client, populated lazily by clientFor
@@ -253,6 +255,7 @@ func New(newClient ClientFactory, cat catalog.Lookup, regionSource RegionSource)
 		Base:         catalog.Base{ProviderName: provider.ProviderAWS, Catalog: cat},
 		newClient:    newClient,
 		regionSource: regionSource,
+		regions:      defaultRegions,
 		clients:      make(map[string]Client),
 	}
 }
@@ -275,20 +278,20 @@ func newSingleRegion(client Client, cat catalog.Lookup, region string) *Provider
 }
 
 // ResolveRegions implements provider.Provider. EC2 region names are not geographies, so AWS
-// resolves them through regionsByGeography. Three levels, in the order they are checked:
+// resolves them through its RegionTable. Three levels, in the order they are checked:
 //
-//	nil/[]          => every default-enabled region
-//	["us"]          => the default-enabled regions in that geography
+//	nil/[]          => every region in the table
+//	["us"]          => the table's regions in that geography
 //	["us-east-1"]   => itself, verbatim and unvalidated
 //
 // narrowTo filters the expansion to only include regions within the requested geographies.
 func (p *Provider) ResolveRegions(declared, narrowTo []string) []string {
-	return narrowRegions(expandDeclared(declared), narrowTo)
+	return p.regions.narrow(p.regions.expand(declared), narrowTo)
 }
 
-// narrowRegions keeps the regions that fall inside at least one requested geography. An
-// empty narrowTo is the no-op.
-func narrowRegions(expanded, narrowTo []string) []string {
+// narrow keeps the regions that fall inside at least one requested geography. An empty
+// narrowTo is the no-op.
+func (t RegionTable) narrow(expanded, narrowTo []string) []string {
 	if len(narrowTo) == 0 {
 		return expanded
 	}
@@ -299,7 +302,7 @@ func narrowRegions(expanded, narrowTo []string) []string {
 		if !provider.IsGeography(token) {
 			continue
 		}
-		for _, r := range regionsByGeography[token] {
+		for _, r := range t[token] {
 			want[r] = true
 		}
 	}
@@ -312,9 +315,9 @@ func narrowRegions(expanded, narrowTo []string) []string {
 	return out
 }
 
-// expandDeclared turns a pool's declaration into concrete EC2 regions, with no narrowing.
-// Placement narrows it and sweepRegions reads it as is, so the two agree.
-func expandDeclared(declared []string) []string {
+// expand turns a pool's declaration into concrete EC2 regions, with no narrowing. Placement
+// narrows it and sweepRegions reads it as is, so the two agree.
+func (t RegionTable) expand(declared []string) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(r string) {
@@ -325,9 +328,9 @@ func expandDeclared(declared []string) []string {
 		out = append(out, r)
 	}
 	if len(declared) == 0 {
-		// Unconstrained: every default-enabled region.
+		// Unconstrained: every region in the table.
 		for _, g := range provider.Geographies {
-			for _, r := range regionsByGeography[g] {
+			for _, r := range t[g] {
 				add(r)
 			}
 		}
@@ -336,7 +339,7 @@ func expandDeclared(declared []string) []string {
 	for _, d := range declared {
 		d = strings.TrimSpace(d)
 		if token := strings.ToLower(d); provider.IsGeography(token) {
-			for _, r := range regionsIn(token) {
+			for _, r := range t[token] {
 				add(r)
 			}
 			continue
@@ -366,7 +369,7 @@ func (p *Provider) sweepRegions() []string {
 	}
 	if p.regionSource != nil {
 		for _, declared := range p.regionSource() {
-			for _, r := range expandDeclared(declared) {
+			for _, r := range p.regions.expand(declared) {
 				add(r)
 			}
 		}

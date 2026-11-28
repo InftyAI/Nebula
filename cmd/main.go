@@ -112,6 +112,7 @@ func main() {
 	var providers string
 	var kubernetesClusters string
 	var kubernetesPropagateLabels string
+	var regionTables string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -158,6 +159,10 @@ func main() {
 		"Path to the kubernetes provider's cluster table in the container, normally "+
 			"/etc/nebula/kubernetes/clusters.yaml mounted from the kubernetes-clusters ConfigMap. "+
 			"Empty leaves the kubernetes provider unregistered.")
+	flag.StringVar(&regionTables, "regions", "",
+		"Path to the region tables in the container, normally /etc/nebula/regions/regions.yaml "+
+			"mounted from the regions ConfigMap. A provider it lists uses that table in place of "+
+			"its built-in one; empty, or no such file, keeps the built-in tables. Only aws today.")
 	flag.StringVar(&kubernetesPropagateLabels, "kubernetes-propagate-labels", "",
 		"Comma-separated label keys copied from each placeholder Pod onto its real pod in the "+
 			"target cluster, values unchanged. A key the placeholder does not carry is skipped, and the "+
@@ -345,7 +350,7 @@ func main() {
 	// startup already sees its provider. The manager's client backs the AWS region
 	// source (regions are read from NodePools at call time, not env), so it is
 	// threaded in; the client is only queried at runtime, after the cache has synced.
-	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, kubernetesClusters,
+	registerProviders(context.Background(), mgr.GetClient(), enabledProviders, regionTables, kubernetesClusters,
 		append(slices.Clone(attribution), propagated...))
 
 	// One shared failover blocklist, written by the virtual kubelet handlers on a
@@ -628,7 +633,7 @@ func setupVirtualNodes(mgr ctrl.Manager, blocklist vnode.Blocklister, kubeletSrv
 //
 // Only providers in enabled are attempted (see parseProviders).
 func registerProviders(ctx context.Context, c client.Client, enabled map[string]bool,
-	kubernetesClusters string, kubernetesLabels []string) {
+	regionTables, kubernetesClusters string, kubernetesLabels []string) {
 	register := func(name string, build func() (provider.Provider, error)) {
 		if !enabled[name] {
 			setupLog.Info("provider disabled by --providers", "provider", name)
@@ -652,7 +657,11 @@ func registerProviders(ctx context.Context, c client.Client, enabled map[string]
 	})
 
 	register(provider.ProviderAWS, func() (provider.Provider, error) {
-		return awsprovider.NewSDKClient(ctx, awsRegionSource(c))
+		tables, err := provider.LoadRegionTables(regionTables)
+		if err != nil {
+			return nil, err
+		}
+		return awsprovider.NewSDKClient(ctx, awsRegionSource(c), tables[provider.ProviderAWS])
 	})
 
 	register(provider.ProviderRunPod, func() (provider.Provider, error) {

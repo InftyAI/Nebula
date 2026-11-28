@@ -169,7 +169,8 @@ var _ Client = (*sdkClient)(nil)
 //
 // regionSource supplies the regions the List/Offerings fan-out sweeps, read from the
 // NodePool at call time rather than from env/flags, since ProviderSpec.Regions is the
-// operator's declaration and changes at runtime. See RegionSource.
+// operator's declaration and changes at runtime. See RegionSource. regions replaces
+// defaultRegions when non-nil.
 //
 // Per-region clients are built LAZILY (see Provider.clientFor), so this constructor only
 // loads the catalog: startup pays no AMI/subnet resolution, and no region is validated
@@ -181,7 +182,7 @@ var _ Client = (*sdkClient)(nil)
 // IRSA / instance-role over AWS_ACCESS_KEY_ID from the environment. An IAM principal is
 // ACCOUNT-GLOBAL, so the same credentials authorize every region and only the endpoint
 // differs.
-func NewSDKClient(_ context.Context, regionSource RegionSource) (*Provider, error) {
+func NewSDKClient(_ context.Context, regionSource RegionSource, regions RegionTable) (*Provider, error) {
 	cat, err := catalog.Load()
 	if err != nil {
 		return nil, fmt.Errorf("aws: load price catalog: %w", err)
@@ -190,7 +191,11 @@ func NewSDKClient(_ context.Context, regionSource RegionSource) (*Provider, erro
 	factory := func(ctx context.Context, region string) (Client, error) {
 		return newSDKClientForRegion(ctx, region)
 	}
-	return New(factory, cat, regionSource), nil
+	p := New(factory, cat, regionSource)
+	if regions != nil {
+		p.regions = regions
+	}
+	return p, nil
 }
 
 // newSDKClientForRegion builds one region-pinned sdkClient: it loads SDK config for

@@ -71,6 +71,9 @@ spec:
           # The kubernetes provider's cluster table, from the optional ConfigMap mounted below.
           # Absent ConfigMap = no file = the provider is skipped at registration.
           - --kubernetes-clusters=/etc/nebula/kubernetes/clusters.yaml
+          # Region tables, from the optional ConfigMap mounted below. Absent ConfigMap = no
+          # file = every provider keeps its built-in table.
+          - --regions=/etc/nebula/regions/regions.yaml
         image: controller:latest
         name: manager
         imagePullPolicy: IfNotPresent
@@ -196,6 +199,9 @@ spec:
           - name: kubernetes-clusters
             mountPath: /etc/nebula/kubernetes
             readOnly: true
+          - name: regions
+            mountPath: /etc/nebula/regions
+            readOnly: true
         #   # The catalog ConfigMap mount, off with NEBULA_CATALOG_DIR above.
         #   - name: catalog
         #     mountPath: /etc/nebula/catalog
@@ -207,6 +213,13 @@ spec:
             # namePrefix rewrites this to the generated "nebula-kubernetes-clusters".
             # optional, so without it the provider is just skipped.
             name: kubernetes-clusters
+            optional: true
+        - name: regions
+          configMap:
+            # Unprefixed on purpose: with `- ../regions` in config/default, namePrefix
+            # rewrites this to the generated "nebula-regions". optional, so without it the
+            # built-in tables are used.
+            name: regions
             optional: true
       #   - name: catalog
       #     configMap:

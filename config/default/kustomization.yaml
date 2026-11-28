@@ -25,6 +25,9 @@ resources:
 # The kubernetes provider's cluster table (config/kubernetes-provider/clusters.yaml). Off:
 # without it the kubernetes provider is not registered. Fill in clusters.yaml first.
 # - ../kubernetes-provider
+# Region tables (config/regions/regions.yaml), e.g. AWS opt-in regions your account enabled.
+# Off: every provider uses its built-in table.
+# - ../regions
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 - ../webhook

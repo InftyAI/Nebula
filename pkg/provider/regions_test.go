@@ -17,7 +17,11 @@ limitations under the License.
 package provider
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -62,5 +66,51 @@ func TestGeographies_AreFlatAndSorted(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+func TestLoadRegionTables(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "regions.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("a valid file is the provider's whole table", func(t *testing.T) {
+		got, err := LoadRegionTables(write(t, "aws:\n  af: [af-south-1]\n  us: [us-east-1, us-west-2]\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := RegionTables{ProviderAWS: {"af": {"af-south-1"}, "us": {"us-east-1", "us-west-2"}}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	// The ConfigMap is optional, so neither is an error: every provider keeps its built-in table.
+	for name, path := range map[string]string{"no flag": "", "no file": filepath.Join(t.TempDir(), "absent.yaml")} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := LoadRegionTables(path); err != nil || got != nil {
+				t.Fatalf("got %v, %v; want nil, nil", got, err)
+			}
+		})
+	}
+
+	for name, tc := range map[string]struct{ body, want string }{
+		"provider with no table": {"modal:\n  us: [us-east]\n", `provider "modal" has no region table`},
+		"unknown geography":      {"aws:\n  jp: [ap-northeast-1]\n", `"jp" is not a geography`},
+		"region under two":       {"aws:\n  eu: [eu-west-2]\n  uk: [eu-west-2]\n", `"eu-west-2" is under both`},
+		"empty region":           {"aws:\n  us: [\"\"]\n", "empty or padded"},
+		"unknown field":          {"aws:\n  us: [us-east-1]\nregions: []\n", "parse region tables"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadRegionTables(write(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
 	}
 }
