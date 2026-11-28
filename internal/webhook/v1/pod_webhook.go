@@ -192,11 +192,29 @@ func validatePod(pod *corev1.Pod) error {
 	if pod.Spec.HostNetwork {
 		return errors.New("nebula does not run host-network Pods: set spec.hostNetwork to false")
 	}
+	if err := validateAffinity(pod.Spec.Affinity); err != nil {
+		return err
+	}
 	// The accelerator type and the GPU count must come together; see util.AcceleratorRequest.
 	if _, _, err := util.AcceleratorRequest(pod); err != nil {
 		return err
 	}
 	return nil
+}
+
+// validateAffinity refuses a required node affinity. The host scheduler checks it against the
+// provider's virtual node, which stands for instances in many regions and so carries no
+// region, zone or instance labels: the term never matches and the Pod stays Pending, where
+// the regions annotation is what chooses where it runs. Pod (anti-)affinity is left to the
+// scheduler, which marks a Pod it cannot place as unschedulable like anywhere else.
+func validateAffinity(a *corev1.Affinity) error {
+	if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return nil
+	}
+	return fmt.Errorf("nebula does not honor required nodeAffinity: placement chooses the provider and "+
+		"region, so constrain the region with the %s annotation and remove "+
+		"spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution, or make it preferred",
+		nebulav1alpha1.RegionsAnnotation)
 }
 
 // placedByNebula reports whether placement chose a provider for pod: it records the choice in the

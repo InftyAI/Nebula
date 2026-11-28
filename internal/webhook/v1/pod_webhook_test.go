@@ -389,3 +389,92 @@ func TestValidateUpdate_JudgesLabelTransitions(t *testing.T) {
 		})
 	}
 }
+
+// Only a required node affinity is refused: it can never match a provider's virtual node. Pod
+// (anti-)affinity is left to the scheduler, preferred terms only score, and a Pod Nebula will not
+// place is not judged.
+func TestValidateCreate_RejectsRequiredNodeAffinity(t *testing.T) {
+	zone := corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+		{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"us-east-1a"}},
+	}}
+	peers := corev1.PodAffinityTerm{
+		LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "trainer"}},
+		TopologyKey:   corev1.LabelHostname,
+	}
+	acrossZones := peers
+	acrossZones.TopologyKey = corev1.LabelTopologyZone
+	acrossProviders := peers
+	acrossProviders.TopologyKey = nebulav1alpha1.ProviderLabel
+	optedIn := map[string]string{nebulav1alpha1.EnabledLabel: "true"}
+	v := &PodCustomValidator{}
+	for _, tc := range []struct {
+		name     string
+		labels   map[string]string
+		nodeName string
+		affinity *corev1.Affinity
+		want     string // a fragment of the rejection, or "" for admitted
+	}{{
+		name: "required nodeAffinity", labels: optedIn,
+		affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{zone}},
+		}},
+		want: "required nodeAffinity",
+	}, {
+		name: "required podAntiAffinity on the hostname", labels: optedIn,
+		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossZones, peers},
+		}},
+	}, {
+		name: "required podAntiAffinity on a zone", labels: optedIn,
+		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossZones},
+		}},
+	}, {
+		name: "required podAntiAffinity on the provider label", labels: optedIn,
+		affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{acrossProviders},
+		}},
+	}, {
+		name: "required podAffinity on the hostname", labels: optedIn,
+		affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers},
+		}},
+	}, {
+		name: "required podAffinity on a zone", labels: optedIn,
+		affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{peers, acrossZones},
+		}},
+	}, {
+		name: "preferred terms pass", labels: optedIn,
+		affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+				{Weight: 1, Preference: zone},
+			}},
+			PodAntiAffinity: &corev1.PodAntiAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+				{Weight: 1, PodAffinityTerm: peers},
+			}},
+		},
+	}, {
+		name: "not opted in", affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{zone}},
+		}},
+	}, {
+		name: "pre-bound", labels: optedIn, nodeName: "node-1",
+		affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{zone}},
+		}},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := podWith(tc.labels, tc.nodeName)
+			pod.Spec.Containers = []corev1.Container{{Name: "main"}}
+			pod.Spec.Affinity = tc.affinity
+			_, err := v.ValidateCreate(context.Background(), pod)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("ValidateCreate = %v, want admitted", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Fatalf("ValidateCreate = %v, want a rejection naming %q", err, tc.want)
+			}
+		})
+	}
+}

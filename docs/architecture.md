@@ -155,6 +155,16 @@ Follow one GPU Pod from creation to teardown:
    geography or a provider its NodePool left out, and the pool's order stands, and
    neither can change once the Pod is placed: placement read them into its NodeClaim.
 
+   A required `nodeAffinity` is refused by the validating webhook: it is checked against
+   the provider's virtual node, which carries no region, zone or instance labels, so it
+   could never match. Use `nebula.inftyai.com/regions` to choose where the Pod runs.
+   Pod (anti-)affinity is admitted and left to the host scheduler, which binds the Pod
+   to the virtual node or marks it unschedulable, as for any Pod. Nebula's placement
+   ignores it, so for Modal, RunPod and AWS it changes nothing about where instances
+   run. The Kubernetes provider keeps it on the real pod, so the target cluster's
+   scheduler applies it there, matching on the labels real pods carry (see
+   `--kubernetes-propagate-labels`).
+
 2. **Gate at admission.** The mutating webhook adds the scheduling gate
    `nebula.inftyai.com/provider-selection` and a key-only `Exists` toleration for
    the virtual-node taint `nebula.inftyai.com/provider:NoSchedule`. The webhook
