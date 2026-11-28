@@ -220,7 +220,7 @@ aws logs filter-log-events --region <host region> \
 | `401 Unauthorized` from a target | its access entry predates the IAM role: recreate the entry |
 | `403 … User "…" cannot …` | `remote-rbac.yaml` missing or outdated in that target |
 | `i/o timeout` to a target's API | network: the target's endpoint does not accept the manager's source address |
-| Pods stay `SchedulingGated` | every serving cluster refused for capacity and is blocklisted; one probe is retried as each block lapses (a 4- or 8-GPU request is the usual cause) |
+| Pods stay `SchedulingGated` | `kubectl describe pod` names the reason in a `PlacementFailed` or `PlacementDeferred` Event. `PlacementDeferred`: every serving cluster refused for capacity and is blocklisted; one probe is retried as each block lapses (a 4- or 8-GPU request is the usual cause) |
 | Pods fail with `provider: pod spec refused: …` and move to the next cluster | that cluster's Karpenter rejects the pod's own spec, usually a taint it does not tolerate (the message is Karpenter's). The cluster is skipped for that workload for 10 minutes; a fixed Deployment template is a new workload and tries it straight away |
 | A real pod pending for minutes, then the placeholder fails | no capacity reported by Karpenter, but the pod stayed unbound past the 5-minute bind timeout |
 

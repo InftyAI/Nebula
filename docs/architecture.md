@@ -208,8 +208,11 @@ Follow one GPU Pod from creation to teardown:
    - writes `nebula.inftyai.com/blocklist-ttl` when the pool sets one;
    - removes only Nebula's scheduling gate.
 
-   If no candidate can serve the Pod, the Pod is left gated. If candidates are
-   only blocked by failover TTLs, the controller requeues for the soonest expiry.
+   If no candidate can serve the Pod, the Pod is left gated with a Warning
+   `PlacementFailed` Event naming why: no NodePool, an invalid request, or what
+   ruled out each provider. If candidates are only blocked by failover TTLs, the
+   controller records a Normal `PlacementDeferred` Event and requeues for the
+   soonest expiry. Either shows in `kubectl describe pod`.
 
 6. **Bind through Kubernetes.** Once the gate is gone, the native scheduler sees
    the provider nodeSelector and binds the Pod to `nebula-<provider>`.
