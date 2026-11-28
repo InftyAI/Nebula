@@ -27,24 +27,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 	"github.com/InftyAI/Nebula/pkg/provider"
 )
 
-// SecretTypeAWSRole marks a Secret carrying the AWS IAM role a provider assumes to pull a
-// private ECR image:
-//
-//	roleARN: arn:aws:iam::123456789012:role/nebula-ecr-pull   # required
-//	region:  us-west-2                                        # required, the REGISTRY's region
-//
-// A dedicated TYPE rather than an Opaque Secret sniffed for known keys: one declared field to
-// dispatch on, and room for the other delegated-identity kinds (GCP, Azure) to arrive as
-// their own types. It holds no actual secret — an ARN is an identifier — and is a Secret only
-// because imagePullSecrets can reference nothing else.
-const SecretTypeAWSRole corev1.SecretType = "nebula.inftyai.com/aws-role"
+// SecretTypeAWSRole is the Secret type naming an AWS role to pull private ECR images with.
+const SecretTypeAWSRole = nebulav1alpha1.SecretTypeAWSRole
 
 // resolveRegistryAuth builds ProvisionRequest.RegistryAuth from the Pod's imagePullSecrets,
-// which name Secrets in the Pod's namespace that an adapter cannot read — the same reason
-// resolveEnv lives here. (nil, nil) is an anonymous pull.
+// which name Secrets in the Pod's namespace that an adapter cannot read. (nil, nil) is an
+// anonymous pull.
 //
 // The first USABLE entry wins, never a merge: a provider attaches ONE credential to one image.
 // Every earlier entry that did not work out — unreadable, mistyped, malformed, or holding
@@ -64,7 +56,7 @@ func resolveRegistryAuth(
 		return nil, nil
 	}
 	if client == nil {
-		// No literals-only path to degrade to, unlike resolveEnv: this is a read or nothing.
+		// No literals-only path to degrade to: this is a read or nothing.
 		return nil, fmt.Errorf("imagePullSecrets are set but this node has no cluster client")
 	}
 	// One container per Nebula Pod, as everywhere else that reads the workload.
@@ -107,14 +99,14 @@ func registryAuthFromSecret(
 
 	switch s.Type {
 	case SecretTypeAWSRole:
-		arn := strings.TrimSpace(string(s.Data[secretKeyRoleARN]))
-		region := strings.TrimSpace(string(s.Data[secretKeyRegion]))
+		arn := strings.TrimSpace(string(s.Data[nebulav1alpha1.AWSRoleARNKey]))
+		region := strings.TrimSpace(string(s.Data[nebulav1alpha1.AWSRoleRegionKey]))
 		// Both required. The region is the REGISTRY's, which the ECR host does encode, but a
 		// pull-through or replicated reference makes reading it off the image a guess — and a
 		// wrong one only ever surfaces as an opaque auth failure.
 		if arn == "" || region == "" {
 			return nil, fmt.Errorf("imagePullSecret %q of type %s needs a non-empty %q and %q",
-				name, s.Type, secretKeyRoleARN, secretKeyRegion)
+				name, s.Type, nebulav1alpha1.AWSRoleARNKey, nebulav1alpha1.AWSRoleRegionKey)
 		}
 		return &provider.RegistryAuth{
 			Registry: registry,
@@ -133,12 +125,6 @@ func registryAuthFromSecret(
 			name, s.Type, SecretTypeAWSRole, corev1.SecretTypeDockerConfigJson)
 	}
 }
-
-// The keys SecretTypeAWSRole carries, both required.
-const (
-	secretKeyRoleARN = "roleARN"
-	secretKeyRegion  = "region"
-)
 
 // dockerConfigAuth reads registry's entry from a kubernetes.io/dockerconfigjson Secret. Only
 // the auths map, never credsStore/credHelpers: a helper names a binary on the machine holding

@@ -19,6 +19,7 @@ package vnode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -320,26 +321,18 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	req.CapacityType = nc.Spec.CapacityType
 	req.Region = nc.Spec.Region
 
-	// Resolve BEFORE anything is requested: the Pod's env may point at Secrets and ConfigMaps
-	// a provider cannot read (see resolveEnv), and nothing exists yet, so failing here is free.
-	//
-	// NON-TERMINAL, like the kubelet's CreateContainerConfigError. A referenced Secret is
-	// often written moments after the Pod (a bootstrap job, an external-secrets sync), so the
-	// Pod waits at ConfigError with the reason on it and VK retries with backoff. Failing it
-	// would reap a workload over a race, and would run recordBlock's failover machinery over
-	// a Pod-spec problem no other provider or region can fix.
-	//
-	// Deliberately NOT stored: tracking a pod makes GetPod return non-nil, which suppresses
-	// the retry this branch wants. (The provision-failure branch below stores for exactly
-	// that reason — it does not want one.)
-	env, err := resolveEnv(ctx, h.client, pod)
+	// virtual-kubelet resolves every env reference before CreatePod, like a kubelet, and fails on
+	// a missing required one. Any reference still here would be silently dropped, so it is a
+	// non-terminal ConfigError (like the kubelet's CreateContainerConfigError) and the pod is NOT
+	// stored: tracking it would suppress the retry (see the provision-failure branch below).
+	env, err := literalEnv(pod)
 	if err != nil {
-		log.Error(err, "cannot resolve the Pod's environment; nothing provisioned, retrying")
+		log.Error(err, "the Pod's environment isn't resolved; nothing provisioned, retrying")
 		h.markStatus(pod, corev1.PodPending, reasonConfigError, err.Error())
 		h.emit(pod)
 		return err
 	}
-	req.Env = env
+	req.Env = provider.Env{Config: env}
 
 	// Same resolve-before-requesting rule, and the same non-terminal treatment, for the
 	// image pull credential: an imagePullSecret names a Secret in the Pod's namespace that
@@ -440,6 +433,29 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 
 	h.emit(pod)
 	return nil
+}
+
+// literalEnv returns the first container's env as virtual-kubelet passes it to CreatePod. Only
+// literal values are accepted, and a later entry overrides an earlier one, as in the kubelet.
+func literalEnv(pod *corev1.Pod) (map[string]string, error) {
+	if len(pod.Spec.Containers) == 0 {
+		return nil, nil
+	}
+	c := pod.Spec.Containers[0]
+	if len(c.EnvFrom) > 0 {
+		return nil, errors.New("the container's envFrom is unresolved")
+	}
+	var out map[string]string
+	for _, e := range c.Env {
+		if e.ValueFrom != nil {
+			return nil, fmt.Errorf("env %q still refers to its source", e.Name)
+		}
+		if out == nil {
+			out = make(map[string]string, len(c.Env))
+		}
+		out[e.Name] = e.Value
+	}
+	return out, nil
 }
 
 // persistCredential writes the bearer token, plus the address it authenticates against,

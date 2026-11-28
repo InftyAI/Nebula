@@ -19,6 +19,7 @@ package kubernetes
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -132,14 +133,6 @@ func TestProvisionBoundToWarmNode(t *testing.T) {
 	if !res.Reserved || res.InstanceID != "us-east-1:org-1:org-1-work-1" {
 		t.Fatalf("result = %+v", res)
 	}
-	sec, err := tc.kube.CoreV1().Secrets("org-1").Get(context.Background(), "org-1-work-1-env", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sec.StringData["K"] != "v" || len(sec.OwnerReferences) != 1 || sec.OwnerReferences[0].UID != testUID {
-		t.Errorf("secret = %+v", sec)
-	}
-
 	inst, err := p.FindByClaim(context.Background(), "org-1-work-1", "eks-use1")
 	if err != nil || inst == nil || inst.ID != res.InstanceID {
 		t.Fatalf("FindByClaim = %+v, %v", inst, err)
@@ -352,17 +345,32 @@ func TestListReportsNoCapacityPastBindTimeout(t *testing.T) {
 	}
 }
 
-func TestProvisionRejectsUnknownClusterAndPullSecret(t *testing.T) {
+func TestProvisionRejectsUnknownCluster(t *testing.T) {
 	p := newTestProvider(map[string]clusterClients{})
 	req := provisionRequest()
 	req.Region = "nowhere"
 	if _, err := p.Provision(context.Background(), placeholder(), req); err == nil {
 		t.Error("unknown cluster: want an error")
 	}
-	req = provisionRequest()
-	req.RegistryAuth = &provider.RegistryAuth{}
-	if _, err := p.Provision(context.Background(), placeholder(), req); err == nil {
-		t.Error("pull credential: want an error")
+}
+
+// The kubelet pulls with every imagePullSecret, so the vnode's one credential is no refusal, even
+// Modal's AWS role listed before the kubelet's dockerconfigjson.
+func TestProvisionLeavesThePullToTheKubelet(t *testing.T) {
+	tc := newTestCluster(t, true)
+	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
+	local := placeholder()
+	local.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "role"}, {Name: "tok"}}
+	req := provisionRequest()
+	req.RegistryAuth = &provider.RegistryAuth{AWSRole: &provider.AWSRoleAuth{RoleARN: "arn", Region: "us-east-1"}}
+	res, err := p.Provision(context.Background(), local, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ns, name, _ := parseInstanceID(res.InstanceID)
+	real, err := tc.kube.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil || !slices.Equal(real.Spec.ImagePullSecrets, local.Spec.ImagePullSecrets) {
+		t.Fatalf("real pod = %+v, %v; want both imagePullSecrets as written", real, err)
 	}
 }
 
@@ -428,30 +436,7 @@ func TestListIgnoresPodsWeDidNotCreate(t *testing.T) {
 	}
 }
 
-// A user's own Secret that happens to carry the env Secret's name is refused, never overwritten.
-func TestProvisionRefusesToOverwriteForeignSecret(t *testing.T) {
-	tc := newTestCluster(t, true)
-	theirs := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "org-1-work-1-env", Namespace: "org-1"},
-		StringData: map[string]string{"THEIRS": "keep"},
-	}
-	if _, err := tc.kube.CoreV1().Secrets("org-1").Create(context.Background(), theirs,
-		metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	p := newTestProvider(map[string]clusterClients{"eks-use1": tc.clients()})
-
-	if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err == nil {
-		t.Fatal("Provision overwrote a Secret Nebula did not create")
-	}
-	got, _ := tc.kube.CoreV1().Secrets("org-1").Get(context.Background(), "org-1-work-1-env", metav1.GetOptions{})
-	if got.StringData["THEIRS"] != "keep" {
-		t.Fatalf("the user's Secret was changed: %+v", got.StringData)
-	}
-}
-
-// Whatever already holds the names is refused before anything is created, so no container can
-// start with a Secret that is not this request's; the error blocks nothing, the Pod's owner
+// Whatever already holds the pod's name is refused; the error blocks nothing, the Pod's owner
 // retries.
 func TestProvisionRefusesWhatHoldsTheName(t *testing.T) {
 	finished := func() *corev1.Pod {
@@ -459,14 +444,8 @@ func TestProvisionRefusesWhatHoldsTheName(t *testing.T) {
 		pod.Status.Phase = corev1.PodSucceeded
 		return pod
 	}
-	stale := func() *corev1.Secret {
-		sec := envSecret("org-1", "org-1-work-1", map[string]string{"K": "stale"})
-		sec.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: "old"}}
-		return sec
-	}
 	cases := map[string]runtime.Object{
 		"earlier pod, finished": finished(),
-		"earlier pod's secret":  stale(),
 	}
 	for name, obj := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -483,22 +462,16 @@ func TestProvisionRefusesWhatHoldsTheName(t *testing.T) {
 			if scope := p.ClassifyProvisionError(err, "H100:1", "us-east-1"); scope != (provider.BlockScope{}) {
 				t.Errorf("a name collision blocked %+v; it says nothing about capacity", scope)
 			}
-			if sec, err := tc.kube.CoreV1().Secrets("org-1").Get(context.Background(), "org-1-work-1-env",
-				metav1.GetOptions{}); err == nil && sec.StringData["K"] == "v" {
-				t.Error("the request's Secret was written despite the refusal")
-			}
 		})
 	}
 }
 
-// A live pod of ours is the one an interrupted Provision left behind: adopted, with its Secret.
+// A live pod of ours is the one an interrupted Provision left behind: adopted.
 func TestProvisionAdoptsLivePod(t *testing.T) {
 	tc := newTestCluster(t, true)
 	live := buildPod(placeholder(), podSpec{claim: "org-1-work-1"})
 	live.UID, live.Spec.NodeName, live.Status.Phase = testUID, "node-1", corev1.PodRunning
-	sec := envSecret("org-1", "org-1-work-1", map[string]string{"K": "v"})
-	sec.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: testUID}}
-	for _, obj := range []runtime.Object{live, sec} {
+	for _, obj := range []runtime.Object{live} {
 		if err := tc.kube.Tracker().Add(obj); err != nil {
 			t.Fatal(err)
 		}
@@ -508,37 +481,5 @@ func TestProvisionAdoptsLivePod(t *testing.T) {
 	res, err := p.Provision(context.Background(), placeholder(), provisionRequest())
 	if err != nil || !res.Reserved || res.InstanceID != "us-east-1:org-1:org-1-work-1" {
 		t.Fatalf("Provision = %+v, %v; want the live pod adopted", res, err)
-	}
-}
-
-// An adopted pod takes over only its own Secret: one with Nebula's labels but another pod's
-// UID, or none, is an earlier pod's leftover that garbage collection may remove at any time.
-func TestProvisionAdoptRejectsAnotherPodsSecret(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		owners []metav1.OwnerReference
-	}{
-		{"owned by an earlier pod", []metav1.OwnerReference{
-			{APIVersion: "v1", Kind: "Pod", Name: "org-1-work-1", UID: "earlier-uid"}}},
-		{"owned by nothing", nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := newTestCluster(t, true)
-			live := buildPod(placeholder(), podSpec{claim: "org-1-work-1"})
-			live.UID, live.Spec.NodeName, live.Status.Phase = testUID, "node-1", corev1.PodRunning
-			sec := envSecret("org-1", "org-1-work-1", map[string]string{"K": "stale"})
-			sec.OwnerReferences = tc.owners
-			for _, obj := range []runtime.Object{live, sec} {
-				if err := c.kube.Tracker().Add(obj); err != nil {
-					t.Fatal(err)
-				}
-			}
-			p := newTestProvider(map[string]clusterClients{"eks-use1": c.clients()})
-
-			if _, err := p.Provision(context.Background(), placeholder(), provisionRequest()); err == nil ||
-				!strings.Contains(err.Error(), "earlier pod") {
-				t.Fatalf("Provision err = %v; want the stale Secret refused", err)
-			}
-		})
 	}
 }

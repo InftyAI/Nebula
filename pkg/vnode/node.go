@@ -115,6 +115,7 @@ func NodeName(providerName string) string {
 // +kubebuilder:rbac:groups="",resources=nodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 // Runner is a manager.Runnable owning one provider's virtual node. It starts the VK
@@ -194,6 +195,15 @@ func (r *Runner) Start(ctx context.Context) error {
 	secretInformer := scmFactory.Core().V1().Secrets()
 	configMapInformer := scmFactory.Core().V1().ConfigMaps()
 	serviceInformer := svcFactory.Core().V1().Services()
+	if reflector, ok := r.prov.(provider.Reflector); ok {
+		err := reflector.Reflect(ctx, provider.ReflectSources{
+			Client: r.client, Secrets: secretInformer, ConfigMaps: configMapInformer,
+			Namespaces: scmFactory.Core().V1().Namespaces(),
+		})
+		if err != nil {
+			return fmt.Errorf("reflect for %q: %w", r.nodeName, err)
+		}
+	}
 
 	eb := record.NewBroadcaster()
 	recorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: r.nodeName + "/pod-controller"})

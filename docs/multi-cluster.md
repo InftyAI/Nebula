@@ -24,8 +24,10 @@ cluster as it picks a region, from the pool's `regions` and `strategy` ([NodePoo
 1. **Provision** works in the chosen cluster, through its EKS API: it creates the Pod's
    namespace if missing and creates the real pod. That is the placeholder's spec, named after
    the claim (`<namespace>-<pod>`), with Nebula's scheduling replaced by a node selection for the
-   GPU's instance families and the capacity type. Secret-sourced env vars go into a Secret the
-   real pod owns.
+   GPU's instance families and the capacity type. Its env holds the values resolved from the
+   placeholder's references at placement. Its imagePullSecrets stay as written: that cluster's
+   kubelet pulls with the [reflected](#pull-secrets) copies, and one that isn't reflected fails
+   the pod there, as on any node.
 2. **That cluster's Karpenter** launches a node, and the real pod starts there.
 3. **Status flows back.** Every 5 seconds Nebula lists the real pods in each cluster; the
    placeholder mirrors the real pod's phase and readiness, and carries its IP.
@@ -50,7 +52,7 @@ cluster as it picks a region, from the pool's `regions` and `strategy` ([NodePoo
 | EKS, with **Karpenter v1** and a GPU NodePool | Karpenter launches the nodes; Nebula checks its NodeClaim API at startup. The NodePool must allow the instance families of the GPUs you request (multi-GPU types too, or nothing packs). |
 | The NVIDIA device plugin | Without it no node advertises `nvidia.com/gpu`. |
 | An **access entry** mapping the host's Nebula IAM role to the Kubernetes group `nebula` | How the target recognises Nebula (STS-signed token; no kubeconfig or secret). |
-| [`config/kubernetes-provider/remote-rbac.yaml`](../config/kubernetes-provider/remote-rbac.yaml) applied | What group `nebula` may do: pods, secrets, namespaces, events. |
+| [`config/kubernetes-provider/remote-rbac.yaml`](../config/kubernetes-provider/remote-rbac.yaml) applied | What group `nebula` may do: pods, secrets, configmaps, namespaces, events. |
 | Its EKS API reachable from the Nebula manager | Every poll lists the real pods there. |
 | Its log agent forwarding Nebula's pods to the host's application log group | The host's log readers query only that group. Its streams there are prefixed `<cluster>-`. |
 
@@ -145,6 +147,39 @@ It is an allowlist because, in the host cluster, the real pod shares the placeho
 a controller label such as `pod-template-hash` would let the placeholder's owner adopt it, and
 anything selecting on labels (a Service, a PodDisruptionBudget, an operator) would count the
 sandbox twice. Add a key only if nothing in that namespace selects on it.
+
+## Pull Secrets
+
+Nebula copies the host cluster's image pull Secrets (`kubernetes.io/dockerconfigjson`) that a
+rule in the table's `reflection` section selects into the same
+namespace of every other cluster, creating the namespace if needed, so a real pod there pulls a
+private image with them. Nothing is copied unless a rule selects it:
+
+```yaml
+reflection:
+  rules:
+    - resources: [secrets]
+      objectSelector: { matchLabels: { app: trainer } }
+```
+
+A rule selects objects of its `resources` (`secrets`, `configmaps`), in a namespace matching
+`namespaceSelector` (omitted: any; a namespace's name is its `kubernetes.io/metadata.name`
+label), whose labels match `objectSelector`, which is required and may not be empty. Select by
+your own labels: `nebula.inftyai.com/` keys are Nebula's, and refused. `mode` is optional and only
+`AllowList` today. A rule can select other Secrets and ConfigMaps too, but a real pod's env
+doesn't read them yet: it holds the values resolved at placement.
+
+A copy follows its source within seconds, so a container restarted there pulls with a registry
+token that hasn't expired. It is deleted when its source is deleted or no rule selects
+it any more, and every 10 minutes Nebula re-checks every selected object and every copy, for a
+change it missed or a copy left while it was down. Copies carry their source's labels, except
+any under `nebula.inftyai.com/`, plus `nebula.inftyai.com/reflected`; an object of the same name
+that isn't a copy is never changed, and the source gets a `ReflectionRefused` Warning Event
+instead.
+
+A copy holds every key of its source, so select only what every target may hold. Kubernetes'
+own objects (service-account tokens, `kube-root-ca.crt`) carry no labels a rule would select;
+don't add some to them.
 
 ## Networking
 

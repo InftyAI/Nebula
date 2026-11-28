@@ -28,6 +28,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/kubernetes"
 
 	nebulav1alpha1 "github.com/InftyAI/Nebula/api/v1alpha1"
 )
@@ -188,6 +190,23 @@ type RegionAccelerators interface {
 // exec would die the moment the start budget ran out.
 type Executor interface {
 	Exec(ctx context.Context, instanceID string, cmd []string, opts ExecOptions) (Process, error)
+}
+
+// Reflector is OPTIONAL. A provider implements it to copy the home cluster's Secrets and
+// ConfigMaps to where its instances run, so they can reference them by name. The virtual node
+// calls Reflect once, before its informers start; Reflect returns immediately and keeps
+// reflecting until ctx is done.
+type Reflector interface {
+	Reflect(ctx context.Context, home ReflectSources) error
+}
+
+// ReflectSources is what a Reflector reads the home cluster through: the virtual node's own
+// informers, so nothing is cached twice, and a client for recording Events.
+type ReflectSources struct {
+	Client     kubernetes.Interface
+	Secrets    coreinformers.SecretInformer
+	ConfigMaps coreinformers.ConfigMapInformer
+	Namespaces coreinformers.NamespaceInformer
 }
 
 // ExecOptions is what the client asked for that the provider must know at start time.

@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -41,8 +42,19 @@ func pullPod(image string, secretNames ...string) *corev1.Pod {
 	return pod
 }
 
-// typedSecret is a Secret of an explicit type, which is what resolveRegistryAuth dispatches
-// on (secretObj in env_test.go leaves the type empty).
+// secretObj is a Secret of no type, which resolveRegistryAuth doesn't take as a credential.
+func secretObj(name string, data map[string]string) *corev1.Secret {
+	s := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+		Data:       map[string][]byte{},
+	}
+	for k, v := range data {
+		s.Data[k] = []byte(v)
+	}
+	return s
+}
+
+// typedSecret is a Secret of an explicit type, which is what resolveRegistryAuth dispatches on.
 func typedSecret(name string, t corev1.SecretType, data map[string]string) *corev1.Secret {
 	s := secretObj(name, data)
 	s.Type = t
