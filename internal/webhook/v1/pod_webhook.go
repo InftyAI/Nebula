@@ -192,9 +192,40 @@ func validatePod(pod *corev1.Pod) error {
 	if pod.Spec.HostNetwork {
 		return errors.New("nebula does not run host-network Pods: set spec.hostNetwork to false")
 	}
+	if err := validateAffinity(pod.Spec.Affinity); err != nil {
+		return err
+	}
 	// The accelerator type and the GPU count must come together; see util.AcceleratorRequest.
 	if _, _, err := util.AcceleratorRequest(pod); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateAffinity refuses the required affinity terms that can never schedule. The host
+// scheduler checks them against the provider's virtual node, which stands for instances in many
+// regions and so carries no region, zone or instance labels: a required node affinity never
+// matches it, and required anti-affinity on the hostname lets only one replica bind to the node
+// they all share. Anything else schedules, even where its meaning is not kept (anti-affinity on
+// a zone the node lacks, pod affinity), so it passes, as do preferred terms, which only score.
+func validateAffinity(a *corev1.Affinity) error {
+	if a == nil {
+		return nil
+	}
+	if a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		return fmt.Errorf("nebula does not honor required nodeAffinity: placement chooses the provider and "+
+			"region, so constrain the region with the %s annotation and remove "+
+			"spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution, or make it preferred",
+			nebulav1alpha1.RegionsAnnotation)
+	}
+	if a.PodAntiAffinity != nil {
+		for _, term := range a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			if term.TopologyKey == corev1.LabelHostname {
+				return fmt.Errorf("nebula does not honor required podAntiAffinity on %s: every Pod already gets its "+
+					"own instance, but its replicas share one virtual node, so only one would schedule; remove the "+
+					"term or make it preferred", corev1.LabelHostname)
+			}
+		}
 	}
 	return nil
 }
