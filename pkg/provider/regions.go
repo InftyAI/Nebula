@@ -42,7 +42,9 @@ func IsGeography(token string) bool {
 type RegionTables map[string]map[string][]string
 
 // regionTableProviders are the providers whose table the --regions file may replace. One not
-// listed resolves its regions some other way, so naming it is refused rather than ignored.
+// listed resolves its regions some other way, so naming it is refused rather than ignored. A
+// provider that expands geographies itself (a future gcp, say) joins it, and cmd/main.go hands
+// its constructor tables[name], as it does for aws.
 var regionTableProviders = []string{ProviderAWS}
 
 // LoadRegionTables reads and validates the --regions file at path. An empty path or a missing

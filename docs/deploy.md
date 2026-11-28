@@ -202,6 +202,9 @@ aws:
   # ...every other geography you want served
 ```
 
+The file is keyed by provider, so other providers' tables can sit beside `aws` once they read
+one; only `aws` does today, and any other key is refused rather than ignored.
+
 The file **replaces** the built-in table, so list every geography AWS should serve; one left
 out serves nothing. Each list is the order placement tries, and a region may sit under one
 geography only. A bad file leaves AWS unregistered, with the reason in the manager's log. It
