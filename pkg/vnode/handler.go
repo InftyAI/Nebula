@@ -651,8 +651,8 @@ func (h *Handler) GetPods(_ context.Context) ([]*corev1.Pod, error) {
 // NotifyPods registers the async status callback and starts the poll loop. VK calls it
 // once at startup; the loop runs until ctx is cancelled.
 //
-// We WRAP VK's callback: its status path writes only the /status subresource and
-// silently drops metadata changes on the same object, but the endpoint has to live on
+// We WRAP VK's callback: its status path writes only the /status subresource (see
+// statusPods) and drops metadata changes on the same object, but the endpoint has to live on
 // metadata (PodIP cannot hold a DNS name — see applyState) and so does the instance id. So
 // the wrapper writes that metadata first, then hands the same Pod to VK. Every status push
 // therefore also reconciles how the workload is reached and which instance backs it.
