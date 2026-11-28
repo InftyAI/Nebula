@@ -321,12 +321,13 @@ func (h *Handler) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	req.CapacityType = nc.Spec.CapacityType
 	req.Region = nc.Spec.Region
 
-	// Unless the provider keeps references (see Capabilities.KeepsEnvReferences), virtual-kubelet
-	// resolves every one before CreatePod, like a kubelet, and fails on a missing required one.
-	// Any reference still here would be silently dropped, so it is a non-terminal ConfigError
-	// (like the kubelet's CreateContainerConfigError) and the pod is NOT stored: tracking it
-	// would suppress the retry (see the provision-failure branch below).
-	if !h.prov.Capabilities().KeepsEnvReferences {
+	// Unless the provider resolves env references itself (see
+	// Capabilities.ResolvesEnvReferences), virtual-kubelet resolves every one before CreatePod,
+	// like a kubelet, and fails on a missing required one. Any reference still here would be
+	// silently dropped, so it is a non-terminal ConfigError (like the kubelet's
+	// CreateContainerConfigError) and the pod is NOT stored: tracking it would suppress the
+	// retry (see the provision-failure branch below).
+	if !h.prov.Capabilities().ResolvesEnvReferences {
 		env, err := literalEnv(pod)
 		if err != nil {
 			log.Error(err, "the Pod's environment isn't resolved; nothing provisioned, retrying")

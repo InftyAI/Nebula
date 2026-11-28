@@ -163,7 +163,7 @@ func TestBuildPod(t *testing.T) {
 	local.Labels["app"] = "trainer"
 	local.Labels["pod-template-hash"] = "5d9f"
 	local.Labels[nebulav1alpha1.ManagedByLabel] = "hive-operator"
-	// As virtual-kubelet hands it over with KeepsEnvReferences: nothing resolved.
+	// As virtual-kubelet hands it over with ResolvesEnvReferences: nothing resolved.
 	env := []corev1.EnvVar{
 		{Name: "TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: "creds"}, Key: "token"}}},

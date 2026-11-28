@@ -198,14 +198,14 @@ func (p *Provider) Name() string { return provider.ProviderKubernetes }
 // Capabilities implements provider.Provider.
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		SupportsStop:         false,
-		SupportsSpot:         true,  // Karpenter's capacity type, see nodeAffinity
-		SupportsEgressPolicy: false, // no NetworkPolicy is written
-		SupportsCPUOnly:      true,
-		NativeTags:           true,
-		KeepsEnvReferences:   true, // the target's kubelet reads the reflected copies
-		PreemptionNotice:     spotNotice,
-		PollInterval:         pollInterval,
+		SupportsStop:          false,
+		SupportsSpot:          true,  // Karpenter's capacity type, see nodeAffinity
+		SupportsEgressPolicy:  false, // no NetworkPolicy is written
+		SupportsCPUOnly:       true,
+		NativeTags:            true,
+		ResolvesEnvReferences: true, // the target's kubelet reads the reflected copies
+		PreemptionNotice:      spotNotice,
+		PollInterval:          pollInterval,
 	}
 }
 

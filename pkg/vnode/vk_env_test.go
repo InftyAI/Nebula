@@ -86,9 +86,9 @@ func TestVirtualKubeletResolvesEnvBeforeCreatePod(t *testing.T) {
 	}
 }
 
-// With KeepsEnvReferences the references must reach CreatePod as written, since the Kubernetes
+// With ResolvesEnvReferences the references must reach CreatePod as written, since the Kubernetes
 // provider copies them to the target. Fails the day SkipDownwardAPIResolution stops skipping.
-func TestVirtualKubeletKeepsEnvReferences(t *testing.T) {
+func TestVirtualKubeletResolvesEnvReferences(t *testing.T) {
 	c := createdThroughPodController(t, true).Spec.Containers[0]
 	if len(c.EnvFrom) != 1 || len(c.Env) != 3 || c.Env[0].ValueFrom == nil || c.Env[1].ValueFrom == nil {
 		t.Fatalf("env = %+v, envFrom = %+v; want the references as written", c.Env, c.EnvFrom)

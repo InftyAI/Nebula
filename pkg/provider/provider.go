@@ -386,11 +386,11 @@ type Capabilities struct {
 	// NativeTags is true if the provider has real instance tags/labels; when
 	// false, identity is encoded in the instance name (RunPod: false).
 	NativeTags bool
-	// KeepsEnvReferences is true if the provider's instances run under a kubelet that resolves
+	// ResolvesEnvReferences is true if the provider's instances run under a kubelet that resolves
 	// env references itself (Kubernetes). Its virtual node then leaves secretKeyRef,
 	// configMapKeyRef, fieldRef and envFrom unresolved and ProvisionRequest.Env empty, so no
 	// Secret value is copied into the instance's spec.
-	KeepsEnvReferences bool
+	ResolvesEnvReferences bool
 	// PreemptionNotice is the advance warning before a spot reclaim; zero means
 	// none (RunPod: 0 — abrupt, detected only by polling).
 	PreemptionNotice time.Duration

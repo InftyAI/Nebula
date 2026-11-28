@@ -143,7 +143,7 @@ func buildPod(local *corev1.Pod, s podSpec) *corev1.Pod {
 
 	c := &spec.Containers[0]
 	c.VolumeMounts = nil
-	// env and envFrom stay as written (see Capabilities.KeepsEnvReferences): the target's kubelet
+	// env and envFrom stay as written (see Capabilities.ResolvesEnvReferences): the target's kubelet
 	// resolves them from the reflected copies, and a reference that was never reflected fails
 	// the pod there with CreateContainerConfigError, as on any node.
 

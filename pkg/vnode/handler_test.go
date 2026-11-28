@@ -2209,8 +2209,8 @@ func TestLiteralEnv(t *testing.T) {
 
 // A provider that keeps env references gets the Pod as written and an empty Env: literalEnv,
 // which would refuse the reference, is not consulted.
-func TestCreatePod_KeepsEnvReferencesForAProviderThatResolvesThem(t *testing.T) {
-	fp := &fakeProvider{provisionID: "inst-1", capabilities: provider.Capabilities{KeepsEnvReferences: true}}
+func TestCreatePod_PassesEnvReferencesToAProviderThatResolvesThem(t *testing.T) {
+	fp := &fakeProvider{provisionID: "inst-1", capabilities: provider.Capabilities{ResolvesEnvReferences: true}}
 	h := NewHandler(fp, nil, nil, openCluster())
 	pod := testPod("default", "p1")
 	pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "TOKEN", ValueFrom: &corev1.EnvVarSource{
